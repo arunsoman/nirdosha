@@ -367,6 +367,59 @@ without a rule that lived only in code until this check surfaced it.
 That gap — spec looser than implementation — is exactly the kind of
 thing an independent cross-check exists to find, and it found one.
 
+**Eighth update:** `Stmt::Return` now gets real Tier-1 treatment in both
+`refine.rs` and `smt.rs` — the one documented gap left over from the
+Sixth update, closed the same way `codegen.rs` already had (a
+`current_fn_ret` field threaded into the checker so a `return` site has
+something to check its value against). Small, bounded fix — except it
+immediately broke a test, and the reason why is worth recording in full.
+
+**A real, structural bug in `refine.rs`, invisible until `Return` sites
+were checked at all.** `factorial_multiplication_is_not_proven_in_range`
+started failing — not because the fix was wrong, but because it exposed
+that `refine.rs`'s `Interval` was `i64`-backed, and `Interval::unknown()`
+was defined as *exactly* `[i64::MIN, i64::MAX]` — `Ty::I64`'s own legal
+range. That makes "is this interval within `i64`'s range" vacuously true
+for *every* interval, since no `i64`-backed bound can ever fall outside
+`i64`'s own range in the first place. `refine.rs` could prove an
+`i64`-typed value safe but could never actually catch a real one that
+wasn't — a blind spot specific to the language's widest type, hidden the
+whole time `Return` sites went unchecked, surfaced the moment they
+weren't. `smt.rs` never had this bug: Z3's `Int` sort is a genuinely
+unbounded mathematical integer, not `i64`-backed, so it was never
+capable of this particular vacuous truth.
+
+**Fixed by widening, not by special-casing.** `Interval`'s `lo`/`hi`
+fields moved from `i64` to `i128`, giving real headroom: a computation
+that actually overflows `i64` now produces bounds outside
+`i64::MIN..=i64::MAX`, which the range check can genuinely detect.
+Pinned directly with a new regression test,
+`two_unconstrained_i64_params_multiplied_is_not_proven_in_range` — two
+unconstrained `i64` parameters multiplied and returned as `i64`, which
+obviously can overflow in reality and, before the fix, was being
+claimed as proven safe. `i128` isn't a perfect ceiling either (chained
+extreme operations could in principle approach *its* limit too), but
+`saturating_*` arithmetic keeps that sound — a wider blind spot than
+`i64`'s, not a reintroduction of the same bug, and honestly noted as a
+residual limitation in `Interval`'s own doc comment rather than assumed
+away.
+
+**Two existing tests had to be corrected, not just re-passed — a
+distinction worth being precise about.** Both `refine.rs`'s and
+`smt.rs`'s versions of `factorial_multiplication_is_not_proven_in_range`
+had asserted "nothing in factorial is proven," which was accidentally
+too broad: `return 1` in the `n <= 1` branch is genuinely, trivially
+safe (`1` always fits `i64`), and correctly *does* get proven now that
+`Return` sites are checked at all. The tests were rewritten to check the
+*specific* multiplying `return` instead — the real claim the test names
+were always meant to make. This is a real improvement surfacing an
+over-broad test, not a regression papered over.
+
+84/84 tests pass. Row 4's status line above and this section together
+are the full, current picture — the row-4 line hasn't been re-edited to
+say "84/84" since the running count would only go stale again next
+session; treat this update as the current authority on the number.
+
 ---
 
 

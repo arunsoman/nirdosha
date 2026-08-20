@@ -212,13 +212,36 @@ fn division_by_an_unconstrained_parameter_is_not_proven_nonzero() {
 
 #[test]
 fn factorial_multiplication_is_not_proven_in_range() {
+    // NOTE: deliberately checks the *specific* multiplying `return`, not
+    // "nothing in factorial is proven" -- an earlier, broader version of
+    // this assertion broke, correctly, the moment `smt.rs` gained the
+    // ability to prove `return` sites at all: `return 1` in the `n <= 1`
+    // branch is genuinely, trivially safe (1 always fits `i64`) and now
+    // correctly gets proven. A real improvement surfacing an
+    // accidentally-over-broad test, not a regression.
     let program = parse(include_str!("../examples/factorial.nir"));
     let report = analyze(&program);
     let factorial_fn = program.fns.iter().find(|f| f.name == "factorial").unwrap();
-    let any_span_inside_factorial = |s: &nirdosha::token::Span| s.line >= factorial_fn.span.line;
+    let mul_return_span = {
+        use nirdosha::ast::{Expr, Stmt};
+        fn find_mul_return(stmts: &[Stmt]) -> Option<nirdosha::token::Span> {
+            stmts.iter().find_map(|s| match s {
+                Stmt::Return { value: Some(Expr::Binary(..)), span } => Some(*span),
+                Stmt::Expr(Expr::If { then_block, else_block, .. }) => {
+                    find_mul_return(&then_block.stmts).or_else(|| match else_block.as_deref() {
+                        Some(nirdosha::ast::ElseBranch::Block(b)) => find_mul_return(&b.stmts),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+        }
+        find_mul_return(&factorial_fn.body.stmts).expect("test setup: expected to find the multiplying return")
+    };
     assert!(
-        !report.proven_in_range.iter().any(any_span_inside_factorial),
-        "factorial's multiplication genuinely can overflow -- nothing in it should be proven safe"
+        !report.proven_in_range.contains(&mul_return_span),
+        "factorial's multiplication genuinely can overflow -- this specific return must not be \
+         claimed as proven safe"
     );
 }
 

@@ -50,30 +50,49 @@ use std::collections::HashSet;
 use crate::ast::*;
 use crate::token::Span;
 
+/// Bounds are `i128`, not `i64` — deliberately, and not for headroom's own
+/// sake. A real bug shipped in an earlier version of this pass with `i64`
+/// bounds: `Interval::unknown()` was `[i64::MIN, i64::MAX]`, which is
+/// *exactly* `Ty::I64`'s own legal range — so `within(&Ty::I64)` was
+/// vacuously true for every interval, since no `i64`-backed bound could
+/// ever fall outside `i64`'s own range in the first place. This pass
+/// could prove an `i64`-typed value safe but could never actually catch
+/// one that wasn't — a structural blind spot for the language's *widest*
+/// type, invisible until `Stmt::Return` started getting checked at all
+/// (see `PHASE0.md`'s write-up: `smt.rs` never had this bug, because
+/// Z3's `Int` sort is genuinely unbounded, not `i64`-backed). `i128` gives
+/// real headroom: a computation that would truly overflow `i64` now
+/// produces bounds outside `i64::MIN..=i64::MAX`, which `within` can
+/// actually detect. Two `i64`-scale values multiplied can still touch
+/// `i128`'s own ceiling in extreme cases (`i64::MAX` squared is a little
+/// under half of `i128::MAX`, chained further ops could approach it) —
+/// `saturating_*` on `i128` keeps that sound (widening, never narrowing)
+/// even then, at the cost of losing precision for genuinely extreme
+/// chains, which is an honest, bounded residual limitation, not a
+/// reintroduction of the original bug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Interval {
-    lo: i64,
-    hi: i64,
+    lo: i128,
+    hi: i128,
 }
 
 impl Interval {
     fn exact(n: i64) -> Self {
-        Interval { lo: n, hi: n }
+        Interval { lo: n as i128, hi: n as i128 }
     }
 
-    /// The maximally conservative "no information" interval — always a
-    /// sound over-approximation of any integer value, regardless of its
-    /// real declared width, since nothing in this language holds a value
-    /// wider than `i64`.
+    /// The maximally conservative "no information" interval — a sound
+    /// over-approximation of any integer value this language can hold,
+    /// with real headroom beyond `i64`'s own range (see the struct doc).
     fn unknown() -> Self {
-        Interval { lo: i64::MIN, hi: i64::MAX }
+        Interval { lo: i128::MIN, hi: i128::MAX }
     }
 
     /// Delegates to `Ty::bounds()` — see its doc comment for why this
     /// isn't a second, independent table.
     fn full(ty: &Ty) -> Self {
         let (lo, hi) = ty.bounds();
-        Interval { lo, hi }
+        Interval { lo: lo as i128, hi: hi as i128 }
     }
 
     fn union(self, other: Interval) -> Interval {
@@ -81,13 +100,9 @@ impl Interval {
     }
 
     fn neg(self) -> Interval {
-        // `i64::MIN` has no positive counterpart — fall back to the
-        // widest possible bound rather than let the analysis's own
-        // arithmetic overflow. A saturated bound is still sound: it just
-        // makes the interval wider (less precise), never narrower.
         Interval {
-            lo: self.hi.checked_neg().unwrap_or(i64::MAX),
-            hi: self.lo.checked_neg().unwrap_or(i64::MAX),
+            lo: self.hi.saturating_neg(),
+            hi: self.lo.saturating_neg(),
         }
     }
 
@@ -121,11 +136,13 @@ impl Interval {
     /// A type's legal values are themselves a contiguous `[MIN, MAX]`
     /// range for every integer type this language has, so "this interval
     /// is fully inside the type's legal range" reduces to checking both
-    /// endpoints — reuses `Ty::in_range`, the exact same table the
-    /// runtime Tier-2 check already trusts, so the static proof and the
-    /// dynamic fallback can never disagree about what "in range" means.
+    /// endpoints against `Ty::bounds()` widened to `i128` — *not*
+    /// `Ty::in_range` (which takes a bare `i64` and can't accept an
+    /// `i128` that has genuinely escaped `i64`'s range, which is exactly
+    /// the case this function most needs to be able to say "no" to).
     fn within(self, ty: &Ty) -> bool {
-        ty.in_range(self.lo) && ty.in_range(self.hi)
+        let (lo, hi) = ty.bounds();
+        self.lo >= lo as i128 && self.hi <= hi as i128
     }
 
     fn excludes_zero(self) -> bool {
@@ -180,8 +197,9 @@ impl Scopes {
 }
 
 pub fn analyze(program: &Program) -> RefineReport {
-    let mut r = Refiner { report: RefineReport::default() };
+    let mut r = Refiner { report: RefineReport::default(), current_fn_ret: Ty::Unit };
     for f in &program.fns {
+        r.current_fn_ret = f.ret.clone();
         let mut scopes = Scopes::new();
         for p in &f.params {
             // No interprocedural analysis — a parameter could be anything
@@ -196,6 +214,12 @@ pub fn analyze(program: &Program) -> RefineReport {
 
 struct Refiner {
     report: RefineReport,
+    /// The function currently being walked — `Stmt::Return` needs its
+    /// declared return type to check against, and there's no other way
+    /// to reach it from inside `stmt()`. Same fix `codegen.rs`'s
+    /// `current_fn_ret` field already made for the same reason; this was
+    /// the documented gap that made it worth doing here too.
+    current_fn_ret: Ty,
 }
 
 impl Refiner {
@@ -222,13 +246,9 @@ impl Refiner {
             }
             Stmt::Return { value: Some(e), span } => {
                 let iv = self.expr(e, scopes);
-                // A `return`'s target type isn't visible from inside this
-                // function-local walk without threading it through every
-                // call — reusing the value's *own* computed interval as
-                // "proven" here would be circular. Left unproven rather
-                // than risk that; `let`/assign/call-arg sites are where
-                // this pass actually contributes.
-                let _ = (iv, span);
+                if iv.within(&self.current_fn_ret) {
+                    self.report.proven_in_range.insert(*span);
+                }
             }
             Stmt::Return { value: None, .. } => {}
             Stmt::While { cond, body, .. } => self.while_loop(cond, body, scopes),

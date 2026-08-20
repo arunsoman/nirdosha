@@ -182,40 +182,39 @@ fn division_by_an_unconstrained_parameter_is_not_proven_nonzero() {
 fn factorial_multiplication_is_not_proven_in_range() {
     // The realistic case: factorial's recursive multiplication genuinely
     // can overflow for large enough n, and this pass has no
-    // interprocedural summary for the recursive call's result -- it must
-    // stay honestly unproven, not falsely claimed safe.
+    // interprocedural summary for the recursive call's result -- that
+    // specific `return` must stay honestly unproven, not falsely claimed
+    // safe. NOTE: this is deliberately *not* "nothing in factorial is
+    // proven" -- an earlier version of this test asserted exactly that,
+    // and it broke, correctly, the moment `refine.rs` gained the ability
+    // to prove `return` sites at all: `return 1` in the `n <= 1` branch
+    // is genuinely, trivially safe (1 always fits `i64`), and now
+    // correctly gets proven. That's a real improvement surfacing a test
+    // that was accidentally over-broad, not a regression to work around.
     let program = parse(include_str!("../examples/factorial.nir"));
     let report = analyze(&program);
     let factorial_fn = program.fns.iter().find(|f| f.name == "factorial").unwrap();
     // The `n * factorial(n - 1)` return lives inside the `else` branch.
-    let has_any_proven_return_site = {
+    let mul_return_span = {
         use nirdosha::ast::Expr;
-        fn contains_mul_return(stmts: &[Stmt]) -> bool {
-            stmts.iter().any(|s| match s {
-                Stmt::Return { value: Some(Expr::Binary(..)), .. } => true,
+        fn find_mul_return(stmts: &[Stmt]) -> Option<nirdosha::token::Span> {
+            stmts.iter().find_map(|s| match s {
+                Stmt::Return { value: Some(Expr::Binary(..)), span } => Some(*span),
                 Stmt::Expr(Expr::If { then_block, else_block, .. }) => {
-                    contains_mul_return(&then_block.stmts)
-                        || matches!(
-                            else_block.as_deref(),
-                            Some(nirdosha::ast::ElseBranch::Block(b)) if contains_mul_return(&b.stmts)
-                        )
+                    find_mul_return(&then_block.stmts).or_else(|| match else_block.as_deref() {
+                        Some(nirdosha::ast::ElseBranch::Block(b)) => find_mul_return(&b.stmts),
+                        _ => None,
+                    })
                 }
-                _ => false,
+                _ => None,
             })
         }
-        contains_mul_return(&factorial_fn.body.stmts)
+        find_mul_return(&factorial_fn.body.stmts).expect("test setup: expected to find the multiplying return")
     };
-    assert!(has_any_proven_return_site, "test setup: expected to find the multiplying return");
-    // `return`'s own span is deliberately never added to proven_in_range
-    // (module doc: no declared target type visible from inside this
-    // function-local walk) -- so the real assertion is simply that the
-    // report doesn't claim anything false. Since nothing about this
-    // function *can* be proven in-range (recursion has no summary), the
-    // in-range set for this whole function should be empty.
-    let any_span_inside_factorial = |s: &nirdosha::token::Span| s.line >= factorial_fn.span.line;
     assert!(
-        !report.proven_in_range.iter().any(any_span_inside_factorial),
-        "factorial's multiplication genuinely can overflow -- nothing in it should be proven safe"
+        !report.proven_in_range.contains(&mul_return_span),
+        "factorial's multiplication genuinely can overflow -- this specific return must not be \
+         claimed as proven safe"
     );
 }
 
@@ -261,6 +260,43 @@ fn arithmetic_on_a_loop_reassigned_variable_after_the_loop_is_not_proven() {
     assert!(
         !report.proven_in_range.contains(&nth_let_span(&program, 1)),
         "n was widened to unknown by the loop -- assigning it to an i8 must not be proven safe"
+    );
+}
+
+// ---- the i64 vacuous-truth bug, pinned directly ------------------------
+
+#[test]
+fn two_unconstrained_i64_params_multiplied_is_not_proven_in_range() {
+    // The direct regression test for the bug `Stmt::Return` support
+    // exposed (see `Interval`'s struct doc in refine.rs for the full
+    // story): with `i64`-backed bounds, `Interval::unknown()` was
+    // *exactly* `i64`'s own legal range, so checking "is this in range
+    // for i64" was vacuously true for every interval -- this pass could
+    // never actually catch a genuine i64-level overflow, only ever
+    // (wrongly) prove one safe. Two unconstrained i64 parameters
+    // multiplied together can very obviously overflow i64 in reality;
+    // this must not be claimed as proven, and before the i128 fix, it
+    // was.
+    let program = parse(
+        r#"
+        fn multiply(a: i64, b: i64) -> i64 {
+            let c: i64 = a * b
+            return c
+        }
+        fn main() -> i64 {
+            return 0
+        }
+    "#,
+    );
+    let report = analyze(&program);
+    let multiply_fn = program.fns.iter().find(|f| f.name == "multiply").unwrap();
+    let let_span = match &multiply_fn.body.stmts[0] {
+        Stmt::Let { span, .. } => *span,
+        _ => panic!("expected a let"),
+    };
+    assert!(
+        !report.proven_in_range.contains(&let_span),
+        "two unconstrained i64 params multiplied can genuinely overflow i64 -- must not be proven safe"
     );
 }
 

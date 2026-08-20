@@ -348,15 +348,13 @@ impl Codegen<'_> {
                     Some(e) => {
                         let val = self.expr(e, scopes)?;
                         let ret_ty = self.current_fn_ret.clone();
-                        // `refine.rs`/`smt.rs` never record a proof for a
-                        // `return` site (both modules' doc comments say
-                        // why — no declared type visible from inside a
-                        // function-local walk without circularity), so
-                        // this is always Tier 2 in practice today. Still
-                        // routed through the same real guard, not a
-                        // hardcoded always-check special case, so it
-                        // automatically picks up Tier-1 elision the day
-                        // either pass is extended to cover `return`.
+                        // `refine.rs`/`smt.rs` now both record a proof for
+                        // `return` sites too (they gained their own
+                        // `current_fn_ret` field, the same fix this file
+                        // already had) — so this can be genuine Tier 1 in
+                        // practice, not just in principle. Still routed
+                        // through the same real guard either way, not a
+                        // hardcoded always-check special case.
                         let val = self.guard_in_range(&val, &ret_ty, *span)?;
                         let val = if ret_ty.is_integer() { self.narrow_from_i64(&val, &ret_ty)? } else { val };
                         writeln!(self.out, "  ret {} {val}", llvm_ty(&ret_ty)?).unwrap();

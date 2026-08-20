@@ -107,7 +107,7 @@ pub fn analyze(program: &Program) -> SmtReport {
             assert_bounds(&solver, &term, &p.ty);
             scopes.define(&p.name, p.ty.clone(), term);
         }
-        let mut checker = Checker { solver: &solver, report: &mut report };
+        let mut checker = Checker { solver: &solver, report: &mut report, current_fn_ret: f.ret.clone() };
         checker.stmts(&f.body.stmts, &mut scopes);
     }
     report
@@ -144,6 +144,11 @@ fn prove_nonzero(solver: &Solver, term: &Int) -> bool {
 struct Checker<'s> {
     solver: &'s Solver,
     report: &'s mut SmtReport,
+    /// The function currently being walked — `Stmt::Return` needs its
+    /// declared return type to discharge a proof against. Same fix
+    /// `codegen.rs`'s `current_fn_ret` field already made for the same
+    /// reason; this closes the matching documented gap in this pass.
+    current_fn_ret: Ty,
 }
 
 impl Checker<'_> {
@@ -173,14 +178,11 @@ impl Checker<'_> {
                 assert_bounds(self.solver, &term, ty);
                 scopes.define(name, ty.clone(), term);
             }
-            Stmt::Return { value: Some(e), .. } => {
-                // Same as refine.rs: no declared return type visible
-                // from inside this function-local walk without threading
-                // it through every call site, and reusing the value's
-                // own computed range would be circular. Left unproven —
-                // `let`/assign/call-arg sites are this pass's real
-                // contribution.
-                self.expr(e, scopes);
+            Stmt::Return { value: Some(e), span } => {
+                let term = self.expr(e, scopes);
+                if prove_in_range(self.solver, &term, &self.current_fn_ret) {
+                    self.report.proven_in_range.insert(*span);
+                }
             }
             Stmt::Return { value: None, .. } => {}
             Stmt::While { cond, body, .. } => self.while_loop(cond, body, scopes),
