@@ -3,6 +3,7 @@ pub mod interpreter;
 pub mod ownership;
 pub mod parser;
 pub mod refine;
+pub mod smt;
 pub mod token;
 pub mod typeck;
 

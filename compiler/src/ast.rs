@@ -108,22 +108,49 @@ impl Ty {
         matches!(self, Ty::Box(_))
     }
 
-    /// Placeholder for goal.md row 4 (refinement types, Phase 2). Real bounds
-    /// eventually get SMT-discharged at compile time (Tier 1) or demand a
-    /// checked op at the call site (Tier 2) — see goal.md §4. Until Phase 2
-    /// exists, this is the honest stand-in: a *runtime* bounds check, so
-    /// overflow is caught (never silently wraps) but not yet proved absent.
+    /// goal.md row 4's runtime fallback (Tier 2, §4): `interpreter.rs`
+    /// checks every `let`/assign/return/call boundary against this. Two
+    /// *static* passes now also exist and prove some of these checks
+    /// unnecessary ahead of time (Tier 1) — `refine.rs` (interval
+    /// analysis) and `smt.rs` (real Z3, where available) — but this
+    /// runtime check stays regardless of what either proves, since
+    /// there's no backend yet to spend a Tier-1 proof's performance
+    /// payoff on removing it. See both modules' doc comments.
     pub fn in_range(&self, v: i64) -> bool {
+        if !self.is_integer() {
+            return false;
+        }
+        let (lo, hi) = self.bounds();
+        (lo..=hi).contains(&v)
+    }
+
+    /// A type's legal values as bare `(min, max)` bounds — the same
+    /// information `in_range` uses, exposed directly for `refine.rs` and
+    /// `smt.rs`, both of which need the endpoints themselves (to build an
+    /// `Interval` or a pair of SMT assertions), not just a yes/no
+    /// predicate. Defined once, here, so the two static passes and the
+    /// runtime check can never silently disagree about what a type's
+    /// range actually is — that kind of three-way drift is exactly the
+    /// class of bug that would be invisible until it wasn't.
+    pub fn bounds(&self) -> (i64, i64) {
         match self {
-            Ty::I8 => (i8::MIN as i64..=i8::MAX as i64).contains(&v),
-            Ty::I16 => (i16::MIN as i64..=i16::MAX as i64).contains(&v),
-            Ty::I32 => (i32::MIN as i64..=i32::MAX as i64).contains(&v),
-            Ty::I64 => true,
-            Ty::U8 => (0..=u8::MAX as i64).contains(&v),
-            Ty::U16 => (0..=u16::MAX as i64).contains(&v),
-            Ty::U32 => (0..=u32::MAX as i64).contains(&v),
-            Ty::U64 | Ty::Usize => v >= 0,
-            Ty::Bool | Ty::Unit | Ty::Error | Ty::Box(_) | Ty::Ref(_) => false,
+            Ty::I8 => (i8::MIN as i64, i8::MAX as i64),
+            Ty::I16 => (i16::MIN as i64, i16::MAX as i64),
+            Ty::I32 => (i32::MIN as i64, i32::MAX as i64),
+            Ty::I64 => (i64::MIN, i64::MAX),
+            Ty::U8 => (0, u8::MAX as i64),
+            Ty::U16 => (0, u16::MAX as i64),
+            Ty::U32 => (0, u32::MAX as i64),
+            // u64's true max doesn't fit in i64 — every value this
+            // language can actually hold is backed by i64 anyway (see
+            // interpreter.rs's `Value::Int(i64)`), so `i64::MAX` is the
+            // real ceiling regardless of the declared type.
+            Ty::U64 | Ty::Usize => (0, i64::MAX),
+            // Never legitimately queried (`is_integer()` is false for
+            // all of these, and `in_range` above already short-circuits
+            // on that) — full range is the harmless, safe default if
+            // something calls this directly anyway.
+            Ty::Bool | Ty::Unit | Ty::Box(_) | Ty::Ref(_) | Ty::Error => (i64::MIN, i64::MAX),
         }
     }
 }

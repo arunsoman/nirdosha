@@ -168,13 +168,72 @@ it's shown up twice: this project's static passes keep arriving before
 the backend that would spend their payoff, and that's a fine order to
 build things in.
 
-**Known limitation, not yet attempted:** no condition-based interval
-narrowing in `if` branches (e.g., proving `n > 1` is known inside the
-`else` of `if n <= 1 { .. } else { .. }`). This would meaningfully
-increase what's provable in straight-line code with guard conditions —
-flagged as the natural next precision improvement for this pass
-specifically, distinct from the loop-widening limitation already
-documented in `refine.rs`'s module doc.
+**Known limitation, not yet attempted (in `refine.rs`; resolved in
+`smt.rs`, see below):** no condition-based interval narrowing in `if`
+branches (e.g., proving `n > 1` is known inside the `else` of `if n <= 1
+{ .. } else { .. }`).
+
+**Fifth update:** the user installed a real Z3 (system `libz3.so`
+4.16.0, headers, and pkg-config module — checked directly, not assumed)
+partway through the Fourth update above. `compiler/src/smt.rs` is the
+result: a genuine SMT-backed Tier-1 checker using the actual `z3` crate
+against the system library (no `cmake`/bundled build needed — the crate
+links directly once headers and the shared library are present). This
+is now the primary Tier-1 checker; `refine.rs` stays in the tree
+deliberately, not deleted, as the documented fallback for an environment
+without Z3 — its design reasoning didn't stop being correct just because
+a stronger solver showed up, and portability to such environments is a
+real, ongoing concern, not a hypothetical one (this project ran in
+exactly that state for two whole increments).
+
+**What SMT actually buys, checked by a real test, not asserted in a
+comment.** `condition_narrowing_proves_what_interval_analysis_cannot` in
+`tests/smt.rs` runs the *identical* program —
+
+```
+fn classify(n: i64) -> i64 {
+    if n >= 0 && n <= 100 {
+        let x: i8 = n
+        return 0
+    }
+    return -1
+}
+```
+
+— through both `smt::analyze` and `refine::analyze`, and asserts they
+disagree in exactly the expected direction: `smt.rs` proves `x: i8 = n`
+safe (it asserts `n >= 0 && n <= 100` into the solver before checking the
+`let`, so `n`'s narrowed range is genuinely known there); `refine.rs`
+does not and structurally cannot (interval analysis has no
+representation for "this variable's range depends on a boolean condition
+holding" — see its module doc). This is the single clearest, checked
+demonstration in the whole codebase of why the Fourth update's
+substitution was honestly labeled a substitution and not treated as
+equivalent.
+
+**The API surface itself needed real investigation, not assumption.**
+The `z3` crate (0.20.2) uses a newer, simpler API than older
+documentation/examples for the crate suggest — an implicit thread-local
+`Context` (no explicit `Context::new`/threading required), `Solver::new()`
+taking no arguments, arithmetic via ordinary Rust operators (`+`, `-`,
+`*`, `!`, `&`, `|`) rather than only named methods. Discovered by reading
+the crate's actual source in the local cargo registry cache rather than
+guessing from memory or older examples, after an initial smoke test
+based on a remembered older API failed to compile — worth naming as a
+small, real instance of the same "check before assuming, then fix, don't
+guess" discipline this whole project has tried to hold to elsewhere.
+
+**What's unchanged from the Fourth update, and why.** Same two proof
+targets (arithmetic-in-range, division-nonzero); division's result value
+still not modeled, for the same integer-truncation-edge-case reason, not
+because the solver is weaker; no interprocedural summaries (a call's
+result is a fresh, only-bounds-constrained symbolic value); loops still
+widen any body-reassigned variable to an unconstrained value on entry
+rather than attempting loop-invariant synthesis (SPARK itself requires
+programmer-supplied loop invariants for the same reason — this isn't a
+shortcut unique to this project). Still not wired to elide the
+interpreter's runtime check, for the same "no backend to spend the
+performance payoff on yet" reason as before.
 
 ---
 
@@ -218,7 +277,7 @@ test result: ok. 14 passed; 0 failed
 | 1 — No GC, no `free()` | **Started, real content.** `box`/`*`, shared borrows (`&`), and a static move-checker (`ownership.rs`) — see the "Second" and "Third" update sections above for what's actually proved and what still isn't (no `&mut`, no `Drop` hook, no place expressions). Regions/bulk-arena allocation is still not started. |
 | 2 — No data races | N/A yet — no concurrency exists. |
 | 3 — No deadlocks | N/A yet — no concurrency exists. |
-| 4 — No int/buffer overflow | **Started, real Tier-1 content, not SMT.** `Ty::in_range` + `check_ty` still catch everything dynamically (Tier 2, unchanged). `compiler/src/refine.rs` now adds a genuine *static* proof pass — interval analysis, not the SMT solver goal.md §3 actually specifies (no Z3/cmake in this environment; see the "Fourth update" section below for why that's a tracked substitution, not a silent one). 59/59 tests pass, including tests that confirm it correctly *refuses* to prove unsound cases (i8+i8 overflow, division by an unconstrained parameter, factorial's multiplication). Not wired to elide the interpreter's runtime check — see below for why. |
+| 4 — No int/buffer overflow | **Started, and now backed by real SMT.** `Ty::in_range` + `check_ty` still catch everything dynamically (Tier 2, unchanged). Two static Tier-1 passes exist: `compiler/src/refine.rs` (interval analysis, built when this environment had no Z3) and `compiler/src/smt.rs` (real Z3 4.16, once the user installed it — see the "Fifth update" section below), the latter now the primary checker since it's strictly more capable. 68/68 tests pass, including a flagship test that runs the *same* program through both passes and confirms SMT proves something interval analysis structurally cannot (condition-based narrowing). Not wired to elide the interpreter's runtime check — see below for why. |
 | 5 — Native speed | Not started. This is a tree-walking interpreter, deliberately — LLVM codegen is Phase 1+ work once there's a stable typed AST to compile from. |
 | 6 — Learning curve | Grammar is small and keyword-heavy on purpose (`fn`/`let`/`return`/`if`/`else`/`while`, C-family operators) — no attempt yet to *measure* this against goal.md §7's proxy metrics (novice user study, Cognitive Dimensions score). Row 6 is aimed at, not yet verified. |
 | 7 — LLM-friendly | The one row with a real, checked claim already: the parser is single-token-lookahead with no backtracking, everywhere — see GRAMMAR.md for what that does and doesn't prove. No LALR-generator cross-check yet, and no benchmark suite / grammar-constrained decoder built yet. |
@@ -256,13 +315,17 @@ Three candidates, none blocking the others:
 - **`&mut`** (exclusive borrows) — needs real liveness tracking to enforce
   "aliasing xor mutability," materially bigger than shared borrows turned
   out to be.
-- **Condition-based narrowing** in `refine.rs` (row 4) — the flagged next
-  precision improvement for the interval pass, independent of the
-  ownership work above.
+- **Extend `smt.rs`'s proof targets** — right now it proves the same two
+  things `refine.rs` did (arithmetic-in-range, division-nonzero); with a
+  real solver in hand, array/index-bounds proofs (goal.md row 4's other
+  half, "buffer overflow") are a natural next target once arrays exist in
+  the language at all (still not — see GRAMMAR.md's omissions list).
 - **Effects** (rows 4/9) — still fully unstarted.
-- **A real SMT solver**, if `cmake`/Z3 become available in this
-  environment (or the user wants to install them) — would let row 4 move
-  from interval analysis to what goal.md's design actually specifies.
+- **Bool-typed variable narrowing in `smt.rs`** — `bool_expr`'s `Ident`
+  case currently falls back to an unconstrained fresh `Bool` (its doc
+  comment flags this explicitly): `let ok: bool = n > 0; if ok { ... }`
+  doesn't currently narrow `n` the way `if n > 0 { ... }` directly would.
+  A real, scoped gap, not a hypothetical one.
 
 **Noted for Phase 3 (concurrency, rows 2–3), not relevant yet:** if actors
 end up implemented as lightweight stackful coroutines multiplexed onto a

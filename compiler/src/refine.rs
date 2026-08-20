@@ -69,18 +69,11 @@ impl Interval {
         Interval { lo: i64::MIN, hi: i64::MAX }
     }
 
+    /// Delegates to `Ty::bounds()` — see its doc comment for why this
+    /// isn't a second, independent table.
     fn full(ty: &Ty) -> Self {
-        match ty {
-            Ty::I8 => Interval { lo: i8::MIN as i64, hi: i8::MAX as i64 },
-            Ty::I16 => Interval { lo: i16::MIN as i64, hi: i16::MAX as i64 },
-            Ty::I32 => Interval { lo: i32::MIN as i64, hi: i32::MAX as i64 },
-            Ty::I64 => Interval::unknown(),
-            Ty::U8 => Interval { lo: 0, hi: u8::MAX as i64 },
-            Ty::U16 => Interval { lo: 0, hi: u16::MAX as i64 },
-            Ty::U32 => Interval { lo: 0, hi: u32::MAX as i64 },
-            Ty::U64 | Ty::Usize => Interval { lo: 0, hi: i64::MAX },
-            Ty::Bool | Ty::Unit | Ty::Box(_) | Ty::Ref(_) | Ty::Error => Interval::unknown(),
-        }
+        let (lo, hi) = ty.bounds();
+        Interval { lo, hi }
     }
 
     fn union(self, other: Interval) -> Interval {
