@@ -154,9 +154,15 @@ Unary: () = {
     "box" Unary => (),
     "&" Unary => (),
 };
+// Exactly zero or one call, not repeated — `f()()` is a real parse error
+// in `parser.rs` (checked directly, not assumed; see GRAMMAR.md's `call`
+// production). An earlier revision of both this file and GRAMMAR.md had
+// this as left-recursive repetition, which was simply wrong, found by
+// testing the actual parser, not by re-deriving the grammar more
+// carefully.
 Call: () = {
     Primary,
-    Call "(" Args ")" => (),
+    Primary "(" Args ")" => (),
 };
 Args: () = {
     => (),

@@ -111,6 +111,20 @@ fn borrowing_a_non_identifier_is_a_parse_error() {
 }
 
 #[test]
+fn reference_to_reference_is_rejected_even_with_a_space() {
+    // GRAMMAR.md documents two independent, stacked limitations here:
+    // `&&x` can't even be *written* (lexes as one AndAnd token), but
+    // writing it with a space instead (`& &x`) genuinely does lex as two
+    // separate `&` tokens -- and is *still* rejected, by the separate
+    // Ident-only restriction on `&`'s operand (`&x`'s own operand here is
+    // `Expr::Ref(...)`, not a bare identifier). This test is the second
+    // limitation, isolated from the lexer one.
+    let toks = Lexer::new("fn main() { let n: i64 = 5\nlet r: &i64 = & &n }").tokenize().unwrap();
+    let result = Parser::new(toks).parse_program();
+    assert!(result.is_err(), "`& &x` must be rejected even though it lexes as two Amp tokens");
+}
+
+#[test]
 fn a_reference_itself_is_freely_copyable_not_affine() {
     // Unlike `box`, using a `&`-typed binding by name twice is fine --
     // references aren't affine (Ty::is_affine returns false for Ty::Ref),

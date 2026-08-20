@@ -228,6 +228,58 @@ fn assignment_to_non_identifier_is_a_parse_error() {
 }
 
 #[test]
+fn chained_call_is_a_parse_error() {
+    // GRAMMAR.md's `call` production once (wrongly) claimed zero-or-more
+    // repeated calls (`f()()`, currying-style) via a `*`. The real
+    // grammar only ever allows one: there's no function-value concept
+    // for a second call to mean anything against (`Expr::Call` names its
+    // callee by a plain identifier, resolved by lookup). Found and fixed
+    // during a grammar-document review, pinned here so it can't silently
+    // regress either direction (accepted when it shouldn't be, or
+    // rejected for the wrong reason).
+    let toks = Lexer::new("fn f() -> i64 { return 5 } fn main() -> i64 { return f()() }")
+        .tokenize()
+        .unwrap();
+    let result = Parser::new(toks).parse_program();
+    assert!(result.is_err(), "f()() must be rejected -- no first-class function values exist");
+}
+
+#[test]
+fn trailing_comma_in_params_is_a_parse_error() {
+    let toks = Lexer::new("fn f(a: i64,) -> i64 { return a }").tokenize().unwrap();
+    let result = Parser::new(toks).parse_program();
+    assert!(result.is_err(), "trailing comma in a parameter list must be rejected");
+}
+
+#[test]
+fn trailing_comma_in_args_is_a_parse_error() {
+    let toks = Lexer::new("fn f(a: i64) -> i64 { return a } fn main() -> i64 { return f(1,) }")
+        .tokenize()
+        .unwrap();
+    let result = Parser::new(toks).parse_program();
+    assert!(result.is_err(), "trailing comma in a call's argument list must be rejected");
+}
+
+#[test]
+fn statement_separator_disambiguation_always_extends_the_expression() {
+    // GRAMMAR.md's documented rule, in its simplest form: no separator
+    // between statements means `let x = 1` immediately followed by `-2`
+    // on the next line is genuinely ambiguous as a plain CFG (confirmed
+    // by the grammar_check/ LALR(1) cross-check) -- the parser always
+    // resolves it the same way, by extending the expression rather than
+    // ending the statement.
+    let src = r#"
+        fn main() -> i64 {
+            let x: i64 = 1
+            -2
+            return x
+        }
+    "#;
+    assert_eq!(run(src), Ok(Value::Int(-1))); // x = (1 - 2), not two statements
+}
+
+
+#[test]
 fn missing_return_on_non_unit_function_is_a_structured_error() {
     // This test drives the interpreter directly, bypassing typeck.rs, to
     // confirm the interpreter's own dynamic MissingReturn check still
