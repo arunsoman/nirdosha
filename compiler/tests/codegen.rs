@@ -223,6 +223,29 @@ fn negative_literal_call_argument_compiles_and_runs_correctly() {
     assert_eq!(code, 7); // 10 + (-3)
 }
 
+#[test]
+fn bool_valued_if_expression_compiles_and_runs_correctly() {
+    // The gap `if_expr`'s doc comment used to flag: a genuinely
+    // `bool`-valued if-expression whose branches both fall through (not
+    // the "both return" or "side-effect only" shapes every existing
+    // example happened to use) needed the result slot to actually be
+    // `i1`, not a hardcoded `i64`. Fixed by inferring the slot's type
+    // from the `then` branch's trailing expression (`typeck.rs` already
+    // proved both branches agree).
+    let src = r#"
+        fn main() -> i64 {
+            let c: bool = true
+            let ok: bool = if c { true } else { false }
+            if ok {
+                return 1
+            }
+            return 0
+        }
+    "#;
+    let (_, code) = compile_and_run(src);
+    assert_eq!(code, 1);
+}
+
 // ---- -O0 vs -O2: both must agree with each other and the interpreter --
 
 #[test]

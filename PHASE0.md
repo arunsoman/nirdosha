@@ -446,6 +446,22 @@ of a bug, not just silence — the difference between "nobody looked" and
 
 85/85 tests pass.
 
+**Tenth update:** `codegen.rs`'s one remaining documented gap is closed —
+a genuinely `bool`-valued `if`-expression whose branches both fall
+through (`let ok: bool = if c { true } else { false }`) now gets a real
+`i1` result slot instead of a hardcoded `i64` one. Fixed by inferring the
+slot's type from the `then` branch's trailing expression
+(`block_trailing_ty`, reusing `local_ty_of`) — sound because
+`typeck::check_if` already proved both branches agree in type at any
+real value-position use, so only the `then` side needs inspecting. A
+`unit`-valued `if` (no LLVM value to hold at all — `alloca void` isn't
+legal IR) skips the slot entirely now, running both branches purely for
+side effects, rather than forcing every case through the same
+one-size-fits-all `i64` slot the old code used.
+
+86/86 tests pass. This closes out every gap the Sixth update's codegen
+milestone originally flagged.
+
 ---
 
 
@@ -558,11 +574,6 @@ Three candidates, none blocking the others:
   comment flags this explicitly): `let ok: bool = n > 0; if ok { ... }`
   doesn't currently narrow `n` the way `if n > 0 { ... }` directly would.
   A real, scoped gap, not a hypothetical one.
-- **`codegen.rs`'s one remaining documented gap** — a genuinely
-  `bool`-valued `if`-expression whose branches both fall through (see the
-  Sixth update above). `Stmt::Return` Tier-1 treatment and codegen
-  optimization (`-O2`) are both done now (Eighth/Ninth updates) — this is
-  the one item left from that original pair.
 
 **Noted for Phase 3 (concurrency, rows 2–3), not relevant yet:** if actors
 end up implemented as lightweight stackful coroutines multiplexed onto a

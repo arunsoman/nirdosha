@@ -733,6 +733,22 @@ impl Codegen<'_> {
         Ok(out)
     }
 
+    /// The type an if-expression's value slot needs to be, so it can
+    /// correctly hold a `bool` (`i1`) result and not just an integer one
+    /// — the fix for the gap this function used to have (a hardcoded
+    /// `i64` result slot, wrong for a genuinely `bool`-valued `if` whose
+    /// branches both fall through). `typeck::check_if` already proved
+    /// both branches agree in type at any real value-position use, so
+    /// inspecting only the `then` branch's trailing type is sound: if
+    /// the program passed type checking, the `else` branch's trailing
+    /// type is guaranteed to match.
+    fn block_trailing_ty(&self, block: &Block, scopes: &Scopes) -> Ty {
+        match block.stmts.last() {
+            Some(Stmt::Expr(e)) => self.local_ty_of(e, scopes),
+            _ => Ty::Unit,
+        }
+    }
+
     fn if_expr(
         &mut self,
         cond: &Expr,
@@ -745,21 +761,20 @@ impl Codegen<'_> {
         let then_label = self.fresh_label("if_then");
         let else_label = self.fresh_label("if_else");
         let merge_label = self.fresh_label("if_merge");
-        // Result slot is hardcoded `i64`. This is a real, known gap, not
-        // a proven-safe simplification: it's correct whenever both
-        // branches definitely `return` (the store is skipped entirely —
-        // see `terminated` below) or the value is a side-effect-only
-        // placeholder (`print`'s bare "0"), which covers every site in
-        // the three core examples. It would be *wrong* for a genuine
-        // `bool`-valued if-expression that both branches fall through
-        // to (e.g. `let ok: bool = if c { true } else { false }`) — an
-        // i1 value stored through an i64 slot. Not hit by any current
-        // example or test; flagged here and in PHASE0.md rather than
-        // silently shipped. The real fix is threading the target `Ty`
-        // through the way `typeck::check_if`'s `want` parameter already
-        // does for the *type-checking* side of this same construct.
-        let result_ptr = self.fresh_reg("if_result.addr");
-        writeln!(self.out, "  {result_ptr} = alloca i64").unwrap();
+
+        let result_ty = self.block_trailing_ty(then_block, scopes);
+        // `unit` has no LLVM value to hold at all (`alloca void` isn't
+        // legal IR) — a `unit`-valued if is only ever run for its
+        // branches' side effects, so there's no slot to allocate, only
+        // both branches to execute.
+        let slot = if result_ty == Ty::Unit {
+            None
+        } else {
+            let llty = llvm_ty(&result_ty)?;
+            let ptr = self.fresh_reg("if_result.addr");
+            writeln!(self.out, "  {ptr} = alloca {llty}").unwrap();
+            Some((ptr, llty))
+        };
 
         writeln!(self.out, "  br i1 {c}, label %{then_label}, label %{else_label}").unwrap();
 
@@ -769,7 +784,9 @@ impl Codegen<'_> {
         let then_val = self.block_value(then_block, scopes)?;
         scopes.pop();
         if !self.terminated {
-            writeln!(self.out, "  store i64 {then_val}, ptr {result_ptr}").unwrap();
+            if let Some((ptr, llty)) = &slot {
+                writeln!(self.out, "  store {llty} {then_val}, ptr {ptr}").unwrap();
+            }
             writeln!(self.out, "  br label %{merge_label}").unwrap();
         }
         let then_terminated = self.terminated;
@@ -787,7 +804,9 @@ impl Codegen<'_> {
             None => "0".to_string(),
         };
         if !self.terminated {
-            writeln!(self.out, "  store i64 {else_val}, ptr {result_ptr}").unwrap();
+            if let Some((ptr, llty)) = &slot {
+                writeln!(self.out, "  store {llty} {else_val}, ptr {ptr}").unwrap();
+            }
             writeln!(self.out, "  br label %{merge_label}").unwrap();
         }
         let else_terminated = self.terminated;
@@ -805,9 +824,14 @@ impl Codegen<'_> {
             writeln!(self.out, "  unreachable").unwrap();
             return Ok("0".to_string());
         }
-        let out = self.fresh_reg("if_val");
-        writeln!(self.out, "  {out} = load i64, ptr {result_ptr}").unwrap();
-        Ok(out)
+        match slot {
+            Some((ptr, llty)) => {
+                let out = self.fresh_reg("if_val");
+                writeln!(self.out, "  {out} = load {llty}, ptr {ptr}").unwrap();
+                Ok(out)
+            }
+            None => Ok("0".to_string()), // unit; never meaningfully read
+        }
     }
 
     fn block_value(&mut self, block: &Block, scopes: &mut Scopes) -> Result<String, CodegenError> {
