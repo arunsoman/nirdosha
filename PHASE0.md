@@ -235,6 +235,86 @@ shortcut unique to this project). Still not wired to elide the
 interpreter's runtime check, for the same "no backend to spend the
 performance payoff on yet" reason as before.
 
+**Sixth update:** row 5 (native, hardware-speed codegen) now has real
+content. `compiler/src/codegen.rs` emits textual LLVM IR — not a Rust
+binding to the LLVM C API (`inkwell`/`llvm-sys`), because this
+environment's LLVM 22 is recent enough that a binding crate's supported-
+version list might not cover it; textual IR is a stable format, and the
+system `clang` compiling it is *the same* LLVM 22, so there's no version
+skew between what's emitted and what assembles it. Several real compilers
+use exactly this strategy. `nirdosha build <file.nir> -o <out>` produces
+an actual native executable; `nirdosha emit-llvm <file.nir>` prints the
+generated IR.
+
+**Honestly scoped, not silently narrowed.** `check_supported` rejects,
+with a specific reason, anything outside signed integers (`i8`..`i64`),
+`bool`, `unit`, and `print` on integer-typed arguments only — no
+`u8`..`usize` (needs a signed-vs-unsigned instruction choice this pass
+doesn't make), no `box`/`&`/`*` (compiling real heap allocation and move
+semantics to native code is separate, larger work than proving the
+discipline statically — `ownership.rs`'s proof exists, nothing executes
+on it yet). `tests/codegen.rs` confirms `examples/ownership.nir` and
+`examples/borrow.nir` are rejected outright, not silently mis-compiled.
+
+**Tier 1 vs Tier 2 finally means something, for the first time in this
+codebase.** `refine.rs` and `smt.rs` both said, explicitly, "not wired to
+elide the runtime check — no backend exists yet to spend the payoff on."
+One does now: a `let`/assignment whose span is in `smt::analyze`'s
+`proven_in_range` gets no runtime bounds check at all in the compiled
+binary (Tier 1); one that isn't gets a real compare-and-trap sequence
+(Tier 2). `tests/codegen.rs`'s `proven_safe_arithmetic_has_no_trap_
+block_in_the_ir` / `unproven_arithmetic_does_have_a_trap_block_in_the_ir`
+check this at the IR text level, not just "it happened to work."
+
+**Three real bugs, found by running compiled binaries, not by reading
+the code — worth recording in full, because each one is exactly the kind
+of mistake this whole project's discipline exists to catch, and each one
+*did* get caught, not shipped silently:**
+
+1. **Silent wraparound defeated the overflow check entirely.** The first
+   draft computed arithmetic directly at the declared narrow LLVM width
+   (`add i8`), which wraps on overflow exactly like real two's-complement
+   hardware. `100 + 100` (overflows `i8`, max 127) wrapped to `-56` —
+   still "in range" for `i8` by construction — so the guard could
+   *never* fire; a deliberately-overflowing test program compiled,
+   ran, and exited 0 instead of aborting. Caught by writing that exact
+   test program and running the compiled binary, not by review. Fixed by
+   matching what `interpreter.rs`'s `Value::Int(i64)` already did all
+   along: every integer-typed value is computed at `i64` internally,
+   range-checked at `i64` width (before any wraparound could happen),
+   and only narrowed to its declared width at storage/parameter/return
+   boundaries, after the check passes. `narrow_type_overflow_actually_
+   traps_at_runtime` in `tests/codegen.rs` pins this as a permanent
+   regression test.
+2. **A negated literal call argument type-mismatched.** `-3` was
+   computed via a real `sub i64 0, 3` instruction, then passed where a
+   narrower parameter type (e.g. `i32`) was declared — LLVM requires a
+   call site's argument types to match the callee's signature exactly.
+   Fixed by reusing the same `literal_value` helper `typeck.rs` already
+   used to decide literal flexibility (factored into `ast.rs` as a
+   shared function specifically so the two modules can't silently
+   disagree about what counts as a literal) and emitting literal
+   arguments directly at the callee's declared width, no instruction
+   needed.
+3. **A process-wide temp-file race.** `codegen::build`'s temp `.ll`
+   filename used only `process::id()`, which is identical across every
+   thread in one process — three genuinely-correct compiles, run in
+   parallel by `cargo test`'s default threading, raced on the same file
+   and came back with empty output. Fixed with a process-wide atomic
+   counter alongside the pid. A real robustness bug for any caller doing
+   concurrent builds in one process, not a test-only artifact.
+
+**What's still not done, honestly.** No optimization passes (`-O0`
+equivalent throughout — correctness over performance was the explicit
+priority for a first backend). `if`-as-a-value's result slot is
+hardcoded `i64`; a genuinely `bool`-valued `if` whose branches both fall
+through (not the common "both return" or "side-effect only" shapes) would
+mis-type the store — not hit by any current example, flagged in
+`codegen.rs`'s `if_expr` rather than silently shipped. `Stmt::Return`'s
+guard is always Tier 2 (neither `refine.rs` nor `smt.rs` records a proof
+for a `return` site yet) — a real, scoped follow-up, not a fundamental
+limitation.
+
 ---
 
 
@@ -245,29 +325,46 @@ This is the first slice, not a finished language — read it next to
 
 ## What runs today
 
+Kept current, unlike the narrative "update" sections above (which are
+left as history) — this tree and test count reflect the actual state of
+the repo, checked, not aspirational.
+
 ```
 compiler/
-  Cargo.toml
+  Cargo.toml            depends on the z3 crate (real Z3, system libz3)
   src/
-    token.rs        lexer — hand-written, single pass, structured LexError
-    ast.rs           AST types; Ty::in_range is the Tier-2 bounds-check stand-in
+    token.rs        lexer — hand-written, single pass, structured LexError, Span: Hash
+    ast.rs           AST types; Ty::bounds()/in_range shared by every pass; literal_value()
     parser.rs        recursive-descent, single-token lookahead, no backtracking
-    interpreter.rs   tree-walking evaluator, dynamic type checking
+    interpreter.rs   tree-walking evaluator; Value::{Boxed,Ref}; dynamic Tier-2 checks
+    typeck.rs        static type checker — runs before interpretation
+    ownership.rs     static move-checker for box/&
+    refine.rs        interval-analysis Tier-1 prover (the pre-Z3 fallback)
+    smt.rs           real Z3-backed Tier-1 prover (primary; condition narrowing)
+    codegen.rs       LLVM IR emission + `clang` driver — real native binaries
     lib.rs           public run(src) -> Result<Value, String>
-    main.rs          CLI: `nirdosha <file.nir>`
+    main.rs          CLI: interpret (default), `build`, `emit-llvm`
   examples/
     hello.nir        functions, params, arithmetic, print
-    factorial.nir     recursion, if/else-as-expression, return-in-branch unwind
+    factorial.nir    recursion, if/else-as-expression, return-in-branch unwind
     loop.nir         while, assignment/mutation, if-as-statement
+    ownership.nir    box, move, consuming calls
+    borrow.nir       shared borrows (&)
   tests/
-    basic.rs         14 tests: 3 example runs + 11 language/error-shape checks
+    basic.rs         28 tests — core language + typeck
+    ownership.rs     21 tests — box/&/move-checking
+    refine.rs        10 tests — interval-analysis proofs (and honest non-proofs)
+    smt.rs           9 tests — SMT proofs, incl. the interval-vs-SMT flagship comparison
+    codegen.rs       10 tests — real compiled binaries, run and compared to the interpreter
 ```
 
 ```
 $ cd compiler && cargo run --quiet -- examples/factorial.nir
 3628800
+$ cargo run --quiet -- build examples/factorial.nir -o /tmp/factorial && /tmp/factorial
+3628800
 $ cargo test
-test result: ok. 14 passed; 0 failed
+test result: ok. 78 passed; 0 failed
 ```
 
 ## Row by row, against goal.md §1
@@ -278,7 +375,7 @@ test result: ok. 14 passed; 0 failed
 | 2 — No data races | N/A yet — no concurrency exists. |
 | 3 — No deadlocks | N/A yet — no concurrency exists. |
 | 4 — No int/buffer overflow | **Started, and now backed by real SMT.** `Ty::in_range` + `check_ty` still catch everything dynamically (Tier 2, unchanged). Two static Tier-1 passes exist: `compiler/src/refine.rs` (interval analysis, built when this environment had no Z3) and `compiler/src/smt.rs` (real Z3 4.16, once the user installed it — see the "Fifth update" section below), the latter now the primary checker since it's strictly more capable. 68/68 tests pass, including a flagship test that runs the *same* program through both passes and confirms SMT proves something interval analysis structurally cannot (condition-based narrowing). Not wired to elide the interpreter's runtime check — see below for why. |
-| 5 — Native speed | Not started. This is a tree-walking interpreter, deliberately — LLVM codegen is Phase 1+ work once there's a stable typed AST to compile from. |
+| 5 — Native speed | **Started, real native binaries.** `compiler/src/codegen.rs` emits textual LLVM IR and shells out to the system `clang` (LLVM 22) — see the "Sixth update" section below. Scoped to signed integers/bool/unit, no `box`/`&`/`*` yet. 78/78 tests pass; three genuine bugs were found and fixed by actually running compiled binaries, not by review — see below. |
 | 6 — Learning curve | Grammar is small and keyword-heavy on purpose (`fn`/`let`/`return`/`if`/`else`/`while`, C-family operators) — no attempt yet to *measure* this against goal.md §7's proxy metrics (novice user study, Cognitive Dimensions score). Row 6 is aimed at, not yet verified. |
 | 7 — LLM-friendly | The one row with a real, checked claim already: the parser is single-token-lookahead with no backtracking, everywhere — see GRAMMAR.md for what that does and doesn't prove. No LALR-generator cross-check yet, and no benchmark suite / grammar-constrained decoder built yet. |
 | 8 — Compositional syntax | Followed structurally: `interpreter.rs`'s `eval_expr` has exactly one match arm per `Expr` variant, none reaching into a sibling's internals. Not yet stated as a proven theorem about a formal semantics — there is no formal semantics document yet, only the implementation. |
@@ -300,9 +397,13 @@ test result: ok. 14 passed; 0 failed
   at, because refinement types (row 4) will shape how indexed/sized types
   get spelled, and it's cheaper to design that once in Phase 2 than to
   bolt it on now and redesign it later (`GRAMMAR.md`'s omissions list).
-- **No LLVM.** A tree-walking interpreter was the right choice for
-  validating the grammar and semantics quickly; codegen is a backend
-  concern (§3's Backend layer) that shouldn't gate front-end iteration.
+- **Superseded, kept for history:** this bullet used to say "no LLVM —
+  codegen is a backend concern that shouldn't gate front-end iteration."
+  A tree-walking interpreter was still the right first choice for
+  validating the grammar and semantics quickly, and turned out to be the
+  right thing to validate *against* too — every example that now compiles
+  to a native binary was cross-checked against the interpreter's own
+  output first. See the Sixth update for what codegen actually covers.
 
 ## Suggested next milestone
 
@@ -326,6 +427,13 @@ Three candidates, none blocking the others:
   comment flags this explicitly): `let ok: bool = n > 0; if ok { ... }`
   doesn't currently narrow `n` the way `if n > 0 { ... }` directly would.
   A real, scoped gap, not a hypothetical one.
+- **`codegen.rs`'s two documented gaps** — a genuinely `bool`-valued
+  `if`-expression whose branches both fall through, and `Stmt::Return`
+  never getting Tier-1 treatment (see the Sixth update above for both).
+- **Optimization passes for codegen** — everything so far is `-O0`-
+  equivalent by design (correctness first); running `clang`/`opt` at
+  `-O2` on the emitted IR is a cheap, real next step once the backend's
+  correctness is trusted further.
 
 **Noted for Phase 3 (concurrency, rows 2–3), not relevant yet:** if actors
 end up implemented as lightweight stackful coroutines multiplexed onto a

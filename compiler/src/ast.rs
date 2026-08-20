@@ -265,3 +265,26 @@ impl Expr {
 pub struct Program {
     pub fns: Vec<FnDecl>,
 }
+
+/// Returns `Some(n)` if `e` is, syntactically, an integer literal or a
+/// unary-negated one (`-5`) — including through the transparent
+/// parenthesization the parser already collapses away. Anything else,
+/// including a variable that merely *holds* a literal-looking value, is
+/// `None`: literal flexibility is a syntactic property of the expression,
+/// not a value-flow analysis.
+///
+/// Shared, not duplicated per-module: `typeck.rs` uses this to decide
+/// which expressions get flexible-width treatment against a declared
+/// target type (goal.md §3's "no implicit conversions" rule, with
+/// literals as the deliberate exception), and `codegen.rs` has to agree
+/// with that decision *exactly* — a literal typeck allowed to fit a
+/// narrower type has to be emitted by codegen at that same narrower
+/// width, not a second, independently-written recognizer that might
+/// drift out of sync with what typeck actually decided.
+pub fn literal_value(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Int(n, _) => Some(*n),
+        Expr::Unary(UnOp::Neg, inner, _) => literal_value(inner).map(|n| -n),
+        _ => None,
+    }
+}

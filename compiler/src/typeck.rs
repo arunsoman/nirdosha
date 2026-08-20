@@ -647,20 +647,6 @@ impl Checker {
     }
 }
 
-/// Returns `Some(n)` if `e` is, syntactically, an integer literal or a
-/// unary-negated one (`-5`) — including through the transparent
-/// parenthesization the parser already collapses away. Anything else,
-/// including a variable that merely *holds* a literal-looking value, is
-/// `None`: literal flexibility is a syntactic property of the expression,
-/// not a value-flow analysis.
-fn literal_value(e: &Expr) -> Option<i64> {
-    match e {
-        Expr::Int(n, _) => Some(*n),
-        Expr::Unary(UnOp::Neg, inner, _) => literal_value(inner).map(|n| -n),
-        _ => None,
-    }
-}
-
 /// Structural "does every path through this statement list hit a
 /// `return`" analysis. An `if` counts only when it has an `else` and both
 /// branches definitely return — an `if` with no `else` never counts, since
