@@ -26,19 +26,29 @@ fn parse_checked(src: &str) -> Program {
     program
 }
 
-/// Compiles `src` to a real native binary in a fresh temp path, runs it,
-/// and returns its stdout and exit code. Panics (loudly, with clang's own
-/// error) if compilation itself fails — a test that expects compilation
-/// to fail should call `codegen::build` directly instead.
-fn compile_and_run(src: &str) -> (String, i32) {
+/// Compiles `src` to a real native binary in a fresh temp path at the
+/// given optimization level, runs it, and returns its stdout and exit
+/// code. Panics (loudly, with clang's own error) if compilation itself
+/// fails — a test that expects compilation to fail should call
+/// `codegen::build` directly instead.
+fn compile_and_run_opt(src: &str, opt: codegen::OptLevel) -> (String, i32) {
     let program = parse_checked(src);
     let report = analyze(&program);
     let mut out_path = std::env::temp_dir();
     out_path.push(format!("nirdosha_test_{}_{}", std::process::id(), unique_suffix()));
-    codegen::build(&program, &report, &out_path).expect("codegen::build should succeed for this program");
+    codegen::build(&program, &report, &out_path, opt).expect("codegen::build should succeed for this program");
     let output = Command::new(&out_path).output().expect("compiled binary should run");
     let _ = std::fs::remove_file(&out_path);
     (String::from_utf8_lossy(&output.stdout).to_string(), output.status.code().unwrap_or(-1))
+}
+
+/// The default most tests use — `-O2`, matching `nirdosha build`'s own
+/// default (module doc: goal.md row 5 is about hardware speed) and, not
+/// incidentally, the stronger correctness check: an aggressive optimizer
+/// is exactly what would expose a subtly wrong `unreachable` marker that
+/// `-O0` happens not to disturb.
+fn compile_and_run(src: &str) -> (String, i32) {
+    compile_and_run_opt(src, codegen::OptLevel::O2)
 }
 
 fn unique_suffix() -> u64 {
@@ -211,4 +221,30 @@ fn negative_literal_call_argument_compiles_and_runs_correctly() {
     "#;
     let (_, code) = compile_and_run(src);
     assert_eq!(code, 7); // 10 + (-3)
+}
+
+// ---- -O0 vs -O2: both must agree with each other and the interpreter --
+
+#[test]
+fn optimized_and_unoptimized_builds_agree_on_every_example() {
+    // The real point of this test: -O2 is an aggressive optimizer, and
+    // it treats every `unreachable` this backend emits (for provably-
+    // dead code, e.g. a definitely-returning function's fallthrough, or
+    // an if-expression whose branches both terminate) as a hard
+    // guarantee it's free to optimize around. A subtly wrong
+    // `unreachable` might produce correct output at -O0 by accident and
+    // silently misbehave at -O2 -- comparing both levels against the
+    // same expected output is what would actually catch that, not
+    // reading the code again.
+    for (src, expected_stdout) in [
+        (include_str!("../examples/hello.nir"), "8\n"),
+        (include_str!("../examples/factorial.nir"), "3628800\n"),
+        (include_str!("../examples/loop.nir"), "20\n19\n18\n17\n16\n11\n"),
+    ] {
+        let (o0_stdout, o0_code) = compile_and_run_opt(src, codegen::OptLevel::O0);
+        let (o2_stdout, o2_code) = compile_and_run_opt(src, codegen::OptLevel::O2);
+        assert_eq!(o0_stdout, expected_stdout, "-O0 output should match the interpreter");
+        assert_eq!(o2_stdout, expected_stdout, "-O2 output should match the interpreter");
+        assert_eq!(o0_code, o2_code, "-O0 and -O2 must exit the same way");
+    }
 }

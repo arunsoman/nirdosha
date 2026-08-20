@@ -872,7 +872,39 @@ impl Codegen<'_> {
 /// `clang`'s stderr on failure — a `CodegenError`-shaped failure (an
 /// unsupported construct) is reported before `clang` ever runs, so the
 /// two failure modes stay distinguishable to a caller.
-pub fn build(program: &Program, smt_report: &SmtReport, output_path: &std::path::Path) -> Result<(), String> {
+/// The IR itself is unoptimized either way (module doc: "correctness over
+/// cleverness," alloca everywhere) — `OptLevel` controls only whether
+/// `clang` is asked to optimize *after* that, the same as it would for C
+/// source. `O2` is the default `build()` uses because goal.md row 5 is
+/// about hardware speed, not about this backend's own IR being clever;
+/// `O0` stays available for debugging a miscompile without an optimizer
+/// in the way, and — not incidentally — running the exact same IR
+/// through both levels is a real stress test: LLVM treats `unreachable`
+/// (this backend emits it for provably-dead code, e.g. a definitely-
+/// returning function's fallthrough) as a hard guarantee and optimizes
+/// aggressively around it, so a subtly wrong `unreachable` that `-O0`
+/// happens not to disturb is exactly the kind of bug `-O2` would expose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptLevel {
+    O0,
+    O2,
+}
+
+impl OptLevel {
+    fn clang_flag(self) -> &'static str {
+        match self {
+            OptLevel::O0 => "-O0",
+            OptLevel::O2 => "-O2",
+        }
+    }
+}
+
+pub fn build(
+    program: &Program,
+    smt_report: &SmtReport,
+    output_path: &std::path::Path,
+    opt: OptLevel,
+) -> Result<(), String> {
     let ir = emit_llvm_ir(program, smt_report).map_err(|e| e.to_string())?;
 
     // `process::id()` alone is **not** unique enough: it's identical
@@ -893,6 +925,7 @@ pub fn build(program: &Program, smt_report: &SmtReport, output_path: &std::path:
 
     let result = std::process::Command::new("clang")
         .arg(&ll_path)
+        .arg(opt.clang_flag())
         .arg("-o")
         .arg(output_path)
         .output();

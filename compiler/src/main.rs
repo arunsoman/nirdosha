@@ -22,7 +22,8 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!("usage:");
     eprintln!("  nirdosha <file.nir>                interpret");
-    eprintln!("  nirdosha build <file.nir> -o <out>  compile to a native binary (LLVM)");
+    eprintln!("  nirdosha build <file.nir> -o <out> [--opt0]");
+    eprintln!("                                      compile to a native binary (LLVM, -O2 by default)");
     eprintln!("  nirdosha emit-llvm <file.nir>       print the generated LLVM IR");
 }
 
@@ -87,14 +88,22 @@ fn typecheck_and_own(src: &str) -> Result<nirdosha::ast::Program, String> {
 fn cmd_build(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;
+    let mut opt = nirdosha::codegen::OptLevel::O2;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-o" => output = args.next(),
+            // The generated IR is unoptimized either way (module doc) --
+            // this only controls whether clang optimizes after. O2 is
+            // the default: goal.md row 5 is about hardware speed, and
+            // `nirdosha build` should actually deliver on that unless
+            // asked not to (debugging a miscompile without an optimizer
+            // in the way is the reason to ask).
+            "--opt0" => opt = nirdosha::codegen::OptLevel::O0,
             other => input = Some(other.to_string()),
         }
     }
     let (Some(path), Some(out)) = (input, output) else {
-        eprintln!("usage: nirdosha build <file.nir> -o <out>");
+        eprintln!("usage: nirdosha build <file.nir> -o <out> [--opt0]");
         return ExitCode::FAILURE;
     };
     let src = match read_source(&path) {
@@ -109,7 +118,7 @@ fn cmd_build(mut args: impl Iterator<Item = String>) -> ExitCode {
         }
     };
     let smt_report = nirdosha::smt::analyze(&program);
-    match nirdosha::codegen::build(&program, &smt_report, std::path::Path::new(&out)) {
+    match nirdosha::codegen::build(&program, &smt_report, std::path::Path::new(&out), opt) {
         Ok(()) => {
             println!("wrote {out}");
             ExitCode::SUCCESS

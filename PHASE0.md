@@ -420,6 +420,32 @@ are the full, current picture — the row-4 line hasn't been re-edited to
 say "84/84" since the running count would only go stale again next
 session; treat this update as the current authority on the number.
 
+**Ninth update:** row 5's codegen now actually delivers on "hardware
+speed," not just "produces a binary that runs." `codegen::build` takes
+an `OptLevel` (`O2` by default, `O0` via `nirdosha build ... --opt0`) —
+the generated IR is unoptimized either way (still "alloca everywhere,"
+module doc), but `clang` is now asked to optimize it afterward, the same
+as it would for C source, matching what goal.md row 5 actually asks for
+rather than settling for the weaker "compiles and runs" bar the earlier
+milestone cleared.
+
+**This was also, deliberately, a stress test — and it passed.** `-O2` is
+an aggressive optimizer, and LLVM treats every `unreachable` this
+backend emits (for provably-dead code — a definitely-returning
+function's fallthrough, an if-expression whose branches both terminate)
+as a hard guarantee it's free to optimize around. A subtly wrong
+`unreachable` could produce correct output at `-O0` by luck and silently
+misbehave at `-O2`. `tests/codegen.rs`'s new `optimized_and_
+unoptimized_builds_agree_on_every_example` runs all three core examples
+at both levels and checks both against the interpreter's own output —
+and the overflow-trap and division-by-zero tests now run at `-O2` by
+default too. All of it passed on the first attempt: no latent
+`unreachable` bug turned up. Worth recording as a real, checked absence
+of a bug, not just silence — the difference between "nobody looked" and
+"someone looked and it held."
+
+85/85 tests pass.
+
 ---
 
 
@@ -532,13 +558,11 @@ Three candidates, none blocking the others:
   comment flags this explicitly): `let ok: bool = n > 0; if ok { ... }`
   doesn't currently narrow `n` the way `if n > 0 { ... }` directly would.
   A real, scoped gap, not a hypothetical one.
-- **`codegen.rs`'s two documented gaps** — a genuinely `bool`-valued
-  `if`-expression whose branches both fall through, and `Stmt::Return`
-  never getting Tier-1 treatment (see the Sixth update above for both).
-- **Optimization passes for codegen** — everything so far is `-O0`-
-  equivalent by design (correctness first); running `clang`/`opt` at
-  `-O2` on the emitted IR is a cheap, real next step once the backend's
-  correctness is trusted further.
+- **`codegen.rs`'s one remaining documented gap** — a genuinely
+  `bool`-valued `if`-expression whose branches both fall through (see the
+  Sixth update above). `Stmt::Return` Tier-1 treatment and codegen
+  optimization (`-O2`) are both done now (Eighth/Ninth updates) — this is
+  the one item left from that original pair.
 
 **Noted for Phase 3 (concurrency, rows 2–3), not relevant yet:** if actors
 end up implemented as lightweight stackful coroutines multiplexed onto a
