@@ -315,6 +315,58 @@ guard is always Tier 2 (neither `refine.rs` nor `smt.rs` records a proof
 for a `return` site yet) — a real, scoped follow-up, not a fundamental
 limitation.
 
+**Seventh update:** row 7's grammar cross-check, deferred since Phase 0
+("worth doing once it stabilizes"), finally happened — a new top-level
+crate, `grammar_check/`, transliterates `GRAMMAR.md`'s EBNF into
+`lalrpop` syntax and asks an independent LALR(1) generator whether it's
+actually conflict-free. It isn't, and the *reason* is a genuine finding,
+not a build-tooling problem: Nirdosha has no statement separator (no
+semicolons, no significant newlines), so anywhere an operator token could
+either extend the current expression or start a new statement, the
+grammar is ambiguous as a plain CFG. `lalrpop` reports this at every
+level of the precedence chain.
+
+**Checked against the real interpreter, not left as a formal curiosity.**
+`return x` immediately followed on the next line by `-y` (nothing
+between them) genuinely could parse two ways — `return (x - y)`, or
+`return x` followed by a separate `-y` statement. Running it:
+
+```
+$ nirdosha /tmp/ambiguity_check2.nir   # let x=5; let y=3; return x \n -y
+=> 2
+```
+
+`5 - 3 = 2` — confirmed as one statement, deterministically, every
+single time (`parser.rs` has no backtracking and no second attempt to
+try the other reading). The rule that produces this — **always prefer to
+extend the current expression over ending the statement** — was real,
+consistent, and load-bearing all along, but existed only as an emergent
+property of the hand-written parser's control flow, never written down
+anywhere. `GRAMMAR.md` now states it explicitly, both as prose and
+attached directly to the EBNF.
+
+**An early attempt to eliminate the conflicts by narrowing the
+`return`-specific case (matching `parser.rs`'s actual rule — bare
+`return` only immediately before `}`) didn't change the conflict count —
+which is itself informative,** not a failed fix to hide: it proved the
+ambiguity was never really about `return` specifically, `return` was
+just the first place it became visible. Fully eliminating the conflicts
+would need either mandatory statement separators (a real, disruptive
+language change) or dense `lalrpop`-specific precedence annotations
+across the whole expression grammar for a green build that wouldn't
+prove anything the finding above doesn't already prove more directly —
+recorded as a real, open option in `grammar_check/README.md`, not
+pursued given what it would have cost against what it would have added.
+
+**The honest bottom line, stated the way row 0's Rice's-theorem framing
+asks every claim in this project to be stated:** the *parser* is
+unambiguous — deterministic, single-token lookahead, no backtracking,
+the original claim stands. The *grammar as an abstract specification*,
+independent of any one parser implementing it, was not unambiguous
+without a rule that lived only in code until this check surfaced it.
+That gap — spec looser than implementation — is exactly the kind of
+thing an independent cross-check exists to find, and it found one.
+
 ---
 
 
@@ -377,7 +429,7 @@ test result: ok. 78 passed; 0 failed
 | 4 — No int/buffer overflow | **Started, and now backed by real SMT.** `Ty::in_range` + `check_ty` still catch everything dynamically (Tier 2, unchanged). Two static Tier-1 passes exist: `compiler/src/refine.rs` (interval analysis, built when this environment had no Z3) and `compiler/src/smt.rs` (real Z3 4.16, once the user installed it — see the "Fifth update" section below), the latter now the primary checker since it's strictly more capable. 68/68 tests pass, including a flagship test that runs the *same* program through both passes and confirms SMT proves something interval analysis structurally cannot (condition-based narrowing). Not wired to elide the interpreter's runtime check — see below for why. |
 | 5 — Native speed | **Started, real native binaries.** `compiler/src/codegen.rs` emits textual LLVM IR and shells out to the system `clang` (LLVM 22) — see the "Sixth update" section below. Scoped to signed integers/bool/unit, no `box`/`&`/`*` yet. 78/78 tests pass; three genuine bugs were found and fixed by actually running compiled binaries, not by review — see below. |
 | 6 — Learning curve | Grammar is small and keyword-heavy on purpose (`fn`/`let`/`return`/`if`/`else`/`while`, C-family operators) — no attempt yet to *measure* this against goal.md §7's proxy metrics (novice user study, Cognitive Dimensions score). Row 6 is aimed at, not yet verified. |
-| 7 — LLM-friendly | The one row with a real, checked claim already: the parser is single-token-lookahead with no backtracking, everywhere — see GRAMMAR.md for what that does and doesn't prove. No LALR-generator cross-check yet, and no benchmark suite / grammar-constrained decoder built yet. |
+| 7 — LLM-friendly | The parser itself remains single-token-lookahead with no backtracking, everywhere — that claim still holds. **Now actually cross-checked** against an independent LALR(1) generator (`grammar_check/`, a real `lalrpop` build) — see the "Seventh update" below for what it found: a genuine, previously-undocumented ambiguity in the grammar-as-CFG (no statement separator, so `return x` / `-y` on separate lines could formally parse two ways), resolved deterministically by the parser's "always shift" behavior but never stated as a rule until this check surfaced it. `GRAMMAR.md` now states it explicitly. Still no benchmark suite / grammar-constrained decoder built. |
 | 8 — Compositional syntax | Followed structurally: `interpreter.rs`'s `eval_expr` has exactly one match arm per `Expr` variant, none reaching into a sibling's internals. Not yet stated as a proven theorem about a formal semantics — there is no formal semantics document yet, only the implementation. |
 | 9 — AI as first-class citizen | Partial groundwork only: errors are structured (`ErrorKind` enum + `Span`, matched by tests without string-parsing — see `tests/basic.rs`'s structured-error tests), which is the prerequisite for row 9, not row 9 itself. No typed AST/IR splicing interface for agents exists yet. |
 | 10 — Tamper-evidence | Not started. No build/attestation pipeline exists yet — this needs Phase 4 (reproducible builds, capability manifests) and, per the earlier discrepancy check, a Sūtra kernel that doesn't exist on this machine yet either. |

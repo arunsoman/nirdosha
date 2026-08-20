@@ -1,0 +1,11 @@
+[package]
+name = "nirdosha-grammar-check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[build-dependencies]
+lalrpop = { version = "0.23", default-features = false, features = ["lexer"] }
+
+[dependencies]
+lalrpop-util = { version = "0.23", features = ["lexer"] }

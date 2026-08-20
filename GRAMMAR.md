@@ -18,13 +18,45 @@ by precedence climbing inside expression parsing, not by grammar
 left-recursion — which is what keeps the expression grammar LL(1)-parseable
 without a separate transformation step.
 
-This is *not yet* cross-checked against an independent LALR(1) parser
-generator (e.g. `lalrpop`) — that's a deliberate deferral, not an oversight:
-the grammar is still small and expected to change through Phase 1–2, and a
-generator cross-check is worth doing once it stabilizes, not on every
-edit. Track that as an open item, not a closed claim.
+**Update — now cross-checked, and the check found something real.**
+`grammar_check/` (a separate crate; see its README for the full story) ran
+this grammar through `lalrpop`, an independent LALR(1) generator. It does
+not build cleanly, and the reason is worth stating as a rule rather than
+leaving buried in a build log: **this language has no statement
+separator — no semicolons, no significant newlines — so wherever an
+operator token could either extend the current expression or start a new
+statement, the grammar is genuinely ambiguous as a plain CFG.** The
+parser resolves every one of these cases the same deterministic way —
+**always prefer to extend the current expression over ending the
+statement** (equivalently: shift over reduce, always) — but that rule
+was previously implicit in `parser.rs`'s control flow only, never stated
+here. It's real and load-bearing: `return x` immediately followed on the
+next line by `-y`, with nothing between them, parses as `return (x - y)`
+— one statement, a subtraction — not as `return x` followed by a
+separate `-y` statement, checked directly against the running
+interpreter (`grammar_check/README.md` has the transcript). Every
+`stmt ::= ...` alternative below should be read with this rule attached,
+not as free-standing productions a parser could combine in whatever
+order first succeeds.
+
+This is the LALR(1) claim's honest final form: the *hand-written parser*
+is unambiguous (deterministic, single-token lookahead, no backtracking —
+the original claim above still holds, and still matters for row 7). The
+*grammar as an abstract CFG*, independent of any particular parser
+implementing it, is not unambiguous without this rule stated explicitly
+— a distinction that only became visible by actually running a second,
+independent tool against it, not by re-reading the hand-written parser
+more carefully.
 
 ## EBNF
+
+**Disambiguation rule this EBNF alone doesn't state** (found by the
+LALR(1) cross-check above, not designed in up front): `stmt ::= stmt*`
+below has no separator between statements. Wherever a token could either
+extend the previous statement's expression or begin a new statement,
+**always extend the previous one** — shift over reduce, with no
+exception. This is what makes `return x` on one line followed by `-y` on
+the next parse as `return (x - y)`, a single statement, never two.
 
 ```ebnf
 program     ::= item*
