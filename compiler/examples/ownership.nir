@@ -1,0 +1,20 @@
+// Exercises: `box`, `*` (deref), and move semantics. `consume` takes
+// ownership of its argument — calling it with `b` moves `b`; a second call
+// with the same `b` would be a compile-time "use after move" error (see
+// tests/ownership.rs for that half of the story — this file only
+// demonstrates the *accepted* program, not the rejected ones).
+fn consume(b: box i64) -> i64 {
+    return *b
+}
+
+fn make_boxed(n: i64) -> box i64 {
+    return box n
+}
+
+fn main() {
+    let a: box i64 = box 10
+    print(consume(a)) // moves `a`; using `a` again here would not typecheck
+
+    let b: box i64 = make_boxed(32)
+    print(*b + 10)
+}

@@ -1,0 +1,13 @@
+// Exercises: recursion, if/else-as-expression with return in both
+// branches, and the arithmetic operator set.
+fn factorial(n: i64) -> i64 {
+    if n <= 1 {
+        return 1
+    } else {
+        return n * factorial(n - 1)
+    }
+}
+
+fn main() {
+    print(factorial(10))
+}

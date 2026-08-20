@@ -1,0 +1,23 @@
+// Exercises: `while`, assignment/mutation, and `if` used as a statement
+// (its value discarded) rather than bound to anything.
+fn is_even(n: i64) -> bool {
+    return n - (n / 2) * 2 == 0
+}
+
+fn main() {
+    let n: i64 = 20
+    while n > 15 {
+        print(n)
+        n = n - 1
+    }
+
+    let count: i64 = 0
+    let i: i64 = 0
+    while i <= 20 {
+        if is_even(i) {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    print(count)
+}
