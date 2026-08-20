@@ -80,6 +80,11 @@ impl Parser {
             let inner = self.expect_type()?;
             return Ok(Ty::Box(Box::new(inner)));
         }
+        if self.peek().tok == Tok::Thread {
+            self.bump();
+            let inner = self.expect_type()?;
+            return Ok(Ty::Thread(Box::new(inner)));
+        }
         match &self.peek().tok {
             Tok::TypeName(name) => {
                 let ty = Ty::from_name(name).expect("lexer only emits valid type names");
@@ -363,6 +368,27 @@ impl Parser {
                         span,
                     }),
                 }
+            }
+            Tok::Spawn => {
+                self.bump();
+                // Restricted to a plain call, same "parse normally, then
+                // validate" pattern as `&`'s Ident restriction above —
+                // `spawn` runs a *named function*, not an arbitrary
+                // expression, so it reuses `parse_call` and destructures
+                // the result rather than inventing a separate production
+                // that would just duplicate `call`'s grammar.
+                let operand = self.parse_call()?;
+                match operand {
+                    Expr::Call(name, args, _) => Ok(Expr::Spawn(name, args, span)),
+                    _ => Err(ParseError {
+                        message: "`spawn` requires a function call, e.g. `spawn worker(x)`".to_string(),
+                        span,
+                    }),
+                }
+            }
+            Tok::Join => {
+                self.bump();
+                Ok(Expr::Join(Box::new(self.parse_unary()?), span))
             }
             _ => self.parse_call(),
         }

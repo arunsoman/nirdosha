@@ -49,7 +49,7 @@ fn cmd_interpret(path: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Value::Unit) => ExitCode::SUCCESS,
-        Ok(v @ (Value::Boxed(_) | Value::Ref(_))) => {
+        Ok(v @ (Value::Boxed(_) | Value::Ref(_) | Value::Thread(_))) => {
             println!("=> {v:?}");
             ExitCode::SUCCESS
         }

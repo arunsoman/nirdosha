@@ -154,7 +154,7 @@ fn out_of_range_i8_is_a_structured_error() {
         }
     "#,
     );
-    let result = Interpreter::new(&program).run_main();
+    let result = Interpreter::new(std::sync::Arc::new(program.clone())).run_main();
     match result {
         Err(e) => assert_eq!(
             e.kind,
@@ -173,7 +173,7 @@ fn division_by_zero_is_a_structured_error() {
         }
     "#,
     );
-    let result = Interpreter::new(&program).run_main();
+    let result = Interpreter::new(std::sync::Arc::new(program.clone())).run_main();
     match result {
         Err(e) => assert_eq!(e.kind, ErrorKind::DivByZero),
         Ok(_) => panic!("expected a DivByZero error"),
@@ -189,7 +189,7 @@ fn unknown_variable_is_a_structured_error() {
         }
     "#,
     );
-    let result = Interpreter::new(&program).run_main();
+    let result = Interpreter::new(std::sync::Arc::new(program.clone())).run_main();
     match result {
         Err(e) => assert_eq!(e.kind, ErrorKind::UnknownVar("does_not_exist".to_string())),
         Ok(_) => panic!("expected an UnknownVar error"),
@@ -208,7 +208,7 @@ fn arity_mismatch_is_a_structured_error() {
         }
     "#,
     );
-    let result = Interpreter::new(&program).run_main();
+    let result = Interpreter::new(std::sync::Arc::new(program.clone())).run_main();
     match result {
         Err(e) => assert_eq!(
             e.kind,
@@ -293,7 +293,7 @@ fn missing_return_on_non_unit_function_is_a_structured_error() {
         }
     "#,
     );
-    let result = Interpreter::new(&program).run_main();
+    let result = Interpreter::new(std::sync::Arc::new(program.clone())).run_main();
     match result {
         Err(e) => assert_eq!(e.kind, ErrorKind::MissingReturn { fn_name: "main".to_string() }),
         Ok(_) => panic!("expected a MissingReturn error"),

@@ -1,0 +1,29 @@
+// Exercises: `spawn`, `join`, and `thread <T>`. `spawn f(args)` runs `f`
+// concurrently (a real OS thread in this first implementation -- see
+// PHASE0.md) and immediately returns a `thread T` handle, where `T` is
+// `f`'s return type. `join h` blocks until that computation finishes and
+// consumes the handle, producing its `T`-typed result.
+//
+// Race-freedom doesn't come from anything thread-specific: `spawn`'s
+// arguments are moved exactly like a normal call's (see tests/ownership.rs
+// for the rejected half of this story -- a `box i64` passed to `spawn`
+// can't be touched again by the spawning side, so no two concurrent
+// computations can ever alias the same affine value).
+fn double(n: i64) -> i64 {
+    return n * 2
+}
+
+fn add(a: i64, b: i64) -> i64 {
+    return a + b
+}
+
+fn main() {
+    let h1: thread i64 = spawn double(21)
+    let h2: thread i64 = spawn add(10, 32)
+
+    let r1: i64 = join h1
+    let r2: i64 = join h2
+
+    print(r1) // 42
+    print(r2) // 42
+}

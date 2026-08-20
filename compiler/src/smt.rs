@@ -302,8 +302,14 @@ impl Checker<'_> {
                 }
                 term
             }
-            Expr::Box(inner, _) | Expr::Deref(inner, _) | Expr::Ref(inner, _) => {
+            Expr::Box(inner, _) | Expr::Deref(inner, _) | Expr::Ref(inner, _) | Expr::Join(inner, _) => {
                 self.expr(inner, scopes);
+                Int::fresh_const("unknown")
+            }
+            Expr::Spawn(_, args, _) => {
+                for a in args {
+                    self.expr(a, scopes);
+                }
                 Int::fresh_const("unknown")
             }
             Expr::Bool(_, _) => Int::fresh_const("unknown"),
@@ -440,14 +446,16 @@ fn assigned_names(stmts: &[Stmt]) -> HashSet<String> {
     fn walk_expr(e: &Expr, names: &mut HashSet<String>) {
         match e {
             Expr::Int(_, _) | Expr::Bool(_, _) | Expr::Ident(_, _) => {}
-            Expr::Unary(_, inner, _) | Expr::Box(inner, _) | Expr::Deref(inner, _) | Expr::Ref(inner, _) => {
-                walk_expr(inner, names)
-            }
+            Expr::Unary(_, inner, _)
+            | Expr::Box(inner, _)
+            | Expr::Deref(inner, _)
+            | Expr::Ref(inner, _)
+            | Expr::Join(inner, _) => walk_expr(inner, names),
             Expr::Binary(_, l, r, _) => {
                 walk_expr(l, names);
                 walk_expr(r, names);
             }
-            Expr::Call(_, args, _) => {
+            Expr::Call(_, args, _) | Expr::Spawn(_, args, _) => {
                 for a in args {
                     walk_expr(a, names);
                 }

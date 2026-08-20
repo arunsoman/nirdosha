@@ -14,6 +14,26 @@
 //! it goes out of scope); see `Value`'s doc comment for why that's an
 //! honest thing to say, not a shortcut being hidden.
 //!
+//! **`spawn`/`join` (goal.md rows 2–3) are real OS threads** — the
+//! honestly-scoped "first implementation" (real concurrency now, not a
+//! simulation), with the door left open for a lighter-weight virtual-
+//! thread scheduler later without changing the *language* semantics:
+//! `spawn`/`join` are the whole surface a Nirdosha program sees, and
+//! nothing about swapping the OS-thread backing for an M:N one later
+//! would change what a program written against that surface means. The
+//! race-freedom claim doesn't come from anything in this file — it comes
+//! from `ownership.rs` already requiring every argument moved into a
+//! `spawn` to be consumed, the same as a normal call argument, so no two
+//! concurrent computations can ever alias the same `box`-typed data. This
+//! file only has to actually run threads correctly; the safety argument
+//! was already proved before it got here.
+//!
+//! Because a spawned thread needs to look up functions independently of
+//! whoever spawned it, `Interpreter` no longer borrows the `Program` (a
+//! borrow can't cross `std::thread::spawn`'s `'static` bound) — it holds
+//! an `Arc<Program>` instead, cheaply cloned into each spawned thread's
+//! own `Interpreter`.
+//!
 //! Control flow: `if` is a genuine expression in the grammar (GRAMMAR.md),
 //! and a block's value is its last expression-statement (Unit if the block
 //! is empty or ends in `let`/`return`/`while`). `return` has to be able to
@@ -23,6 +43,7 @@
 //! propagates it with `?`, and only `call()` catches `Signal::Return`.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::ast::*;
 use crate::token::Span;
@@ -39,7 +60,7 @@ use crate::token::Span;
 /// backend would need to free deterministically with no garbage collector
 /// at all. Don't read "the interpreter runs `box` correctly" as "row 1 is
 /// done" — it's the checker that's doing the row-1 work, not this file.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
     Bool(bool),
@@ -56,6 +77,42 @@ pub enum Value {
     /// static distinction corresponds to at the value level, even though
     /// nothing here currently depends on telling the two apart at runtime.
     Ref(Box<Value>),
+    /// A handle to a real OS thread running a spawned computation. The
+    /// `Mutex<Option<..>>` wrapper exists for exactly one reason: `join`
+    /// needs to *take* the `JoinHandle` out (handles aren't `Clone` — a
+    /// thread can only be joined once, by design, matching `Ty::Thread`'s
+    /// affine-ness), but this interpreter's `Env` clones every `Value` on
+    /// read (documented above), so the handle needs a container that's
+    /// cheap to clone (an `Arc`) while still letting exactly one clone
+    /// ever successfully extract the real handle. `Arc`, not `Rc`: this
+    /// has to be `Send` to be moved into a spawned thread's own captured
+    /// arguments (e.g. a function spawning another function and handing
+    /// it a thread handle), and `Rc` isn't.
+    Thread(Arc<Mutex<Option<ThreadHandle>>>),
+}
+
+/// A spawned computation's raw join handle. Its own alias, not just inline
+/// in `Value::Thread`, purely to keep clippy's `type_complexity` lint (and
+/// human readers) from tripping over four levels of generic nesting.
+type ThreadHandle = std::thread::JoinHandle<Result<Value, RuntimeError>>;
+
+/// Manual, not derived: `JoinHandle` has no `PartialEq`, so `Value` can't
+/// derive it once `Thread` exists. Two thread handles are equal only if
+/// they're literally the same handle (`Arc::ptr_eq`) — there's no
+/// sensible *value* equality for "is this running computation the same
+/// as that one" otherwise.
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Unit, Value::Unit) => true,
+            (Value::Boxed(a), Value::Boxed(b)) => a == b,
+            (Value::Ref(a), Value::Ref(b)) => a == b,
+            (Value::Thread(a), Value::Thread(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 impl Value {
@@ -66,6 +123,7 @@ impl Value {
             Value::Unit => "unit",
             Value::Boxed(_) => "box",
             Value::Ref(_) => "ref",
+            Value::Thread(_) => "thread",
         }
     }
 
@@ -76,6 +134,7 @@ impl Value {
             Value::Unit => "()".to_string(),
             Value::Boxed(inner) => format!("box({})", inner.render()),
             Value::Ref(inner) => format!("&{}", inner.render()),
+            Value::Thread(_) => "thread(..)".to_string(),
         }
     }
 }
@@ -92,6 +151,17 @@ pub enum ErrorKind {
     OutOfRange { ty: String, value: i64 },
     DivByZero,
     MissingReturn { fn_name: String },
+    /// The spawned thread panicked instead of returning normally — Rust's
+    /// own panic payload isn't `Display`-friendly in general, so this
+    /// carries a best-effort message rather than the raw payload.
+    ThreadPanicked { message: String },
+    /// Defense in depth, not a case `ownership.rs` should ever let
+    /// through: joining a handle that was already joined. Kept as a real,
+    /// structured runtime error (matching this file's existing pattern —
+    /// see `MissingReturn`) rather than a Rust-level `panic!`/`unwrap`,
+    /// the same "the static checker is the real gate, the runtime check
+    /// is the backstop" shape as everywhere else in this file.
+    AlreadyJoined,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +192,10 @@ impl std::fmt::Display for RuntimeError {
             ErrorKind::MissingReturn { fn_name } => {
                 write!(f, "{line}:{col}: `{fn_name}` did not return a value")
             }
+            ErrorKind::ThreadPanicked { message } => {
+                write!(f, "{line}:{col}: spawned thread panicked: {message}")
+            }
+            ErrorKind::AlreadyJoined => write!(f, "{line}:{col}: this thread was already joined"),
         }
     }
 }
@@ -196,14 +270,19 @@ impl Env {
     }
 }
 
-pub struct Interpreter<'p> {
-    fns: HashMap<String, &'p FnDecl>,
+/// Owns the program (via `Arc`, not a borrow — see module doc) plus a
+/// name→index table built once so a lookup doesn't need to linear-scan
+/// `program.fns`. Cheap to reconstruct: `Interpreter::new(Arc::clone(&p))`
+/// is exactly what a spawned thread does to get its own independent one.
+pub struct Interpreter {
+    program: Arc<Program>,
+    fn_index: HashMap<String, usize>,
 }
 
-impl<'p> Interpreter<'p> {
-    pub fn new(program: &'p Program) -> Self {
-        let fns = program.fns.iter().map(|f| (f.name.clone(), f)).collect();
-        Interpreter { fns }
+impl Interpreter {
+    pub fn new(program: Arc<Program>) -> Self {
+        let fn_index = program.fns.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect();
+        Interpreter { program, fn_index }
     }
 
     pub fn run_main(&self) -> Result<Value, RuntimeError> {
@@ -211,11 +290,15 @@ impl<'p> Interpreter<'p> {
         self.call("main", &[], span)
     }
 
+    fn find_fn(&self, name: &str) -> Option<&FnDecl> {
+        self.fn_index.get(name).map(|&i| &self.program.fns[i])
+    }
+
     /// The one place `Signal::Return` gets caught and turned back into a
     /// plain value — every nested `if`/block/expression underneath just
     /// propagates it with `?`.
     fn call(&self, name: &str, arg_vals: &[Value], span: Span) -> Result<Value, RuntimeError> {
-        let f = *self.fns.get(name).ok_or_else(|| RuntimeError {
+        let f = self.find_fn(name).ok_or_else(|| RuntimeError {
             kind: ErrorKind::UnknownFn(name.to_string()),
             span,
         })?;
@@ -261,6 +344,12 @@ impl<'p> Interpreter<'p> {
             (Value::Unit, Ty::Unit) => Ok(()),
             (Value::Boxed(inner), Ty::Box(inner_ty)) => self.check_ty(inner, inner_ty, span),
             (Value::Ref(inner), Ty::Ref(inner_ty)) => self.check_ty(inner, inner_ty, span),
+            // No inner value to recurse into yet — the spawned thread's
+            // own `call()` already validates its result against *its*
+            // declared return type independently, on its own stack, the
+            // moment it produces one; there's nothing more to check here
+            // than "this is in fact a thread handle."
+            (Value::Thread(_), Ty::Thread(_)) => Ok(()),
             (Value::Int(n), _) if ty.is_integer() => {
                 if ty.in_range(*n) {
                     Ok(())
@@ -408,6 +497,60 @@ impl<'p> Interpreter<'p> {
             Expr::Ref(inner, _span) => {
                 let v = self.eval_expr(inner, env)?;
                 Ok(Value::Ref(Box::new(v)))
+            }
+            Expr::Spawn(name, arg_exprs, span) => {
+                let mut vals = Vec::with_capacity(arg_exprs.len());
+                for a in arg_exprs {
+                    vals.push(self.eval_expr(a, env)?);
+                }
+                // Everything moved into the closure is owned, not
+                // borrowed from `self`/`env` — `std::thread::spawn`
+                // requires `'static`, and this is also the concrete,
+                // checkable form of the race-freedom claim: the spawned
+                // thread gets its *own* independent copy of the program
+                // (a cheap `Arc` clone) and its *own* values (already
+                // proven, by `ownership.rs`, to have been moved out of
+                // the spawning side — see this file's module doc).
+                let program = Arc::clone(&self.program);
+                let name = name.clone();
+                let call_span = *span;
+                let handle = std::thread::spawn(move || {
+                    let interp = Interpreter::new(program);
+                    interp.call(&name, &vals, call_span)
+                });
+                Ok(Value::Thread(Arc::new(Mutex::new(Some(handle)))))
+            }
+            Expr::Join(inner, span) => {
+                let v = self.eval_expr(inner, env)?;
+                match v {
+                    Value::Thread(slot) => {
+                        // `.take()` is what makes a handle single-use at
+                        // runtime, backing up `ownership.rs`'s static
+                        // single-join proof the same "checker is the real
+                        // gate, this is the backstop" way `check_ty`
+                        // backs up `typeck.rs` elsewhere in this file.
+                        let handle = slot.lock().unwrap().take();
+                        match handle {
+                            None => Err(Signal::Err(RuntimeError { kind: ErrorKind::AlreadyJoined, span: *span })),
+                            Some(h) => match h.join() {
+                                Ok(Ok(result)) => Ok(result),
+                                Ok(Err(runtime_err)) => Err(Signal::Err(runtime_err)),
+                                Err(panic_payload) => {
+                                    let message = panic_payload
+                                        .downcast_ref::<&str>()
+                                        .map(|s| s.to_string())
+                                        .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                                        .unwrap_or_else(|| "(no message)".to_string());
+                                    Err(Signal::Err(RuntimeError {
+                                        kind: ErrorKind::ThreadPanicked { message },
+                                        span: *span,
+                                    }))
+                                }
+                            },
+                        }
+                    }
+                    v => Err(mismatch("thread", v.ty_name(), *span)),
+                }
             }
         }
     }

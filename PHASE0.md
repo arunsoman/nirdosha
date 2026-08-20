@@ -462,6 +462,83 @@ one-size-fits-all `i64` slot the old code used.
 86/86 tests pass. This closes out every gap the Sixth update's codegen
 milestone originally flagged.
 
+**Eleventh update:** rows 2-3 (no data races, no deadlocks) now have a
+first, real implementation — `spawn`/`join` and a new `thread <T>` type,
+wired through every pass (lexer, parser, `typeck.rs`, `ownership.rs`,
+`refine.rs`/`smt.rs`, `interpreter.rs`; `codegen.rs` honestly rejects it,
+the same "reject, don't mis-compile" treatment `box`/`&` got before their
+own codegen support existed).
+
+*Execution model, chosen deliberately.* The user asked for the API to be
+framed like Java's virtual threads — a cheap, language-level concurrency
+abstraction, decoupled from what actually backs it. The honest first
+implementation is real OS threads (`std::thread::spawn`/`JoinHandle`):
+`spawn f(args)` runs `f` on a genuine new OS thread and returns a
+`thread T` handle immediately (`T` = `f`'s return type); `join h` blocks
+until it finishes, consumes the handle, and produces its `T`-typed result.
+Nothing about the *language-level* API (the `spawn`/`join` surface, or
+`Ty::Thread`'s affine-ness) assumes OS threads specifically — a future
+M:N/lightweight scheduler can replace what backs a `thread T` without
+changing any program's observable semantics. That's the actual point of
+naming it after virtual threads now, before the cheaper backing exists.
+
+*Race-freedom, and where it actually comes from.* No new concurrency-
+specific safety logic was written. `ownership.rs`'s `Expr::Spawn` arm
+reuses the exact move-checking a normal function call already does on its
+arguments — an argument passed to `spawn` is consumed, exactly like an
+argument passed to any function, so the spawning side can never alias a
+moved value with the spawned computation. `Expr::Join` consumes the whole
+handle the same way, giving `join` its single-use behavior statically (a
+second `join h` is a compile-time use-after-move, not a runtime race).
+Deadlock-freedom follows from the same shape: `thread T` handles are
+affine, so a program's handles form a DAG by construction (no handle can
+be shared to create a wait-cycle) — there is no mutex/lock primitive yet,
+so this is the whole deadlock story so far, not a completed one.
+
+*Runtime backstops, as defense in depth, not the real gate* — matching
+every other check in `interpreter.rs`: joining an already-joined handle
+hits `ErrorKind::AlreadyJoined` if it were ever reached at runtime (it
+isn't, statically, per above); a genuine Rust panic inside a spawned
+computation (e.g. undetected i64-vs-i64 overflow — i64 has no *dynamic*
+range guard, only the Tier-1 static provers even attempt it, see the
+Fourth/Fifth updates) is caught at the `JoinHandle::join()` boundary and
+converted to a structured `ErrorKind::ThreadPanicked { message }` instead
+of unwinding past the thread.
+
+*The architectural cost.* Real `std::thread::spawn` requires `'static`
+data, and the old `Interpreter<'p> { fns: HashMap<String, &'p FnDecl> }`
+borrowed from the program it was interpreting — incompatible with a
+spawned thread needing its own independent way to look up functions.
+`Interpreter` now owns `Arc<Program>` instead of borrowing it (cheap to
+clone into a spawned closure); `Value` gained a `Thread(Arc<Mutex<Option<
+ThreadHandle>>>)` variant (`Arc`+`Mutex`, not `Rc`+`RefCell`, because the
+value must be `Send` to cross into the spawned closure; `Mutex<Option<_>>`
+so `.take()` can extract the handle exactly once, matching `join`'s
+single-use semantics, while the interpreter's existing clone-on-read
+`Env` model still works via cheap `Arc::clone`). `Value` lost its derived
+`PartialEq` (`JoinHandle` has none) in favor of a manual impl.
+
+Explicit, honest limitations: still one OS thread per `spawn` (no M:N
+scheduling yet — the API is *shaped* for it, not backed by it); `codegen`
+doesn't support `spawn`/`join` at all yet (interpreter-only, like `box`/`&`
+were before their own codegen work); `print` (and any other builtin) can't
+be spawned — `typeck.rs` rejects it explicitly (`CannotSpawnBuiltin`)
+because the interpreter's spawn machinery only knows named user functions;
+no channels or other message-passing primitive exists yet, only
+spawn+join's single-result-handoff shape.
+
+`examples/threads.nir` demonstrates the accepted program (two independent
+`spawn`s, both joined, matching the loose/deep-nesting-free style of the
+other examples); `tests/concurrency.rs` (9 tests) covers the round trip,
+two-independent-spawns, the two ownership-checker rejections above (moved-
+box-reused, double-join), both runtime backstops (driven directly against
+`Interpreter`, bypassing `check_ownership`, to prove the backstop fires on
+its own rather than only ever being shadowed by the static check), and
+both static `typeck.rs` rejections (`CannotSpawnBuiltin`,
+`ExpectedThreadType`). 96/96 tests pass; `cargo clippy --all-targets` is
+clean (one `type_complexity` warning on `Value::Thread`'s nested generic,
+fixed with a `ThreadHandle` type alias rather than suppressed).
+
 ---
 
 
@@ -483,9 +560,9 @@ compiler/
     token.rs        lexer — hand-written, single pass, structured LexError, Span: Hash
     ast.rs           AST types; Ty::bounds()/in_range shared by every pass; literal_value()
     parser.rs        recursive-descent, single-token lookahead, no backtracking
-    interpreter.rs   tree-walking evaluator; Value::{Boxed,Ref}; dynamic Tier-2 checks
+    interpreter.rs   tree-walking evaluator; Value::{Boxed,Ref,Thread}; dynamic Tier-2 checks
     typeck.rs        static type checker — runs before interpretation
-    ownership.rs     static move-checker for box/&
+    ownership.rs     static move-checker for box/&/spawn/join
     refine.rs        interval-analysis Tier-1 prover (the pre-Z3 fallback)
     smt.rs           real Z3-backed Tier-1 prover (primary; condition narrowing)
     codegen.rs       LLVM IR emission + `clang` driver — real native binaries
@@ -497,12 +574,14 @@ compiler/
     loop.nir         while, assignment/mutation, if-as-statement
     ownership.nir    box, move, consuming calls
     borrow.nir       shared borrows (&)
+    threads.nir      spawn/join, thread <T>
   tests/
-    basic.rs         28 tests — core language + typeck
-    ownership.rs     21 tests — box/&/move-checking
-    refine.rs        10 tests — interval-analysis proofs (and honest non-proofs)
+    basic.rs         32 tests — core language + typeck
+    ownership.rs     22 tests — box/&/move-checking
+    refine.rs        11 tests — interval-analysis proofs (and honest non-proofs)
     smt.rs           9 tests — SMT proofs, incl. the interval-vs-SMT flagship comparison
-    codegen.rs       10 tests — real compiled binaries, run and compared to the interpreter
+    codegen.rs       13 tests — real compiled binaries, run and compared to the interpreter
+    concurrency.rs   9 tests — spawn/join round trips, race-freedom, panic/double-join backstops
 ```
 
 ```
@@ -511,7 +590,7 @@ $ cd compiler && cargo run --quiet -- examples/factorial.nir
 $ cargo run --quiet -- build examples/factorial.nir -o /tmp/factorial && /tmp/factorial
 3628800
 $ cargo test
-test result: ok. 78 passed; 0 failed
+test result: ok. 96 passed; 0 failed
 ```
 
 ## Row by row, against goal.md §1
@@ -519,8 +598,8 @@ test result: ok. 78 passed; 0 failed
 | Row | Status |
 |---|---|
 | 1 — No GC, no `free()` | **Started, real content.** `box`/`*`, shared borrows (`&`), and a static move-checker (`ownership.rs`) — see the "Second" and "Third" update sections above for what's actually proved and what still isn't (no `&mut`, no `Drop` hook, no place expressions). Regions/bulk-arena allocation is still not started. |
-| 2 — No data races | N/A yet — no concurrency exists. |
-| 3 — No deadlocks | N/A yet — no concurrency exists. |
+| 2 — No data races | **Started, first implementation.** `spawn`/`join` and `thread <T>` — real OS threads under the hood (see the "Eleventh update" section below for the Java-virtual-threads framing and why that's the honest v1). Race-freedom comes entirely from `ownership.rs` reusing its existing move-checker on `spawn`'s arguments and `join`'s handle — no new concurrency-specific safety logic exists. `codegen.rs` doesn't support it yet (interpreter-only, like `box`/`&` before their own codegen work); no channels or other primitive beyond spawn+join exists. |
+| 3 — No deadlocks | **Started, narrow.** `thread <T>` handles are affine, so they form a DAG by construction — no handle can be shared to create a wait-cycle. That's the whole story so far because there's no mutex/lock primitive yet to deadlock *on*; this row will need real content again once one exists. |
 | 4 — No int/buffer overflow | **Started, and now backed by real SMT.** `Ty::in_range` + `check_ty` still catch everything dynamically (Tier 2, unchanged). Two static Tier-1 passes exist: `compiler/src/refine.rs` (interval analysis, built when this environment had no Z3) and `compiler/src/smt.rs` (real Z3 4.16, once the user installed it — see the "Fifth update" section below), the latter now the primary checker since it's strictly more capable. 68/68 tests pass, including a flagship test that runs the *same* program through both passes and confirms SMT proves something interval analysis structurally cannot (condition-based narrowing). Not wired to elide the interpreter's runtime check — see below for why. |
 | 5 — Native speed | **Started, real native binaries.** `compiler/src/codegen.rs` emits textual LLVM IR and shells out to the system `clang` (LLVM 22) — see the "Sixth update" section below. Scoped to signed integers/bool/unit, no `box`/`&`/`*` yet. 78/78 tests pass; three genuine bugs were found and fixed by actually running compiled binaries, not by review — see below. |
 | 6 — Learning curve | Grammar is small and keyword-heavy on purpose (`fn`/`let`/`return`/`if`/`else`/`while`, C-family operators) — no attempt yet to *measure* this against goal.md §7's proxy metrics (novice user study, Cognitive Dimensions score). Row 6 is aimed at, not yet verified. |
@@ -574,12 +653,25 @@ Three candidates, none blocking the others:
   comment flags this explicitly): `let ok: bool = n > 0; if ok { ... }`
   doesn't currently narrow `n` the way `if n > 0 { ... }` directly would.
   A real, scoped gap, not a hypothetical one.
-
-**Noted for Phase 3 (concurrency, rows 2–3), not relevant yet:** if actors
-end up implemented as lightweight stackful coroutines multiplexed onto a
-few OS threads (rather than one-OS-thread-per-actor), a *cactus stack*
-(spaghetti stack — a tree-shaped call stack where many logical stacks share
-common ancestor frames) is a real, established technique for making that
-cheap at scale. Not applicable today: the interpreter is a plain recursive
-tree-walker on Rust's own call stack, with no user-level threading or
-continuation-capture for it to help with yet.
+- **A lock/mutex primitive** — the natural next step for row 3 now that
+  `spawn`/`join` exist (see the Eleventh update): today's deadlock-freedom
+  is "vacuously true, there's nothing to deadlock on yet"; a real primitive
+  is what makes that claim need to be earned again.
+- **M:N thread scheduling** — replace `spawn`'s one-OS-thread-per-call
+  backing with lightweight (green/virtual) threads multiplexed onto a
+  fixed pool, without changing `spawn`/`join`'s observable semantics —
+  the whole reason the API was framed after Java virtual threads in the
+  Eleventh update. If actors/scheduling end up implemented as stackful
+  coroutines multiplexed onto a few OS threads, a *cactus stack*
+  (spaghetti stack — a tree-shaped call stack where many logical stacks
+  share common ancestor frames) is a real, established technique for
+  making that cheap at scale — now directly relevant, unlike when this
+  note was first written (the interpreter was a plain recursive
+  tree-walker on Rust's own call stack with no user-level threading to
+  help; `spawn` still runs each call on the interpreter's ordinary Rust
+  recursion, just on its own OS thread, so the note remains aspirational
+  until an M:N scheduler is actually built).
+- **`codegen.rs` support for `spawn`/`join`** — currently interpreter-only;
+  needs an ABI decision for what a native `thread T` handle even is
+  (an OS thread handle again, or already the lightweight scheduler's unit)
+  before it's worth building.

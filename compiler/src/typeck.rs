@@ -67,6 +67,8 @@ pub enum TypeErrorKind {
     ExpectedNumeric { found: Ty },
     ExpectedBoxType { found: Ty },
     CannotMoveOutOfReference { content: Ty },
+    ExpectedThreadType { found: Ty },
+    CannotSpawnBuiltin { name: String },
     LiteralOutOfRange { ty: Ty, value: i64 },
     IfWithoutElseUsedAsValue { expected: Ty },
     NotAllPathsReturn { fn_name: String },
@@ -120,6 +122,14 @@ impl std::fmt::Display for TypeError {
                  (only through an owned `box`)",
                 content.name()
             ),
+            TypeErrorKind::ExpectedThreadType { found } => write!(
+                f,
+                "{line}:{col}: `join` needs a `thread` type, found `{}`",
+                found.name()
+            ),
+            TypeErrorKind::CannotSpawnBuiltin { name } => {
+                write!(f, "{line}:{col}: `{name}` is a builtin and can't be spawned")
+            }
             TypeErrorKind::LiteralOutOfRange { ty, value } => write!(
                 f,
                 "{line}:{col}: literal `{value}` does not fit in `{}`",
@@ -418,6 +428,47 @@ impl Checker {
                     Ty::Ref(Box::new(it))
                 }
             }
+            Expr::Spawn(name, args, span) => self.infer_spawn(name, args, expected_ret, scopes, *span),
+            Expr::Join(inner, span) => {
+                let it = self.infer(inner, expected_ret, scopes);
+                match it {
+                    Ty::Error => Ty::Error,
+                    Ty::Thread(t) => *t,
+                    other => {
+                        self.error(TypeErrorKind::ExpectedThreadType { found: other }, *span);
+                        Ty::Error
+                    }
+                }
+            }
+        }
+    }
+
+    /// `spawn name(args)` type-checks its arguments exactly like an
+    /// ordinary call to `name` (reusing the same signature lookup and
+    /// literal-flexibility rules `infer_call` already has — a spawned
+    /// computation's parameters are no different from a called
+    /// function's), and wraps the result in `Ty::Thread` instead of
+    /// returning it directly. `print` is rejected explicitly, not
+    /// delegated to `infer_call`: `print` isn't in the `sigs` table at
+    /// all (it's special-cased ahead of the lookup, in `infer_call`
+    /// itself), so delegating blindly would silently accept `spawn
+    /// print(x)` — but `interpreter.rs`'s spawn machinery only knows how
+    /// to run a *named function* from `self.fns`, not the builtin. Caught
+    /// here, at the type level, rather than left for the interpreter to
+    /// fail on.
+    fn infer_spawn(&mut self, name: &str, args: &[Expr], expected_ret: &Ty, scopes: &mut Scopes, span: Span) -> Ty {
+        if name == "print" {
+            self.error(TypeErrorKind::CannotSpawnBuiltin { name: name.to_string() }, span);
+            for a in args {
+                self.infer(a, expected_ret, scopes); // still check the args for their own errors
+            }
+            return Ty::Error;
+        }
+        let ret = self.infer_call(name, args, expected_ret, scopes, span);
+        if ret == Ty::Error {
+            Ty::Error
+        } else {
+            Ty::Thread(Box::new(ret))
         }
     }
 

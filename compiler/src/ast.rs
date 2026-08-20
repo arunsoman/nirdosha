@@ -39,6 +39,19 @@ pub enum Ty {
     /// to enforce "aliasing xor mutability" and are deliberately deferred;
     /// see `ownership.rs`'s module doc.
     Ref(Box<Ty>),
+    /// A handle to a spawned concurrent computation (`spawn f(x)` — see
+    /// `Expr::Spawn`) that will eventually produce a `Ty`-typed result.
+    /// Affine, like `Ty::Box`: a handle has exactly one owner, and
+    /// `join`ing it (`Expr::Join`) consumes it — you can't join the same
+    /// spawned computation twice, the same "own it or don't touch it"
+    /// discipline `box` already has. goal.md rows 2–3 (no data races, no
+    /// deadlocks): a spawned computation only ever receives values moved
+    /// to it (this reuses the exact move-checking a normal function call
+    /// argument already gets — nothing new in `ownership.rs` beyond
+    /// treating `Thread` as affine), so no two concurrent computations
+    /// can ever alias the same `box`-typed data. That's the actual
+    /// content of the race-freedom claim, not a separate mechanism.
+    Thread(Box<Ty>),
     /// Poison type: stands in for an expression that already produced a
     /// type error, so the checker (`typeck.rs`) doesn't cascade a dozen
     /// follow-on diagnostics from one root cause. Never produced by the
@@ -83,12 +96,13 @@ impl Ty {
             Ty::Unit => "unit".to_string(),
             Ty::Box(inner) => format!("box {}", inner.name()),
             Ty::Ref(inner) => format!("&{}", inner.name()),
+            Ty::Thread(inner) => format!("thread {}", inner.name()),
             Ty::Error => "<error>".to_string(),
         }
     }
 
     pub fn is_integer(&self) -> bool {
-        !matches!(self, Ty::Bool | Ty::Unit | Ty::Error | Ty::Box(_) | Ty::Ref(_))
+        !matches!(self, Ty::Bool | Ty::Unit | Ty::Error | Ty::Box(_) | Ty::Ref(_) | Ty::Thread(_))
     }
 
     /// The property that makes ownership meaningful: an affine value has
@@ -104,8 +118,11 @@ impl Ty {
         // `Ty::Ref` is deliberately excluded: a shared borrow is always
         // freely copyable (unlimited simultaneous readers is sound), even
         // though it can point at affine content. That's what actually
-        // makes borrowing useful — see `Ty::Ref`'s doc comment.
-        matches!(self, Ty::Box(_))
+        // makes borrowing useful — see `Ty::Ref`'s doc comment. `Ty::Thread`
+        // *is* affine, for the same reason `Ty::Box` is: a spawned
+        // computation has exactly one owner, and joining it is a one-time
+        // consuming operation, the same shape as freeing a box.
+        matches!(self, Ty::Box(_) | Ty::Thread(_))
     }
 
     /// goal.md row 4's runtime fallback (Tier 2, §4): `interpreter.rs`
@@ -150,7 +167,9 @@ impl Ty {
             // all of these, and `in_range` above already short-circuits
             // on that) — full range is the harmless, safe default if
             // something calls this directly anyway.
-            Ty::Bool | Ty::Unit | Ty::Box(_) | Ty::Ref(_) | Ty::Error => (i64::MIN, i64::MAX),
+            Ty::Bool | Ty::Unit | Ty::Box(_) | Ty::Ref(_) | Ty::Thread(_) | Ty::Error => {
+                (i64::MIN, i64::MAX)
+            }
         }
     }
 }
@@ -235,6 +254,19 @@ pub enum Expr {
     /// temporary-lifetime rules this language doesn't have a story for
     /// yet.
     Ref(Box<Expr>, Span),
+    /// `spawn name(args)` — runs `name` as a new concurrent computation
+    /// and immediately returns a `Ty::Thread` handle to it, without
+    /// waiting. Shaped exactly like `Expr::Call` (a name plus arguments,
+    /// not an arbitrary expression) so it can reuse the same signature
+    /// lookup and argument-move-checking a normal call already gets —
+    /// see `Ty::Thread`'s doc comment for why that reuse is the actual
+    /// content of the race-freedom claim, not incidental.
+    Spawn(String, Vec<Expr>, Span),
+    /// `join expr` — blocks until the spawned computation `expr` (which
+    /// must be `Ty::Thread`-typed) finishes, consumes the handle (it's
+    /// affine — a single join, like a single free), and yields its
+    /// result.
+    Join(Box<Expr>, Span),
 }
 
 #[derive(Debug, Clone)]
@@ -256,7 +288,9 @@ impl Expr {
             | Expr::Assign(_, _, s)
             | Expr::Box(_, s)
             | Expr::Deref(_, s)
-            | Expr::Ref(_, s) => *s,
+            | Expr::Ref(_, s)
+            | Expr::Spawn(_, _, s)
+            | Expr::Join(_, s) => *s,
         }
     }
 }

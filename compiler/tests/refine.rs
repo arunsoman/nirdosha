@@ -310,6 +310,7 @@ fn analyze_does_not_panic_on_any_example() {
         include_str!("../examples/loop.nir"),
         include_str!("../examples/ownership.nir"),
         include_str!("../examples/borrow.nir"),
+        include_str!("../examples/threads.nir"),
     ] {
         let program = parse(src);
         let _ = analyze(&program); // just must not panic

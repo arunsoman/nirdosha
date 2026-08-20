@@ -338,6 +338,26 @@ impl Checker {
                     self.touch_expr(inner, false);
                 }
             }
+            Expr::Spawn(_, args, _) => {
+                // The actual content of goal.md rows 2-3's race-freedom
+                // claim: every argument moved into a spawned computation
+                // is checked exactly like a normal call argument. An
+                // affine (`box`-typed) argument is consumed here, the
+                // same as any function call — so the spawning side can
+                // never touch it again, and no two concurrent
+                // computations can ever alias the same allocation. No new
+                // logic beyond "touch like a call" is needed for this to
+                // be true; it falls out of the existing move-checker.
+                for a in args {
+                    self.touch_expr(a, true);
+                }
+            }
+            Expr::Join(inner, _) => {
+                // `join` consumes the whole handle -- a spawned
+                // computation can only be joined once, the same
+                // single-owner discipline as `box`.
+                self.touch_expr(inner, true);
+            }
         }
     }
 

@@ -92,6 +92,11 @@ fn llvm_ty(ty: &Ty) -> Result<&'static str, CodegenError> {
              proving it",
             ty.name()
         )),
+        Ty::Thread(_) => unsupported(format!(
+            "codegen doesn't support `{}` yet — spawn/join are interpreter-only for now \
+             (real OS threads, not yet compiled to native code)",
+            ty.name()
+        )),
         Ty::Error => unreachable!("a program with a type error is never handed to codegen"),
     }
 }
@@ -170,6 +175,9 @@ fn check_expr(e: &Expr) -> Result<(), CodegenError> {
         Expr::Assign(_, rhs, _) => check_expr(rhs),
         Expr::Box(_, _) | Expr::Deref(_, _) | Expr::Ref(_, _) => {
             unsupported("codegen doesn't support `box`/`*`/`&` yet — see module doc")
+        }
+        Expr::Spawn(_, _, _) | Expr::Join(_, _) => {
+            unsupported("codegen doesn't support `spawn`/`join` yet — interpreter-only for now")
         }
     }
 }
@@ -548,7 +556,7 @@ impl Codegen<'_> {
                 // need to know it came from an assignment specifically.
                 Ok(val)
             }
-            Expr::Box(_, _) | Expr::Deref(_, _) | Expr::Ref(_, _) => {
+            Expr::Box(_, _) | Expr::Deref(_, _) | Expr::Ref(_, _) | Expr::Spawn(_, _, _) | Expr::Join(_, _) => {
                 unreachable!("check_supported already rejected this program")
             }
         }
