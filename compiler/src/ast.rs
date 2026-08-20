@@ -32,6 +32,13 @@ pub enum Ty {
     /// until this existed. See `ownership.rs` for what actually enforces
     /// single ownership; this type just makes it meaningful to ask.
     Box(Box<Ty>),
+    /// A shared, read-only borrow — `&i64`, `&box i64`. Unlike `Ty::Box`,
+    /// this is **not** affine: unlimited simultaneous `&T`s are always
+    /// sound (many readers, no writers), the same as Rust. There is no
+    /// `&mut` yet — exclusive/mutable borrows need real liveness tracking
+    /// to enforce "aliasing xor mutability" and are deliberately deferred;
+    /// see `ownership.rs`'s module doc.
+    Ref(Box<Ty>),
     /// Poison type: stands in for an expression that already produced a
     /// type error, so the checker (`typeck.rs`) doesn't cascade a dozen
     /// follow-on diagnostics from one root cause. Never produced by the
@@ -75,12 +82,13 @@ impl Ty {
             Ty::Bool => "bool".to_string(),
             Ty::Unit => "unit".to_string(),
             Ty::Box(inner) => format!("box {}", inner.name()),
+            Ty::Ref(inner) => format!("&{}", inner.name()),
             Ty::Error => "<error>".to_string(),
         }
     }
 
     pub fn is_integer(&self) -> bool {
-        !matches!(self, Ty::Bool | Ty::Unit | Ty::Error | Ty::Box(_))
+        !matches!(self, Ty::Bool | Ty::Unit | Ty::Error | Ty::Box(_) | Ty::Ref(_))
     }
 
     /// The property that makes ownership meaningful: an affine value has
@@ -93,6 +101,10 @@ impl Ty {
     /// allocation, which is exactly the class of bug row 1 exists to rule
     /// out statically.
     pub fn is_affine(&self) -> bool {
+        // `Ty::Ref` is deliberately excluded: a shared borrow is always
+        // freely copyable (unlimited simultaneous readers is sound), even
+        // though it can point at affine content. That's what actually
+        // makes borrowing useful — see `Ty::Ref`'s doc comment.
         matches!(self, Ty::Box(_))
     }
 
@@ -111,7 +123,7 @@ impl Ty {
             Ty::U16 => (0..=u16::MAX as i64).contains(&v),
             Ty::U32 => (0..=u32::MAX as i64).contains(&v),
             Ty::U64 | Ty::Usize => v >= 0,
-            Ty::Bool | Ty::Unit | Ty::Error | Ty::Box(_) => false,
+            Ty::Bool | Ty::Unit | Ty::Error | Ty::Box(_) | Ty::Ref(_) => false,
         }
     }
 }
@@ -183,11 +195,19 @@ pub enum Expr {
     /// `box expr` — heap-allocate `expr`'s value. The only expression form
     /// that produces an affine (`Ty::Box`) value.
     Box(Box<Expr>, Span),
-    /// `*expr` — read the value out of a box. Does **not** move the box:
-    /// see `ownership.rs`'s doc comment for why a deref-read is exempt
-    /// from move-checking in this language (every boxable inner type here
-    /// is currently a scalar, i.e. freely copyable once read out).
+    /// `*expr` — read the value out of a box or through a reference. Does
+    /// **not** move the box/reference itself when what comes out is
+    /// freely copyable; see `ownership.rs`'s doc comment for the type-
+    /// directed rule this actually needs (it's more subtle than "derefs
+    /// never move" once nested boxes and references both exist).
     Deref(Box<Expr>, Span),
+    /// `&expr` — borrow a binding without taking ownership of it. The
+    /// operand is restricted to a plain `Expr::Ident` — parsed and
+    /// enforced in `parser.rs`, the same way `Expr::Assign`'s left side
+    /// is — because "borrow an arbitrary temporary expression" drags in
+    /// temporary-lifetime rules this language doesn't have a story for
+    /// yet.
+    Ref(Box<Expr>, Span),
 }
 
 #[derive(Debug, Clone)]
@@ -208,7 +228,8 @@ impl Expr {
             | Expr::If { span: s, .. }
             | Expr::Assign(_, _, s)
             | Expr::Box(_, s)
-            | Expr::Deref(_, s) => *s,
+            | Expr::Deref(_, s)
+            | Expr::Ref(_, s) => *s,
         }
     }
 }

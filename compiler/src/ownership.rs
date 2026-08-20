@@ -32,6 +32,24 @@
 //! can't know at compile time which branch ran, so it assumes the worse
 //! one, the same as Rust's own borrow checker does. See `merge_moved`.
 //!
+//! **Known limitation: no place-expression semantics, so `&box T` is
+//! borrow-only, not read-through.** `*r` for `r: &box i64` denotes the
+//! `box i64` itself — extracting it is correctly rejected as a move out
+//! of a shared reference (`typeck.rs`'s `CannotMoveOutOfReference`),
+//! since you don't own what's behind a `&`. But that means there is
+//! currently *no way* to read the scalar inside a box reached only
+//! through a reference — `**r` doesn't help, because the inner `*r` hits
+//! the same rejection before the outer `*` ever runs. Real Rust avoids
+//! this with place-expression semantics: `**r` reads straight through
+//! both layers in one composed operation, never treating the
+//! intermediate `Box` as a value that has to be moved out on its own.
+//! Building that properly is real, additional work (tracking whether an
+//! expression denotes a *place* vs. a *value*, the way a MIR-based
+//! borrow checker does) that this increment doesn't attempt — `&box T`
+//! is honestly borrow-and-pass-around-only for now, not read-through.
+//! Reading a box's content still works fine through an *owned* box (the
+//! existing `box`/`*` tests), just not through a `&` to one.
+//!
 //! **Loops get checked twice.** A `while` body might run more than once,
 //! and a variable the body moves on iteration 1 is gone by iteration 2 —
 //! checking the body only once, from the state *before* the loop, would
@@ -289,6 +307,16 @@ impl Checker {
                 self.scopes.set_moved(name, false);
             }
             Expr::Box(inner, _) => self.touch_expr(inner, true),
+            Expr::Ref(inner, _) => {
+                // Borrowing is, definitionally, not moving — that's the
+                // entire point of `&`. No liveness/exclusivity tracking
+                // is needed here yet because there's no `&mut`: unlimited
+                // simultaneous shared borrows are always sound, so the
+                // only thing to check is that the referent isn't already
+                // moved, which `touch_expr(inner, false)` already does via
+                // `touch_ident`'s existing moved-check.
+                self.touch_expr(inner, false);
+            }
             Expr::Deref(inner, _) => {
                 // Reading through a box is exempt from moving it — *only*
                 // when what comes out is freely copyable. `*b` for `b: box

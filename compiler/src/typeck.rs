@@ -66,6 +66,7 @@ pub enum TypeErrorKind {
     ExpectedBool { found: Ty },
     ExpectedNumeric { found: Ty },
     ExpectedBoxType { found: Ty },
+    CannotMoveOutOfReference { content: Ty },
     LiteralOutOfRange { ty: Ty, value: i64 },
     IfWithoutElseUsedAsValue { expected: Ty },
     NotAllPathsReturn { fn_name: String },
@@ -110,8 +111,14 @@ impl std::fmt::Display for TypeError {
             ),
             TypeErrorKind::ExpectedBoxType { found } => write!(
                 f,
-                "{line}:{col}: `*` needs a `box` type, found `{}`",
+                "{line}:{col}: `*` needs a `box` or `&` type, found `{}`",
                 found.name()
+            ),
+            TypeErrorKind::CannotMoveOutOfReference { content } => write!(
+                f,
+                "{line}:{col}: cannot move `{}` out of a shared reference \
+                 (only through an owned `box`)",
+                content.name()
             ),
             TypeErrorKind::LiteralOutOfRange { ty, value } => write!(
                 f,
@@ -384,10 +391,31 @@ impl Checker {
                 match it {
                     Ty::Error => Ty::Error,
                     Ty::Box(t) => *t,
+                    Ty::Ref(t) => {
+                        if t.is_affine() {
+                            self.error(TypeErrorKind::CannotMoveOutOfReference { content: *t }, *span);
+                            Ty::Error
+                        } else {
+                            *t
+                        }
+                    }
                     other => {
                         self.error(TypeErrorKind::ExpectedBoxType { found: other }, *span);
                         Ty::Error
                     }
+                }
+            }
+            Expr::Ref(inner, span) => {
+                debug_assert!(
+                    matches!(inner.as_ref(), Expr::Ident(..)),
+                    "parser only ever produces Expr::Ref with an Ident operand"
+                );
+                let it = self.infer(inner, expected_ret, scopes);
+                let _ = span;
+                if it == Ty::Error {
+                    Ty::Error
+                } else {
+                    Ty::Ref(Box::new(it))
                 }
             }
         }

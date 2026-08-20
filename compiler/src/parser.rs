@@ -68,8 +68,13 @@ impl Parser {
         }
     }
 
-    // type ::= "box" type | i8 | i16 | ... | bool | unit
+    // type ::= "&" type | "box" type | i8 | i16 | ... | bool | unit
     fn expect_type(&mut self) -> PResult<Ty> {
+        if self.peek().tok == Tok::Amp {
+            self.bump();
+            let inner = self.expect_type()?;
+            return Ok(Ty::Ref(Box::new(inner)));
+        }
         if self.peek().tok == Tok::Box {
             self.bump();
             let inner = self.expect_type()?;
@@ -343,6 +348,21 @@ impl Parser {
             Tok::Box => {
                 self.bump();
                 Ok(Expr::Box(Box::new(self.parse_unary()?), span))
+            }
+            Tok::Amp => {
+                self.bump();
+                let operand = self.parse_unary()?;
+                // Restricted to a plain name — see `Expr::Ref`'s doc
+                // comment for why. Same pattern as `parse_assignment`'s
+                // "left-hand side must be a plain variable name" check:
+                // parse normally, then validate what came out.
+                match operand {
+                    Expr::Ident(..) => Ok(Expr::Ref(Box::new(operand), span)),
+                    _ => Err(ParseError {
+                        message: "`&` can only borrow a plain variable name".to_string(),
+                        span,
+                    }),
+                }
             }
             _ => self.parse_call(),
         }

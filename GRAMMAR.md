@@ -36,7 +36,8 @@ fn_decl     ::= "fn" ident "(" params? ")" ("->" type)? block
 params      ::= param ("," param)*
 param       ::= ident ":" type
 
-type        ::= "box" type
+type        ::= "&" type
+              | "box" type
               | "i8" | "i16" | "i32" | "i64"
               | "u8" | "u16" | "u32" | "u64" | "usize"
               | "bool" | "unit"
@@ -80,7 +81,13 @@ multiplicative ::= unary (("*" | "/") unary)*
 // sees `*` in infix position, after a full `unary` is already parsed, so
 // there's no ambiguity: which meaning applies is determined purely by
 // which production is asking, never by extra lookahead.
-unary       ::= ("!" | "-" | "*" | "box") unary | call
+// `&expr`'s operand is restricted, after parsing, to exactly `Expr::Ident`
+// — see `Expr::Ref`'s doc comment in ast.rs for why. Known limitation:
+// `&&x` lexes as one `AndAnd` token (needed for the boolean operator), so
+// a reference-to-a-reference isn't expressible at all right now — the
+// same ambiguity early C-family lexers have historically had, not solved
+// here, not silently pretended away either.
+unary       ::= ("!" | "-" | "*" | "box" | "&") unary | call
 call        ::= primary ("(" args? ")")*
 args        ::= expr ("," expr)*
 

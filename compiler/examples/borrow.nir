@@ -1,0 +1,13 @@
+// Exercises: shared borrows (`&`). `peek` reads through a reference
+// without taking ownership, so `n` is usable again after each call --
+// unlike `box`/`consume` (see examples/ownership.nir), where the same
+// pattern would move the argument on the first call and reject the second.
+fn peek(r: &i64) -> i64 {
+    return *r + 1
+}
+
+fn main() {
+    let n: i64 = 41
+    print(peek(&n))
+    print(peek(&n)) // `n` was only borrowed, not moved -- this is fine
+}

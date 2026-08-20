@@ -45,6 +45,17 @@ pub enum Value {
     Bool(bool),
     Unit,
     Boxed(Box<Value>),
+    /// A shared borrow. Under the hood this is still just a *clone* of the
+    /// pointee's `Value` (this interpreter has no real aliasing — see
+    /// `Value`'s doc comment above), so `Value::Ref` is observably
+    /// identical to `Value::Boxed` at runtime. It exists as its own
+    /// variant anyway so `Expr::Deref` can be honest about *why* a
+    /// dereference is allowed: `ownership.rs`/`typeck.rs` enforce "you
+    /// can't move affine content out through a reference" using the
+    /// *static* `Ty::Ref` distinction, and this variant is what that
+    /// static distinction corresponds to at the value level, even though
+    /// nothing here currently depends on telling the two apart at runtime.
+    Ref(Box<Value>),
 }
 
 impl Value {
@@ -54,6 +65,7 @@ impl Value {
             Value::Bool(_) => "bool",
             Value::Unit => "unit",
             Value::Boxed(_) => "box",
+            Value::Ref(_) => "ref",
         }
     }
 
@@ -63,6 +75,7 @@ impl Value {
             Value::Bool(b) => b.to_string(),
             Value::Unit => "()".to_string(),
             Value::Boxed(inner) => format!("box({})", inner.render()),
+            Value::Ref(inner) => format!("&{}", inner.render()),
         }
     }
 }
@@ -247,6 +260,7 @@ impl<'p> Interpreter<'p> {
             (Value::Bool(_), Ty::Bool) => Ok(()),
             (Value::Unit, Ty::Unit) => Ok(()),
             (Value::Boxed(inner), Ty::Box(inner_ty)) => self.check_ty(inner, inner_ty, span),
+            (Value::Ref(inner), Ty::Ref(inner_ty)) => self.check_ty(inner, inner_ty, span),
             (Value::Int(n), _) if ty.is_integer() => {
                 if ty.in_range(*n) {
                     Ok(())
@@ -379,13 +393,21 @@ impl<'p> Interpreter<'p> {
             Expr::Deref(inner, span) => {
                 let v = self.eval_expr(inner, env)?;
                 match v {
-                    // Reading through the box copies the scalar out; the
-                    // box itself is untouched (`ownership.rs` guarantees
-                    // this doesn't need to move it — every inner type here
-                    // is a scalar, hence freely copyable once read out).
-                    Value::Boxed(inner) => Ok(*inner),
-                    v => Err(mismatch("box", v.ty_name(), *span)),
+                    // `typeck.rs` already proved, statically, that this
+                    // dereference is either reading a scalar out (always
+                    // fine) or reading affine content out of an owned
+                    // `box` (fine — it's the outer binding's problem to
+                    // have been marked moved, which `ownership.rs`
+                    // handles) — never affine content out of a `&`
+                    // (`typeck.rs` rejects that before this ever runs).
+                    // So both variants just unwrap the same way here.
+                    Value::Boxed(inner) | Value::Ref(inner) => Ok(*inner),
+                    v => Err(mismatch("box or ref", v.ty_name(), *span)),
                 }
+            }
+            Expr::Ref(inner, _span) => {
+                let v = self.eval_expr(inner, env)?;
+                Ok(Value::Ref(Box::new(v)))
             }
         }
     }

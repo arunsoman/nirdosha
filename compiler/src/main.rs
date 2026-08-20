@@ -28,7 +28,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Value::Unit) => ExitCode::SUCCESS,
-        Ok(v @ Value::Boxed(_)) => {
+        Ok(v @ (Value::Boxed(_) | Value::Ref(_))) => {
             println!("=> {v:?}");
             ExitCode::SUCCESS
         }

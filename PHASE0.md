@@ -81,14 +81,48 @@ memory deterministically with no garbage collector, before there's a real
 backend that needs it. Read this as "the proof exists, not yet
 load-bearing" — see `ownership.rs`'s module doc for the full reasoning.
 
-**What's still not ownership, on purpose.** There's no borrowing (`&`/
-`&mut`) — a function that wants to use a `box` without taking it still has
-to take it by value and hand it back. No `Drop`-like destructor hook
-exists (nothing runs "when a box goes out of scope" beyond what Rust's own
-`Box<Value>` does for free). No aliasing of a box is possible at all yet,
-borrowed or owned — which is actually *more* restrictive than real Rust,
-not less; loosening it safely (shared read-only borrows, primarily) is a
-real next increment, not a bug.
+**Third update:** shared borrows (`&type`, `&expr`) now exist. A function
+can read a value without consuming it — `fn peek(r: &i64) -> i64 { return
+*r }` — and the same binding can be borrowed any number of times, since a
+reference is never affine (`Ty::is_affine` returns `false` for `Ty::Ref`;
+unlimited simultaneous readers is always sound, the same reason Rust
+allows it). 49/49 tests pass. `&mut` (exclusive/mutable borrows) is still
+not built — it needs real liveness tracking to enforce "aliasing xor
+mutability" (at most one mutable borrow, or any number of shared ones,
+never both at once), which is a materially bigger undertaking than shared
+borrows turned out to be, so it stayed out of this increment rather than
+being rushed.
+
+Two things worth being precise about, both found by testing rather than
+assumed correct from the design alone:
+
+- **The real rule enforced, not an invented one.** `*r` for `r: &box i64`
+  is a compile error ("cannot move `box i64` out of a shared reference") —
+  you can't extract owned, affine content through a borrow, regardless of
+  whether the underlying binding happens to be unmoved. This is the exact
+  rule real Rust enforces too (`*r` for `r: &Box<T>` requires `T: Copy`
+  or an explicit `.clone()`), not a simplification invented for this
+  project.
+- **Known, honestly documented limitation: no place-expression
+  semantics.** Because of the rule above, there is currently *no way* to
+  read the scalar *inside* a box reached only through a reference — `**r`
+  doesn't help, because the inner `*r` hits the same rejection before the
+  outer `*` runs at all. Real Rust avoids this because `**r` is evaluated
+  as one composed *place* expression, never treating the intermediate
+  `Box` as a value that has to move. Building that (tracking whether an
+  expression denotes a place or a value, the way a MIR-based borrow
+  checker does) is real additional work this increment didn't attempt.
+  `&box T` is borrow-and-pass-around-only for now, not read-through — see
+  `ownership.rs`'s module doc and
+  `borrowing_a_box_repeatedly_does_not_consume_it` in `tests/ownership.rs`
+  for the full reasoning and a pinned example of exactly what does and
+  doesn't work.
+
+**What's still not ownership, on purpose.** No `&mut` (see above). No
+`Drop`-like destructor hook exists (nothing runs "when a box goes out of
+scope" beyond what Rust's own `Box<Value>` does for free). No place
+expressions (see above) — `&box T` can be passed around and re-borrowed
+freely, but not read through to affine content inside it.
 
 ---
 
@@ -129,7 +163,7 @@ test result: ok. 14 passed; 0 failed
 
 | Row | Status |
 |---|---|
-| 1 — No GC, no `free()` | **Started, real content.** `box`/`*` plus a static move-checker (`ownership.rs`) — see the "Second update" section above for what's actually proved and what still isn't (no borrowing, no `Drop` hook, no aliasing at all yet). Regions/bulk-arena allocation is still not started. |
+| 1 — No GC, no `free()` | **Started, real content.** `box`/`*`, shared borrows (`&`), and a static move-checker (`ownership.rs`) — see the "Second" and "Third" update sections above for what's actually proved and what still isn't (no `&mut`, no `Drop` hook, no place expressions). Regions/bulk-arena allocation is still not started. |
 | 2 — No data races | N/A yet — no concurrency exists. |
 | 3 — No deadlocks | N/A yet — no concurrency exists. |
 | 4 — No int/buffer overflow | **Placeholder only.** `Ty::in_range` + `check_ty` catch out-of-declared-range values at `let`/assign/return/call boundaries — but at *runtime*, dynamically, not proved absent at compile time. This is honestly labeled Tier-2-shaped, not Tier-1: see `ErrorKind::OutOfRange`'s message and `ast.rs`'s doc comment. Real Phase 2 work is an SMT-discharged static pass. |
@@ -161,14 +195,18 @@ test result: ok. 14 passed; 0 failed
 
 ## Suggested next milestone
 
-Borrowing (`&`/`&mut`) for `box` values — right now a function that wants
-to *use* a box without consuming it still has to take it by value and hand
-it back, which makes the ownership model correct but nearly unusable for
-anything beyond toy programs. That's the natural next increment on row 1.
-Refinement types (row 4, needs an SMT solver integration) and effects
-(rows 4/9) remain the two other prerequisite-free next milestones, chosen
-by which the next session's time is better spent on rather than a fixed
-order.
+Three candidates, none blocking the others:
+
+- **Place expressions**, to make `&box T` actually read-through (the gap
+  the Third update documents) — the more foundational of the two ownership
+  gaps, since `&mut` needs place-expression machinery too, just with an
+  extra exclusivity check on top.
+- **`&mut`** (exclusive borrows) — needs real liveness tracking to enforce
+  "aliasing xor mutability," materially bigger than shared borrows turned
+  out to be.
+- **Refinement types** (row 4, needs an SMT solver integration) and
+  **effects** (rows 4/9) — both still fully unstarted, independent of the
+  ownership work above.
 
 **Noted for Phase 3 (concurrency, rows 2–3), not relevant yet:** if actors
 end up implemented as lightweight stackful coroutines multiplexed onto a

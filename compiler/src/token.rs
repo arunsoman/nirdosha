@@ -49,6 +49,7 @@ pub enum Tok {
     AndAnd,
     OrOr,
     Bang,
+    Amp,
 
     Eof,
 }
@@ -206,6 +207,7 @@ impl<'a> Lexer<'a> {
                         b'<' => Tok::Lt,
                         b'>' => Tok::Gt,
                         b'!' => Tok::Bang,
+                        b'&' => Tok::Amp,
                         other => {
                             return Err(LexError {
                                 message: format!(

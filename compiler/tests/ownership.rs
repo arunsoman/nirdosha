@@ -8,7 +8,7 @@ use nirdosha::interpreter::Value;
 use nirdosha::ownership::{check_ownership, OwnershipErrorKind};
 use nirdosha::parser::Parser;
 use nirdosha::token::Lexer;
-use nirdosha::typeck::typecheck;
+use nirdosha::typeck::{typecheck, TypeErrorKind};
 use nirdosha::run;
 
 fn parse_ok(src: &str) -> nirdosha::ast::Program {
@@ -24,6 +24,108 @@ fn first_ownership_error(src: &str) -> OwnershipErrorKind {
         Ok(()) => panic!("expected an ownership error, but none was found"),
         Err(errors) => errors.into_iter().next().unwrap().kind,
     }
+}
+
+/// For cases that are rejected by `typeck.rs` itself (before ownership
+/// checking would even run), not by `ownership.rs` — doesn't go through
+/// `parse_ok`, since that asserts a clean typecheck.
+fn first_type_error(src: &str) -> TypeErrorKind {
+    let toks = Lexer::new(src).tokenize().expect("lex should succeed");
+    let program = Parser::new(toks).parse_program().expect("parse should succeed");
+    match typecheck(&program) {
+        Ok(()) => panic!("expected a type error, but the program type-checked cleanly"),
+        Err(errors) => errors.into_iter().next().unwrap().kind,
+    }
+}
+
+// ---- shared borrows (`&`) ----------------------------------------------
+
+#[test]
+fn reading_through_a_shared_borrow_does_not_consume_it() {
+    let src = r#"
+        fn peek(r: &i64) -> i64 {
+            return *r + 1
+        }
+        fn main() -> i64 {
+            let n: i64 = 41
+            let a: i64 = peek(&n)
+            let b: i64 = peek(&n)
+            return a + b
+        }
+    "#;
+    assert_eq!(run(src), Ok(Value::Int(84)));
+}
+
+#[test]
+fn borrowing_a_box_repeatedly_does_not_consume_it() {
+    // Known, documented limitation (see `ownership.rs`'s module doc):
+    // reading the *scalar inside* a box reached through a `&` isn't
+    // supported at all yet -- `*r` for `r: &box i64` denotes the `box
+    // i64` itself, and extracting that is a move-out-of-a-reference
+    // error regardless (see the `CannotMoveOutOfReference` test above).
+    // Real Rust handles this via place-expression semantics (`**r` reads
+    // straight through both layers without ever treating the
+    // intermediate `Box` as a value to move); this language doesn't have
+    // that machinery yet. What *does* work, and is what this test
+    // covers: borrowing a box repeatedly without consuming it, and
+    // reading through the box directly (not through the borrow).
+    let src = r#"
+        fn touch(r: &box i64) -> bool {
+            return true
+        }
+        fn main() -> i64 {
+            let b: box i64 = box 7
+            let ok1: bool = touch(&b)
+            let ok2: bool = touch(&b)
+            return *b
+        }
+    "#;
+    assert_eq!(run(src), Ok(Value::Int(7)));
+}
+
+#[test]
+fn moving_affine_content_out_through_a_shared_reference_is_rejected() {
+    // The one real rule this increment needs: `*r` for `r: &box T` is a
+    // type error, not an ownership error -- you can't move out of a
+    // shared reference at all, regardless of move-state, the same rule
+    // real Rust enforces (`*r` for `r: &Box<T>` needs `T: Copy` or an
+    // explicit `.clone()`).
+    let kind = first_type_error(
+        r#"
+        fn main() -> i64 {
+            let b: box i64 = box 5
+            let r: &box i64 = &b
+            let stolen: box i64 = *r
+            return *stolen
+        }
+    "#,
+    );
+    assert_eq!(kind, TypeErrorKind::CannotMoveOutOfReference { content: nirdosha::ast::Ty::Box(Box::new(nirdosha::ast::Ty::I64)) });
+}
+
+#[test]
+fn borrowing_a_non_identifier_is_a_parse_error() {
+    let toks = Lexer::new("fn main() { let x: i64 = &(1 + 1) }").tokenize().unwrap();
+    let result = Parser::new(toks).parse_program();
+    assert!(result.is_err(), "borrowing a non-identifier expression must be rejected");
+}
+
+#[test]
+fn a_reference_itself_is_freely_copyable_not_affine() {
+    // Unlike `box`, using a `&`-typed binding by name twice is fine --
+    // references aren't affine (Ty::is_affine returns false for Ty::Ref),
+    // since unlimited simultaneous shared borrows are always sound.
+    let src = r#"
+        fn peek(r: &i64) -> i64 { return *r }
+        fn main() -> i64 {
+            let n: i64 = 5
+            let r: &i64 = &n
+            let a: i64 = peek(r)
+            let b: i64 = peek(r)
+            return a + b
+        }
+    "#;
+    assert_eq!(run(src), Ok(Value::Int(10)));
 }
 
 // ---- the basics: box, deref, move -----------------------------------
@@ -270,6 +372,7 @@ fn all_examples_pass_ownership_checking() {
         include_str!("../examples/factorial.nir"),
         include_str!("../examples/loop.nir"),
         include_str!("../examples/ownership.nir"),
+        include_str!("../examples/borrow.nir"),
     ] {
         let program = parse_ok(src);
         assert_eq!(check_ownership(&program), Ok(()));
@@ -279,5 +382,11 @@ fn all_examples_pass_ownership_checking() {
 #[test]
 fn example_ownership_runs_to_completion() {
     let src = include_str!("../examples/ownership.nir");
+    assert_eq!(run(src), Ok(Value::Unit));
+}
+
+#[test]
+fn example_borrow_runs_to_completion() {
+    let src = include_str!("../examples/borrow.nir");
     assert_eq!(run(src), Ok(Value::Unit));
 }
