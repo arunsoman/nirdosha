@@ -2,6 +2,7 @@ pub mod ast;
 pub mod interpreter;
 pub mod ownership;
 pub mod parser;
+pub mod refine;
 pub mod token;
 pub mod typeck;
 

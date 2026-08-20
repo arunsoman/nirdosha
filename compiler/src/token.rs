@@ -3,7 +3,9 @@
 //! instead of prose — the diagnostic shape goal.md row 9 asks for, started
 //! here rather than bolted on later.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Hash` is for `refine.rs`, which keys a `HashSet<Span>` of proven-safe
+// sites — every other consumer only needed equality/ordering before this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
     pub line: usize,
     pub col: usize,

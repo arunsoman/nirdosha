@@ -124,6 +124,58 @@ scope" beyond what Rust's own `Box<Value>` does for free). No place
 expressions (see above) — `&box T` can be passed around and re-borrowed
 freely, but not read through to affine content inside it.
 
+**Fourth update:** row 4 (no int/buffer overflow) now has a real static
+proof pass — `compiler/src/refine.rs`, interval (range) analysis. Checked
+first: no system Z3, no `cmake` (needed for the `z3` crate's bundled
+build), and installing system packages wasn't something to do without
+asking — so this is a deliberate, documented substitution for what
+goal.md §3/§6 Phase 2 actually specify (a Z3-class SMT solver), not a
+silent downgrade. Interval analysis is the same family of technique real
+safety-critical tools (Astrée, Polyspace) use for exactly this class of
+proof, and it's strictly weaker than SMT: no disjunctive reasoning, no
+cross-procedure inference, no nonlinear arithmetic, no condition-based
+narrowing in `if` branches.
+
+**Scoped to two proofs, deliberately, not for lack of ideas but to avoid
+a wrong proof.** (1) An arithmetic expression fits its declared target
+type. (2) A division's divisor is never zero. Division's *result*
+interval is never computed — integer-division interval arithmetic has
+real edge cases (truncation direction, sign-crossing divisors) that are
+exactly the kind of place a soundness bug hides, and given how much this
+whole project's credibility rests on "what's proved is really proved,"
+that felt like the wrong place to cut a corner under time pressure.
+
+**Tested for honesty, not just success.** 59/59 tests pass, and several
+exist specifically to confirm the pass *doesn't* over-claim:
+`two_full_range_i8_params_summed_is_not_proven_in_range` (i8+i8 can reach
+254, genuinely unsafe), `division_by_an_unconstrained_parameter_is_not_
+proven_nonzero`, and `factorial_multiplication_is_not_proven_in_range`
+(the realistic case — recursive multiplication really can overflow, and
+there's no interprocedural summary to say otherwise). A proof pass that
+only ever demonstrates success hasn't demonstrated it's sound; these
+tests are the other half of that claim.
+
+**Not wired to elide the interpreter's runtime check, on purpose.** A
+real Tier 1 in a compiled backend would skip emitting the check entirely,
+recovering real runtime cost. This is a tree-walking interpreter with no
+codegen yet (goal.md §3's Backend layer doesn't exist) — removing the
+redundant check here would only remove a safety net for zero performance
+benefit. `RefineReport` is the real, standalone deliverable: a genuine
+proof, ready for a future backend to act on, not yet load-bearing for the
+same reason `ownership.rs`'s proof isn't yet either (see the "What this
+does and doesn't prove" note above) — a pattern worth naming now that
+it's shown up twice: this project's static passes keep arriving before
+the backend that would spend their payoff, and that's a fine order to
+build things in.
+
+**Known limitation, not yet attempted:** no condition-based interval
+narrowing in `if` branches (e.g., proving `n > 1` is known inside the
+`else` of `if n <= 1 { .. } else { .. }`). This would meaningfully
+increase what's provable in straight-line code with guard conditions —
+flagged as the natural next precision improvement for this pass
+specifically, distinct from the loop-widening limitation already
+documented in `refine.rs`'s module doc.
+
 ---
 
 
@@ -166,7 +218,7 @@ test result: ok. 14 passed; 0 failed
 | 1 — No GC, no `free()` | **Started, real content.** `box`/`*`, shared borrows (`&`), and a static move-checker (`ownership.rs`) — see the "Second" and "Third" update sections above for what's actually proved and what still isn't (no `&mut`, no `Drop` hook, no place expressions). Regions/bulk-arena allocation is still not started. |
 | 2 — No data races | N/A yet — no concurrency exists. |
 | 3 — No deadlocks | N/A yet — no concurrency exists. |
-| 4 — No int/buffer overflow | **Placeholder only.** `Ty::in_range` + `check_ty` catch out-of-declared-range values at `let`/assign/return/call boundaries — but at *runtime*, dynamically, not proved absent at compile time. This is honestly labeled Tier-2-shaped, not Tier-1: see `ErrorKind::OutOfRange`'s message and `ast.rs`'s doc comment. Real Phase 2 work is an SMT-discharged static pass. |
+| 4 — No int/buffer overflow | **Started, real Tier-1 content, not SMT.** `Ty::in_range` + `check_ty` still catch everything dynamically (Tier 2, unchanged). `compiler/src/refine.rs` now adds a genuine *static* proof pass — interval analysis, not the SMT solver goal.md §3 actually specifies (no Z3/cmake in this environment; see the "Fourth update" section below for why that's a tracked substitution, not a silent one). 59/59 tests pass, including tests that confirm it correctly *refuses* to prove unsound cases (i8+i8 overflow, division by an unconstrained parameter, factorial's multiplication). Not wired to elide the interpreter's runtime check — see below for why. |
 | 5 — Native speed | Not started. This is a tree-walking interpreter, deliberately — LLVM codegen is Phase 1+ work once there's a stable typed AST to compile from. |
 | 6 — Learning curve | Grammar is small and keyword-heavy on purpose (`fn`/`let`/`return`/`if`/`else`/`while`, C-family operators) — no attempt yet to *measure* this against goal.md §7's proxy metrics (novice user study, Cognitive Dimensions score). Row 6 is aimed at, not yet verified. |
 | 7 — LLM-friendly | The one row with a real, checked claim already: the parser is single-token-lookahead with no backtracking, everywhere — see GRAMMAR.md for what that does and doesn't prove. No LALR-generator cross-check yet, and no benchmark suite / grammar-constrained decoder built yet. |
@@ -204,9 +256,13 @@ Three candidates, none blocking the others:
 - **`&mut`** (exclusive borrows) — needs real liveness tracking to enforce
   "aliasing xor mutability," materially bigger than shared borrows turned
   out to be.
-- **Refinement types** (row 4, needs an SMT solver integration) and
-  **effects** (rows 4/9) — both still fully unstarted, independent of the
+- **Condition-based narrowing** in `refine.rs` (row 4) — the flagged next
+  precision improvement for the interval pass, independent of the
   ownership work above.
+- **Effects** (rows 4/9) — still fully unstarted.
+- **A real SMT solver**, if `cmake`/Z3 become available in this
+  environment (or the user wants to install them) — would let row 4 move
+  from interval analysis to what goal.md's design actually specifies.
 
 **Noted for Phase 3 (concurrency, rows 2–3), not relevant yet:** if actors
 end up implemented as lightweight stackful coroutines multiplexed onto a
