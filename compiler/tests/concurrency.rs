@@ -129,7 +129,7 @@ fn joining_an_already_joined_handle_is_rejected_at_runtime_if_ownership_is_bypas
     "#,
     );
     typecheck(&program).expect("should typecheck cleanly");
-    let result = Interpreter::new(std::sync::Arc::new(program)).run_main();
+    let result = Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from("")).run_main();
     match result {
         Err(e) => assert_eq!(e.kind, ErrorKind::AlreadyJoined),
         Ok(v) => panic!("expected AlreadyJoined, got Ok({v:?})"),
@@ -157,7 +157,7 @@ fn a_panic_inside_a_spawned_function_surfaces_as_thread_panicked() {
     let program = parse_ok(src);
     typecheck(&program).expect("should typecheck cleanly");
     check_ownership(&program).expect("should ownership-check cleanly");
-    let result = Interpreter::new(std::sync::Arc::new(program)).run_main();
+    let result = Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src)).run_main();
     match result {
         Err(e) => assert!(
             matches!(e.kind, ErrorKind::ThreadPanicked { .. }),

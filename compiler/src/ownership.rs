@@ -375,6 +375,22 @@ impl Checker {
             Expr::Recv(chan, _) => {
                 self.touch_expr(chan, false);
             }
+            Expr::SpawnSandbox(_, args, _) => {
+                // Same reuse as `Expr::Spawn` -- typeck.rs already
+                // restricts these args to non-affine scalars, so this is
+                // a no-op in practice today, but the treatment matches
+                // every other call-shaped form on principle, not because
+                // it's currently load-bearing.
+                for a in args {
+                    self.touch_expr(a, true);
+                }
+            }
+            Expr::StopSandbox(inner, _) => {
+                // `stop` consumes the whole handle -- a sandboxed process
+                // can only be stopped once, the same single-owner
+                // discipline as `join`.
+                self.touch_expr(inner, true);
+            }
         }
     }
 

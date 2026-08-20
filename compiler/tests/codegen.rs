@@ -122,6 +122,17 @@ fn channels_example_is_rejected_by_codegen() {
     );
 }
 
+#[test]
+fn sandbox_example_is_rejected_by_codegen() {
+    let program = parse_checked(include_str!("../examples/sandbox.nir"));
+    let report = analyze(&program);
+    let result = codegen::emit_llvm_ir(&program, &report);
+    assert!(
+        result.is_err(),
+        "codegen doesn't support `sandbox`/`stop` yet -- must reject, not mis-compile"
+    );
+}
+
 // ---- the bug this module actually shipped with, pinned as a regression -
 
 #[test]

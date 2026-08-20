@@ -1,6 +1,8 @@
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use nirdosha::interpreter::Value;
+use nirdosha::ast::Ty;
+use nirdosha::interpreter::{Interpreter, Value};
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -15,6 +17,12 @@ fn main() -> ExitCode {
     match first.as_str() {
         "build" => cmd_build(args),
         "emit-llvm" => cmd_emit_llvm(args),
+        // Not a user-facing subcommand — the *only* caller is a `sandbox`
+        // handle's own `Expr::SpawnSandbox` (see interpreter.rs), which
+        // execs this exact binary with this exact flag to become the
+        // separate OS process a sandbox handle actually points at.
+        // Deliberately absent from `print_usage()` for the same reason.
+        "--sandbox-worker" => cmd_sandbox_worker(args),
         path => cmd_interpret(path),
     }
 }
@@ -49,7 +57,7 @@ fn cmd_interpret(path: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Value::Unit) => ExitCode::SUCCESS,
-        Ok(v @ (Value::Boxed(_) | Value::Ref(_) | Value::Thread(_) | Value::Channel(_))) => {
+        Ok(v @ (Value::Boxed(_) | Value::Ref(_) | Value::Thread(_) | Value::Channel(_) | Value::Sandbox(_))) => {
             println!("=> {v:?}");
             ExitCode::SUCCESS
         }
@@ -154,6 +162,67 @@ fn cmd_emit_llvm(mut args: impl Iterator<Item = String>) -> ExitCode {
         }
         Err(e) => {
             eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The process a `sandbox name(args)` expression actually spawns (see
+/// `interpreter.rs`'s `spawn_sandbox`): re-lex/parse/typecheck the source
+/// file it was handed, look up `name`, parse the remaining argv strings
+/// back into `Value`s using that function's own declared parameter types
+/// (`typeck.rs`'s `SandboxArgMustBeScalar` already proved every one of
+/// them is `Int`-or-`Bool`-shaped, so this is a lossless round trip, not
+/// a best-effort parse), and call it directly — there's no `main` to run
+/// here, just the one function the parent asked for.
+fn cmd_sandbox_worker(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let (Some(path), Some(fn_name)) = (args.next(), args.next()) else {
+        eprintln!("usage: nirdosha --sandbox-worker <file.nir> <fn-name> [args...]");
+        return ExitCode::FAILURE;
+    };
+    let src = match read_source(&path) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let program = match typecheck_and_own(&src) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(f) = program.fns.iter().find(|f| f.name == fn_name) else {
+        eprintln!("sandbox worker: no such function `{fn_name}`");
+        return ExitCode::FAILURE;
+    };
+    let mut vals = Vec::with_capacity(f.params.len());
+    for (p, raw) in f.params.iter().zip(args) {
+        let v = if p.ty == Ty::Bool {
+            match raw.as_str() {
+                "true" => Value::Bool(true),
+                "false" => Value::Bool(false),
+                _ => {
+                    eprintln!("sandbox worker: bad bool argument `{raw}` for `{}`", p.name);
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else {
+            match raw.parse::<i64>() {
+                Ok(n) => Value::Int(n),
+                Err(_) => {
+                    eprintln!("sandbox worker: bad integer argument `{raw}` for `{}`", p.name);
+                    return ExitCode::FAILURE;
+                }
+            }
+        };
+        vals.push(v);
+    }
+
+    let interp = Interpreter::new(Arc::new(program), Arc::from(src.as_str()));
+    match interp.call_named(&fn_name, &vals) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("sandbox worker: runtime error: {e}");
             ExitCode::FAILURE
         }
     }

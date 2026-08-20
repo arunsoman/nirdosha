@@ -97,6 +97,14 @@ pub enum Value {
     /// `Ty::Channel`'s doc comment), so every clone of this `Arc` is just
     /// another equally-valid handle to the same shared queue.
     Channel(Arc<ChannelInner>),
+    /// A handle to a real, separate OS process (see `Ty::Sandbox`'s doc
+    /// comment). `Mutex<Option<..>>`, same shape and reason as
+    /// `Value::Thread`: `stop` needs to `.take()` the process out
+    /// exactly once. Unlike `Value::Thread`, dropping every `Arc` to this
+    /// *without* ever calling `stop` still kills the process — see
+    /// `SandboxChild`'s `Drop` impl — which is the actual "deterministic
+    /// teardown" guarantee SANDBOXING.md's layer 1 promises.
+    Sandbox(Arc<Mutex<Option<SandboxChild>>>),
 }
 
 /// A spawned computation's raw join handle. Its own alias, not just inline
@@ -136,6 +144,65 @@ impl ChannelInner {
     }
 }
 
+/// A sandboxed process, plus the temp file its source was written to
+/// (removed once the process is known to have exited — not before, since
+/// the child re-reads that file at its own startup and deleting it out
+/// from under a not-yet-started child would be a real, if narrow, race).
+///
+/// **`stop` is idempotent by construction, not by a tracked flag.**
+/// `Expr::StopSandbox` calls `stop()` explicitly and then this value goes
+/// out of scope, running `Drop::drop` — which calls `stop()` again. A
+/// second `try_wait`/`kill`/`wait`/`remove_file` on an already-reaped,
+/// already-deleted target is a harmless OS-level no-op (ignored errors),
+/// not a bug: simpler than threading an extra "already stopped" bool
+/// through a type that can't be partially moved-out-of once it has a
+/// `Drop` impl.
+pub struct SandboxChild {
+    child: std::process::Child,
+    tmp_source_path: std::path::PathBuf,
+}
+
+impl std::fmt::Debug for SandboxChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SandboxChild(pid={})", self.child.id())
+    }
+}
+
+impl SandboxChild {
+    /// The OS process id — exposed for tests that need to independently
+    /// verify (e.g. via `kill -0`) that dropping a handle without `stop`
+    /// really did terminate the process, not just that this file's own
+    /// bookkeeping thinks it did.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Kills the process if it's still running, waits on it (reaping it
+    /// either way — a `Child` that's never `wait()`-ed leaks a zombie
+    /// entry in the OS process table even after it exits), and cleans up
+    /// its temp source file. Returns the OS exit code, or `-1` if it
+    /// exited via a signal (including this same call's own `kill()` —
+    /// SIGKILL termination has no exit code to report) or if the wait
+    /// itself failed.
+    fn stop(&mut self) -> i64 {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let code = match self.child.wait() {
+            Ok(status) => status.code().unwrap_or(-1) as i64,
+            Err(_) => -1,
+        };
+        let _ = std::fs::remove_file(&self.tmp_source_path);
+        code
+    }
+}
+
+impl Drop for SandboxChild {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
 /// Manual, not derived: `JoinHandle` has no `PartialEq`, so `Value` can't
 /// derive it once `Thread` exists. Two thread handles are equal only if
 /// they're literally the same handle (`Arc::ptr_eq`) — there's no
@@ -151,6 +218,7 @@ impl PartialEq for Value {
             (Value::Ref(a), Value::Ref(b)) => a == b,
             (Value::Thread(a), Value::Thread(b)) => Arc::ptr_eq(a, b),
             (Value::Channel(a), Value::Channel(b)) => Arc::ptr_eq(a, b),
+            (Value::Sandbox(a), Value::Sandbox(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -166,6 +234,7 @@ impl Value {
             Value::Ref(_) => "ref",
             Value::Thread(_) => "thread",
             Value::Channel(_) => "chan",
+            Value::Sandbox(_) => "sandbox",
         }
     }
 
@@ -178,6 +247,7 @@ impl Value {
             Value::Ref(inner) => format!("&{}", inner.render()),
             Value::Thread(_) => "thread(..)".to_string(),
             Value::Channel(_) => "chan(..)".to_string(),
+            Value::Sandbox(_) => "sandbox(..)".to_string(),
         }
     }
 }
@@ -205,6 +275,14 @@ pub enum ErrorKind {
     /// the same "the static checker is the real gate, the runtime check
     /// is the backstop" shape as everywhere else in this file.
     AlreadyJoined,
+    /// `sandbox`'s own failure category (SANDBOXING.md's decision to give
+    /// sandboxes a distinct error family rather than reusing
+    /// `ThreadPanicked`): launching the child process itself failed —
+    /// writing its temp source file, or the OS-level `spawn()` call.
+    SandboxSpawnFailed { message: String },
+    /// Defense in depth, mirroring `AlreadyJoined`: `stop`ping a handle
+    /// that was already stopped.
+    AlreadySandboxStopped,
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +317,12 @@ impl std::fmt::Display for RuntimeError {
                 write!(f, "{line}:{col}: spawned thread panicked: {message}")
             }
             ErrorKind::AlreadyJoined => write!(f, "{line}:{col}: this thread was already joined"),
+            ErrorKind::SandboxSpawnFailed { message } => {
+                write!(f, "{line}:{col}: failed to spawn sandbox: {message}")
+            }
+            ErrorKind::AlreadySandboxStopped => {
+                write!(f, "{line}:{col}: this sandbox was already stopped")
+            }
         }
     }
 }
@@ -315,22 +399,59 @@ impl Env {
 
 /// Owns the program (via `Arc`, not a borrow — see module doc) plus a
 /// name→index table built once so a lookup doesn't need to linear-scan
-/// `program.fns`. Cheap to reconstruct: `Interpreter::new(Arc::clone(&p))`
-/// is exactly what a spawned thread does to get its own independent one.
+/// `program.fns`. Cheap to reconstruct: `Interpreter::new(Arc::clone(&p),
+/// Arc::clone(&self.source))` is exactly what a spawned thread does to
+/// get its own independent one.
 pub struct Interpreter {
     program: Arc<Program>,
     fn_index: HashMap<String, usize>,
+    /// The original source text, kept around only for `Expr::SpawnSandbox`
+    /// (see its `eval_expr` arm): a sandboxed process is a *separate*
+    /// `nirdosha` invocation, with no shared memory to hand it a parsed
+    /// `Program` through — it re-lexes/parses/typechecks its own copy,
+    /// written to a fresh temp file at spawn time. Every other feature in
+    /// this file only ever needed the already-parsed `Program`; this is
+    /// the first one that needs the raw text back.
+    source: Arc<str>,
+    /// Which binary a `sandbox` handle's child re-execs as. `None` (the
+    /// default) means `std::env::current_exe()` at spawn time — correct
+    /// for the real `nirdosha` CLI, but wrong for *any other* process
+    /// embedding this interpreter: `current_exe()` resolves to whatever
+    /// binary is actually running, which under `cargo test` is the test
+    /// harness, not `nirdosha` — a real bug caught by writing an
+    /// integration test that actually spawns a sandbox and checks what
+    /// ran, not by inspection. `with_sandbox_exe` is the escape hatch,
+    /// used by `tests/sandbox.rs` to point sandboxed children at the
+    /// real, separately-built `nirdosha` binary instead.
+    sandbox_exe: Option<std::path::PathBuf>,
 }
 
 impl Interpreter {
-    pub fn new(program: Arc<Program>) -> Self {
+    pub fn new(program: Arc<Program>, source: Arc<str>) -> Self {
         let fn_index = program.fns.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect();
-        Interpreter { program, fn_index }
+        Interpreter { program, fn_index, source, sandbox_exe: None }
+    }
+
+    pub fn with_sandbox_exe(mut self, path: std::path::PathBuf) -> Self {
+        self.sandbox_exe = Some(path);
+        self
     }
 
     pub fn run_main(&self) -> Result<Value, RuntimeError> {
         let span = Span { line: 0, col: 0 };
         self.call("main", &[], span)
+    }
+
+    /// A public entry point for calling an arbitrary named function
+    /// directly, bypassing `main` — used by `main.rs`'s hidden
+    /// `--sandbox-worker` mode (the process a `sandbox` handle actually
+    /// spawns), which has no `main` of its own to run: it's told exactly
+    /// which function to call and with what arguments on its own command
+    /// line. `span` is a placeholder (`0:0`) for the same reason
+    /// `run_main` already uses one — there's no real call-site source
+    /// position for "the CLI asked for this."
+    pub fn call_named(&self, name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+        self.call(name, args, Span { line: 0, col: 0 })
     }
 
     fn find_fn(&self, name: &str) -> Option<&FnDecl> {
@@ -398,6 +519,7 @@ impl Interpreter {
             // checked against `Ty::Channel`'s inner type, so there's no
             // inner value sitting here to recurse into.
             (Value::Channel(_), Ty::Channel(_)) => Ok(()),
+            (Value::Sandbox(_), Ty::Sandbox) => Ok(()),
             (Value::Int(n), _) if ty.is_integer() => {
                 if ty.in_range(*n) {
                     Ok(())
@@ -560,10 +682,15 @@ impl Interpreter {
                 // proven, by `ownership.rs`, to have been moved out of
                 // the spawning side — see this file's module doc).
                 let program = Arc::clone(&self.program);
+                let source = Arc::clone(&self.source);
+                let sandbox_exe = self.sandbox_exe.clone();
                 let name = name.clone();
                 let call_span = *span;
                 let handle = std::thread::spawn(move || {
-                    let interp = Interpreter::new(program);
+                    let mut interp = Interpreter::new(program, source);
+                    if let Some(exe) = sandbox_exe {
+                        interp = interp.with_sandbox_exe(exe);
+                    }
                     interp.call(&name, &vals, call_span)
                 });
                 Ok(Value::Thread(Arc::new(Mutex::new(Some(handle)))))
@@ -622,6 +749,90 @@ impl Interpreter {
                     Value::Channel(inner) => Ok(inner.recv()),
                     other => Err(mismatch("chan", other.ty_name(), *span)),
                 }
+            }
+            Expr::SpawnSandbox(name, arg_exprs, span) => {
+                let mut vals = Vec::with_capacity(arg_exprs.len());
+                for a in arg_exprs {
+                    vals.push(self.eval_expr(a, env)?);
+                }
+                self.spawn_sandbox(name, &vals, *span)
+            }
+            Expr::StopSandbox(inner, span) => {
+                let v = self.eval_expr(inner, env)?;
+                match v {
+                    Value::Sandbox(slot) => {
+                        let taken = slot.lock().unwrap().take();
+                        match taken {
+                            None => Err(Signal::Err(RuntimeError {
+                                kind: ErrorKind::AlreadySandboxStopped,
+                                span: *span,
+                            })),
+                            Some(mut child) => Ok(Value::Int(child.stop())),
+                        }
+                    }
+                    other => Err(mismatch("sandbox", other.ty_name(), *span)),
+                }
+            }
+        }
+    }
+
+    /// Writes `self.source` to a fresh temp file and launches a *separate*
+    /// `nirdosha --sandbox-worker <that file> <name> <args...>` process —
+    /// a real OS process, not a thread, re-lexing/parsing/typechecking its
+    /// own independent copy of the program (see the `source` field's doc
+    /// comment for why re-parsing is necessary at all: no shared memory
+    /// crosses a real process boundary). `typeck.rs` has already proved
+    /// every value in `vals` is a plain `Int`/`Bool` (`infer_sandbox_spawn`
+    /// restricts `name`'s declared parameters to scalars), so rendering
+    /// each as a decimal/`true`/`false` command-line argument and parsing
+    /// it back on the other side is a complete, lossless round trip — not
+    /// a "best effort" serialization, the way an arbitrary `T` would need
+    /// to be (SANDBOXING.md's layer 3, not this one).
+    fn spawn_sandbox(&self, name: &str, vals: &[Value], span: Span) -> SResult<Value> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("nirdosha_sandbox_{}_{n}.nir", std::process::id()));
+        if let Err(e) = std::fs::write(&tmp, self.source.as_bytes()) {
+            return Err(Signal::Err(RuntimeError {
+                kind: ErrorKind::SandboxSpawnFailed { message: e.to_string() },
+                span,
+            }));
+        }
+
+        let exe = match self.sandbox_exe.clone().map(Ok).unwrap_or_else(std::env::current_exe) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Signal::Err(RuntimeError {
+                    kind: ErrorKind::SandboxSpawnFailed { message: e.to_string() },
+                    span,
+                }));
+            }
+        };
+
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--sandbox-worker").arg(&tmp).arg(name);
+        for v in vals {
+            let arg = match v {
+                Value::Int(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                _ => unreachable!("typeck.rs already restricted sandbox args to int/bool"),
+            };
+            cmd.arg(arg);
+        }
+
+        match cmd.spawn() {
+            Ok(child) => {
+                let sandbox = SandboxChild { child, tmp_source_path: tmp };
+                Ok(Value::Sandbox(Arc::new(Mutex::new(Some(sandbox)))))
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(Signal::Err(RuntimeError {
+                    kind: ErrorKind::SandboxSpawnFailed { message: e.to_string() },
+                    span,
+                }))
             }
         }
     }

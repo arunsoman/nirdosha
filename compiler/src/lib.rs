@@ -36,7 +36,7 @@ pub fn run(src: &str) -> Result<Value, String> {
         let joined = errors.iter().map(|e| format!("ownership error: {e}")).collect::<Vec<_>>().join("\n");
         return Err(joined);
     }
-    Interpreter::new(std::sync::Arc::new(program))
+    Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src))
         .run_main()
         .map_err(|e| format!("runtime error: {e}"))
 }

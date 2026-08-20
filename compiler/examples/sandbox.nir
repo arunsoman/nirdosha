@@ -1,0 +1,30 @@
+// Exercises: `sandbox`, `stop`. `sandbox worker(args)` runs `worker` as a
+// real, separate OS process (not a thread -- a fresh `nirdosha` invocation
+// that re-interprets this same source file) and returns an affine
+// `sandbox` handle. `stop` terminates it (killing it if still running)
+// and yields its OS exit code.
+//
+// This first layer (SANDBOXING.md) has no typed IPC yet -- a sandboxed
+// function's return value never reaches the caller, only its exit status
+// does, so `worker` must declare `-> unit` and take only plain scalar
+// parameters (an integer type or `bool`); typeck.rs rejects anything else
+// (see tests/sandbox.rs for the rejected programs).
+//
+// The interesting property this example demonstrates isn't the explicit
+// `stop` below -- it's what happens if a program *doesn't* call it: a
+// `sandbox` handle that goes out of scope without ever being stopped
+// still kills its process (see `SandboxChild`'s `Drop` impl in
+// interpreter.rs) -- no zombie process left behind just because a
+// program forgot to clean up, the same "deterministic, not discipline-
+// dependent" guarantee `box` already gives memory.
+fn background_work() -> unit {
+    while true {
+    }
+}
+
+fn main() {
+    let s: sandbox = sandbox background_work()
+    let code: i64 = stop s
+    print(code) // -1: background_work runs forever, so `stop` always
+                // catches it still running and kills it
+}

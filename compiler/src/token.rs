@@ -33,6 +33,8 @@ pub enum Tok {
     Chan,
     Send,
     Recv,
+    Sandbox,
+    Stop,
     TypeName(String), // i8/i16/.../usize/bool/unit — validated by the parser
 
     // symbols
@@ -186,6 +188,8 @@ impl<'a> Lexer<'a> {
                     "chan" => Tok::Chan,
                     "send" => Tok::Send,
                     "recv" => Tok::Recv,
+                    "sandbox" => Tok::Sandbox,
+                    "stop" => Tok::Stop,
                     "true" => Tok::True,
                     "false" => Tok::False,
                     t if TYPE_NAMES.contains(&t) => Tok::TypeName(t.to_string()),

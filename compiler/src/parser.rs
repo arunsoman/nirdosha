@@ -90,6 +90,15 @@ impl Parser {
             let inner = self.expect_type()?;
             return Ok(Ty::Channel(Box::new(inner)));
         }
+        // Unlike `box`/`thread`/`chan`, `sandbox` takes no inner type — it
+        // doesn't recurse into `expect_type()` again, it just resolves
+        // directly, the mirror image of `chan` being a bare keyword in
+        // *expression* position (see `parse_unary` below) but a wrapping
+        // type-former here.
+        if self.peek().tok == Tok::Sandbox {
+            self.bump();
+            return Ok(Ty::Sandbox);
+        }
         match &self.peek().tok {
             Tok::TypeName(name) => {
                 let ty = Ty::from_name(name).expect("lexer only emits valid type names");
@@ -414,6 +423,25 @@ impl Parser {
                 let chan = self.parse_expr()?;
                 self.expect(&Tok::RParen, "`)`")?;
                 Ok(Expr::Recv(Box::new(chan), span))
+            }
+            Tok::Sandbox => {
+                self.bump();
+                // Same "parse normally, then validate what came out"
+                // technique `spawn` already uses — `sandbox` runs a named
+                // function as a separate process, not an arbitrary
+                // expression.
+                let operand = self.parse_call()?;
+                match operand {
+                    Expr::Call(name, args, _) => Ok(Expr::SpawnSandbox(name, args, span)),
+                    _ => Err(ParseError {
+                        message: "`sandbox` requires a function call, e.g. `sandbox worker(x)`".to_string(),
+                        span,
+                    }),
+                }
+            }
+            Tok::Stop => {
+                self.bump();
+                Ok(Expr::StopSandbox(Box::new(self.parse_unary()?), span))
             }
             _ => self.parse_call(),
         }

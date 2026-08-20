@@ -312,6 +312,7 @@ fn analyze_does_not_panic_on_any_example() {
         include_str!("../examples/borrow.nir"),
         include_str!("../examples/threads.nir"),
         include_str!("../examples/channels.nir"),
+        include_str!("../examples/sandbox.nir"),
     ] {
         let program = parse(src);
         let _ = analyze(&program); // just must not panic

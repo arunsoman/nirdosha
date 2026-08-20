@@ -604,6 +604,103 @@ annotation, `send`/`recv` on a non-channel value, sending the wrong
 payload type). 107/107 tests pass; `cargo clippy --all-targets` is
 clean.
 
+**Thirteenth update:** `sandbox`/`stop` — the first slice of
+`SANDBOXING.md`'s sandboxing extension ("layer 1": an affine handle
+around a *real, separate OS process*, no isolation backend and no typed
+IPC yet). Not one of goal.md's original ten rows; a new capability built
+squarely on top of rows 1-3's existing ownership/concurrency machinery
+— see `SANDBOXING.md` for the full design rationale, kept there rather
+than duplicated here.
+
+*What it is.* `sandbox worker(args)` launches `worker` as a genuinely
+separate OS process — a fresh `nirdosha --sandbox-worker` invocation
+that re-lexes/parses/typechecks its own copy of the source (written to
+a fresh temp file at spawn time; there's no shared memory to hand a
+parsed `Program` across a real process boundary the way a spawned
+*thread* gets one) — and returns an affine `sandbox` handle. `stop`
+terminates it (killing it if still running, harmless no-op if it had
+already exited) and yields its OS exit code. No typed result channel
+exists yet, so a sandboxed function must declare `-> unit` and take
+only plain scalar parameters (`typeck.rs`'s new `SandboxFnMustReturnUnit`/
+`SandboxArgMustBeScalar` gates, checked against the callee's *declared
+signature*, not just what one call site happens to pass) — crossing a
+real process boundary has no serialization story for `box`/`thread`/
+`chan`/`sandbox` values yet (`SANDBOXING.md`'s layer 3).
+
+*Deterministic teardown, actually backed by a real `Drop`.* This is the
+one thing that makes this update different in kind from `thread`/`chan`:
+those rely entirely on `ownership.rs`'s *static* proof for their safety
+story, with no real cleanup obligation if a handle is silently dropped
+(an unjoined thread just detaches; nothing bad happens). A leaked OS
+process is a genuinely bad outcome, so `SandboxChild` (interpreter.rs)
+carries a real Rust `Drop` impl that kills and reaps the child regardless
+of whether `stop` was ever called — verified directly, not assumed: a
+test spawns an infinite-loop sandbox, confirms the process exists via
+`kill -0`, drops the handle without calling `stop`, and confirms the
+process is gone. `stop` and `Drop` both call the same `stop()` method;
+calling it twice (explicit `stop`, then the local binding's own drop) is
+a harmless no-op on an already-reaped, already-deleted target, not a
+tracked special case.
+
+*A real bug caught by testing, not review.* `spawn_sandbox` originally
+used `std::env::current_exe()` to find the binary to re-exec as — correct
+for the real `nirdosha` CLI, but under `cargo test` that resolves to the
+*test harness* binary, not `nirdosha`, so a sandboxed child would have
+silently run the wrong program (visible as `error: Unrecognized option:
+'sandbox-worker'` on stderr — libtest's own harness rejecting the flag).
+A first draft of the test suite didn't check what the child actually
+executed and would have passed anyway. Fixed with `Interpreter::
+with_sandbox_exe`, an explicit override (defaulting to `current_exe()`)
+that tests point at `CARGO_BIN_EXE_nirdosha`, the real, separately-built
+binary Cargo exposes to integration tests — and the fix doubles as the
+honest answer to a real embedding question: *any* host process other
+than the `nirdosha` CLI itself (a language server, a test harness, a
+future embedding) needs the same override, since `current_exe()` only
+ever means "whatever binary is actually running." The fix didn't
+initially reach every test, either: one test still called the plain
+`run(src)` entry point (no override), and passed anyway on its own —
+its assertion only checked that `stop` returns *some* exit code, and a
+wrong-binary child happens to still be "running" long enough to get
+killed most of the time. It only showed up as a real, intermittent
+`cargo test` failure once every test file ran together in parallel
+(the wrong-binary child, under contention, sometimes finished erroring
+out *before* `stop`'s `try_wait` ran, so the "definitely still running"
+assumption the test's own comment claimed was quietly false). Caught by
+running the full suite repeatedly, not by re-reading the test — fixed
+the same way, routed through `with_sandbox_exe`.
+
+`examples/sandbox.nir` demonstrates the accepted program (spawn an
+infinite-loop background task, `stop` it, observe the killed exit code
+`-1`); `tests/sandbox.rs` (10 tests) covers a deterministic spawn+stop
+round trip (an infinite-loop worker removes the "did it race" question
+entirely), passing real scalar arguments across the process boundary
+(verified by the sandboxed child actually printing them — real output,
+not just "the program didn't error"), the drop-without-stop zombie-
+prevention test described above, the double-stop backstop (both the
+static `ownership.rs` proof and the dynamic `AlreadySandboxStopped`
+runtime check), and four static rejections (spawning a builtin, a
+non-`unit`-returning function, a non-scalar parameter, `stop` on a
+non-sandbox value). 118/118 tests pass; `cargo clippy --all-targets` is
+clean.
+
+Explicit, honest limitations, beyond the ones `SANDBOXING.md` already
+names: no isolation backend yet (a bare OS process, not a container or
+microVM — that's layers 4-5); no wait-for-natural-completion primitive,
+only kill (`stop` calling a still-running process a "kill", not a
+"wait", is deliberate — see `SANDBOXING.md`'s decision on backend
+ordering — but it means there's currently no way to observe a
+sandboxed process's *graceful* exit code without the caller separately
+burning wall-clock time first, the same "no timing primitive exists"
+gap `chan`'s `recv` doesn't have this problem with since it's woken by
+an event, not polled); `codegen.rs` doesn't support any of it
+(interpreter-only, like every other concurrency primitive so far); the
+`SandboxSpawnFailed` error path (temp-file-write or process-spawn
+failure) is wired but not independently tested — hard to trigger
+deterministically without an environment-fragile setup (e.g. an
+unwritable temp dir), so it's exercised by code review and the type of
+the error path existing, not by a dedicated test, and that gap is
+recorded here rather than left silent.
+
 ---
 
 
@@ -625,14 +722,14 @@ compiler/
     token.rs        lexer — hand-written, single pass, structured LexError, Span: Hash
     ast.rs           AST types; Ty::bounds()/in_range shared by every pass; literal_value()
     parser.rs        recursive-descent, single-token lookahead, no backtracking
-    interpreter.rs   tree-walking evaluator; Value::{Boxed,Ref,Thread,Channel}; dynamic Tier-2 checks
+    interpreter.rs   tree-walking evaluator; Value::{Boxed,Ref,Thread,Channel,Sandbox}; dynamic Tier-2 checks
     typeck.rs        static type checker — runs before interpretation
-    ownership.rs     static move-checker for box/&/spawn/join/send/recv
+    ownership.rs     static move-checker for box/&/spawn/join/send/recv/sandbox/stop
     refine.rs        interval-analysis Tier-1 prover (the pre-Z3 fallback)
     smt.rs           real Z3-backed Tier-1 prover (primary; condition narrowing)
     codegen.rs       LLVM IR emission + `clang` driver — real native binaries
     lib.rs           public run(src) -> Result<Value, String>
-    main.rs          CLI: interpret (default), `build`, `emit-llvm`
+    main.rs          CLI: interpret (default), `build`, `emit-llvm`, hidden `--sandbox-worker`
   examples/
     hello.nir        functions, params, arithmetic, print
     factorial.nir    recursion, if/else-as-expression, return-in-branch unwind
@@ -641,14 +738,16 @@ compiler/
     borrow.nir       shared borrows (&)
     threads.nir      spawn/join, thread <T>
     channels.nir     chan/send/recv
+    sandbox.nir      sandbox/stop
   tests/
     basic.rs         32 tests — core language + typeck
     ownership.rs     22 tests — box/&/move-checking
     refine.rs        11 tests — interval-analysis proofs (and honest non-proofs)
     smt.rs           9 tests — SMT proofs, incl. the interval-vs-SMT flagship comparison
-    codegen.rs       14 tests — real compiled binaries, run and compared to the interpreter
+    codegen.rs       15 tests — real compiled binaries, run and compared to the interpreter
     concurrency.rs   9 tests — spawn/join round trips, race-freedom, panic/double-join backstops
     channels.rs      10 tests — send/recv round trips, FIFO order, payload race-freedom
+    sandbox.rs       10 tests — real process spawn/stop, zombie-prevention-on-drop, static rejections
 ```
 
 ```
@@ -657,7 +756,7 @@ $ cd compiler && cargo run --quiet -- examples/factorial.nir
 $ cargo run --quiet -- build examples/factorial.nir -o /tmp/factorial && /tmp/factorial
 3628800
 $ cargo test
-test result: ok. 107 passed; 0 failed
+test result: ok. 118 passed; 0 failed
 ```
 
 ## Row by row, against goal.md §1

@@ -70,6 +70,22 @@ pub enum Ty {
     /// *not* full Pony-style proof-by-construction yet; see PHASE0.md's
     /// row 3 entry for the honest scope of that claim.
     Channel(Box<Ty>),
+    /// A handle to a real, separate OS process (`sandbox worker(x)` — see
+    /// `Expr::SpawnSandbox`). No inner type parameter, unlike `Thread`/
+    /// `Channel`: this first slice has no typed result channel at all
+    /// (SANDBOXING.md's "layer 1" — an affine handle and deterministic
+    /// teardown, nothing else yet), so there's no `T` to name. Affine,
+    /// for the same reason `Thread` is: a spawned process has exactly one
+    /// owner, and `stop`ping it (`Expr::StopSandbox`) is a one-time
+    /// consuming operation. Unlike every other affine type here, this one
+    /// backs its cleanup with a real Rust `Drop` impl on the interpreter
+    /// value (`SandboxChild` in `interpreter.rs`) that actually kills the
+    /// child process — not just Rust's ordinary memory reclamation — so
+    /// "deterministic teardown" is a real guarantee even if a Nirdosha
+    /// program never calls `stop` at all, the same way `box`'s memory is
+    /// freed by Rust's own `Drop` regardless of whether `ownership.rs`'s
+    /// static proof is the thing a reader trusts.
+    Sandbox,
     /// Poison type: stands in for an expression that already produced a
     /// type error, so the checker (`typeck.rs`) doesn't cascade a dozen
     /// follow-on diagnostics from one root cause. Never produced by the
@@ -116,6 +132,7 @@ impl Ty {
             Ty::Ref(inner) => format!("&{}", inner.name()),
             Ty::Thread(inner) => format!("thread {}", inner.name()),
             Ty::Channel(inner) => format!("chan {}", inner.name()),
+            Ty::Sandbox => "sandbox".to_string(),
             Ty::Error => "<error>".to_string(),
         }
     }
@@ -123,7 +140,14 @@ impl Ty {
     pub fn is_integer(&self) -> bool {
         !matches!(
             self,
-            Ty::Bool | Ty::Unit | Ty::Error | Ty::Box(_) | Ty::Ref(_) | Ty::Thread(_) | Ty::Channel(_)
+            Ty::Bool
+                | Ty::Unit
+                | Ty::Error
+                | Ty::Box(_)
+                | Ty::Ref(_)
+                | Ty::Thread(_)
+                | Ty::Channel(_)
+                | Ty::Sandbox
         )
     }
 
@@ -149,7 +173,7 @@ impl Ty {
         // computation at once, so it has to be freely copyable — see its
         // own doc comment for where the actual ownership-transfer happens
         // instead (a channel's *payload*, at `send`, not the handle).
-        matches!(self, Ty::Box(_) | Ty::Thread(_))
+        matches!(self, Ty::Box(_) | Ty::Thread(_) | Ty::Sandbox)
     }
 
     /// goal.md row 4's runtime fallback (Tier 2, §4): `interpreter.rs`
@@ -200,6 +224,7 @@ impl Ty {
             | Ty::Ref(_)
             | Ty::Thread(_)
             | Ty::Channel(_)
+            | Ty::Sandbox
             | Ty::Error => (i64::MIN, i64::MAX),
         }
     }
@@ -315,6 +340,23 @@ pub enum Expr {
     /// comment for why that keeps row 3's "no deadlocks" claim narrower
     /// than full proof-by-construction for now.
     Recv(Box<Expr>, Span),
+    /// `sandbox name(args)` — runs `name` as a **real, separate OS
+    /// process** (not a thread — a fresh invocation of the `nirdosha`
+    /// binary itself, re-interpreting the same source) and returns a
+    /// `Ty::Sandbox` handle. Shaped like `Expr::Spawn` (a name plus
+    /// arguments, reusing the same signature lookup and argument-move-
+    /// checking machinery) for the same reason: no new ownership logic
+    /// needed. `typeck.rs` additionally restricts `name`'s parameters and
+    /// return type to plain scalars — see `TypeErrorKind::
+    /// SandboxArgMustBeScalar`/`SandboxFnMustReturnUnit` — since crossing
+    /// a real process boundary has no typed serialization story yet
+    /// (SANDBOXING.md's layer 3, not built here).
+    SpawnSandbox(String, Vec<Expr>, Span),
+    /// `stop expr` — terminates the sandboxed process (killing it if
+    /// still running), consumes the handle (affine, single stop like a
+    /// single join), and yields its OS exit code as an `i64` (`-1` if it
+    /// was terminated by a signal, including by this same `stop`).
+    StopSandbox(Box<Expr>, Span),
 }
 
 #[derive(Debug, Clone)]
@@ -341,7 +383,9 @@ impl Expr {
             | Expr::Join(_, s)
             | Expr::Chan(s)
             | Expr::Send(_, _, s)
-            | Expr::Recv(_, s) => *s,
+            | Expr::Recv(_, s)
+            | Expr::SpawnSandbox(_, _, s)
+            | Expr::StopSandbox(_, s) => *s,
         }
     }
 }

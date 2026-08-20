@@ -101,6 +101,9 @@ fn llvm_ty(ty: &Ty) -> Result<&'static str, CodegenError> {
             "codegen doesn't support `{}` yet — chan/send/recv are interpreter-only for now",
             ty.name()
         )),
+        Ty::Sandbox => unsupported(
+            "codegen doesn't support `sandbox` yet — sandbox/stop are interpreter-only for now",
+        ),
         Ty::Error => unreachable!("a program with a type error is never handed to codegen"),
     }
 }
@@ -185,6 +188,9 @@ fn check_expr(e: &Expr) -> Result<(), CodegenError> {
         }
         Expr::Chan(_) | Expr::Send(_, _, _) | Expr::Recv(_, _) => {
             unsupported("codegen doesn't support `chan`/`send`/`recv` yet — interpreter-only for now")
+        }
+        Expr::SpawnSandbox(_, _, _) | Expr::StopSandbox(_, _) => {
+            unsupported("codegen doesn't support `sandbox`/`stop` yet — interpreter-only for now")
         }
     }
 }
@@ -570,7 +576,9 @@ impl Codegen<'_> {
             | Expr::Join(_, _)
             | Expr::Chan(_)
             | Expr::Send(_, _, _)
-            | Expr::Recv(_, _) => {
+            | Expr::Recv(_, _)
+            | Expr::SpawnSandbox(_, _, _)
+            | Expr::StopSandbox(_, _) => {
                 unreachable!("check_supported already rejected this program")
             }
         }

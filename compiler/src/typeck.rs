@@ -76,6 +76,18 @@ pub enum TypeErrorKind {
     /// case, so this variant is really just the first one).
     ChannelNeedsExplicitType,
     ExpectedChannelType { found: Ty },
+    /// `sandbox name(...)` requires `name` to declare `-> unit` — there's
+    /// no typed channel to carry a result back across a real process
+    /// boundary yet (SANDBOXING.md's layer 3). `stop`'s `i64` result is
+    /// the OS exit code, not the function's Nirdosha-typed return value.
+    SandboxFnMustReturnUnit { name: String },
+    /// `sandbox name(...)` requires every one of `name`'s declared
+    /// parameters to be a plain scalar (an integer type or `bool`) —
+    /// `box`/`&`/`thread`/`chan`/`sandbox` values are meaningless across
+    /// a real OS process boundary at this layer (no serialization story
+    /// exists for them yet).
+    SandboxArgMustBeScalar { found: Ty },
+    ExpectedSandboxType { found: Ty },
     LiteralOutOfRange { ty: Ty, value: i64 },
     IfWithoutElseUsedAsValue { expected: Ty },
     NotAllPathsReturn { fn_name: String },
@@ -145,6 +157,22 @@ impl std::fmt::Display for TypeError {
             TypeErrorKind::ExpectedChannelType { found } => write!(
                 f,
                 "{line}:{col}: `send`/`recv` need a `chan` type, found `{}`",
+                found.name()
+            ),
+            TypeErrorKind::SandboxFnMustReturnUnit { name } => write!(
+                f,
+                "{line}:{col}: `{name}` must return `unit` to be run with `sandbox` \
+                 (no typed result channel exists yet -- see SANDBOXING.md)"
+            ),
+            TypeErrorKind::SandboxArgMustBeScalar { found } => write!(
+                f,
+                "{line}:{col}: `sandbox` functions can only take plain scalar parameters \
+                 (an integer type or `bool`), found `{}`",
+                found.name()
+            ),
+            TypeErrorKind::ExpectedSandboxType { found } => write!(
+                f,
+                "{line}:{col}: `stop` needs a `sandbox` type, found `{}`",
                 found.name()
             ),
             TypeErrorKind::LiteralOutOfRange { ty, value } => write!(
@@ -507,6 +535,65 @@ impl Checker {
                     }
                 }
             }
+            Expr::SpawnSandbox(name, args, span) => {
+                self.infer_sandbox_spawn(name, args, expected_ret, scopes, *span)
+            }
+            Expr::StopSandbox(inner, span) => {
+                let it = self.infer(inner, expected_ret, scopes);
+                match it {
+                    Ty::Error => Ty::Error,
+                    Ty::Sandbox => Ty::I64,
+                    other => {
+                        self.error(TypeErrorKind::ExpectedSandboxType { found: other }, *span);
+                        Ty::Error
+                    }
+                }
+            }
+        }
+    }
+
+    /// `sandbox name(args)` type-checks its arguments exactly like an
+    /// ordinary call (reusing `infer_call`, same as `infer_spawn` does),
+    /// plus two extra, layer-1-specific gates that have no analog for
+    /// `spawn`: `name`'s declared return type must be `unit`, and every
+    /// declared parameter must be a plain scalar. Both gates check the
+    /// callee's *declared signature*, not just the arguments actually
+    /// passed here — a `box i64` parameter is rejected even if every
+    /// caller happens to pass something scalar-looking, because the
+    /// restriction is about what can cross a real process boundary at
+    /// all, not about this one call site.
+    fn infer_sandbox_spawn(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        expected_ret: &Ty,
+        scopes: &mut Scopes,
+        span: Span,
+    ) -> Ty {
+        if name == "print" {
+            self.error(TypeErrorKind::CannotSpawnBuiltin { name: name.to_string() }, span);
+            for a in args {
+                self.infer(a, expected_ret, scopes);
+            }
+            return Ty::Error;
+        }
+        if let Some(sig) = self.sigs.get(name) {
+            let ret_ty = sig.ret.clone();
+            let params = sig.params.clone();
+            if ret_ty != Ty::Unit {
+                self.error(TypeErrorKind::SandboxFnMustReturnUnit { name: name.to_string() }, span);
+            }
+            for p in params {
+                if !(p.is_integer() || p == Ty::Bool) {
+                    self.error(TypeErrorKind::SandboxArgMustBeScalar { found: p }, span);
+                }
+            }
+        }
+        let ret = self.infer_call(name, args, expected_ret, scopes, span);
+        if ret == Ty::Error {
+            Ty::Error
+        } else {
+            Ty::Sandbox
         }
     }
 
