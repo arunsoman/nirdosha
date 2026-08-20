@@ -539,6 +539,71 @@ both static `typeck.rs` rejections (`CannotSpawnBuiltin`,
 clean (one `type_complexity` warning on `Value::Thread`'s nested generic,
 fixed with a `ThreadHandle` type alias rather than suppressed).
 
+**Twelfth update:** `chan`/`send`/`recv` — a first `Ty::Channel(Box<Ty>)`
+type-former (`chan T`) plus three new expression forms, wired through
+every pass the same way the Eleventh update's `spawn`/`join` were.
+
+*Why channels, and why now.* goal.md's own row 3 design table doesn't
+just say "no deadlocks" — it says *how*: "remove blocking locks as a
+primitive; concurrency = async messages only; shared-memory locks
+opt-in, gated by a static lock-rank check," citing Pony's "no mutex
+exists in the language" as the model. A first cut at a plain `Mutex<T>`
+was the obvious next step after threads, but would have directly
+contradicted that design (goal.md's own Rust comparison calls out
+exactly this failure mode: "two mutexes locked in opposite order still
+deadlock"). Channels are the design's actual prescribed default, so they
+came first instead — a lock primitive, if one gets built later, should
+be the opt-in, statically-gated exception the design describes, not the
+default this update reaches for.
+
+*Design, and why the channel handle isn't affine.* `chan T` creates an
+unbounded, multi-producer multi-consumer queue (`ChannelInner` in
+`interpreter.rs`: a `Mutex<VecDeque<Value>>` plus a `Condvar` so `recv`
+blocks efficiently instead of spin-polling). Unlike `thread T`, a
+channel handle is *not* affine — it's meant to be held by more than one
+concurrent computation at once (whoever sends, whoever receives, and
+there can be several of each), so every read of a `chan T` binding is
+just a cheap `Arc::clone` to the same shared queue, the same "freely
+copyable" treatment `&T` already gets. The actual ownership-transfer
+moment isn't the handle, it's `send`'s *payload*: `ownership.rs` checks
+it exactly like a call argument, so an affine `box`-typed value sent on
+a channel is consumed the instant it's sent, and can never still be
+touched by the sender afterward — that's what makes it sound for it to
+cross to another concurrent computation, no new safety logic beyond
+"touch like a call argument" required (same shape as the Eleventh
+update's `spawn` reasoning). `chan` itself (the zero-argument
+channel-creating expression) has no sub-expression to infer a payload
+type from, unlike `box expr`/`spawn f(x)` — `typeck.rs` only accepts it
+against an already-known `chan T` expected type (a `let` with an
+explicit annotation), and reports a dedicated
+`ChannelNeedsExplicitType` error everywhere else.
+
+*The honest limitation, stated plainly rather than left implicit.*
+`recv` is a genuine blocking wait — nothing here makes it non-blocking
+or gives it a timeout. A well-typed Nirdosha program can still write
+`recv(c)` on a channel nobody ever sends to and hang forever. That is a
+**liveness** bug, not the **aliased-lock-order** failure goal.md's row 3
+Rust comparison is specifically about, and channels *do* fully close off
+that specific failure mode (there is no lock primitive in the language
+at all to acquire out of order). But it means row 3's "Hard — proof by
+construction" status isn't fully earned yet by this update alone — see
+the row-by-row table's updated row 3 entry for the precise, narrower
+claim this update actually supports. Full Pony-style proof-by-construction
+would need non-blocking mailbox/actor dispatch (a behavior runs only
+when a message is already available, so there's no wait primitive left
+to hang on at all) — a materially bigger feature, not built here.
+
+`examples/channels.nir` demonstrates the accepted program (a producer
+sends two values, `main` receives both, matching the other examples'
+loose style); `tests/channels.rs` (10 tests) covers the round trip,
+FIFO ordering across multiple sends, a boxed payload surviving the
+round trip, the channel handle itself being freely reusable by both
+sides, the boxed-payload-reuse-after-send rejection, and four static
+rejections (`chan` with no type hint, `chan` against a non-channel
+annotation, `send`/`recv` on a non-channel value, sending the wrong
+payload type). 107/107 tests pass; `cargo clippy --all-targets` is
+clean.
+
 ---
 
 
@@ -560,9 +625,9 @@ compiler/
     token.rs        lexer — hand-written, single pass, structured LexError, Span: Hash
     ast.rs           AST types; Ty::bounds()/in_range shared by every pass; literal_value()
     parser.rs        recursive-descent, single-token lookahead, no backtracking
-    interpreter.rs   tree-walking evaluator; Value::{Boxed,Ref,Thread}; dynamic Tier-2 checks
+    interpreter.rs   tree-walking evaluator; Value::{Boxed,Ref,Thread,Channel}; dynamic Tier-2 checks
     typeck.rs        static type checker — runs before interpretation
-    ownership.rs     static move-checker for box/&/spawn/join
+    ownership.rs     static move-checker for box/&/spawn/join/send/recv
     refine.rs        interval-analysis Tier-1 prover (the pre-Z3 fallback)
     smt.rs           real Z3-backed Tier-1 prover (primary; condition narrowing)
     codegen.rs       LLVM IR emission + `clang` driver — real native binaries
@@ -575,13 +640,15 @@ compiler/
     ownership.nir    box, move, consuming calls
     borrow.nir       shared borrows (&)
     threads.nir      spawn/join, thread <T>
+    channels.nir     chan/send/recv
   tests/
     basic.rs         32 tests — core language + typeck
     ownership.rs     22 tests — box/&/move-checking
     refine.rs        11 tests — interval-analysis proofs (and honest non-proofs)
     smt.rs           9 tests — SMT proofs, incl. the interval-vs-SMT flagship comparison
-    codegen.rs       13 tests — real compiled binaries, run and compared to the interpreter
+    codegen.rs       14 tests — real compiled binaries, run and compared to the interpreter
     concurrency.rs   9 tests — spawn/join round trips, race-freedom, panic/double-join backstops
+    channels.rs      10 tests — send/recv round trips, FIFO order, payload race-freedom
 ```
 
 ```
@@ -590,7 +657,7 @@ $ cd compiler && cargo run --quiet -- examples/factorial.nir
 $ cargo run --quiet -- build examples/factorial.nir -o /tmp/factorial && /tmp/factorial
 3628800
 $ cargo test
-test result: ok. 96 passed; 0 failed
+test result: ok. 107 passed; 0 failed
 ```
 
 ## Row by row, against goal.md §1
@@ -598,8 +665,8 @@ test result: ok. 96 passed; 0 failed
 | Row | Status |
 |---|---|
 | 1 — No GC, no `free()` | **Started, real content.** `box`/`*`, shared borrows (`&`), and a static move-checker (`ownership.rs`) — see the "Second" and "Third" update sections above for what's actually proved and what still isn't (no `&mut`, no `Drop` hook, no place expressions). Regions/bulk-arena allocation is still not started. |
-| 2 — No data races | **Started, first implementation.** `spawn`/`join` and `thread <T>` — real OS threads under the hood (see the "Eleventh update" section below for the Java-virtual-threads framing and why that's the honest v1). Race-freedom comes entirely from `ownership.rs` reusing its existing move-checker on `spawn`'s arguments and `join`'s handle — no new concurrency-specific safety logic exists. `codegen.rs` doesn't support it yet (interpreter-only, like `box`/`&` before their own codegen work); no channels or other primitive beyond spawn+join exists. |
-| 3 — No deadlocks | **Started, narrow.** `thread <T>` handles are affine, so they form a DAG by construction — no handle can be shared to create a wait-cycle. That's the whole story so far because there's no mutex/lock primitive yet to deadlock *on*; this row will need real content again once one exists. |
+| 2 — No data races | **Started, first implementation.** `spawn`/`join`, `thread <T>` (real OS threads under the hood — see the "Eleventh update" for the Java-virtual-threads framing) and `chan`/`send`/`recv` (see the "Twelfth update"). Race-freedom for both comes entirely from `ownership.rs` reusing its existing move-checker — `spawn`'s arguments and `join`'s handle for threads, `send`'s payload for channels — no new concurrency-specific safety logic exists either time. `codegen.rs` doesn't support any of it yet (interpreter-only, like `box`/`&` before their own codegen work). |
+| 3 — No deadlocks | **Started, narrower than proof-by-construction — see the "Twelfth update" for the honest scope.** goal.md's own row 3 design says exactly this: default to async messages, keep shared-memory locks opt-in and gated. Channels are now that default (no `mutex`/`lock` primitive exists in the language, so the classic "two locks in opposite order" failure goal.md cites for Rust is genuinely not expressible) — but `recv` is a real blocking wait, so a well-typed Nirdosha program can still hang forever on a `recv` nobody `send`s to. That's a liveness bug, not the aliased-lock-order failure mode row 3's Pony comparison is about, but it means the *proof-by-construction* claim isn't fully earned yet — true Pony-style non-blocking mailbox dispatch would need actors/behaviors, not yet built. `thread <T>` handles being affine (forming a DAG by construction) still holds on its own, narrower terms. |
 | 4 — No int/buffer overflow | **Started, and now backed by real SMT.** `Ty::in_range` + `check_ty` still catch everything dynamically (Tier 2, unchanged). Two static Tier-1 passes exist: `compiler/src/refine.rs` (interval analysis, built when this environment had no Z3) and `compiler/src/smt.rs` (real Z3 4.16, once the user installed it — see the "Fifth update" section below), the latter now the primary checker since it's strictly more capable. 68/68 tests pass, including a flagship test that runs the *same* program through both passes and confirms SMT proves something interval analysis structurally cannot (condition-based narrowing). Not wired to elide the interpreter's runtime check — see below for why. |
 | 5 — Native speed | **Started, real native binaries.** `compiler/src/codegen.rs` emits textual LLVM IR and shells out to the system `clang` (LLVM 22) — see the "Sixth update" section below. Scoped to signed integers/bool/unit, no `box`/`&`/`*` yet. 78/78 tests pass; three genuine bugs were found and fixed by actually running compiled binaries, not by review — see below. |
 | 6 — Learning curve | Grammar is small and keyword-heavy on purpose (`fn`/`let`/`return`/`if`/`else`/`while`, C-family operators) — no attempt yet to *measure* this against goal.md §7's proxy metrics (novice user study, Cognitive Dimensions score). Row 6 is aimed at, not yet verified. |
@@ -653,10 +720,23 @@ Three candidates, none blocking the others:
   comment flags this explicitly): `let ok: bool = n > 0; if ok { ... }`
   doesn't currently narrow `n` the way `if n > 0 { ... }` directly would.
   A real, scoped gap, not a hypothetical one.
-- **A lock/mutex primitive** — the natural next step for row 3 now that
-  `spawn`/`join` exist (see the Eleventh update): today's deadlock-freedom
-  is "vacuously true, there's nothing to deadlock on yet"; a real primitive
-  is what makes that claim need to be earned again.
+- **Non-blocking mailbox/actor dispatch** — the actual remaining gap for
+  row 3's full proof-by-construction claim (see the Twelfth update):
+  `recv` today is a genuine blocking wait, so a well-typed program can
+  still hang on a message nobody sends. Pony's answer is that there's no
+  user-facing blocking primitive at all — a behavior only runs once a
+  message is already in its mailbox. Building that (not a lock primitive
+  — see below for why that was deliberately *not* the next step) is
+  materially bigger than `chan`/`send`/`recv` turned out to be.
+- **A lock/mutex primitive, gated by a static lock-rank check** — this
+  was the original candidate here, but goal.md's own row 3 design says
+  shared-memory locks should be the *opt-in, gated exception*, not the
+  default (channels are the default — see the Twelfth update for why
+  a plain, ungated `Mutex<T>` was rejected as the next step). If this
+  gets built later, the static lock-rank check is the part that actually
+  keeps it from reopening "two locks in opposite order" deadlocks — a
+  lock primitive without one would just be `chan`/`send`/`recv`'s
+  regression, not real progress.
 - **M:N thread scheduling** — replace `spawn`'s one-OS-thread-per-call
   backing with lightweight (green/virtual) threads multiplexed onto a
   fixed pool, without changing `spawn`/`join`'s observable semantics —
@@ -670,8 +750,10 @@ Three candidates, none blocking the others:
   tree-walker on Rust's own call stack with no user-level threading to
   help; `spawn` still runs each call on the interpreter's ordinary Rust
   recursion, just on its own OS thread, so the note remains aspirational
-  until an M:N scheduler is actually built).
-- **`codegen.rs` support for `spawn`/`join`** — currently interpreter-only;
-  needs an ABI decision for what a native `thread T` handle even is
-  (an OS thread handle again, or already the lightweight scheduler's unit)
-  before it's worth building.
+  until an M:N scheduler is actually built). The non-blocking mailbox
+  dispatch above would likely be built on the same scheduler.
+- **`codegen.rs` support for `spawn`/`join`/`chan`/`send`/`recv`** —
+  currently interpreter-only; needs an ABI decision for what a native
+  `thread T`/`chan T` handle even is (an OS thread/queue handle again,
+  or already the lightweight scheduler's unit) before it's worth
+  building.

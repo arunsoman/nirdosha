@@ -388,6 +388,7 @@ fn all_examples_pass_ownership_checking() {
         include_str!("../examples/ownership.nir"),
         include_str!("../examples/borrow.nir"),
         include_str!("../examples/threads.nir"),
+        include_str!("../examples/channels.nir"),
     ] {
         let program = parse_ok(src);
         assert_eq!(check_ownership(&program), Ok(()));

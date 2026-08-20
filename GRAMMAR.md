@@ -2,11 +2,16 @@
 
 Scope: the "Core language" slice from `goal.md` §3/§6, plus Phase 1's first
 increment — `box`/`*` and the ownership discipline they make meaningful
-(`compiler/src/ownership.rs`). Still no effects or refinement types, and
-still no concurrency; those remain later-phase additions layered on top of
-this grammar without changing it, which was the point of getting the
-grammar's shape right early (§6 Phase 0 note: retrofitting parseability
-later is expensive).
+(`compiler/src/ownership.rs`) — plus a first slice of concurrency (rows
+2–3): `spawn`/`join`/`thread T` (real OS threads; see `PHASE0.md`'s
+"Eleventh update") and `chan`/`send`/`recv` (see its "Twelfth update").
+Still no effects or refinement types; those remain later-phase additions
+layered on top of this grammar without changing it, which was the point
+of getting the grammar's shape right early (§6 Phase 0 note: retrofitting
+parseability later is expensive). Note that `spawn`/`join`/`thread`/
+`chan`/`send`/`recv` are, so far, interpreter-only — `codegen.rs` rejects
+them explicitly, the same "reject, don't mis-compile" treatment `box`/`&`
+got before their own codegen support existed.
 
 ## Row 7 claim, stated precisely
 
@@ -102,8 +107,16 @@ param       ::= ident ":" type
 // completion, or the result of calling one) — you cannot write `let x:
 // unit = <something>` except by assigning the result of such a call;
 // there's no direct literal to put on the right of `=`.
+// `thread T` and `chan T` (goal.md rows 2-3) follow `box`'s shape exactly
+// — a prefix type-former wrapping another `type`, not a separate grammar
+// category. `thread T` is affine (a spawned computation has exactly one
+// owner, `join` consumes it); `chan T` is **not** — see `Ty::Channel`'s
+// doc comment in `ast.rs` for why a channel handle needs to stay freely
+// copyable while its *payload* still moves through `send`.
 type        ::= "&" type
               | "box" type
+              | "thread" type
+              | "chan" type
               | "i8" | "i16" | "i32" | "i64"
               | "u8" | "u16" | "u32" | "u64" | "usize"
               | "bool" | "unit"
@@ -195,7 +208,27 @@ multiplicative ::= unary (("*" | "/") unary)*
 // variable name" regardless of the lexer question. Fixing the lexer
 // wouldn't be enough on its own to make `& &x` legal; both limitations
 // would need to be addressed together.
-unary       ::= ("!" | "-" | "*" | "box" | "&") unary | call
+// `spawn`'s operand is restricted, after parsing, to exactly `Expr::Call`
+// — the same "parse normally, then validate what came out" technique
+// `&`'s `Expr::Ident` restriction above uses. `spawn` runs a *named
+// function*, not an arbitrary expression, so `spawn f()()` (were it even
+// legal — see `call`'s own arity restriction below) or `spawn (1 + 2)`
+// are both rejected with a specific message, not a generic parse error.
+// `chan` takes no operand at all — it's a nullary keyword in expression
+// position (see `Expr::Chan` in ast.rs for why: unlike `box`/`spawn`, it
+// has no sub-expression to infer a payload type from, so it only
+// type-checks against an already-known `chan T` expectation).
+// `send`/`recv` don't fit this file's "prefix keyword wraps a `unary`"
+// shape at all — `send` needs *two* operands (the channel, the payload),
+// so both use an explicit, fixed-arity `"(" ... ")"` form instead, closer
+// in shape to `call` below than to `spawn`/`join`.
+unary       ::= ("!" | "-" | "*" | "box" | "&") unary
+              | "spawn" call
+              | "join" unary
+              | "chan"
+              | "send" "(" expr "," expr ")"
+              | "recv" "(" expr ")"
+              | call
 
 // Exactly zero or one call, not "zero or more" — `f()()` is a **parse
 // error**, checked directly against the real parser, not assumed:

@@ -42,8 +42,8 @@
 //! statement list. `Signal` is what carries that: every `eval_expr` site
 //! propagates it with `?`, and only `call()` catches `Signal::Return`.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::ast::*;
 use crate::token::Span;
@@ -89,12 +89,52 @@ pub enum Value {
     /// arguments (e.g. a function spawning another function and handing
     /// it a thread handle), and `Rc` isn't.
     Thread(Arc<Mutex<Option<ThreadHandle>>>),
+    /// A handle to an unbounded, multi-producer multi-consumer message
+    /// queue. `Arc`, not `Rc` (same reason as `Value::Thread`): has to be
+    /// `Send` to cross into a spawned thread's captured arguments. Unlike
+    /// `Value::Thread`'s `Mutex<Option<..>>`, there's no one-time `.take()`
+    /// here — a channel handle is meant to be read many times (see
+    /// `Ty::Channel`'s doc comment), so every clone of this `Arc` is just
+    /// another equally-valid handle to the same shared queue.
+    Channel(Arc<ChannelInner>),
 }
 
 /// A spawned computation's raw join handle. Its own alias, not just inline
 /// in `Value::Thread`, purely to keep clippy's `type_complexity` lint (and
 /// human readers) from tripping over four levels of generic nesting.
 type ThreadHandle = std::thread::JoinHandle<Result<Value, RuntimeError>>;
+
+/// The shared state behind a `Value::Channel`: a plain `Mutex`-guarded
+/// FIFO queue plus a `Condvar` to let `recv` block until `send` wakes it,
+/// rather than spin-polling. `send` never blocks (the queue is unbounded)
+/// — the only blocking operation is `recv` on an empty queue, which is
+/// also the reason row 3's "no deadlocks" claim stays narrower than full
+/// proof-by-construction for channels specifically; see `Ty::Channel`'s
+/// doc comment.
+#[derive(Debug)]
+pub struct ChannelInner {
+    queue: Mutex<VecDeque<Value>>,
+    not_empty: Condvar,
+}
+
+impl ChannelInner {
+    fn new() -> Self {
+        ChannelInner { queue: Mutex::new(VecDeque::new()), not_empty: Condvar::new() }
+    }
+
+    fn send(&self, v: Value) {
+        self.queue.lock().unwrap().push_back(v);
+        self.not_empty.notify_one();
+    }
+
+    fn recv(&self) -> Value {
+        let mut q = self.queue.lock().unwrap();
+        while q.is_empty() {
+            q = self.not_empty.wait(q).unwrap();
+        }
+        q.pop_front().expect("just proved non-empty under the same lock")
+    }
+}
 
 /// Manual, not derived: `JoinHandle` has no `PartialEq`, so `Value` can't
 /// derive it once `Thread` exists. Two thread handles are equal only if
@@ -110,6 +150,7 @@ impl PartialEq for Value {
             (Value::Boxed(a), Value::Boxed(b)) => a == b,
             (Value::Ref(a), Value::Ref(b)) => a == b,
             (Value::Thread(a), Value::Thread(b)) => Arc::ptr_eq(a, b),
+            (Value::Channel(a), Value::Channel(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -124,6 +165,7 @@ impl Value {
             Value::Boxed(_) => "box",
             Value::Ref(_) => "ref",
             Value::Thread(_) => "thread",
+            Value::Channel(_) => "chan",
         }
     }
 
@@ -135,6 +177,7 @@ impl Value {
             Value::Boxed(inner) => format!("box({})", inner.render()),
             Value::Ref(inner) => format!("&{}", inner.render()),
             Value::Thread(_) => "thread(..)".to_string(),
+            Value::Channel(_) => "chan(..)".to_string(),
         }
     }
 }
@@ -350,6 +393,11 @@ impl Interpreter {
             // moment it produces one; there's nothing more to check here
             // than "this is in fact a thread handle."
             (Value::Thread(_), Ty::Thread(_)) => Ok(()),
+            // Same reasoning as `Value::Thread` above: a channel's own
+            // `send`/`recv` are the only places a payload value is
+            // checked against `Ty::Channel`'s inner type, so there's no
+            // inner value sitting here to recurse into.
+            (Value::Channel(_), Ty::Channel(_)) => Ok(()),
             (Value::Int(n), _) if ty.is_integer() => {
                 if ty.in_range(*n) {
                     Ok(())
@@ -550,6 +598,29 @@ impl Interpreter {
                         }
                     }
                     v => Err(mismatch("thread", v.ty_name(), *span)),
+                }
+            }
+            Expr::Chan(_) => Ok(Value::Channel(Arc::new(ChannelInner::new()))),
+            Expr::Send(chan_expr, value_expr, span) => {
+                let c = self.eval_expr(chan_expr, env)?;
+                let v = self.eval_expr(value_expr, env)?;
+                match c {
+                    Value::Channel(inner) => {
+                        inner.send(v);
+                        Ok(Value::Unit)
+                    }
+                    other => Err(mismatch("chan", other.ty_name(), *span)),
+                }
+            }
+            Expr::Recv(chan_expr, span) => {
+                let c = self.eval_expr(chan_expr, env)?;
+                match c {
+                    // Blocks the calling OS thread until `send` wakes it —
+                    // see `ChannelInner::recv` and `Ty::Channel`'s doc
+                    // comment for why this is a genuine wait primitive,
+                    // not just a race-freedom mechanism.
+                    Value::Channel(inner) => Ok(inner.recv()),
+                    other => Err(mismatch("chan", other.ty_name(), *span)),
                 }
             }
         }

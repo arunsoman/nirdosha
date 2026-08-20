@@ -302,7 +302,11 @@ impl Checker<'_> {
                 }
                 term
             }
-            Expr::Box(inner, _) | Expr::Deref(inner, _) | Expr::Ref(inner, _) | Expr::Join(inner, _) => {
+            Expr::Box(inner, _)
+            | Expr::Deref(inner, _)
+            | Expr::Ref(inner, _)
+            | Expr::Join(inner, _)
+            | Expr::Recv(inner, _) => {
                 self.expr(inner, scopes);
                 Int::fresh_const("unknown")
             }
@@ -312,6 +316,12 @@ impl Checker<'_> {
                 }
                 Int::fresh_const("unknown")
             }
+            Expr::Send(chan, value, _) => {
+                self.expr(chan, scopes);
+                self.expr(value, scopes);
+                Int::fresh_const("unknown")
+            }
+            Expr::Chan(_) => Int::fresh_const("unknown"),
             Expr::Bool(_, _) => Int::fresh_const("unknown"),
         }
     }
@@ -445,12 +455,13 @@ fn assigned_names(stmts: &[Stmt]) -> HashSet<String> {
     }
     fn walk_expr(e: &Expr, names: &mut HashSet<String>) {
         match e {
-            Expr::Int(_, _) | Expr::Bool(_, _) | Expr::Ident(_, _) => {}
+            Expr::Int(_, _) | Expr::Bool(_, _) | Expr::Ident(_, _) | Expr::Chan(_) => {}
             Expr::Unary(_, inner, _)
             | Expr::Box(inner, _)
             | Expr::Deref(inner, _)
             | Expr::Ref(inner, _)
-            | Expr::Join(inner, _) => walk_expr(inner, names),
+            | Expr::Join(inner, _)
+            | Expr::Recv(inner, _) => walk_expr(inner, names),
             Expr::Binary(_, l, r, _) => {
                 walk_expr(l, names);
                 walk_expr(r, names);
@@ -459,6 +470,10 @@ fn assigned_names(stmts: &[Stmt]) -> HashSet<String> {
                 for a in args {
                     walk_expr(a, names);
                 }
+            }
+            Expr::Send(chan, value, _) => {
+                walk_expr(chan, names);
+                walk_expr(value, names);
             }
             Expr::If { cond, then_block, else_block, .. } => {
                 walk_expr(cond, names);

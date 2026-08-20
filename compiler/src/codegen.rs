@@ -97,6 +97,10 @@ fn llvm_ty(ty: &Ty) -> Result<&'static str, CodegenError> {
              (real OS threads, not yet compiled to native code)",
             ty.name()
         )),
+        Ty::Channel(_) => unsupported(format!(
+            "codegen doesn't support `{}` yet — chan/send/recv are interpreter-only for now",
+            ty.name()
+        )),
         Ty::Error => unreachable!("a program with a type error is never handed to codegen"),
     }
 }
@@ -178,6 +182,9 @@ fn check_expr(e: &Expr) -> Result<(), CodegenError> {
         }
         Expr::Spawn(_, _, _) | Expr::Join(_, _) => {
             unsupported("codegen doesn't support `spawn`/`join` yet — interpreter-only for now")
+        }
+        Expr::Chan(_) | Expr::Send(_, _, _) | Expr::Recv(_, _) => {
+            unsupported("codegen doesn't support `chan`/`send`/`recv` yet — interpreter-only for now")
         }
     }
 }
@@ -556,7 +563,14 @@ impl Codegen<'_> {
                 // need to know it came from an assignment specifically.
                 Ok(val)
             }
-            Expr::Box(_, _) | Expr::Deref(_, _) | Expr::Ref(_, _) | Expr::Spawn(_, _, _) | Expr::Join(_, _) => {
+            Expr::Box(_, _)
+            | Expr::Deref(_, _)
+            | Expr::Ref(_, _)
+            | Expr::Spawn(_, _, _)
+            | Expr::Join(_, _)
+            | Expr::Chan(_)
+            | Expr::Send(_, _, _)
+            | Expr::Recv(_, _) => {
                 unreachable!("check_supported already rejected this program")
             }
         }

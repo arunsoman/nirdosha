@@ -1,0 +1,30 @@
+// Exercises: `chan`, `send`, `recv`. `chan i64` is a handle to an
+// unbounded, multi-producer multi-consumer queue; `send(c, v)` never
+// blocks, `recv(c)` blocks until a value is available. Unlike `thread T`
+// (see examples/threads.nir), a channel handle is freely copyable -- it's
+// meant to be held by more than one concurrent computation at once, so
+// both the sender and the receiver keep their own handle to the same
+// queue after `spawn` (see `Ty::Channel`'s doc comment in ast.rs).
+//
+// The actual ownership-transfer moment is `send`'s payload, not the
+// handle: `box i64` sent on a channel is moved out of the sender the
+// instant it's sent (see tests/channels.rs for the rejected program --
+// touching it again afterward is a compile-time use-after-move), so a
+// value can safely cross from one concurrent computation to another
+// without ever being aliased by both at once.
+fn producer(c: chan i64) -> unit {
+    send(c, 14)
+    send(c, 28)
+    return
+}
+
+fn main() {
+    let c: chan i64 = chan
+    let h: thread unit = spawn producer(c)
+
+    let a: i64 = recv(c)
+    let b: i64 = recv(c)
+    join h
+
+    print(a + b) // 42
+}

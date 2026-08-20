@@ -358,6 +358,23 @@ impl Checker {
                 // single-owner discipline as `box`.
                 self.touch_expr(inner, true);
             }
+            Expr::Chan(_) => {
+                // A fresh value with no sub-expression -- nothing to touch.
+            }
+            Expr::Send(chan, value, _) => {
+                // The channel handle itself is freely reusable (not
+                // affine -- see `Ty::Channel`'s doc comment), same
+                // treatment as `&`'s referent: `touch_expr(chan, false)`.
+                // The *payload* is the actual ownership transfer -- an
+                // affine value handed to `send` is consumed exactly like
+                // a call argument, which is what makes it sound for it to
+                // cross to another concurrent computation.
+                self.touch_expr(chan, false);
+                self.touch_expr(value, true);
+            }
+            Expr::Recv(chan, _) => {
+                self.touch_expr(chan, false);
+            }
         }
     }
 

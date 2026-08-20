@@ -69,6 +69,13 @@ pub enum TypeErrorKind {
     CannotMoveOutOfReference { content: Ty },
     ExpectedThreadType { found: Ty },
     CannotSpawnBuiltin { name: String },
+    /// `chan` (the channel-creating expression) appeared somewhere its
+    /// payload type can't be pinned down — either with no expected type at
+    /// all (`infer`), or against an expected type that isn't `chan T`
+    /// (`check`, which reports a `TypeMismatch` instead in that second
+    /// case, so this variant is really just the first one).
+    ChannelNeedsExplicitType,
+    ExpectedChannelType { found: Ty },
     LiteralOutOfRange { ty: Ty, value: i64 },
     IfWithoutElseUsedAsValue { expected: Ty },
     NotAllPathsReturn { fn_name: String },
@@ -130,6 +137,16 @@ impl std::fmt::Display for TypeError {
             TypeErrorKind::CannotSpawnBuiltin { name } => {
                 write!(f, "{line}:{col}: `{name}` is a builtin and can't be spawned")
             }
+            TypeErrorKind::ChannelNeedsExplicitType => write!(
+                f,
+                "{line}:{col}: `chan` needs an explicit `chan T` type annotation \
+                 (e.g. `let c: chan i64 = chan`)"
+            ),
+            TypeErrorKind::ExpectedChannelType { found } => write!(
+                f,
+                "{line}:{col}: `send`/`recv` need a `chan` type, found `{}`",
+                found.name()
+            ),
             TypeErrorKind::LiteralOutOfRange { ty, value } => write!(
                 f,
                 "{line}:{col}: literal `{value}` does not fit in `{}`",
@@ -327,6 +344,20 @@ impl Checker {
             self.check_if(cond, then_block, else_block.as_deref(), *span, Some(want), expected_ret, scopes);
             return;
         }
+        // `chan` has no sub-expression to infer a payload type from — it's
+        // only well-typed against an expected `chan T`. Handled here,
+        // top-down, the same reason `Expr::If`'s value-position case is
+        // handled here rather than in `infer` below.
+        if let Expr::Chan(span) = e {
+            if matches!(want, Ty::Channel(_)) {
+                return;
+            }
+            self.error(
+                TypeErrorKind::TypeMismatch { expected: want.clone(), found: Ty::Channel(Box::new(Ty::Error)) },
+                *span,
+            );
+            return;
+        }
         let found = self.infer(e, expected_ret, scopes);
         if found != Ty::Error && found != *want {
             self.error(TypeErrorKind::TypeMismatch { expected: want.clone(), found }, e.span());
@@ -436,6 +467,42 @@ impl Checker {
                     Ty::Thread(t) => *t,
                     other => {
                         self.error(TypeErrorKind::ExpectedThreadType { found: other }, *span);
+                        Ty::Error
+                    }
+                }
+            }
+            // Reached only with no expected type at all (`check`, above,
+            // intercepts the case where an expected `chan T` type *is*
+            // known) — e.g. a bare `chan` statement, or `print(chan)`.
+            Expr::Chan(span) => {
+                self.error(TypeErrorKind::ChannelNeedsExplicitType, *span);
+                Ty::Error
+            }
+            Expr::Send(chan, value, span) => {
+                let ct = self.infer(chan, expected_ret, scopes);
+                match ct {
+                    Ty::Error => {
+                        self.infer(value, expected_ret, scopes);
+                        Ty::Error
+                    }
+                    Ty::Channel(inner) => {
+                        self.check(value, &inner, expected_ret, scopes);
+                        Ty::Unit
+                    }
+                    other => {
+                        self.error(TypeErrorKind::ExpectedChannelType { found: other }, *span);
+                        self.infer(value, expected_ret, scopes);
+                        Ty::Error
+                    }
+                }
+            }
+            Expr::Recv(chan, span) => {
+                let ct = self.infer(chan, expected_ret, scopes);
+                match ct {
+                    Ty::Error => Ty::Error,
+                    Ty::Channel(inner) => *inner,
+                    other => {
+                        self.error(TypeErrorKind::ExpectedChannelType { found: other }, *span);
                         Ty::Error
                     }
                 }

@@ -85,6 +85,11 @@ impl Parser {
             let inner = self.expect_type()?;
             return Ok(Ty::Thread(Box::new(inner)));
         }
+        if self.peek().tok == Tok::Chan {
+            self.bump();
+            let inner = self.expect_type()?;
+            return Ok(Ty::Channel(Box::new(inner)));
+        }
         match &self.peek().tok {
             Tok::TypeName(name) => {
                 let ty = Ty::from_name(name).expect("lexer only emits valid type names");
@@ -389,6 +394,26 @@ impl Parser {
             Tok::Join => {
                 self.bump();
                 Ok(Expr::Join(Box::new(self.parse_unary()?), span))
+            }
+            Tok::Chan => {
+                self.bump();
+                Ok(Expr::Chan(span))
+            }
+            Tok::Send => {
+                self.bump();
+                self.expect(&Tok::LParen, "`(`")?;
+                let chan = self.parse_expr()?;
+                self.expect(&Tok::Comma, "`,`")?;
+                let value = self.parse_expr()?;
+                self.expect(&Tok::RParen, "`)`")?;
+                Ok(Expr::Send(Box::new(chan), Box::new(value), span))
+            }
+            Tok::Recv => {
+                self.bump();
+                self.expect(&Tok::LParen, "`(`")?;
+                let chan = self.parse_expr()?;
+                self.expect(&Tok::RParen, "`)`")?;
+                Ok(Expr::Recv(Box::new(chan), span))
             }
             _ => self.parse_call(),
         }

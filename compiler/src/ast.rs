@@ -52,6 +52,24 @@ pub enum Ty {
     /// can ever alias the same `box`-typed data. That's the actual
     /// content of the race-freedom claim, not a separate mechanism.
     Thread(Box<Ty>),
+    /// A handle to an unbounded, multi-producer multi-consumer message
+    /// queue — `chan i64`, `chan box i64`. **Not** affine, unlike
+    /// `Ty::Thread`: a channel is meant to be held by more than one
+    /// concurrent computation at once (whoever sends, whoever receives),
+    /// so every read of a `chan T`-typed binding is a free, cheap-clone
+    /// copy of the same underlying queue (see `Value::Channel` in
+    /// `interpreter.rs`), the same "freely copyable" treatment `Ty::Ref`
+    /// already gets. Race-freedom for a *sent* value still comes from
+    /// ownership, though: `Expr::Send`'s payload is a normal moving use
+    /// (see `ownership.rs`), so an affine value handed to `send` can't
+    /// still be touched by the sender afterward — sending is how
+    /// ownership actually crosses a channel. goal.md row 3 (no
+    /// deadlocks): channels remove the shared-memory lock primitive that
+    /// causes classic lock-order deadlocks (there is no `mutex`/`lock` in
+    /// this language) — but `recv` is a genuine blocking wait, so this is
+    /// *not* full Pony-style proof-by-construction yet; see PHASE0.md's
+    /// row 3 entry for the honest scope of that claim.
+    Channel(Box<Ty>),
     /// Poison type: stands in for an expression that already produced a
     /// type error, so the checker (`typeck.rs`) doesn't cascade a dozen
     /// follow-on diagnostics from one root cause. Never produced by the
@@ -97,12 +115,16 @@ impl Ty {
             Ty::Box(inner) => format!("box {}", inner.name()),
             Ty::Ref(inner) => format!("&{}", inner.name()),
             Ty::Thread(inner) => format!("thread {}", inner.name()),
+            Ty::Channel(inner) => format!("chan {}", inner.name()),
             Ty::Error => "<error>".to_string(),
         }
     }
 
     pub fn is_integer(&self) -> bool {
-        !matches!(self, Ty::Bool | Ty::Unit | Ty::Error | Ty::Box(_) | Ty::Ref(_) | Ty::Thread(_))
+        !matches!(
+            self,
+            Ty::Bool | Ty::Unit | Ty::Error | Ty::Box(_) | Ty::Ref(_) | Ty::Thread(_) | Ty::Channel(_)
+        )
     }
 
     /// The property that makes ownership meaningful: an affine value has
@@ -121,7 +143,12 @@ impl Ty {
         // makes borrowing useful — see `Ty::Ref`'s doc comment. `Ty::Thread`
         // *is* affine, for the same reason `Ty::Box` is: a spawned
         // computation has exactly one owner, and joining it is a one-time
-        // consuming operation, the same shape as freeing a box.
+        // consuming operation, the same shape as freeing a box. `Ty::Channel`
+        // is deliberately excluded too, for the same reason as `Ty::Ref`:
+        // a channel handle is meant to be held by more than one concurrent
+        // computation at once, so it has to be freely copyable — see its
+        // own doc comment for where the actual ownership-transfer happens
+        // instead (a channel's *payload*, at `send`, not the handle).
         matches!(self, Ty::Box(_) | Ty::Thread(_))
     }
 
@@ -167,9 +194,13 @@ impl Ty {
             // all of these, and `in_range` above already short-circuits
             // on that) — full range is the harmless, safe default if
             // something calls this directly anyway.
-            Ty::Bool | Ty::Unit | Ty::Box(_) | Ty::Ref(_) | Ty::Thread(_) | Ty::Error => {
-                (i64::MIN, i64::MAX)
-            }
+            Ty::Bool
+            | Ty::Unit
+            | Ty::Box(_)
+            | Ty::Ref(_)
+            | Ty::Thread(_)
+            | Ty::Channel(_)
+            | Ty::Error => (i64::MIN, i64::MAX),
         }
     }
 }
@@ -267,6 +298,23 @@ pub enum Expr {
     /// affine — a single join, like a single free), and yields its
     /// result.
     Join(Box<Expr>, Span),
+    /// `chan` — creates a fresh, empty channel. Unlike `box expr` or `spawn
+    /// name(args)`, there's no sub-expression to infer the payload type
+    /// from, so `typeck.rs` only accepts this where an expected `chan T`
+    /// type is already known (a `let` with an explicit type annotation) —
+    /// see `TypeErrorKind::ChannelNeedsExplicitType`.
+    Chan(Span),
+    /// `send(chan_expr, value_expr)` — pushes a value onto a channel and
+    /// returns immediately (never blocks; unbounded queue). The payload is
+    /// a normal moving use, checked exactly like a call argument (see
+    /// `ownership.rs`) — that's what makes it sound for an affine value to
+    /// cross a channel: the sender loses it the moment it's sent.
+    Send(Box<Expr>, Box<Expr>, Span),
+    /// `recv(chan_expr)` — blocks until a value is available, then removes
+    /// and returns it. A genuine blocking wait — see `Ty::Channel`'s doc
+    /// comment for why that keeps row 3's "no deadlocks" claim narrower
+    /// than full proof-by-construction for now.
+    Recv(Box<Expr>, Span),
 }
 
 #[derive(Debug, Clone)]
@@ -290,7 +338,10 @@ impl Expr {
             | Expr::Deref(_, s)
             | Expr::Ref(_, s)
             | Expr::Spawn(_, _, s)
-            | Expr::Join(_, s) => *s,
+            | Expr::Join(_, s)
+            | Expr::Chan(s)
+            | Expr::Send(_, _, s)
+            | Expr::Recv(_, s) => *s,
         }
     }
 }

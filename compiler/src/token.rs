@@ -30,6 +30,9 @@ pub enum Tok {
     Spawn,
     Join,
     Thread,
+    Chan,
+    Send,
+    Recv,
     TypeName(String), // i8/i16/.../usize/bool/unit — validated by the parser
 
     // symbols
@@ -180,6 +183,9 @@ impl<'a> Lexer<'a> {
                     "spawn" => Tok::Spawn,
                     "join" => Tok::Join,
                     "thread" => Tok::Thread,
+                    "chan" => Tok::Chan,
+                    "send" => Tok::Send,
+                    "recv" => Tok::Recv,
                     "true" => Tok::True,
                     "false" => Tok::False,
                     t if TYPE_NAMES.contains(&t) => Tok::TypeName(t.to_string()),
