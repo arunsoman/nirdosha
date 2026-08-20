@@ -1,0 +1,28 @@
+// Exercises: `sandbox`/`stop` combined with `chan`/`send`/`recv` --
+// SANDBOXING.md's layer 2, a real cross-process transport for the same
+// `chan T` primitive examples/channels.nir already demonstrates
+// in-process. A `chan`-typed argument to `sandbox worker(c)` gives the
+// spawned OS process a genuine, live communication channel with the
+// parent -- not just the one-shot argv-in/exit-code-out layer 1 gave.
+//
+// Same channel, same handle, same `send`/`recv` syntax on both sides of
+// the process boundary -- the only thing that's different is what's
+// backing it (a real Unix domain socket instead of an in-memory queue),
+// and that's invisible from Nirdosha source. `worker` doubles whatever
+// it receives and sends the result back.
+fn worker(c: chan i64) -> unit {
+    let v: i64 = recv(c)
+    send(c, v * 2)
+    return
+}
+
+fn main() {
+    let c: chan i64 = chan
+    let s: sandbox = sandbox worker(c)
+
+    send(c, 21)
+    let result: i64 = recv(c)
+    stop s
+
+    print(result) // 42
+}

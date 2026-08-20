@@ -112,36 +112,219 @@ pub enum Value {
 /// human readers) from tripping over four levels of generic nesting.
 type ThreadHandle = std::thread::JoinHandle<Result<Value, RuntimeError>>;
 
-/// The shared state behind a `Value::Channel`: a plain `Mutex`-guarded
-/// FIFO queue plus a `Condvar` to let `recv` block until `send` wakes it,
-/// rather than spin-polling. `send` never blocks (the queue is unbounded)
-/// — the only blocking operation is `recv` on an empty queue, which is
-/// also the reason row 3's "no deadlocks" claim stays narrower than full
-/// proof-by-construction for channels specifically; see `Ty::Channel`'s
-/// doc comment.
+/// The shared state behind a `Value::Channel` — SANDBOXING.md's "one
+/// primitive, multiple transports" decision, made real: `send`/`recv`'s
+/// language-level meaning never changes, only what backs them does.
+///
+/// - `InMemory` is transport #1, unchanged from before layer 2: a plain
+///   `Mutex`-guarded FIFO queue plus a `Condvar` so `recv` blocks until
+///   `send` wakes it, rather than spin-polling. This is what every `chan`
+///   expression creates, always — nothing chooses the cross-process
+///   transport up front.
+/// - `PendingListener`/`Socket` are transport #2, added for layer 2: a
+///   real Unix domain socket, used when a `chan`-typed value crosses into
+///   a `sandbox` argument (see `Interpreter::spawn_sandbox`). A channel
+///   only ever *becomes* socket-backed at that moment — `prepare_for_sandbox`
+///   binds a fresh listener and transitions `InMemory` straight to
+///   `PendingListener`; `accept()` itself is deferred to the first real
+///   `send`/`recv` (`ensure_connected`), so spawning a sandbox with a
+///   `chan` argument doesn't itself become a blocking call. `Socket`'s
+///   own `send`/`recv` can genuinely fail (a real `io::Error` — the peer
+///   process crashed, the pipe broke) in a way `InMemory`'s never could;
+///   see `ErrorKind::ChannelIoError` for where that surfaces.
+///
+/// **Known, deliberate scope limit:** `prepare_for_sandbox` requires the
+/// channel's `InMemory` queue to be empty at the moment it's handed to
+/// `sandbox` — a channel created and used purely in-process for a while
+/// *first*, then later passed to a sandbox, would need those already-
+/// queued messages replayed onto the new socket, which this layer
+/// doesn't attempt (SANDBOXING.md layer 2 is scoped to "create a channel
+/// specifically to hand to a sandbox," not "reuse an arbitrary existing
+/// one"). Returns a clear runtime error rather than silently dropping
+/// messages if this is violated.
 #[derive(Debug)]
 pub struct ChannelInner {
-    queue: Mutex<VecDeque<Value>>,
+    state: Mutex<TransportState>,
     not_empty: Condvar,
+}
+
+#[derive(Debug)]
+enum TransportState {
+    InMemory(VecDeque<Value>),
+    PendingListener(std::os::unix::net::UnixListener, std::path::PathBuf),
+    Socket(std::os::unix::net::UnixStream),
 }
 
 impl ChannelInner {
     fn new() -> Self {
-        ChannelInner { queue: Mutex::new(VecDeque::new()), not_empty: Condvar::new() }
+        ChannelInner { state: Mutex::new(TransportState::InMemory(VecDeque::new())), not_empty: Condvar::new() }
     }
 
-    fn send(&self, v: Value) {
-        self.queue.lock().unwrap().push_back(v);
-        self.not_empty.notify_one();
+    /// The child side's constructor: a `Value::Channel` built directly
+    /// from an already-connected socket, no `InMemory`/`PendingListener`
+    /// detour — the child never creates a channel via `chan`, it's always
+    /// handed one that's already meant to cross a process boundary.
+    pub fn from_socket(stream: std::os::unix::net::UnixStream) -> Self {
+        ChannelInner { state: Mutex::new(TransportState::Socket(stream)), not_empty: Condvar::new() }
     }
 
-    fn recv(&self) -> Value {
-        let mut q = self.queue.lock().unwrap();
-        while q.is_empty() {
-            q = self.not_empty.wait(q).unwrap();
+    /// Binds a fresh Unix domain socket and transitions this channel from
+    /// `InMemory` to `PendingListener`, returning the socket's path (for
+    /// the caller to pass to the spawned child via argv, the same way the
+    /// source file's temp path already is). Doesn't `accept()` — that's
+    /// deferred to first use (see the type's doc comment) — so this never
+    /// blocks.
+    fn prepare_for_sandbox(&self) -> std::io::Result<std::path::PathBuf> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("nirdosha_sandbox_chan_{}_{n}.sock", std::process::id()));
+
+        let mut state = self.state.lock().unwrap();
+        match &*state {
+            TransportState::InMemory(queue) if !queue.is_empty() => {
+                return Err(std::io::Error::other(
+                    "a `chan` with already-queued messages can't be passed to `sandbox` yet \
+                     (SANDBOXING.md layer 2 only supports channels created fresh for the sandbox)",
+                ));
+            }
+            TransportState::InMemory(_) => {}
+            TransportState::PendingListener(_, _) | TransportState::Socket(_) => {
+                return Err(std::io::Error::other(
+                    "this `chan` was already passed to a `sandbox` once — a channel can only \
+                     cross into one sandboxed process",
+                ));
+            }
         }
-        q.pop_front().expect("just proved non-empty under the same lock")
+        let listener = std::os::unix::net::UnixListener::bind(&path)?;
+        *state = TransportState::PendingListener(listener, path.clone());
+        Ok(path)
     }
+
+    /// If still `PendingListener`, blocks until the child connects, then
+    /// transitions to `Socket` — the one place this file's "sandbox
+    /// spawning never blocks, only send/recv do" rule gets enforced for
+    /// the channel transport specifically. Unlinks the socket's path
+    /// immediately on a successful accept: once connected, a Unix domain
+    /// socket doesn't need its filesystem path anymore, and nothing else
+    /// will ever connect to it (exactly one child, exactly one accept).
+    fn ensure_connected(state: &mut TransportState) -> std::io::Result<()> {
+        if let TransportState::PendingListener(listener, path) = state {
+            let (stream, _addr) = listener.accept()?;
+            let _ = std::fs::remove_file(path);
+            *state = TransportState::Socket(stream);
+        }
+        Ok(())
+    }
+
+    fn send(&self, v: Value) -> std::io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        Self::ensure_connected(&mut state)?;
+        match &mut *state {
+            TransportState::InMemory(queue) => {
+                queue.push_back(v);
+                drop(state);
+                self.not_empty.notify_one();
+                Ok(())
+            }
+            TransportState::Socket(stream) => write_value(stream, &v),
+            TransportState::PendingListener(..) => unreachable!("ensure_connected already resolved this"),
+        }
+    }
+
+    fn recv(&self) -> std::io::Result<Value> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            Self::ensure_connected(&mut state)?;
+            match &mut *state {
+                TransportState::InMemory(queue) => {
+                    if let Some(v) = queue.pop_front() {
+                        return Ok(v);
+                    }
+                    state = self.not_empty.wait(state).unwrap();
+                }
+                TransportState::Socket(stream) => return read_value(stream),
+                TransportState::PendingListener(..) => unreachable!("ensure_connected already resolved this"),
+            }
+        }
+    }
+}
+
+impl Drop for ChannelInner {
+    /// The only cleanup a channel ever needs beyond Rust's own (closing
+    /// the socket fd, which `UnixListener`/`UnixStream`'s own `Drop`
+    /// already does): a *bound but never-accepted* listener's socket file
+    /// would otherwise leak on disk — `ensure_connected` already unlinks
+    /// it on the success path, so this only ever fires for a channel that
+    /// was prepared for a sandbox but never actually used.
+    fn drop(&mut self) {
+        let state = match self.state.get_mut() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let TransportState::PendingListener(_, path) = state {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// The wire format layer 2 needs and no more: a one-byte tag plus a
+/// fixed-size payload for exactly the two scalar shapes `typeck.rs`
+/// allows to cross into a `sandbox` argument (`Ty::Channel(inner)` where
+/// `inner` is an integer type or `bool` — see `SandboxArgMustBeScalar`).
+/// `Value::Int` is always `i64` internally regardless of the *declared*
+/// width (`i8`..`usize`), so one integer encoding covers every integer
+/// type; there's no narrower-type tag to get wrong. Not the general,
+/// formally-checked serialization boundary SANDBOXING.md's layer 3 is —
+/// this only has to be correct for the types layer 1 already proved safe
+/// to move across a process boundary at all.
+fn write_value(stream: &mut std::os::unix::net::UnixStream, v: &Value) -> std::io::Result<()> {
+    use std::io::Write;
+    match v {
+        Value::Int(n) => {
+            let mut buf = [0u8; 9];
+            buf[0] = 0;
+            buf[1..9].copy_from_slice(&n.to_le_bytes());
+            stream.write_all(&buf)
+        }
+        Value::Bool(b) => stream.write_all(&[1, u8::from(*b)]),
+        other => unreachable!("typeck.rs only allows scalar payloads across a sandbox channel, got {other:?}"),
+    }
+}
+
+fn read_value(stream: &mut std::os::unix::net::UnixStream) -> std::io::Result<Value> {
+    use std::io::Read;
+    let mut tag = [0u8; 1];
+    let result = stream.read_exact(&mut tag).and_then(|()| match tag[0] {
+        0 => {
+            let mut buf = [0u8; 8];
+            stream.read_exact(&mut buf)?;
+            Ok(Value::Int(i64::from_le_bytes(buf)))
+        }
+        1 => {
+            let mut buf = [0u8; 1];
+            stream.read_exact(&mut buf)?;
+            Ok(Value::Bool(buf[0] != 0))
+        }
+        other => Err(std::io::Error::other(format!("corrupt sandbox channel wire tag {other}"))),
+    });
+    // The overwhelmingly common cause of an EOF here, by far, is the
+    // *far* end of the socket closing -- the sandboxed process exited or
+    // was killed before sending anything. Rust's own message ("failed to
+    // fill whole buffer") is technically accurate but useless to a user;
+    // this is the one real place layer 2's own error family (SANDBOXING.md's
+    // "channel-closed" case, promised back at the Decisions section) earns
+    // its keep over a generic io::Error passthrough.
+    result.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            std::io::Error::other(
+                "the sandboxed process closed this channel (exited or was killed) \
+                 before sending a value",
+            )
+        } else {
+            e
+        }
+    })
 }
 
 /// A sandboxed process, plus the temp file its source was written to
@@ -283,6 +466,14 @@ pub enum ErrorKind {
     /// Defense in depth, mirroring `AlreadyJoined`: `stop`ping a handle
     /// that was already stopped.
     AlreadySandboxStopped,
+    /// SANDBOXING.md layer 2: `send`/`recv` on a `chan` that's crossed
+    /// into a sandboxed process, where the underlying socket I/O itself
+    /// failed — the peer process crashed or was killed mid-conversation,
+    /// the pipe broke, or (see `ChannelInner::prepare_for_sandbox`) the
+    /// channel was already queued-up or already handed to another
+    /// sandbox. Never reachable for the in-process transport, which
+    /// can't fail this way at all.
+    ChannelIoError { message: String },
 }
 
 #[derive(Debug, Clone)]
@@ -322,6 +513,9 @@ impl std::fmt::Display for RuntimeError {
             }
             ErrorKind::AlreadySandboxStopped => {
                 write!(f, "{line}:{col}: this sandbox was already stopped")
+            }
+            ErrorKind::ChannelIoError { message } => {
+                write!(f, "{line}:{col}: sandbox channel I/O error: {message}")
             }
         }
     }
@@ -732,10 +926,17 @@ impl Interpreter {
                 let c = self.eval_expr(chan_expr, env)?;
                 let v = self.eval_expr(value_expr, env)?;
                 match c {
-                    Value::Channel(inner) => {
-                        inner.send(v);
-                        Ok(Value::Unit)
-                    }
+                    Value::Channel(inner) => match inner.send(v) {
+                        Ok(()) => Ok(Value::Unit),
+                        // Only reachable for a socket-backed channel (the
+                        // in-process transport's `send` can never fail) —
+                        // the peer (a sandboxed process) is gone or the
+                        // pipe broke.
+                        Err(e) => Err(Signal::Err(RuntimeError {
+                            kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                            span: *span,
+                        })),
+                    },
                     other => Err(mismatch("chan", other.ty_name(), *span)),
                 }
             }
@@ -746,7 +947,13 @@ impl Interpreter {
                     // see `ChannelInner::recv` and `Ty::Channel`'s doc
                     // comment for why this is a genuine wait primitive,
                     // not just a race-freedom mechanism.
-                    Value::Channel(inner) => Ok(inner.recv()),
+                    Value::Channel(inner) => match inner.recv() {
+                        Ok(v) => Ok(v),
+                        Err(e) => Err(Signal::Err(RuntimeError {
+                            kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                            span: *span,
+                        })),
+                    },
                     other => Err(mismatch("chan", other.ty_name(), *span)),
                 }
             }
@@ -811,15 +1018,38 @@ impl Interpreter {
             }
         };
 
+        // Every argument's declared parameter type decides how it's
+        // rendered: a plain scalar becomes a decimal/`true`/`false`
+        // string (as before layer 2); a `chan`-typed argument instead
+        // becomes a fresh Unix socket path the spawned child connects to
+        // (`cmd_sandbox_worker`, main.rs, does the matching `connect()`
+        // using the exact same declared signature). `typeck.rs`'s
+        // `SandboxArgMustBeScalar` already proved there's no third case.
+        let param_tys: Vec<Ty> = self.find_fn(name).map(|f| f.params.iter().map(|p| p.ty.clone()).collect()).unwrap_or_default();
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("--sandbox-worker").arg(&tmp).arg(name);
-        for v in vals {
-            let arg = match v {
-                Value::Int(n) => n.to_string(),
-                Value::Bool(b) => b.to_string(),
-                _ => unreachable!("typeck.rs already restricted sandbox args to int/bool"),
-            };
-            cmd.arg(arg);
+        for (i, v) in vals.iter().enumerate() {
+            match (v, param_tys.get(i)) {
+                (Value::Int(n), _) => {
+                    cmd.arg(n.to_string());
+                }
+                (Value::Bool(b), _) => {
+                    cmd.arg(b.to_string());
+                }
+                (Value::Channel(inner), Some(Ty::Channel(_))) => match inner.prepare_for_sandbox() {
+                    Ok(path) => {
+                        cmd.arg(path);
+                    }
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(Signal::Err(RuntimeError {
+                            kind: ErrorKind::SandboxSpawnFailed { message: e.to_string() },
+                            span,
+                        }));
+                    }
+                },
+                _ => unreachable!("typeck.rs already restricted sandbox args to int/bool/chan-of-scalar"),
+            }
         }
 
         match cmd.spawn() {

@@ -741,6 +741,79 @@ for `sandbox`/`stop`'s real grammar productions — a gap the same
 verification pass flagged (it had been updated for `thread`/`chan`/
 `spawn`/`join`/`send`/`recv` already, but not for this update).
 
+**Fourteenth update:** SANDBOXING.md's layer 2 — `sandbox`-spawned
+processes can now actually talk back. `chan T` (`T` a scalar) is a legal
+`sandbox` argument, and it's the *same* `chan T` `tests/channels.rs`
+already covers in-process — no new type, no new keyword, no syntax
+change at all. What changed is entirely inside `ChannelInner`:
+`Value::Channel` now carries a `TransportState` (`InMemory`, unchanged
+from before; `PendingListener`/`Socket`, new) instead of a bare
+`Mutex<VecDeque<Value>>` — SANDBOXING.md's own "one primitive, multiple
+transports" decision, built exactly as decided rather than the cheaper
+forwarding-bridge alternative that was also on the table.
+
+*How a channel actually crosses.* `spawn_sandbox` (interpreter.rs) now
+looks up the callee's declared parameter types (not just the argument
+values it already had) so it can tell a `chan`-typed argument apart from
+a scalar one. For a `chan` argument, it binds a fresh Unix domain socket
+at a temp path (same `AtomicU64`+pid uniqueness trick the temp source
+file already used) and transitions that specific `ChannelInner` from
+`InMemory` to `PendingListener` — critically, *without* calling
+`accept()`, so spawning a sandbox with a channel argument stays exactly
+as non-blocking as spawning one without. The child connects to that same
+path (`cmd_sandbox_worker`, main.rs, branches on the declared parameter
+type exactly like the parent does) and gets a `Value::Channel` built
+directly from the connected stream. The actual `accept()` — the one real
+blocking step — is deferred to the *first* `send`/`recv` either side
+performs (`ChannelInner::ensure_connected`), the same "don't block
+until you actually have to" discipline `stop`'s kill-vs-wait choice
+already follows.
+
+*A wire format, but a deliberately small one.* `send`/`recv` across the
+socket transport serialize to a one-byte tag plus a fixed-size payload —
+`Value::Int` is always `i64` internally regardless of declared width, so
+one integer encoding covers every integer type; `Value::Bool` is one more
+byte. This is *not* SANDBOXING.md's layer 3 (a general, formally
+type-checked serialization boundary) — it only has to be correct for the
+two scalar shapes `typeck.rs`'s `is_sandbox_safe` already lets cross a
+sandbox boundary at all, and it is, checked directly (an `i64` round
+trip, a `bool` round trip, both directions, multiple messages in
+sequence — not just one message each way).
+
+*Real failure surfaced honestly, not as a hang.* Socket I/O can fail in
+a way the in-process transport structurally can't — the peer process
+exits, crashes, or is killed mid-conversation. `ErrorKind::ChannelIoError`
+is the new variant this earns (SANDBOXING.md's Decisions section
+promised a "channel-closed" case back when only `sandbox` itself had an
+error family; this is where it actually lands). Worth calling out
+specifically: Rust's own `read_exact` failure on a closed socket says
+"failed to fill whole buffer," which is technically accurate and
+useless to a user — `read_value` catches exactly that `UnexpectedEof`
+case and reports "the sandboxed process closed this channel (exited or
+was killed) before sending a value" instead. Checked directly (a worker
+that returns without ever touching its channel argument; the parent's
+`recv` gets the improved message, not a hang and not the raw Rust text).
+
+*Two scope limits, both deliberate and both enforced, not just
+documented.* A channel can only cross into `sandbox` while its in-memory
+queue is still empty — replaying already-queued messages onto a fresh
+socket isn't attempted this layer, and `prepare_for_sandbox` returns a
+real error rather than silently dropping them if violated. A channel can
+only cross into *one* sandboxed process, ever — passing the same `chan`
+to two separate `sandbox` calls is also a real, checked error
+(`PendingListener`/`Socket` already occupied), not undefined behavior.
+Both are exercised directly, not just asserted true in a comment.
+
+`examples/sandbox_channels.nir` demonstrates the accepted program (send
+a value in, the sandboxed process doubles it, receive the result back);
+`tests/sandbox_channels.rs` (8 tests) covers the round trip, multiple
+messages in both directions, a `bool` payload, the dead-peer
+`ChannelIoError` (with its improved message pinned), both scope-limit
+rejections, and the static `chan`-of-non-scalar rejection. 128/128 tests
+pass, stable across repeated runs; `cargo clippy --all-targets` is clean.
+No grammar changes this update (nothing new to add to `GRAMMAR.md` —
+`chan`/`sandbox` were already there).
+
 ---
 
 
@@ -779,15 +852,17 @@ compiler/
     threads.nir      spawn/join, thread <T>
     channels.nir     chan/send/recv
     sandbox.nir      sandbox/stop
+    sandbox_channels.nir  sandbox + chan together, real bidirectional IPC
   tests/
     basic.rs         32 tests — core language + typeck
     ownership.rs     22 tests — box/&/move-checking
     refine.rs        11 tests — interval-analysis proofs (and honest non-proofs)
     smt.rs           9 tests — SMT proofs, incl. the interval-vs-SMT flagship comparison
-    codegen.rs       15 tests — real compiled binaries, run and compared to the interpreter
+    codegen.rs       16 tests — real compiled binaries, run and compared to the interpreter
     concurrency.rs   9 tests — spawn/join round trips, race-freedom, panic/double-join backstops
     channels.rs      10 tests — send/recv round trips, FIFO order, payload race-freedom
     sandbox.rs       11 tests — real process spawn/stop, zombie-prevention-on-drop, spawn-failure, static rejections
+    sandbox_channels.rs  8 tests — cross-process round trips, dead-peer errors, scope-limit rejections
 ```
 
 ```
@@ -796,7 +871,7 @@ $ cd compiler && cargo run --quiet -- examples/factorial.nir
 $ cargo run --quiet -- build examples/factorial.nir -o /tmp/factorial && /tmp/factorial
 3628800
 $ cargo test
-test result: ok. 119 passed; 0 failed
+test result: ok. 128 passed; 0 failed
 ```
 
 ## Row by row, against goal.md §1

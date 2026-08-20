@@ -77,15 +77,18 @@ pub enum TypeErrorKind {
     ChannelNeedsExplicitType,
     ExpectedChannelType { found: Ty },
     /// `sandbox name(...)` requires `name` to declare `-> unit` — there's
-    /// no typed channel to carry a result back across a real process
-    /// boundary yet (SANDBOXING.md's layer 3). `stop`'s `i64` result is
-    /// the OS exit code, not the function's Nirdosha-typed return value.
+    /// `name`'s own return value has no path back to the caller — its
+    /// declared return type must be `unit`. As of SANDBOXING.md's layer
+    /// 2, this doesn't mean "no way to get a result back at all": a
+    /// `chan T` argument gives a sandboxed function a real, live
+    /// communication channel with the caller (see `is_sandbox_safe`);
+    /// what's still missing (layer 3) is a serialization story general
+    /// enough to carry an arbitrary *return value* across automatically.
     SandboxFnMustReturnUnit { name: String },
     /// `sandbox name(...)` requires every one of `name`'s declared
-    /// parameters to be a plain scalar (an integer type or `bool`) —
-    /// `box`/`&`/`thread`/`chan`/`sandbox` values are meaningless across
-    /// a real OS process boundary at this layer (no serialization story
-    /// exists for them yet).
+    /// parameters to satisfy `is_sandbox_safe`: a plain scalar (an
+    /// integer type or `bool`), or `chan T` where `T` is one — see that
+    /// function's doc comment for why nothing else qualifies yet.
     SandboxArgMustBeScalar { found: Ty },
     ExpectedSandboxType { found: Ty },
     LiteralOutOfRange { ty: Ty, value: i64 },
@@ -162,12 +165,13 @@ impl std::fmt::Display for TypeError {
             TypeErrorKind::SandboxFnMustReturnUnit { name } => write!(
                 f,
                 "{line}:{col}: `{name}` must return `unit` to be run with `sandbox` \
-                 (no typed result channel exists yet -- see SANDBOXING.md)"
+                 (its own return value has no way back to the caller -- send a result over \
+                 a `chan` argument instead, or use `stop`'s exit code; see SANDBOXING.md)"
             ),
             TypeErrorKind::SandboxArgMustBeScalar { found } => write!(
                 f,
                 "{line}:{col}: `sandbox` functions can only take plain scalar parameters \
-                 (an integer type or `bool`), found `{}`",
+                 (an integer type or `bool`) or a `chan` of one, found `{}`",
                 found.name()
             ),
             TypeErrorKind::ExpectedSandboxType { found } => write!(
@@ -554,9 +558,9 @@ impl Checker {
 
     /// `sandbox name(args)` type-checks its arguments exactly like an
     /// ordinary call (reusing `infer_call`, same as `infer_spawn` does),
-    /// plus two extra, layer-1-specific gates that have no analog for
-    /// `spawn`: `name`'s declared return type must be `unit`, and every
-    /// declared parameter must be a plain scalar. Both gates check the
+    /// plus two extra gates that have no analog for `spawn`: `name`'s
+    /// declared return type must be `unit`, and every declared parameter
+    /// must be `sandbox_safe` (see that function). Both gates check the
     /// callee's *declared signature*, not just the arguments actually
     /// passed here — a `box i64` parameter is rejected even if every
     /// caller happens to pass something scalar-looking, because the
@@ -584,7 +588,7 @@ impl Checker {
                 self.error(TypeErrorKind::SandboxFnMustReturnUnit { name: name.to_string() }, span);
             }
             for p in params {
-                if !(p.is_integer() || p == Ty::Bool) {
+                if !is_sandbox_safe(&p) {
                     self.error(TypeErrorKind::SandboxArgMustBeScalar { found: p }, span);
                 }
             }
@@ -881,5 +885,19 @@ fn if_definitely_returns(e: &Expr) -> bool {
             then_ret && else_ret
         }
         _ => false,
+    }
+}
+
+/// What's allowed to cross into a `sandbox`-spawned function's parameter
+/// list (SANDBOXING.md layers 1-2): a plain scalar (an integer type or
+/// `bool`, layer 1's original rule), or now also `chan T` where `T`
+/// itself is a plain scalar (layer 2's real cross-process transport —
+/// see `interpreter.rs`'s `ChannelInner`/`spawn_sandbox`). Not `chan` of
+/// anything else, and not `box`/`&`/`thread`/`sandbox` at all — those
+/// have no wire format defined yet (SANDBOXING.md layer 3).
+fn is_sandbox_safe(ty: &Ty) -> bool {
+    match ty {
+        Ty::Channel(inner) => inner.is_integer() || **inner == Ty::Bool,
+        other => other.is_integer() || *other == Ty::Bool,
     }
 }

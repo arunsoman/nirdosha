@@ -109,10 +109,23 @@ commit, one coherent slice at a time):
    for the full writeup and `examples/sandbox.nir`/`tests/sandbox.rs` for
    what's actually covered, including what deliberately isn't yet (no
    wait-for-natural-completion, only kill; no isolation backend).
-2. **Wire `chan T` to that process over a real cross-process transport**
-   (a pipe or unix socket) instead of the in-process queue. See the
-   transport-abstraction decision above — this is `ChannelInner` gaining
-   a second transport, not a new primitive.
+2. **Done — `chan T` over a real cross-process transport (PHASE0.md's
+   "Fourteenth update").** Built exactly as decided above: `ChannelInner`
+   gained a `TransportState` (in-memory, unchanged; or a Unix domain
+   socket), not a second primitive. A `chan`-typed `sandbox` argument now
+   gives the spawned process a genuine live channel back to the parent —
+   `send`/`recv` work identically on both sides of the process boundary,
+   same syntax, same `Ty::Channel`. The one real blocking step (accepting
+   the child's connection) is deferred to the first actual `send`/`recv`,
+   so spawning stays non-blocking either way. New, honest failure mode:
+   `ErrorKind::ChannelIoError` when the socket transport's I/O itself
+   fails (the peer died) — impossible for the in-process transport, so
+   this is new territory, not a gap in the old one. Two deliberate scope
+   limits, both enforced with real errors, not just documented: a channel
+   can only cross into `sandbox` while empty (no replay of already-queued
+   messages), and only into *one* sandboxed process, ever. See
+   PHASE0.md, `examples/sandbox_channels.nir`, `tests/sandbox_channels.rs`
+   for what's covered.
 3. **A typed serialization boundary.** Bytes in, bytes out, checked
    against the declared payload type at both ends — no refinement-witness
    propagation until refinement types themselves exist.

@@ -197,23 +197,34 @@ fn cmd_sandbox_worker(mut args: impl Iterator<Item = String>) -> ExitCode {
     };
     let mut vals = Vec::with_capacity(f.params.len());
     for (p, raw) in f.params.iter().zip(args) {
-        let v = if p.ty == Ty::Bool {
-            match raw.as_str() {
+        let v = match &p.ty {
+            Ty::Bool => match raw.as_str() {
                 "true" => Value::Bool(true),
                 "false" => Value::Bool(false),
                 _ => {
                     eprintln!("sandbox worker: bad bool argument `{raw}` for `{}`", p.name);
                     return ExitCode::FAILURE;
                 }
-            }
-        } else {
-            match raw.parse::<i64>() {
+            },
+            // A `chan`-typed parameter's argv string is a Unix socket
+            // path (see interpreter.rs's `spawn_sandbox`), not a value to
+            // parse -- connect to the same socket the parent bound,
+            // giving this side of the sandboxed process a live channel
+            // to the parent, not a re-parsed literal.
+            Ty::Channel(_) => match std::os::unix::net::UnixStream::connect(&raw) {
+                Ok(stream) => Value::Channel(Arc::new(nirdosha::interpreter::ChannelInner::from_socket(stream))),
+                Err(e) => {
+                    eprintln!("sandbox worker: failed to connect channel `{}`: {e}", p.name);
+                    return ExitCode::FAILURE;
+                }
+            },
+            _ => match raw.parse::<i64>() {
                 Ok(n) => Value::Int(n),
                 Err(_) => {
                     eprintln!("sandbox worker: bad integer argument `{raw}` for `{}`", p.name);
                     return ExitCode::FAILURE;
                 }
-            }
+            },
         };
         vals.push(v);
     }
