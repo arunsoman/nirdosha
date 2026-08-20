@@ -12,7 +12,6 @@ use nirdosha::ownership::{check_ownership, OwnershipErrorKind};
 use nirdosha::parser::Parser;
 use nirdosha::token::Lexer;
 use nirdosha::typeck::{typecheck, TypeErrorKind};
-use nirdosha::run;
 
 fn parse_ok(src: &str) -> nirdosha::ast::Program {
     let toks = Lexer::new(src).tokenize().expect("lex should succeed");
@@ -52,8 +51,22 @@ fn process_exists(pid: u32) -> bool {
 
 #[test]
 fn example_sandbox_runs_to_completion() {
+    // Not the plain `run(src)` entry point -- a real, independent-
+    // verification-caught gap (see PHASE0.md's "Thirteenth update"): this
+    // test used to call `run` directly, with no `with_sandbox_exe`
+    // override, so under `cargo test` it silently raced the exact same
+    // wrong-binary bug every other runtime test in this file was already
+    // fixed against -- it only ever "passed" because its assertion never
+    // checked what the sandboxed child actually ran, so a fast-failing
+    // wrong-binary child looked the same as a correctly-killed real one.
     let src = include_str!("../examples/sandbox.nir");
-    assert_eq!(run(src), Ok(Value::Unit));
+    let program = parse_ok(src);
+    typecheck(&program).expect("should typecheck cleanly");
+    check_ownership(&program).expect("should ownership-check cleanly");
+    match interp(program, src).run_main() {
+        Ok(v) => assert_eq!(v, Value::Unit),
+        Err(e) => panic!("expected Ok(Unit), got Err({e})"),
+    }
 }
 
 // ---- spawn + stop, deterministically ----------------------------------
@@ -207,6 +220,38 @@ fn stopping_an_already_stopped_sandbox_is_rejected_at_runtime_if_ownership_is_by
     match result {
         Err(e) => assert_eq!(e.kind, ErrorKind::AlreadySandboxStopped),
         Ok(v) => panic!("expected AlreadySandboxStopped, got Ok({v:?})"),
+    }
+}
+
+#[test]
+fn a_sandbox_exe_that_does_not_exist_produces_sandbox_spawn_failed() {
+    // Deterministic, not the "environment-fragile" case PHASE0.md
+    // originally described (an unwritable temp dir) -- `with_sandbox_exe`
+    // already gives every test a way to point the child re-exec at an
+    // arbitrary path, so pointing it at one that flatly doesn't exist
+    // triggers the OS-level spawn failure every time, no special setup
+    // needed. A gap an independent verification pass caught: this path
+    // was wired but had no test at all before.
+    let src = r#"
+        fn worker() -> unit { return }
+        fn main() -> i64 {
+            let s: sandbox = sandbox worker()
+            return stop s
+        }
+    "#;
+    let program = parse_ok(src);
+    typecheck(&program).expect("should typecheck cleanly");
+    check_ownership(&program).expect("should ownership-check cleanly");
+    let result = Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src))
+        .with_sandbox_exe(std::path::PathBuf::from("/does/not/exist/nirdosha"))
+        .run_main();
+    match result {
+        Err(e) => assert!(
+            matches!(e.kind, ErrorKind::SandboxSpawnFailed { .. }),
+            "expected SandboxSpawnFailed, got {:?}",
+            e.kind
+        ),
+        Ok(v) => panic!("expected SandboxSpawnFailed, got Ok({v:?})"),
     }
 }
 

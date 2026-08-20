@@ -671,7 +671,7 @@ the same way, routed through `with_sandbox_exe`.
 
 `examples/sandbox.nir` demonstrates the accepted program (spawn an
 infinite-loop background task, `stop` it, observe the killed exit code
-`-1`); `tests/sandbox.rs` (10 tests) covers a deterministic spawn+stop
+`-1`); `tests/sandbox.rs` (11 tests) covers a deterministic spawn+stop
 round trip (an infinite-loop worker removes the "did it race" question
 entirely), passing real scalar arguments across the process boundary
 (verified by the sandboxed child actually printing them — real output,
@@ -693,13 +693,53 @@ sandboxed process's *graceful* exit code without the caller separately
 burning wall-clock time first, the same "no timing primitive exists"
 gap `chan`'s `recv` doesn't have this problem with since it's woken by
 an event, not polled); `codegen.rs` doesn't support any of it
-(interpreter-only, like every other concurrency primitive so far); the
-`SandboxSpawnFailed` error path (temp-file-write or process-spawn
-failure) is wired but not independently tested — hard to trigger
-deterministically without an environment-fragile setup (e.g. an
-unwritable temp dir), so it's exercised by code review and the type of
-the error path existing, not by a dedicated test, and that gap is
-recorded here rather than left silent.
+(interpreter-only, like every other concurrency primitive so far).
+
+**Verification pass, same milestone:** the Thirteenth update's own
+claims were checked by an independent review (a fresh agent, not this
+session's own author, deliberately — the same "verify, don't trust the
+summary" discipline the whole project follows) against `SANDBOXING.md`
+and the actual code/tests. Confirmed correct: the error-family, no-
+effect-marker, and signature-based-not-call-site-based typeck decisions
+all hold literally; deterministic teardown holds even across an
+unrelated runtime error (division-by-zero after spawning); no third
+uncovered `current_exe()` call site exists (`main.rs`'s own worker mode
+correctly doesn't need the override — it only ever runs *as* the
+already-correct binary); nested sandboxing (a sandboxed process itself
+spawning a sandbox) and multiple independent sandboxes in one program
+both work. Two real findings, both fixed in the same commit as this
+paragraph:
+
+- The "wrong binary" bug (above) had a **third**, unfixed instance:
+  `tests/sandbox.rs`'s `example_sandbox_runs_to_completion` still called
+  the plain `run(src)` entry point with no `with_sandbox_exe` override,
+  so it silently raced the same bug — its assertion (`Ok(Value::Unit)`)
+  never actually checked what the sandboxed child ran, so a fast-failing
+  wrong-binary child was indistinguishable from a correctly-killed real
+  one. The commit message's "both fixed" was true of the two bugs found
+  *at the time*, not a closed set — fixed now by routing this test
+  through the same `with_sandbox_exe` override as every other runtime
+  test in the file.
+- The `SandboxSpawnFailed` path's "hard to trigger deterministically
+  without an environment-fragile setup" claim was wrong, not just
+  untested: `with_sandbox_exe` (already built, for the bug above)
+  trivially triggers it by pointing the re-exec at a path that flatly
+  doesn't exist — no unwritable-temp-dir setup needed. A dedicated test
+  now exists for it.
+
+Also newly documented, not a bug: a `sandbox worker()` expression whose
+result is never bound to anything (a bare statement, or immediately
+discarded) gets killed almost immediately — the returned `Value::Sandbox`
+is a Rust temporary, dropped at the end of the statement, and `Drop`
+firing that fast rarely gives the spawned function time to do anything
+first. This is the affine-teardown machinery working exactly as
+designed, not a defect, but it's a sharp edge worth a user actually
+hitting it once, not discovering by surprise.
+
+`GRAMMAR.md` (rows 6-7's independent LL(1) claim) is now also updated
+for `sandbox`/`stop`'s real grammar productions — a gap the same
+verification pass flagged (it had been updated for `thread`/`chan`/
+`spawn`/`join`/`send`/`recv` already, but not for this update).
 
 ---
 
@@ -747,7 +787,7 @@ compiler/
     codegen.rs       15 tests — real compiled binaries, run and compared to the interpreter
     concurrency.rs   9 tests — spawn/join round trips, race-freedom, panic/double-join backstops
     channels.rs      10 tests — send/recv round trips, FIFO order, payload race-freedom
-    sandbox.rs       10 tests — real process spawn/stop, zombie-prevention-on-drop, static rejections
+    sandbox.rs       11 tests — real process spawn/stop, zombie-prevention-on-drop, spawn-failure, static rejections
 ```
 
 ```
@@ -756,7 +796,7 @@ $ cd compiler && cargo run --quiet -- examples/factorial.nir
 $ cargo run --quiet -- build examples/factorial.nir -o /tmp/factorial && /tmp/factorial
 3628800
 $ cargo test
-test result: ok. 118 passed; 0 failed
+test result: ok. 119 passed; 0 failed
 ```
 
 ## Row by row, against goal.md §1

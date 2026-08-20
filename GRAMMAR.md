@@ -4,14 +4,17 @@ Scope: the "Core language" slice from `goal.md` §3/§6, plus Phase 1's first
 increment — `box`/`*` and the ownership discipline they make meaningful
 (`compiler/src/ownership.rs`) — plus a first slice of concurrency (rows
 2–3): `spawn`/`join`/`thread T` (real OS threads; see `PHASE0.md`'s
-"Eleventh update") and `chan`/`send`/`recv` (see its "Twelfth update").
-Still no effects or refinement types; those remain later-phase additions
-layered on top of this grammar without changing it, which was the point
-of getting the grammar's shape right early (§6 Phase 0 note: retrofitting
-parseability later is expensive). Note that `spawn`/`join`/`thread`/
-`chan`/`send`/`recv` are, so far, interpreter-only — `codegen.rs` rejects
-them explicitly, the same "reject, don't mis-compile" treatment `box`/`&`
-got before their own codegen support existed.
+"Eleventh update") and `chan`/`send`/`recv` (see its "Twelfth update") —
+plus a first slice of `SANDBOXING.md`'s sandboxing extension: `sandbox`/
+`stop` (an affine handle around a real, separate OS process; see
+`PHASE0.md`'s "Thirteenth update"). Still no effects or refinement types;
+those remain later-phase additions layered on top of this grammar without
+changing it, which was the point of getting the grammar's shape right
+early (§6 Phase 0 note: retrofitting parseability later is expensive).
+Note that `spawn`/`join`/`thread`/`chan`/`send`/`recv`/`sandbox`/`stop`
+are, so far, interpreter-only — `codegen.rs` rejects them explicitly, the
+same "reject, don't mis-compile" treatment `box`/`&` got before their own
+codegen support existed.
 
 ## Row 7 claim, stated precisely
 
@@ -113,10 +116,18 @@ param       ::= ident ":" type
 // owner, `join` consumes it); `chan T` is **not** — see `Ty::Channel`'s
 // doc comment in `ast.rs` for why a channel handle needs to stay freely
 // copyable while its *payload* still moves through `send`.
+// `sandbox`, unlike every other type-former above, is a **plain, bare**
+// type name — not a prefix wrapping another `type`. It has no `T` to
+// parameterize: this first slice (SANDBOXING.md's "layer 1") has no
+// typed result channel at all, only an affine handle and an OS exit
+// code. Spelled `"sandbox"` in both type position (here) and expression
+// position (see `unary` below, where it's likewise nullary) the same way
+// `chan` is dual-use, just without `chan`'s own type parameter.
 type        ::= "&" type
               | "box" type
               | "thread" type
               | "chan" type
+              | "sandbox"
               | "i8" | "i16" | "i32" | "i64"
               | "u8" | "u16" | "u32" | "u64" | "usize"
               | "bool" | "unit"
@@ -222,12 +233,20 @@ multiplicative ::= unary (("*" | "/") unary)*
 // shape at all — `send` needs *two* operands (the channel, the payload),
 // so both use an explicit, fixed-arity `"(" ... ")"` form instead, closer
 // in shape to `call` below than to `spawn`/`join`.
+// `sandbox`'s operand restriction is identical to `spawn`'s (`Expr::Call`
+// only, same "parse then validate" technique) — `sandbox worker(x)`
+// launches a *named function* as a real OS process, not an arbitrary
+// expression. `stop`'s operand is an unrestricted `unary`, exactly like
+// `join` — both consume a handle-typed expression and don't care how
+// it was produced (an `Ident`, a nested `stop`/`join`, etc.).
 unary       ::= ("!" | "-" | "*" | "box" | "&") unary
               | "spawn" call
               | "join" unary
               | "chan"
               | "send" "(" expr "," expr ")"
               | "recv" "(" expr ")"
+              | "sandbox" call
+              | "stop" unary
               | call
 
 // Exactly zero or one call, not "zero or more" — `f()()` is a **parse
