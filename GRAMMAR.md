@@ -7,13 +7,18 @@ increment — `box`/`*` and the ownership discipline they make meaningful
 "Eleventh update") and `chan`/`send`/`recv` (see its "Twelfth update") —
 plus a first slice of `SANDBOXING.md`'s sandboxing extension: `sandbox`/
 `stop` (an affine handle around a real, separate OS process; see
-`PHASE0.md`'s "Thirteenth update"). Still no effects or refinement types;
-those remain later-phase additions layered on top of this grammar without
-changing it, which was the point of getting the grammar's shape right
-early (§6 Phase 0 note: retrofitting parseability later is expensive).
-Note that `spawn`/`join`/`thread`/`chan`/`send`/`recv`/`sandbox`/`stop`
-are, so far, interpreter-only — `codegen.rs` rejects them explicitly, the
-same "reject, don't mis-compile" treatment `box`/`&` got before their own
+`PHASE0.md`'s "Thirteenth update"), `chan` wired to a real cross-process
+transport for sandboxed processes ("Fourteenth update"), and `str`/`tcp`/
+`connect` (a real TCP client — the prerequisite for orchestrating an
+*arbitrary* containerized workload, not just another Nirdosha process;
+see `PHASE0.md`'s "Fifteenth update"). Still no effects or refinement
+types; those remain later-phase additions layered on top of this grammar
+without changing it, which was the point of getting the grammar's shape
+right early (§6 Phase 0 note: retrofitting parseability later is
+expensive). Note that `spawn`/`join`/`thread`/`chan`/`send`/`recv`/
+`sandbox`/`stop`/`connect` are, so far, interpreter-only (`str`/`tcp`
+included) — `codegen.rs` rejects them explicitly, the same "reject, don't
+mis-compile" treatment `box`/`&` got before their own
 codegen support existed.
 
 ## Row 7 claim, stated precisely
@@ -123,6 +128,12 @@ param       ::= ident ":" type
 // code. Spelled `"sandbox"` in both type position (here) and expression
 // position (see `unary` below, where it's likewise nullary) the same way
 // `chan` is dual-use, just without `chan`'s own type parameter.
+// `str`/`tcp` (SANDBOXING.md layer 2's prerequisites) fit the plain
+// `TypeName` alternative below, not a dedicated production — neither
+// takes a type parameter, and unlike `sandbox`, `str` never needs to
+// appear in *expression* position at all (`connect`, not a bare `tcp`
+// keyword, is what produces a `tcp` value — see `unary` below), so it
+// didn't need `sandbox`'s dual-use token treatment either.
 type        ::= "&" type
               | "box" type
               | "thread" type
@@ -130,7 +141,7 @@ type        ::= "&" type
               | "sandbox"
               | "i8" | "i16" | "i32" | "i64"
               | "u8" | "u16" | "u32" | "u64" | "usize"
-              | "bool" | "unit"
+              | "bool" | "unit" | "str" | "tcp"
 
 // A block's *value* (relevant wherever a block sits in an expression
 // position — an `if`'s branches, most concretely) is its last
@@ -237,8 +248,16 @@ multiplicative ::= unary (("*" | "/") unary)*
 // only, same "parse then validate" technique) — `sandbox worker(x)`
 // launches a *named function* as a real OS process, not an arbitrary
 // expression. `stop`'s operand is an unrestricted `unary`, exactly like
-// `join` — both consume a handle-typed expression and don't care how
-// it was produced (an `Ident`, a nested `stop`/`join`, etc.).
+// `join` — both consume a handle-typed expression (a `sandbox` *or* a
+// `tcp` connection — `stop` was reused rather than inventing a second
+// word that would mean the same "one-time consuming close" thing) and
+// don't care how it was produced (an `Ident`, a nested `stop`/`join`,
+// etc.). `send`/`recv` are likewise reused for `tcp`, not given their
+// own second production — same fixed two-/one-operand shape either way,
+// dispatched on the first operand's type, not the grammar. `connect`
+// fits the same fixed-arity `"(" ... ")"` shape `send` already
+// established, just under its own keyword (it's not consuming an
+// existing handle the way `send`/`recv`/`stop` are — it *produces* one).
 unary       ::= ("!" | "-" | "*" | "box" | "&") unary
               | "spawn" call
               | "join" unary
@@ -247,6 +266,7 @@ unary       ::= ("!" | "-" | "*" | "box" | "&") unary
               | "recv" "(" expr ")"
               | "sandbox" call
               | "stop" unary
+              | "connect" "(" expr "," expr ")"
               | call
 
 // Exactly zero or one call, not "zero or more" — `f()()` is a **parse
@@ -270,7 +290,14 @@ args        ::= expr ("," expr)*
 // parenthesized group) is not a valid `primary`, and isn't a way to
 // spell a `unit` *value* either; see the omissions list for what that
 // means for `unit`.
-primary     ::= int_lit | "true" | "false" | ident | "(" expr ")"
+primary     ::= int_lit | str_lit | "true" | "false" | ident | "(" expr ")"
+
+// `"` ... `"`, with a deliberately small escape set (`\"`, `\\`, `\n`,
+// `\t`, `\r` — nothing else, no `\u{...}`/`\x..`/`\0`; see `token.rs`'s
+// lexer). No concatenation exists at the expression-grammar level either
+// — a `str` value only ever comes from a literal, a `let`/parameter
+// binding, or `recv` on a `tcp` connection.
+str_lit     ::= '"' (any_char | escape)* '"'
 
 // Decimal digits only — no `0x`/`0b` prefixes, no `_` digit-group
 // separators (`1_000`). Not needed for Phase 0's examples; listed in

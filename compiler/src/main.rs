@@ -57,7 +57,11 @@ fn cmd_interpret(path: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Value::Unit) => ExitCode::SUCCESS,
-        Ok(v @ (Value::Boxed(_) | Value::Ref(_) | Value::Thread(_) | Value::Channel(_) | Value::Sandbox(_))) => {
+        Ok(Value::Str(s)) => {
+            println!("=> {s:?}");
+            ExitCode::SUCCESS
+        }
+        Ok(v @ (Value::Boxed(_) | Value::Ref(_) | Value::Thread(_) | Value::Channel(_) | Value::Sandbox(_) | Value::Tcp(_))) => {
             println!("=> {v:?}");
             ExitCode::SUCCESS
         }

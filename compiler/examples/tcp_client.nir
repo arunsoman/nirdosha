@@ -1,0 +1,22 @@
+// Exercises: `tcp`, `connect`, `send`/`recv` (reused from `chan`), `stop`
+// (reused from `sandbox`). A raw TCP client -- connects to *any* service
+// speaking a text protocol, not just another Nirdosha process. This is
+// the actual mechanism behind "orchestrate an arbitrary containerized
+// workload": Nirdosha doesn't need to speak the target's language or run
+// its interpreter inside the container -- it just needs a socket.
+//
+// Needs something listening on 127.0.0.1:8000 first, e.g.:
+//   python3 -m http.server 8000
+//
+// `recv` is one read syscall, not a loop until a full response arrives
+// (see `read_tcp`'s doc comment in interpreter.rs) -- for a small enough
+// response this is the whole reply in one call; a larger or chunked one
+// would need a read loop and string concatenation, neither of which
+// exists yet.
+fn main() {
+    let conn: tcp = connect("127.0.0.1", 8000)
+    send(conn, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    let response: str = recv(conn)
+    stop conn
+    print(response)
+}

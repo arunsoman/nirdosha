@@ -104,6 +104,14 @@ fn llvm_ty(ty: &Ty) -> Result<&'static str, CodegenError> {
         Ty::Sandbox => unsupported(
             "codegen doesn't support `sandbox` yet — sandbox/stop are interpreter-only for now",
         ),
+        Ty::Str => unsupported(
+            "codegen doesn't support `str` yet — no runtime string representation exists in \
+             generated native code",
+        ),
+        Ty::Tcp => unsupported(
+            "codegen doesn't support `tcp` yet — connect/send/recv/stop are interpreter-only \
+             for now",
+        ),
         Ty::Error => unreachable!("a program with a type error is never handed to codegen"),
     }
 }
@@ -191,6 +199,9 @@ fn check_expr(e: &Expr) -> Result<(), CodegenError> {
         }
         Expr::SpawnSandbox(_, _, _) | Expr::StopSandbox(_, _) => {
             unsupported("codegen doesn't support `sandbox`/`stop` yet — interpreter-only for now")
+        }
+        Expr::Str(_, _) | Expr::Connect(_, _, _) => {
+            unsupported("codegen doesn't support `str`/`connect` yet — interpreter-only for now")
         }
     }
 }
@@ -578,7 +589,9 @@ impl Codegen<'_> {
             | Expr::Send(_, _, _)
             | Expr::Recv(_, _)
             | Expr::SpawnSandbox(_, _, _)
-            | Expr::StopSandbox(_, _) => {
+            | Expr::StopSandbox(_, _)
+            | Expr::Str(_, _)
+            | Expr::Connect(_, _, _) => {
                 unreachable!("check_supported already rejected this program")
             }
         }

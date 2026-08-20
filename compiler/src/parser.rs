@@ -443,6 +443,15 @@ impl Parser {
                 self.bump();
                 Ok(Expr::StopSandbox(Box::new(self.parse_unary()?), span))
             }
+            Tok::Connect => {
+                self.bump();
+                self.expect(&Tok::LParen, "`(`")?;
+                let host = self.parse_expr()?;
+                self.expect(&Tok::Comma, "`,`")?;
+                let port = self.parse_expr()?;
+                self.expect(&Tok::RParen, "`)`")?;
+                Ok(Expr::Connect(Box::new(host), Box::new(port), span))
+            }
             _ => self.parse_call(),
         }
     }
@@ -486,6 +495,10 @@ impl Parser {
             Tok::Int(n) => {
                 self.bump();
                 Ok(Expr::Int(n, span))
+            }
+            Tok::Str(s) => {
+                self.bump();
+                Ok(Expr::Str(s, span))
             }
             Tok::True => {
                 self.bump();

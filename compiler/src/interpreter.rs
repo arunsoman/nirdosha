@@ -105,6 +105,21 @@ pub enum Value {
     /// `SandboxChild`'s `Drop` impl — which is the actual "deterministic
     /// teardown" guarantee SANDBOXING.md's layer 1 promises.
     Sandbox(Arc<Mutex<Option<SandboxChild>>>),
+    /// UTF-8 text (`Ty::Str`). `Arc<str>`, not `String`: not affine (see
+    /// `Ty::Str`'s doc comment), so every `Env` read clones it — an `Arc`
+    /// clone is a refcount bump, a `String` clone would copy the bytes
+    /// every single time a string-typed binding is merely read. Same
+    /// reasoning as `Value::Channel`'s `Arc`, just for content instead of
+    /// shared state.
+    Str(Arc<str>),
+    /// A handle to a real TCP connection (`connect(host, port)` — see
+    /// `Ty::Tcp`'s doc comment). `Mutex<Option<..>>`, same shape and
+    /// reason as `Value::Sandbox`: `stop` needs to `.take()` the stream
+    /// out exactly once. Unlike `SandboxChild`, no custom `Drop` is
+    /// needed here — a `TcpStream` closes its own socket on drop with no
+    /// help required (there's no analog to a leaked OS *process* to
+    /// guard against; a dropped socket is just... closed).
+    Tcp(Arc<Mutex<Option<std::net::TcpStream>>>),
 }
 
 /// A spawned computation's raw join handle. Its own alias, not just inline
@@ -327,6 +342,36 @@ fn read_value(stream: &mut std::os::unix::net::UnixStream) -> std::io::Result<Va
     })
 }
 
+/// `tcp`'s wire format: raw UTF-8 bytes, no tag/framing at all — unlike
+/// `write_value`/`read_value`, the peer here is never assumed to be
+/// another Nirdosha interpreter that agrees on a wire protocol (that's
+/// the whole reason `tcp` exists: to talk to *anything*, an arbitrary
+/// service speaking its own protocol, e.g. HTTP text over the wire).
+fn write_tcp(stream: &mut std::net::TcpStream, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    stream.write_all(text.as_bytes())
+}
+
+/// One read syscall, not a loop until some message boundary — there is
+/// no message boundary to look for in an arbitrary external protocol.
+/// This returns whatever bytes are available right now (up to 64KiB),
+/// which is exactly "one chunk," not "one complete response": a reply
+/// larger than one read (or one that arrives in several TCP segments) is
+/// genuinely not fully reassembled by a single `recv` call. Honest,
+/// deliberate first-cut scope (no string concatenation exists yet to
+/// stitch multiple chunks together either) — not a bug to silently paper
+/// over, see SANDBOXING.md.
+fn read_tcp(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut buf = [0u8; 65536];
+    let n = stream.read(&mut buf)?;
+    if n == 0 {
+        return Err(std::io::Error::other("the tcp connection was closed by the peer"));
+    }
+    String::from_utf8(buf[..n].to_vec())
+        .map_err(|_| std::io::Error::other("tcp connection received bytes that were not valid UTF-8"))
+}
+
 /// A sandboxed process, plus the temp file its source was written to
 /// (removed once the process is known to have exited — not before, since
 /// the child re-reads that file at its own startup and deleting it out
@@ -402,6 +447,8 @@ impl PartialEq for Value {
             (Value::Thread(a), Value::Thread(b)) => Arc::ptr_eq(a, b),
             (Value::Channel(a), Value::Channel(b)) => Arc::ptr_eq(a, b),
             (Value::Sandbox(a), Value::Sandbox(b)) => Arc::ptr_eq(a, b),
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Tcp(a), Value::Tcp(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -418,6 +465,8 @@ impl Value {
             Value::Thread(_) => "thread",
             Value::Channel(_) => "chan",
             Value::Sandbox(_) => "sandbox",
+            Value::Str(_) => "str",
+            Value::Tcp(_) => "tcp",
         }
     }
 
@@ -431,6 +480,8 @@ impl Value {
             Value::Thread(_) => "thread(..)".to_string(),
             Value::Channel(_) => "chan(..)".to_string(),
             Value::Sandbox(_) => "sandbox(..)".to_string(),
+            Value::Str(s) => s.to_string(),
+            Value::Tcp(_) => "tcp(..)".to_string(),
         }
     }
 }
@@ -472,7 +523,10 @@ pub enum ErrorKind {
     /// the pipe broke, or (see `ChannelInner::prepare_for_sandbox`) the
     /// channel was already queued-up or already handed to another
     /// sandbox. Never reachable for the in-process transport, which
-    /// can't fail this way at all.
+    /// can't fail this way at all. Also reused for `connect`/`send`/
+    /// `recv` on a `tcp` connection — a raw TCP socket is just another
+    /// real-world I/O transport, the same failure category, not a
+    /// separate one.
     ChannelIoError { message: String },
 }
 
@@ -515,7 +569,7 @@ impl std::fmt::Display for RuntimeError {
                 write!(f, "{line}:{col}: this sandbox was already stopped")
             }
             ErrorKind::ChannelIoError { message } => {
-                write!(f, "{line}:{col}: sandbox channel I/O error: {message}")
+                write!(f, "{line}:{col}: channel I/O error: {message}")
             }
         }
     }
@@ -714,6 +768,8 @@ impl Interpreter {
             // inner value sitting here to recurse into.
             (Value::Channel(_), Ty::Channel(_)) => Ok(()),
             (Value::Sandbox(_), Ty::Sandbox) => Ok(()),
+            (Value::Str(_), Ty::Str) => Ok(()),
+            (Value::Tcp(_), Ty::Tcp) => Ok(()),
             (Value::Int(n), _) if ty.is_integer() => {
                 if ty.in_range(*n) {
                     Ok(())
@@ -922,6 +978,7 @@ impl Interpreter {
                 }
             }
             Expr::Chan(_) => Ok(Value::Channel(Arc::new(ChannelInner::new()))),
+            Expr::Str(s, _) => Ok(Value::Str(Arc::from(s.as_str()))),
             Expr::Send(chan_expr, value_expr, span) => {
                 let c = self.eval_expr(chan_expr, env)?;
                 let v = self.eval_expr(value_expr, env)?;
@@ -937,6 +994,27 @@ impl Interpreter {
                             span: *span,
                         })),
                     },
+                    Value::Tcp(slot) => {
+                        let Value::Str(text) = v else {
+                            unreachable!("typeck.rs already restricted tcp send payloads to str")
+                        };
+                        let mut guard = slot.lock().unwrap();
+                        match guard.as_mut() {
+                            None => Err(Signal::Err(RuntimeError {
+                                kind: ErrorKind::ChannelIoError {
+                                    message: "this tcp connection was already stopped".to_string(),
+                                },
+                                span: *span,
+                            })),
+                            Some(stream) => match write_tcp(stream, &text) {
+                                Ok(()) => Ok(Value::Unit),
+                                Err(e) => Err(Signal::Err(RuntimeError {
+                                    kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                                    span: *span,
+                                })),
+                            },
+                        }
+                    }
                     other => Err(mismatch("chan", other.ty_name(), *span)),
                 }
             }
@@ -954,7 +1032,52 @@ impl Interpreter {
                             span: *span,
                         })),
                     },
+                    Value::Tcp(slot) => {
+                        let mut guard = slot.lock().unwrap();
+                        match guard.as_mut() {
+                            None => Err(Signal::Err(RuntimeError {
+                                kind: ErrorKind::ChannelIoError {
+                                    message: "this tcp connection was already stopped".to_string(),
+                                },
+                                span: *span,
+                            })),
+                            Some(stream) => match read_tcp(stream) {
+                                Ok(s) => Ok(Value::Str(Arc::from(s.as_str()))),
+                                Err(e) => Err(Signal::Err(RuntimeError {
+                                    kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                                    span: *span,
+                                })),
+                            },
+                        }
+                    }
                     other => Err(mismatch("chan", other.ty_name(), *span)),
+                }
+            }
+            Expr::Connect(host_expr, port_expr, span) => {
+                let host = match self.eval_expr(host_expr, env)? {
+                    Value::Str(s) => s,
+                    v => return Err(mismatch("str", v.ty_name(), *span)),
+                };
+                let port = match self.eval_expr(port_expr, env)? {
+                    Value::Int(n) => match u16::try_from(n) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            return Err(Signal::Err(RuntimeError {
+                                kind: ErrorKind::ChannelIoError {
+                                    message: format!("port {n} is not a valid 0-65535 TCP port"),
+                                },
+                                span: *span,
+                            }));
+                        }
+                    },
+                    v => return Err(mismatch("i64", v.ty_name(), *span)),
+                };
+                match std::net::TcpStream::connect((host.as_ref(), port)) {
+                    Ok(stream) => Ok(Value::Tcp(Arc::new(Mutex::new(Some(stream))))),
+                    Err(e) => Err(Signal::Err(RuntimeError {
+                        kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                        span: *span,
+                    })),
                 }
             }
             Expr::SpawnSandbox(name, arg_exprs, span) => {
@@ -976,6 +1099,18 @@ impl Interpreter {
                             })),
                             Some(mut child) => Ok(Value::Int(child.stop())),
                         }
+                    }
+                    // Closing a `tcp` connection is just dropping the
+                    // `TcpStream` -- no kill-on-drop machinery needed the
+                    // way `SandboxChild` needs (see `Value::Tcp`'s doc
+                    // comment), so `.take()` alone is the whole
+                    // implementation. A double-`stop` is `Unit`, not an
+                    // error -- closing an already-closed connection isn't
+                    // the same hazard a double-kill/double-join is, so
+                    // there's nothing to guard against here.
+                    Value::Tcp(slot) => {
+                        drop(slot.lock().unwrap().take());
+                        Ok(Value::Unit)
                     }
                     other => Err(mismatch("sandbox", other.ty_name(), *span)),
                 }
@@ -1123,6 +1258,20 @@ impl Interpreter {
                 BinOp::NotEq => Ok(Value::Bool(a != b)),
                 _ => err(
                     ErrorKind::TypeMismatch { expected: "int".to_string(), found: "bool".to_string() },
+                    span,
+                ),
+            },
+            // `typeck.rs`'s `unify_operands` already permits `str == str`
+            // generically (same-type `Eq`/`NotEq` is allowed for *any*
+            // pair of matching types, not just `Int`/`Bool`) -- this was
+            // a real gap between that promise and what the interpreter
+            // actually implemented, caught by testing the equality this
+            // typechecks, not by re-reading either file.
+            (Value::Str(a), Value::Str(b)) => match op {
+                BinOp::Eq => Ok(Value::Bool(a == b)),
+                BinOp::NotEq => Ok(Value::Bool(a != b)),
+                _ => err(
+                    ErrorKind::TypeMismatch { expected: "int".to_string(), found: "str".to_string() },
                     span,
                 ),
             },

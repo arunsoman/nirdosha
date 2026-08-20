@@ -367,7 +367,12 @@ impl Refiner {
                 self.expr(inner, scopes);
                 Interval::unknown()
             }
-            Expr::Bool(_, _) => Interval::unknown(),
+            Expr::Connect(host, port, _) => {
+                self.expr(host, scopes);
+                self.expr(port, scopes);
+                Interval::unknown()
+            }
+            Expr::Bool(_, _) | Expr::Str(_, _) => Interval::unknown(),
         }
     }
 
@@ -442,7 +447,7 @@ fn assigned_names(stmts: &[Stmt]) -> HashSet<String> {
     }
     fn walk_expr(e: &Expr, names: &mut HashSet<String>) {
         match e {
-            Expr::Int(_, _) | Expr::Bool(_, _) | Expr::Ident(_, _) | Expr::Chan(_) => {}
+            Expr::Int(_, _) | Expr::Bool(_, _) | Expr::Str(_, _) | Expr::Ident(_, _) | Expr::Chan(_) => {}
             Expr::Unary(_, inner, _)
             | Expr::Box(inner, _)
             | Expr::Deref(inner, _)
@@ -459,7 +464,7 @@ fn assigned_names(stmts: &[Stmt]) -> HashSet<String> {
                     walk_expr(a, names);
                 }
             }
-            Expr::Send(chan, value, _) => {
+            Expr::Send(chan, value, _) | Expr::Connect(chan, value, _) => {
                 walk_expr(chan, names);
                 walk_expr(value, names);
             }

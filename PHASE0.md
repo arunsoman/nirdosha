@@ -814,6 +814,106 @@ pass, stable across repeated runs; `cargo clippy --all-targets` is clean.
 No grammar changes this update (nothing new to add to `GRAMMAR.md` —
 `chan`/`sandbox` were already there).
 
+**Fifteenth update:** `str`/`tcp`/`connect` — real string literals and a
+raw TCP client. Not one of SANDBOXING.md's original six layers; a
+prerequisite the user asked for directly, once it became clear what
+"orchestrate any containerized workload" actually needs. Everything
+built through the Fourteenth update always spawned *another copy of the
+`nirdosha` binary itself* — that's why no string was ever needed (a
+sandboxed function is named directly in source, and both sides already
+agree on `chan`'s tag-byte wire protocol because they're the same
+interpreter). Talking to an arbitrary pre-existing service — a real
+Spring Boot app, or anything else, was the concrete example — hits two
+walls that had no workaround: no way to *name* the thing at all (no
+string type existed), and no way to speak *its* protocol (only the
+private tag-byte format `chan` uses between two Nirdosha processes).
+This update closes both, narrowly.
+
+*`str`.* A UTF-8 literal (`"..."`, a small escape set — `\"` `\\` `\n`
+`\t` `\r`, nothing else), `Ty::Str`, `Value::Str(Arc<str>)` (not affine,
+same "cheap to clone, not exclusive" treatment `Ty::Channel` already
+gets, for the same reason: a string is meant to be read freely). No
+concatenation, no indexing, no slicing — deliberately just enough to
+name a host or a message.
+
+*`tcp`/`connect`.* `connect(host, port)` opens a real
+`std::net::TcpStream` and returns an affine `Ty::Tcp` handle. Rather
+than invent three more keywords, this reuses `send`/`recv` (now
+dispatching on the handle's type — `Ty::Channel` or `Ty::Tcp` — not a
+separate production) and `stop` (now closing a `tcp` connection the same
+"one-time consuming operation" way it stops a `sandbox`, returning
+`unit` instead of an exit code). The wire format is deliberately *not*
+`chan`'s tag-byte scheme: raw bytes in, raw bytes out, because the peer
+here is never assumed to be another Nirdosha interpreter — that's the
+whole point. `recv` is one `read()` syscall, not a loop until some
+message boundary (there is no boundary to look for in an arbitrary
+external protocol) — an honest "one chunk," not "one complete response,"
+scope limit, stated plainly in `read_tcp`'s doc comment, not glossed
+over.
+
+*A real bug found immediately by using it, not by review.* The first
+manual test — a raw HTTP GET against `nirdosha`'s own already-running
+Neo4j Docker container on this machine, `GET / HTTP/1.1` over `connect`
+— failed at the lexer: the minimal escape set didn't include `\r`, and
+HTTP genuinely needs `\r\n` line endings, not a hypothetical. Fixed
+before the feature was called done, not after.
+
+*Two more real bugs, in typeck.rs, found by testing equality/ordering on
+`str` specifically but not specific to `str` at all.* `unify_operands`
+already permitted `a == b` generically for any two same-typed operands —
+but the interpreter had never actually implemented `Eq`/`NotEq` for
+anything except `Int` and `Bool`, so `"a" == "b"` typechecked and then
+failed at *runtime* with a confusing "expected str, found str"
+(`eval_binary`'s fallthrough, which doesn't render the actual values).
+Fixed by adding the missing `Value::Str` arm. Second, worse gap in the
+same area: `Lt`/`Gt`/`LtEq`/`GtEq` and `Add`/`Sub`/`Mul`/`Div` only ever
+checked `t == Ty::Bool` before rejecting — the only non-numeric type that
+existed when that code was written. `"a" < "b"` and `"a" + "b"` both
+typechecked cleanly and only failed at runtime, the exact "should have
+been a compile error" gap this project's whole discipline exists to
+catch. Fixed generically (`!t.is_integer()`, not `t == Ty::Bool`) rather
+than special-cased for `str` — the fix now also correctly rejects
+`unit < unit`, `sandbox + sandbox`, and every other non-numeric type
+uniformly, not just the one this update happened to expose.
+
+*Docker exists, but only as a live demo target, not a dependency.*
+`examples/tcp_client.nir` needs an external service listening on
+`127.0.0.1:8000` (documented in the file — `python3 -m http.server 8000`
+is enough) — deliberately not baked into the automated test suite, which
+must stay green with nothing more than this repo and the Rust toolchain.
+`tests/tcp.rs`'s real coverage spins up its own `TcpListener` inside the
+test process itself, the same self-contained discipline every other test
+file here already follows. The live proof this actually reaches an
+unrelated, real containerized service happened by hand, against Neo4j's
+HTTP API already running in a Docker container on this machine (not
+Nirdosha's own, not built by Nirdosha, not aware Nirdosha exists) — real
+JSON back, including its real version string. That's the concrete shape
+of "orchestrate any tech stack" this whole effort has been aiming at
+since `SANDBOXING.md`'s first paragraph; `str`/`tcp`/`connect` are what
+finally make it possible to point at something and mean it.
+
+`examples/strings.nir` and `examples/tcp_client.nir` demonstrate the
+accepted programs; `tests/strings.rs` (10 tests) covers literals,
+escapes, an unknown-escape lex error, an unterminated-string lex error,
+function parameter/return passing, equality (pinning the fix above), and
+both now-static rejections (ordering, arithmetic); `tests/tcp.rs` (6
+tests) covers a real send/recv round trip against a self-hosted server,
+a connection-refused error, and four static rejections (`connect`'s
+argument types, `send`'s payload type, double-`stop`). 146/146 tests
+pass, stable across repeated full-suite runs; `cargo clippy --all-targets`
+is clean. `GRAMMAR.md` updated for real new syntax this time (`str_lit`,
+`str`/`tcp` in `type`, `connect` in `unary`) — unlike the Fourteenth
+update, which added no new syntax at all.
+
+*What this still doesn't reach.* Sandboxed functions still can't take
+`str`/`tcp` parameters (`is_sandbox_safe` wasn't widened — that's the
+next real step: an actual "launch a pre-existing image by name" `sandbox`
+variant, using these primitives, not yet built). No response
+reassembly (no read loop, no string concatenation) for a reply larger
+than one TCP read. No TLS — `connect` is plaintext-only, so an `https://`
+target isn't reachable at all yet, only bare HTTP or any other
+plaintext-TCP protocol.
+
 ---
 
 
@@ -835,7 +935,7 @@ compiler/
     token.rs        lexer — hand-written, single pass, structured LexError, Span: Hash
     ast.rs           AST types; Ty::bounds()/in_range shared by every pass; literal_value()
     parser.rs        recursive-descent, single-token lookahead, no backtracking
-    interpreter.rs   tree-walking evaluator; Value::{Boxed,Ref,Thread,Channel,Sandbox}; dynamic Tier-2 checks
+    interpreter.rs   tree-walking evaluator; Value::{Boxed,Ref,Thread,Channel,Sandbox,Str,Tcp}; dynamic Tier-2 checks
     typeck.rs        static type checker — runs before interpretation
     ownership.rs     static move-checker for box/&/spawn/join/send/recv/sandbox/stop
     refine.rs        interval-analysis Tier-1 prover (the pre-Z3 fallback)
@@ -853,16 +953,20 @@ compiler/
     channels.nir     chan/send/recv
     sandbox.nir      sandbox/stop
     sandbox_channels.nir  sandbox + chan together, real bidirectional IPC
+    strings.nir      str literals, escapes, equality
+    tcp_client.nir   tcp/connect/send/recv against an external service
   tests/
     basic.rs         32 tests — core language + typeck
     ownership.rs     22 tests — box/&/move-checking
     refine.rs        11 tests — interval-analysis proofs (and honest non-proofs)
     smt.rs           9 tests — SMT proofs, incl. the interval-vs-SMT flagship comparison
-    codegen.rs       16 tests — real compiled binaries, run and compared to the interpreter
+    codegen.rs       18 tests — real compiled binaries, run and compared to the interpreter
     concurrency.rs   9 tests — spawn/join round trips, race-freedom, panic/double-join backstops
     channels.rs      10 tests — send/recv round trips, FIFO order, payload race-freedom
     sandbox.rs       11 tests — real process spawn/stop, zombie-prevention-on-drop, spawn-failure, static rejections
     sandbox_channels.rs  8 tests — cross-process round trips, dead-peer errors, scope-limit rejections
+    strings.rs       10 tests — literals, escapes, equality, static ordering/arithmetic rejections
+    tcp.rs           6 tests — self-hosted send/recv round trip, connection errors, static rejections
 ```
 
 ```
@@ -871,7 +975,7 @@ $ cd compiler && cargo run --quiet -- examples/factorial.nir
 $ cargo run --quiet -- build examples/factorial.nir -o /tmp/factorial && /tmp/factorial
 3628800
 $ cargo test
-test result: ok. 128 passed; 0 failed
+test result: ok. 146 passed; 0 failed
 ```
 
 ## Row by row, against goal.md §1

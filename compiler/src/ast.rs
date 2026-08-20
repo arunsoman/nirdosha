@@ -86,6 +86,23 @@ pub enum Ty {
     /// freed by Rust's own `Drop` regardless of whether `ownership.rs`'s
     /// static proof is the thing a reader trusts.
     Sandbox,
+    /// A UTF-8 text value — `str`. Just enough to name things (a Docker
+    /// image, a hostname) that can't be spelled any other way; not a
+    /// general string-processing type yet (no concatenation, no slicing,
+    /// no indexing — see `is_sandbox_safe` and the parser for the exact
+    /// literal grammar). **Not** affine: like `Ty::Channel`, a string
+    /// value is meant to be read freely (`Value::Str` is an `Arc<str>` in
+    /// `interpreter.rs` for exactly this reason — cheap to clone, same
+    /// trick `Value::Channel` already uses).
+    Str,
+    /// A handle to a real TCP connection (`connect(host, port)` — see
+    /// `Expr::Connect`). Affine, for the same reason `Ty::Sandbox` is: a
+    /// connection has exactly one owner, and `stop`ping it (reusing
+    /// `Expr::StopSandbox`'s keyword — see its doc comment) is a one-time
+    /// consuming close. Payloads crossing a `Tcp` connection are `str`
+    /// only, the same "smallest thing that's actually needed" scope
+    /// `chan`'s sandbox-crossing payload restriction already set.
+    Tcp,
     /// Poison type: stands in for an expression that already produced a
     /// type error, so the checker (`typeck.rs`) doesn't cascade a dozen
     /// follow-on diagnostics from one root cause. Never produced by the
@@ -109,6 +126,8 @@ impl Ty {
             "usize" => Ty::Usize,
             "bool" => Ty::Bool,
             "unit" => Ty::Unit,
+            "str" => Ty::Str,
+            "tcp" => Ty::Tcp,
             _ => return None,
         })
     }
@@ -133,6 +152,8 @@ impl Ty {
             Ty::Thread(inner) => format!("thread {}", inner.name()),
             Ty::Channel(inner) => format!("chan {}", inner.name()),
             Ty::Sandbox => "sandbox".to_string(),
+            Ty::Str => "str".to_string(),
+            Ty::Tcp => "tcp".to_string(),
             Ty::Error => "<error>".to_string(),
         }
     }
@@ -148,6 +169,8 @@ impl Ty {
                 | Ty::Thread(_)
                 | Ty::Channel(_)
                 | Ty::Sandbox
+                | Ty::Str
+                | Ty::Tcp
         )
     }
 
@@ -173,7 +196,7 @@ impl Ty {
         // computation at once, so it has to be freely copyable — see its
         // own doc comment for where the actual ownership-transfer happens
         // instead (a channel's *payload*, at `send`, not the handle).
-        matches!(self, Ty::Box(_) | Ty::Thread(_) | Ty::Sandbox)
+        matches!(self, Ty::Box(_) | Ty::Thread(_) | Ty::Sandbox | Ty::Tcp)
     }
 
     /// goal.md row 4's runtime fallback (Tier 2, §4): `interpreter.rs`
@@ -225,6 +248,8 @@ impl Ty {
             | Ty::Thread(_)
             | Ty::Channel(_)
             | Ty::Sandbox
+            | Ty::Str
+            | Ty::Tcp
             | Ty::Error => (i64::MIN, i64::MAX),
         }
     }
@@ -283,6 +308,7 @@ pub enum UnOp {
 #[derive(Debug, Clone)]
 pub enum Expr {
     Int(i64, Span),
+    Str(String, Span),
     Bool(bool, Span),
     Ident(String, Span),
     Unary(UnOp, Box<Expr>, Span),
@@ -355,8 +381,18 @@ pub enum Expr {
     /// `stop expr` — terminates the sandboxed process (killing it if
     /// still running), consumes the handle (affine, single stop like a
     /// single join), and yields its OS exit code as an `i64` (`-1` if it
-    /// was terminated by a signal, including by this same `stop`).
+    /// was terminated by a signal, including by this same `stop`). Also
+    /// the consuming close for a `Ty::Tcp` connection (`Expr::Connect`)
+    /// — same keyword, same affine "own it or don't touch it" shape, so
+    /// it was reused rather than inventing a second word that would mean
+    /// the same thing.
     StopSandbox(Box<Expr>, Span),
+    /// `connect(host, port)` — opens a real TCP connection and returns a
+    /// `Ty::Tcp` handle. `host`/`port` are `str`/`i64` expressions, not
+    /// restricted to identifiers or literals — same "an ordinary
+    /// expression, not a special grammar position" treatment `send`'s
+    /// operands already get.
+    Connect(Box<Expr>, Box<Expr>, Span),
 }
 
 #[derive(Debug, Clone)]
@@ -369,6 +405,7 @@ impl Expr {
     pub fn span(&self) -> Span {
         match self {
             Expr::Int(_, s)
+            | Expr::Str(_, s)
             | Expr::Bool(_, s)
             | Expr::Ident(_, s)
             | Expr::Unary(_, _, s)
@@ -385,7 +422,8 @@ impl Expr {
             | Expr::Send(_, _, s)
             | Expr::Recv(_, s)
             | Expr::SpawnSandbox(_, _, s)
-            | Expr::StopSandbox(_, s) => *s,
+            | Expr::StopSandbox(_, s)
+            | Expr::Connect(_, _, s) => *s,
         }
     }
 }

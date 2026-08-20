@@ -159,7 +159,7 @@ impl std::fmt::Display for TypeError {
             ),
             TypeErrorKind::ExpectedChannelType { found } => write!(
                 f,
-                "{line}:{col}: `send`/`recv` need a `chan` type, found `{}`",
+                "{line}:{col}: `send`/`recv` need a `chan` or `tcp` type, found `{}`",
                 found.name()
             ),
             TypeErrorKind::SandboxFnMustReturnUnit { name } => write!(
@@ -176,7 +176,7 @@ impl std::fmt::Display for TypeError {
             ),
             TypeErrorKind::ExpectedSandboxType { found } => write!(
                 f,
-                "{line}:{col}: `stop` needs a `sandbox` type, found `{}`",
+                "{line}:{col}: `stop` needs a `sandbox` or `tcp` type, found `{}`",
                 found.name()
             ),
             TypeErrorKind::LiteralOutOfRange { ty, value } => write!(
@@ -403,6 +403,7 @@ impl Checker {
     fn infer(&mut self, e: &Expr, expected_ret: &Ty, scopes: &mut Scopes) -> Ty {
         match e {
             Expr::Int(_, _) => Ty::I64, // untyped literal's default when nothing constrains it
+            Expr::Str(_, _) => Ty::Str,
             Expr::Bool(_, _) => Ty::Bool,
             Expr::Ident(name, span) => match scopes.get(name) {
                 Some(t) => t,
@@ -521,6 +522,16 @@ impl Checker {
                         self.check(value, &inner, expected_ret, scopes);
                         Ty::Unit
                     }
+                    // `send`/`recv` double as a `tcp` connection's I/O —
+                    // same keywords, reused rather than duplicated, the
+                    // same way `stop` is. A TCP payload is always `str`
+                    // (see `Ty::Tcp`'s doc comment): there's no per-
+                    // connection payload type to check against the way a
+                    // `chan T`'s `T` gives one.
+                    Ty::Tcp => {
+                        self.check(value, &Ty::Str, expected_ret, scopes);
+                        Ty::Unit
+                    }
                     other => {
                         self.error(TypeErrorKind::ExpectedChannelType { found: other }, *span);
                         self.infer(value, expected_ret, scopes);
@@ -533,6 +544,7 @@ impl Checker {
                 match ct {
                     Ty::Error => Ty::Error,
                     Ty::Channel(inner) => *inner,
+                    Ty::Tcp => Ty::Str,
                     other => {
                         self.error(TypeErrorKind::ExpectedChannelType { found: other }, *span);
                         Ty::Error
@@ -547,11 +559,20 @@ impl Checker {
                 match it {
                     Ty::Error => Ty::Error,
                     Ty::Sandbox => Ty::I64,
+                    // `stop` doubles as a TCP connection's consuming
+                    // close (see `Expr::StopSandbox`'s doc comment) — no
+                    // exit code to report for that case, just `unit`.
+                    Ty::Tcp => Ty::Unit,
                     other => {
                         self.error(TypeErrorKind::ExpectedSandboxType { found: other }, *span);
                         Ty::Error
                     }
                 }
+            }
+            Expr::Connect(host, port, _span) => {
+                self.check(host, &Ty::Str, expected_ret, scopes);
+                self.check(port, &Ty::I64, expected_ret, scopes);
+                Ty::Tcp
             }
         }
     }
@@ -683,17 +704,27 @@ impl Checker {
                 self.unify_operands(lhs, rhs, expected_ret, scopes, span);
                 Ty::Bool
             }
+            // Both arms below used to check `t == Ty::Bool` specifically
+            // -- the only non-numeric type that existed when they were
+            // written. That under-restricted every *other* non-numeric
+            // type (a real, found-by-testing gap: `"a" < "b"` and
+            // `"a" + "b"` both typechecked cleanly and only failed at
+            // *runtime*, with a generic `TypeMismatch`, instead of being
+            // rejected statically the way `true < false` already was).
+            // `!t.is_integer()` is the correct, general condition -- it
+            // covers `Bool` and every other non-numeric type uniformly,
+            // not just the one this project happened to have first.
             BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
                 let t = self.unify_operands(lhs, rhs, expected_ret, scopes, span);
-                if t == Ty::Bool {
-                    self.error(TypeErrorKind::ExpectedNumeric { found: Ty::Bool }, span);
+                if t != Ty::Error && !t.is_integer() {
+                    self.error(TypeErrorKind::ExpectedNumeric { found: t }, span);
                 }
                 Ty::Bool
             }
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
                 let t = self.unify_operands(lhs, rhs, expected_ret, scopes, span);
-                if t == Ty::Bool {
-                    self.error(TypeErrorKind::ExpectedNumeric { found: Ty::Bool }, span);
+                if t != Ty::Error && !t.is_integer() {
+                    self.error(TypeErrorKind::ExpectedNumeric { found: t }, span);
                     return Ty::Error;
                 }
                 t

@@ -15,6 +15,7 @@ pub struct Span {
 pub enum Tok {
     // literals & identifiers
     Int(i64),
+    Str(String),
     True,
     False,
     Ident(String),
@@ -35,7 +36,8 @@ pub enum Tok {
     Recv,
     Sandbox,
     Stop,
-    TypeName(String), // i8/i16/.../usize/bool/unit — validated by the parser
+    Connect,
+    TypeName(String), // i8/i16/.../usize/bool/unit/str — validated by the parser
 
     // symbols
     LParen,
@@ -71,7 +73,7 @@ pub struct Token {
 }
 
 const TYPE_NAMES: &[&str] = &[
-    "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "bool", "unit",
+    "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "bool", "unit", "str", "tcp",
 ];
 
 #[derive(Debug, Clone)]
@@ -150,6 +152,57 @@ impl<'a> Lexer<'a> {
                 Some(c) => c,
             };
 
+            if c == b'"' {
+                self.bump(); // opening quote
+                // Raw bytes, not `char`-by-`char` -- this lexer works over
+                // `&[u8]` throughout (see `src`'s type), and pushing bytes
+                // one at a time as `as char` would silently corrupt any
+                // multi-byte UTF-8 content (each continuation byte would
+                // become its own bogus Latin-1 codepoint). Collecting raw
+                // bytes and validating the whole run as UTF-8 once, at the
+                // end, is the only correct way to do this byte-wise.
+                let mut bytes = Vec::new();
+                loop {
+                    match self.bump() {
+                        None => {
+                            return Err(LexError { message: "unterminated string literal".to_string(), span });
+                        }
+                        Some(b'"') => break,
+                        // Minimal, deliberately small escape set -- just
+                        // enough to write a quote, a backslash, a
+                        // newline/tab/carriage-return (`\r\n` matters for
+                        // real reasons -- e.g. HTTP request lines over
+                        // `tcp` genuinely need it, not a hypothetical);
+                        // not a full escape grammar (no \u{...}, no \x..,
+                        // no \0). Nothing needing those exists yet.
+                        Some(b'\\') => match self.bump() {
+                            Some(b'"') => bytes.push(b'"'),
+                            Some(b'\\') => bytes.push(b'\\'),
+                            Some(b'n') => bytes.push(b'\n'),
+                            Some(b't') => bytes.push(b'\t'),
+                            Some(b'r') => bytes.push(b'\r'),
+                            Some(other) => {
+                                return Err(LexError {
+                                    message: format!("unknown escape `\\{}`", other as char),
+                                    span,
+                                });
+                            }
+                            None => {
+                                return Err(LexError {
+                                    message: "unterminated string literal".to_string(),
+                                    span,
+                                });
+                            }
+                        },
+                        Some(b) => bytes.push(b),
+                    }
+                }
+                let s = String::from_utf8(bytes)
+                    .map_err(|_| LexError { message: "string literal is not valid UTF-8".to_string(), span })?;
+                out.push(Token { tok: Tok::Str(s), span });
+                continue;
+            }
+
             if c.is_ascii_digit() {
                 let start = self.pos;
                 while self.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
@@ -190,6 +243,7 @@ impl<'a> Lexer<'a> {
                     "recv" => Tok::Recv,
                     "sandbox" => Tok::Sandbox,
                     "stop" => Tok::Stop,
+                    "connect" => Tok::Connect,
                     "true" => Tok::True,
                     "false" => Tok::False,
                     t if TYPE_NAMES.contains(&t) => Tok::TypeName(t.to_string()),

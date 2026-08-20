@@ -314,6 +314,8 @@ fn analyze_does_not_panic_on_any_example() {
         include_str!("../examples/channels.nir"),
         include_str!("../examples/sandbox.nir"),
         include_str!("../examples/sandbox_channels.nir"),
+        include_str!("../examples/strings.nir"),
+        include_str!("../examples/tcp_client.nir"),
     ] {
         let program = parse(src);
         let _ = analyze(&program); // just must not panic

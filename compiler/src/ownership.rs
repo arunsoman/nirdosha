@@ -278,7 +278,7 @@ impl Checker {
     /// box is exempt from move-checking (see module doc).
     fn touch_expr(&mut self, e: &Expr, consume: bool) {
         match e {
-            Expr::Int(_, _) | Expr::Bool(_, _) => {}
+            Expr::Int(_, _) | Expr::Bool(_, _) | Expr::Str(_, _) => {}
             Expr::Ident(name, span) => self.touch_ident(name, *span, consume),
             Expr::Unary(_, inner, _) => self.touch_expr(inner, true),
             Expr::Binary(_, lhs, rhs, _) => {
@@ -387,9 +387,18 @@ impl Checker {
             }
             Expr::StopSandbox(inner, _) => {
                 // `stop` consumes the whole handle -- a sandboxed process
-                // can only be stopped once, the same single-owner
-                // discipline as `join`.
+                // (or, reusing the same keyword, a TCP connection) can
+                // only be stopped once, the same single-owner discipline
+                // as `join`.
                 self.touch_expr(inner, true);
+            }
+            Expr::Connect(host, port, _) => {
+                // Neither operand is affine (`str`/`i64`), so this is a
+                // no-op in practice, same as `Expr::SpawnSandbox`'s args
+                // above -- touched anyway on principle, not because it's
+                // currently load-bearing.
+                self.touch_expr(host, true);
+                self.touch_expr(port, true);
             }
         }
     }

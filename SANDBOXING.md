@@ -143,6 +143,25 @@ commit, one coherent slice at a time):
    all later — each is additive once 1–5 exist and none of them changes
    the shape of what's below it.
 
+**2b. Done — `str`/`tcp`/`connect` (PHASE0.md's "Fifteenth update"), not
+one of the six layers above, added out of sequence.** Working through
+layer 2 surfaced a real gap in the plan itself: every layer through 2
+only ever spawns *another copy of the `nirdosha` binary*, so there was
+never a need to name an external thing or speak a foreign protocol. The
+concrete goal this whole document opens with — orchestrate *any*
+containerized workload, a real Spring Boot app was the example given —
+needs both, and neither existed. `str` (minimal UTF-8 literals, just
+enough to name a host or an image) and `tcp`/`connect` (a real, raw TCP
+client, reusing `send`/`recv`/`stop` rather than inventing new keywords)
+close that gap. Verified against something genuinely external and
+unaware of Nirdosha: a raw HTTP GET over `connect` to this machine's
+already-running Neo4j Docker container, real JSON back. This is now the
+actual prerequisite for layer 4 (a `sandbox` variant that launches a
+pre-existing image by name, rather than one of the program's own
+functions) — see PHASE0.md for what's still missing before that's
+buildable (`is_sandbox_safe` doesn't accept `str`/`tcp` yet; that's the
+next concrete step, not yet started).
+
 ## Decisions
 
 Resolved now rather than left open, so the plan above has a fixed

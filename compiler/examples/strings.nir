@@ -1,0 +1,25 @@
+// Exercises: `str` -- literals, escapes, function parameters/returns,
+// equality. Deliberately minimal: no concatenation, no indexing, no
+// slicing -- just enough to name things (a hostname, an image, a
+// message) that couldn't be spelled any other way. See tcp_client.nir
+// for what strings are actually *for* right now.
+fn greet(name: str) -> str {
+    return name
+}
+
+fn main() {
+    let s: str = "hello, nirdosha"
+    print(s)
+
+    let escaped: str = "line one\nline two\ttabbed"
+    print(escaped)
+
+    let g: str = greet("world")
+    print(g)
+
+    let a: str = "same"
+    let b: str = "same"
+    let c: str = "different"
+    print(a == b) // true
+    print(a == c) // false
+}
