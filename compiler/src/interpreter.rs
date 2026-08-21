@@ -1578,6 +1578,76 @@ impl Interpreter {
         self.program.enums.iter().find_map(|e| e.variants.iter().find(|v| v.name == name).map(|v| (e, v)))
     }
 
+    /// Row 11 layer 6 (generics) — walks `decl_ty` (a variant's own
+    /// declared payload type, possibly containing a bare reference to
+    /// one of `type_params`) opposite `val` (that position's actual
+    /// runtime value), binding any parameter found bare to a best-effort
+    /// concrete `Ty` recovered from `val`'s own shape (`value_shape_ty`).
+    /// See `Expr::Match`'s `eval_expr` arm for why this file has to
+    /// recover this from the *value*, not an expected-type context the
+    /// way `typeck.rs`'s `bind_type_params` does from an *argument's own
+    /// inferred type* — this interpreter never threads one through
+    /// `eval_expr` at all (module doc).
+    fn bind_type_params_from_value(&self, decl_ty: &Ty, val: &Value, type_params: &[String], subst: &mut HashMap<String, Ty>) {
+        match decl_ty {
+            Ty::Named(name, args) if args.is_empty() && type_params.iter().any(|p| p == name) => {
+                subst.entry(name.clone()).or_insert_with(|| self.value_shape_ty(val));
+            }
+            Ty::Box(inner) => {
+                if let Value::Boxed(v) = val {
+                    self.bind_type_params_from_value(inner, v, type_params, subst);
+                }
+            }
+            Ty::Ref(inner) => {
+                if let Value::Ref(v) = val {
+                    self.bind_type_params_from_value(inner, v, type_params, subst);
+                }
+            }
+            Ty::Vector(inner, _) => {
+                if let Value::Vector(elems) = val
+                    && let Some(first) = elems.first()
+                {
+                    self.bind_type_params_from_value(inner, first, type_params, subst);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A reasonable, if imprecise, `Ty` for a bare runtime `Value` —
+    /// integer width is inherently ambiguous at this level (`Value::Int`
+    /// carries no declared width of its own; see its doc comment), so
+    /// this always answers `Ty::I64`, the widest legal width, matching
+    /// `typeck.rs::infer`'s own "untyped literal's default when nothing
+    /// constrains it" convention. Used only as `bind_type_params_from_
+    /// value`'s fallback source of truth for one `match` binding's own
+    /// type — never anything load-bearing to a real static proof (that's
+    /// already been done, by `typeck.rs`, before this file ever runs).
+    /// `Value::Struct`/`Value::Enum` answer with their own name and *no*
+    /// type arguments — a real, accepted imprecision for a nested
+    /// generic struct/enum specifically (this interpreter doesn't carry
+    /// a value's own resolved type arguments at runtime at all), not
+    /// silently pretended away: a reassignment inside a `match` arm
+    /// whose payload is itself another generic instantiation is the one
+    /// narrow shape this can under-check, and only for that.
+    fn value_shape_ty(&self, v: &Value) -> Ty {
+        match v {
+            Value::Int(_) => Ty::I64,
+            Value::Float(_) => Ty::F64,
+            Value::Bool(_) => Ty::Bool,
+            Value::Unit => Ty::Unit,
+            Value::Str(_) => Ty::Str,
+            Value::Boxed(inner) => Ty::Box(Box::new(self.value_shape_ty(inner))),
+            Value::Ref(inner) => Ty::Ref(Box::new(self.value_shape_ty(inner))),
+            Value::Vector(elems) => {
+                Ty::Vector(Box::new(elems.first().map(|e| self.value_shape_ty(e)).unwrap_or(Ty::F64)), elems.len())
+            }
+            Value::Struct(name, _) => Ty::Named(name.to_string(), Vec::new()),
+            Value::Enum(name, _, _) => Ty::Named(name.to_string(), Vec::new()),
+            _ => Ty::Error,
+        }
+    }
+
     /// The one place `Signal::Return` gets caught and turned back into a
     /// plain value — every nested `if`/block/expression underneath just
     /// propagates it with `?`.
@@ -1691,21 +1761,32 @@ impl Interpreter {
             // the runtime Tier-2 backstop for each individual value's
             // range/shape, same "checker is the real gate, this is the
             // backstop" shape every other arm here already has.
-            (Value::Struct(name, fields), Ty::Named(want_name)) if name.as_ref() == want_name.as_str() => {
+            // `want_args` (Row 11 layer 6, generics) substitutes each
+            // declared field/payload type before recursing -- unlike
+            // `typeck.rs`/`ownership.rs`, this file never needs to
+            // *resolve* an instantiation's concrete type arguments
+            // itself: `ty` is always supplied directly by the caller
+            // (`Stmt::Let`, a parameter binding, `Expr::Assign`'s
+            // target), which already carries them.
+            (Value::Struct(name, fields), Ty::Named(want_name, want_args)) if name.as_ref() == want_name.as_str() => {
                 let decl = self
                     .find_struct(want_name)
                     .expect("typeck.rs already proved this struct name is declared");
+                let subst = zip_type_params(&decl.type_params, want_args);
                 for (v, field) in fields.iter().zip(decl.fields.iter()) {
-                    self.check_ty(v, &field.ty, span)?;
+                    self.check_ty(v, &substitute_ty(&field.ty, &subst), span)?;
                 }
                 Ok(())
             }
-            (Value::Enum(name, variant, payload), Ty::Named(want_name)) if name.as_ref() == want_name.as_str() => {
-                let (_, v) = self
+            (Value::Enum(name, variant, payload), Ty::Named(want_name, want_args))
+                if name.as_ref() == want_name.as_str() =>
+            {
+                let (enum_decl, v) = self
                     .find_variant(variant)
                     .expect("typeck.rs already proved this variant name is declared");
+                let subst = zip_type_params(&enum_decl.type_params, want_args);
                 for (val, want) in payload.iter().zip(v.payload.iter()) {
-                    self.check_ty(val, want, span)?;
+                    self.check_ty(val, &substitute_ty(want, &subst), span)?;
                 }
                 Ok(())
             }
@@ -2363,7 +2444,7 @@ impl Interpreter {
                     .iter()
                     .find(|a| a.variant.as_str() == variant.as_ref())
                     .expect("typeck.rs already proved every match is exhaustive");
-                let (_, decl_variant) = self
+                let (enum_decl, decl_variant) = self
                     .find_variant(variant)
                     .expect("typeck.rs already proved this variant name is declared");
                 env.push();
@@ -2371,9 +2452,23 @@ impl Interpreter {
                 // (not a placeholder) -- a binding is an ordinary local
                 // like any other, and `Expr::Assign` inside the arm body
                 // needs `get_ty` to answer with something real to check
-                // a reassignment against.
-                for ((name, val), ty) in arm.bindings.iter().zip(payload.iter()).zip(decl_variant.payload.iter()) {
-                    env.define(name, val.clone(), ty.clone());
+                // a reassignment against. For a generic enum, the
+                // declared payload type may itself be a bare reference
+                // to the enum's own type parameter (`Some(T)`) -- there's
+                // no expected-type context available here to substitute
+                // it properly the way `typeck.rs`/`ownership.rs` can
+                // (module doc: this file never threads one through
+                // `eval_expr`), so `bind_type_params_from_value` recovers
+                // a best-effort concrete type from the payload *value*
+                // itself instead, purely so a later reassignment inside
+                // this arm has something real to check against.
+                let mut subst: HashMap<String, Ty> = HashMap::new();
+                for (val, decl_ty) in payload.iter().zip(decl_variant.payload.iter()) {
+                    self.bind_type_params_from_value(decl_ty, val, &enum_decl.type_params, &mut subst);
+                }
+                let subst_refs: HashMap<&str, &Ty> = subst.iter().map(|(k, v)| (k.as_str(), v)).collect();
+                for ((name, val), decl_ty) in arm.bindings.iter().zip(payload.iter()).zip(decl_variant.payload.iter()) {
+                    env.define(name, val.clone(), substitute_ty(decl_ty, &subst_refs));
                 }
                 let result = self.eval_expr(&arm.body, env);
                 env.pop();

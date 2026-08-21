@@ -154,19 +154,24 @@ pub enum Ty {
     /// needed" scope `Ty::Tcp`'s payload restriction already set — this
     /// language has no `bytes` type to carry anything richer yet.
     File,
-    /// A user-declared `struct`/`enum` name (`nirdosha_row11_amendment.md`
-    /// — Row 11). Carries just the name, not its fields/variants: what a
-    /// given name actually means (struct vs. enum, its field/payload
-    /// types) lives in `Program::structs`/`Program::enums`, looked up
-    /// through a `TypeRegistry` built once per checking pass, the same
-    /// "each pass redoes its own minimal shadow walk" idiom `refine.rs`/
-    /// `smt.rs`/`effects.rs` already establish — not carried inline here,
-    /// since a `Ty` has no access to the declaration table that would let
-    /// it resolve itself. No type-parameter list yet (`Point`, not
-    /// `Pair(A, B)`) — Row 11's own rollout layers scope generics to a
-    /// later layer (`nirdosha_row11_amendment.md` §3.6, step 6); this is
-    /// "layer 1: fixed concrete fields, no generics yet."
-    Named(String),
+    /// A user-declared `struct`/`enum` name, plus its concrete type
+    /// arguments (`nirdosha_row11_amendment.md` — Row 11, layer 6:
+    /// generics). `Point` is `Named("Point", [])`; `Pair(i64, str)` is
+    /// `Named("Pair", [I64, Str])` — two, fully concrete, structurally
+    /// distinct `Ty`s, the same "structural-per-instantiation, no
+    /// erasure" identity `Vector(f64,3)`/`Vector(f64,4)` already have
+    /// (§3.3: "this means 'monomorphization' isn't a separate pass... it
+    /// falls out of a type equality rule Nirdosha already has"). Carries
+    /// just the name and args, not the declaration's fields/variants:
+    /// what a given name actually means (struct vs. enum, its field/
+    /// payload types, its own type-parameter names) lives in
+    /// `Program::structs`/`Program::enums`, looked up through a
+    /// `TypeRegistry` built once per checking pass, the same "each pass
+    /// redoes its own minimal shadow walk" idiom `refine.rs`/`smt.rs`/
+    /// `effects.rs` already establish — not carried inline here, since a
+    /// `Ty` has no access to the declaration table that would let it
+    /// resolve itself.
+    Named(String, Vec<Ty>),
     /// Poison type: stands in for an expression that already produced a
     /// type error, so the checker (`typeck.rs`) doesn't cascade a dozen
     /// follow-on diagnostics from one root cause. Never produced by the
@@ -226,7 +231,10 @@ impl Ty {
             Ty::Tcp => "tcp".to_string(),
             Ty::TcpListener => "tcp_listener".to_string(),
             Ty::File => "file".to_string(),
-            Ty::Named(name) => name.clone(),
+            Ty::Named(name, args) if args.is_empty() => name.clone(),
+            Ty::Named(name, args) => {
+                format!("{name}({})", args.iter().map(Ty::name).collect::<Vec<_>>().join(", "))
+            }
             Ty::Error => "<error>".to_string(),
         }
     }
@@ -246,7 +254,7 @@ impl Ty {
                 | Ty::Tcp
                 | Ty::TcpListener
                 | Ty::File
-                | Ty::Named(_)
+                | Ty::Named(_, _)
                 | Ty::F64
                 | Ty::Vector(_, _)
                 | Ty::Matrix(_, _, _)
@@ -366,7 +374,7 @@ impl Ty {
             | Ty::Tcp
             | Ty::TcpListener
             | Ty::File
-            | Ty::Named(_)
+            | Ty::Named(_, _)
             | Ty::F64
             | Ty::Vector(_, _)
             | Ty::Matrix(_, _, _)
@@ -393,14 +401,24 @@ pub struct Field {
     pub ty: Ty,
 }
 
-/// `struct Point { x: f64, y: f64 }` — Row 11's product type. No type
-/// parameters yet (`nirdosha_row11_amendment.md` §3.6, layer 1: "fixed
-/// concrete fields, no generics yet") — `name` is registered both as a
-/// type name (`Ty::Named(name)`) and, via `Expr::Call`, as a constructor
-/// (§3.1: "construction is an ordinary call, not a new literal form").
+/// `struct Point { x: f64, y: f64 }` — Row 11's product type. `name` is
+/// registered both as a type name (`Ty::Named(name, _)`) and, via
+/// `Expr::Call`, as a constructor (§3.1: "construction is an ordinary
+/// call, not a new literal form"). `type_params` (layer 6, generics —
+/// §3.3) is empty for a fully concrete struct like `Point`; for `struct
+/// Pair(A, B) { first: A, second: B }` it's `["A", "B"]`, and `fields`'
+/// own `Ty`s are free to reference those names directly (a bare
+/// `Ty::Named("A", [])`, indistinguishable at the `Ty` level from a
+/// genuine zero-arg struct/enum reference named `A` — `typeck.rs`'s
+/// `validate_ty` is what tells the two apart, by checking the *current*
+/// declaration's own `type_params` first). No constraint syntax
+/// (`nirdosha_row11_amendment.md` §2.2/§3.3): whatever a field's own type
+/// does with a parameter is checked normally at each concrete
+/// instantiation, the same way `Vector(T,N)`'s `T` already works.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StructDecl {
     pub name: String,
+    pub type_params: Vec<String>,
     pub fields: Vec<Field>,
     pub span: Span,
 }
@@ -417,17 +435,59 @@ pub struct Variant {
     pub span: Span,
 }
 
-/// `enum Option(T) { Some(T), None }` — Row 11's sum type. Same "no type
-/// parameters yet" scope limit as `StructDecl`. Unlike a struct, an
-/// enum's own name is never itself callable — only its variants are;
-/// `TypeRegistry` and `typeck.rs`'s registration pass both keep this
-/// distinction (a struct name doubles as its own constructor, an enum
-/// name never does).
+/// `enum Option(T) { Some(T), None }` — Row 11's sum type. Same
+/// `type_params` shape and meaning as `StructDecl`'s, shared across every
+/// variant (there's no per-variant parameter list — `T` in `Some(T)`
+/// names the *enum's* own type parameter). Unlike a struct, an enum's own
+/// name is never itself callable — only its variants are; `TypeRegistry`
+/// and `typeck.rs`'s registration pass both keep this distinction (a
+/// struct name doubles as its own constructor, an enum name never does).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EnumDecl {
     pub name: String,
+    pub type_params: Vec<String>,
     pub variants: Vec<Variant>,
     pub span: Span,
+}
+
+/// `Option(T)`/`Result(T, E)` — Row 11 layer 7's prelude, injected into
+/// every `Program.enums` at parse time (`Parser::parse_program`) as if
+/// the user had written them, exactly the way `nirdosha_row11_amendment.md`
+/// §3.6's own step 7 frames it: "ordinary user `enum`s... no
+/// special-casing, which is itself the proof that the mechanism is
+/// general enough to earn its place in `std`." No module/import system
+/// exists yet (`LANGUAGE.md` §6) for a real prelude mechanism to hook
+/// into, so this is the honest, narrow stand-in: two literal `EnumDecl`
+/// values prepended to whatever the user's own source declares, going
+/// through the exact same registration/collision-checking
+/// (`typeck.rs::typecheck`) as any user-written `enum` — a program that
+/// tries to redeclare `Option`/`Result`, or reuse `Some`/`None`/`Ok`/`Err`
+/// as a function/struct/other-variant name, gets the same
+/// `DuplicateType`/`DuplicateConstructor` error it would for colliding
+/// with any other real declaration, with no special-casing anywhere else
+/// in the checker.
+pub fn prelude_enums() -> Vec<EnumDecl> {
+    let span = Span { line: 0, col: 0 };
+    vec![
+        EnumDecl {
+            name: "Option".to_string(),
+            type_params: vec!["T".to_string()],
+            variants: vec![
+                Variant { name: "Some".to_string(), payload: vec![Ty::Named("T".to_string(), vec![])], span },
+                Variant { name: "None".to_string(), payload: vec![], span },
+            ],
+            span,
+        },
+        EnumDecl {
+            name: "Result".to_string(),
+            type_params: vec!["T".to_string(), "E".to_string()],
+            variants: vec![
+                Variant { name: "Ok".to_string(), payload: vec![Ty::Named("T".to_string(), vec![])], span },
+                Variant { name: "Err".to_string(), payload: vec![Ty::Named("E".to_string(), vec![])], span },
+            ],
+            span,
+        },
+    ]
 }
 
 /// `goal.md`'s "Effects" synthesis layer (row 4, 9) — `PROTOLANG_PORT.md`'s
@@ -797,8 +857,8 @@ pub struct Program {
 /// fields does this struct have" / "what payload does this variant
 /// carry."
 pub struct TypeRegistry<'a> {
-    structs: HashMap<&'a str, &'a [Field]>,
-    enums: HashMap<&'a str, &'a [Variant]>,
+    structs: HashMap<&'a str, &'a StructDecl>,
+    enums: HashMap<&'a str, &'a EnumDecl>,
     /// `(owning enum's name, the variant itself)`, keyed by variant name
     /// — variant names live in the same flat callable namespace as
     /// functions/struct constructors (`nirdosha_row11_amendment.md` §3.2:
@@ -823,10 +883,10 @@ impl<'a> TypeRegistry<'a> {
         let mut enums = HashMap::new();
         let mut variant_owner = HashMap::new();
         for s in &program.structs {
-            structs.insert(s.name.as_str(), s.fields.as_slice());
+            structs.insert(s.name.as_str(), s);
         }
         for e in &program.enums {
-            enums.insert(e.name.as_str(), e.variants.as_slice());
+            enums.insert(e.name.as_str(), e);
             for v in &e.variants {
                 variant_owner.insert(v.name.as_str(), (e.name.as_str(), v));
             }
@@ -834,12 +894,28 @@ impl<'a> TypeRegistry<'a> {
         TypeRegistry { structs, enums, variant_owner }
     }
 
-    pub fn struct_fields(&self, name: &str) -> Option<&'a [Field]> {
+    pub fn struct_decl(&self, name: &str) -> Option<&'a StructDecl> {
         self.structs.get(name).copied()
     }
 
-    pub fn enum_variants(&self, name: &str) -> Option<&'a [Variant]> {
+    pub fn enum_decl(&self, name: &str) -> Option<&'a EnumDecl> {
         self.enums.get(name).copied()
+    }
+
+    pub fn struct_fields(&self, name: &str) -> Option<&'a [Field]> {
+        self.structs.get(name).map(|s| s.fields.as_slice())
+    }
+
+    pub fn enum_variants(&self, name: &str) -> Option<&'a [Variant]> {
+        self.enums.get(name).map(|e| e.variants.as_slice())
+    }
+
+    pub fn struct_type_params(&self, name: &str) -> Option<&'a [String]> {
+        self.structs.get(name).map(|s| s.type_params.as_slice())
+    }
+
+    pub fn enum_type_params(&self, name: &str) -> Option<&'a [String]> {
+        self.enums.get(name).map(|e| e.type_params.as_slice())
     }
 
     pub fn is_struct(&self, name: &str) -> bool {
@@ -855,9 +931,14 @@ impl<'a> TypeRegistry<'a> {
     }
 
     /// Registry-aware affinity — `Ty::is_affine`'s doc comment explains
-    /// why the plain method can't do this itself. Recurses "one level
-    /// through" a field/payload at a time, exactly as
-    /// `nirdosha_row11_amendment.md` §3.5 describes.
+    /// why the plain method can't do this itself. For a generic
+    /// instantiation (`Ty::Named(name, args)` with `args` non-empty), the
+    /// declaration's own fields/payloads are substituted against `args`
+    /// first (`substitute_ty`) — `Wrapper(box i64)` is affine even though
+    /// `struct Wrapper(T) { v: T }`'s own declared field type, `T`, is
+    /// not (it's not a real type at all outside a substitution context).
+    /// Recurses "one level through" a field/payload at a time otherwise,
+    /// exactly as `nirdosha_row11_amendment.md` §3.5 describes.
     ///
     /// **Known, deliberate non-issue, not a guarded-against case:** a
     /// struct/enum that's directly self-referential with no `box`/`chan`/
@@ -868,11 +949,13 @@ impl<'a> TypeRegistry<'a> {
     /// well-typed program can ever reach this path with one.
     pub fn is_affine(&self, ty: &Ty) -> bool {
         match ty {
-            Ty::Named(name) => {
-                if let Some(fields) = self.structs.get(name.as_str()) {
-                    fields.iter().any(|f| self.is_affine(&f.ty))
-                } else if let Some(variants) = self.enums.get(name.as_str()) {
-                    variants.iter().any(|v| v.payload.iter().any(|t| self.is_affine(t)))
+            Ty::Named(name, args) => {
+                if let Some(decl) = self.structs.get(name.as_str()) {
+                    let subst = zip_type_params(&decl.type_params, args);
+                    decl.fields.iter().any(|f| self.is_affine(&substitute_ty(&f.ty, &subst)))
+                } else if let Some(decl) = self.enums.get(name.as_str()) {
+                    let subst = zip_type_params(&decl.type_params, args);
+                    decl.variants.iter().any(|v| v.payload.iter().any(|t| self.is_affine(&substitute_ty(t, &subst))))
                 } else {
                     // Unknown name -- `typeck.rs` reports this separately
                     // (`TypeErrorKind::UnknownType`); nothing sound to say
@@ -882,6 +965,49 @@ impl<'a> TypeRegistry<'a> {
             }
             _ => ty.is_affine(),
         }
+    }
+}
+
+/// `type_params.iter().zip(args)`, as a lookup map — the shared shape
+/// every generic-substitution call site needs (`TypeRegistry::is_affine`,
+/// `typeck.rs`, `ownership.rs`, `interpreter.rs`). Silently ignores a
+/// length mismatch (zips to the shorter of the two) rather than panicking
+/// — `typeck.rs`'s own arity check (`TypeErrorKind::WrongTypeArity`) is
+/// what rejects that case; every other caller here just needs a sound
+/// (if partial) substitution to keep walking without crashing.
+pub fn zip_type_params<'a, 'b>(type_params: &'a [String], args: &'b [Ty]) -> HashMap<&'a str, &'b Ty> {
+    type_params.iter().map(String::as_str).zip(args.iter()).collect()
+}
+
+/// Replaces every bare `Ty::Named(p, [])` in `ty` where `p` is a key of
+/// `subst` with its bound concrete type, recursing through every
+/// type-former this language has (`Box`/`Ref`/`Thread`/`Channel`/
+/// `Vector`/`Matrix`'s inner type, and a nested `Ty::Named`'s own type
+/// arguments) — Row 11 layer 6's actual substitution mechanism, used
+/// identically by every pass that needs to turn a generic declaration's
+/// field/payload types into a specific instantiation's concrete ones. A
+/// `Ty::Named(p, args)` where `args` is non-empty is never itself treated
+/// as a substitutable parameter reference (a bare type-parameter name is
+/// never itself further parameterized — nothing in this language's
+/// grammar can write `A(B)` as a *use* of type parameter `A`), only
+/// recursed into for its own args.
+pub fn substitute_ty(ty: &Ty, subst: &HashMap<&str, &Ty>) -> Ty {
+    match ty {
+        Ty::Named(name, args) if args.is_empty() => {
+            subst.get(name.as_str()).map(|t| (*t).clone()).unwrap_or_else(|| ty.clone())
+        }
+        Ty::Named(name, args) => {
+            Ty::Named(name.clone(), args.iter().map(|a| substitute_ty(a, subst)).collect())
+        }
+        Ty::Box(inner) => Ty::Box(Box::new(substitute_ty(inner, subst))),
+        Ty::Ref(inner) => Ty::Ref(Box::new(substitute_ty(inner, subst))),
+        Ty::Thread(inner) => Ty::Thread(Box::new(substitute_ty(inner, subst))),
+        Ty::Channel(inner) => Ty::Channel(Box::new(substitute_ty(inner, subst))),
+        Ty::Vector(inner, n) => Ty::Vector(Box::new(substitute_ty(inner, subst)), *n),
+        Ty::Matrix(inner, r, c) => Ty::Matrix(Box::new(substitute_ty(inner, subst)), *r, *c),
+        // Every other `Ty` is a plain scalar/handle with nothing inside it
+        // to substitute into.
+        _ => ty.clone(),
     }
 }
 

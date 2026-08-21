@@ -2,17 +2,23 @@
 
 **Document:** Amendment to `goal.md` (§1, §3, §6, §7)
 **Date:** 21 Aug 2026
-**Status:** §3.6 layers 1–4 shipped (21 Aug 2026) — `struct`/`enum`
-declarations, positional construction, field access, `match` with
-exhaustiveness checking, and affinity propagation through struct/enum
-fields are real, tested (`compiler/tests/structs_enums.rs`,
-`compiler/examples/structs_enums.nir`), interpreter-only per layer 8's own
-scoping (`compiler/src/codegen.rs::check_supported` rejects any program
-declaring a `struct`/`enum`, the same "reject, don't mis-compile"
-treatment every other interpreter-only feature already gets). Layers 5–7
-(extending `refine.rs`/`smt.rs`'s boundary set, generics, and the
-`Option(T)`/`Result(T, E)` prelude) are still future work — see each
-layer's own entry in §3.6 below for what's left.
+**Status:** §3.6 layers 1–4 and 6–7 shipped (21 Aug 2026) — `struct`/
+`enum` declarations (with type-parameter lists — layer 6, generics),
+positional construction, field access, `match` with exhaustiveness
+checking, affinity propagation through struct/enum fields (including
+through a generic instantiation's own concrete type arguments), and the
+`Option(T)`/`Result(T, E)` prelude (layer 7) are real, tested
+(`compiler/tests/structs_enums.rs`, `compiler/tests/generics.rs`,
+`compiler/examples/structs_enums.nir`, `compiler/examples/generics.nir`),
+interpreter-only per layer 8's own scoping
+(`compiler/src/codegen.rs::check_supported` rejects any program that
+actually constructs/matches a `struct`/`enum` — including a prelude
+variant like `Some(5)` — the same "reject, don't mis-compile" treatment
+every other interpreter-only feature already gets; a program that never
+touches Row 11 at all still compiles, since the prelude's own presence in
+`Program.enums` isn't by itself a use). Layer 5 (extending
+`refine.rs`/`smt.rs`'s boundary set) is still future work — see its own
+entry in §3.6 below.
 **Supersedes:** an earlier draft of this file. That draft described a
 different, Austral/Pony-flavored language — `record ... is ... end;`,
 reference capabilities (`iso`/`val`/`ref`/`box`/`tag`), an already-working
@@ -292,20 +298,46 @@ before the next:
    argument does; they still get the Tier-2 runtime check
    (`interpreter.rs::check_ty`), same as everything else before its own
    Tier-1 pass lands.
-6. **Not yet shipped.** Generics: type parameters on `struct`/`enum`
-   declarations. No new pass needed when it lands — each concrete
-   instantiation registers as its own `Ty` the first time it's used, per
-   §3.3.
-7. **Not yet shipped.** Prelude sum types: `Option(T)`, `Result(T, E)`.
-   Ordinary user `enum`s once step 6 lands — no special-casing, which is
-   itself the proof that the mechanism is general enough to earn its
-   place in `std`.
+6. **Shipped.** Generics: type parameters on `struct`/`enum` declarations
+   (`Ty::Named(name, args)`, `ast::substitute_ty`). No separate
+   monomorphizer pass, as designed — each concrete instantiation is just
+   a structurally distinct `Ty` (`ast::zip_type_params` builds the
+   substitution once per construction/field-access/match site). Two
+   sources resolve a construction call's type arguments, since there's no
+   explicit-type-argument call syntax at all: the expected type at the
+   call site (`Checker::check`'s `Expr::Call` arm, the common case — a
+   `let`/return/argument annotation), or, failing that, structural
+   inference from the constructor's own arguments
+   (`Checker::resolve_type_args`'s fallback, `bind_type_params`) — a
+   parameter that appears in neither is
+   `TypeErrorKind::GenericConstructorNeedsExplicitType`. `ownership.rs`'s
+   affinity/match-arm-binding and `interpreter.rs`'s runtime `check_ty`/
+   match-arm-binding are all substitution-aware too (the latter recovers
+   a binding's concrete type from the payload *value* itself, via
+   `Interpreter::value_shape_ty`, since this file has no expected-type
+   context flowing through `eval_expr` at all to substitute from
+   directly — a real, narrow, accepted imprecision for a *nested*
+   generic struct/enum's own further type arguments specifically, not
+   silently pretended away).
+7. **Shipped.** Prelude sum types: `Option(T)`, `Result(T, E)`
+   (`ast::prelude_enums`). Ordinary user `enum`s, exactly as designed —
+   injected into `Program.enums` at parse time
+   (`Parser::parse_program`) as if hand-written, going through the same
+   registration/collision-checking as any real declaration (redeclaring
+   `Option`, or reusing `Some`/`None`/`Ok`/`Err` as another name, is an
+   ordinary `DuplicateType`/`DuplicateConstructor` error) — no
+   special-casing anywhere else in the checker, which is itself the proof
+   the mechanism is general enough to earn its place in `std`.
 8. **Out of scope, as designed** — `struct`/`enum`/`match` join
    `box`/`thread`/`chan`/`sandbox`/`tcp`/`str` on the "interpreter-only,
    rejected not mis-compiled" list (`LANGUAGE.md` §10), not an exception
-   to it: `codegen.rs::check_supported` rejects any program declaring a
-   `struct`/`enum` up front, with a specific reason, rather than letting
-   a struct constructor call slip past `check_expr`'s generic `Expr::Call`
+   to it. Since the prelude means `Program.enums` is never actually empty,
+   `codegen.rs::check_supported` can't reject on declaration presence
+   alone any more — it rejects a program only if it actually *constructs*
+   a struct/variant (a name lookup against the declared constructor set,
+   since a constructor call is syntactically just `Expr::Call`) or uses
+   `match`/field access directly, rather than letting a struct
+   constructor call slip past `check_expr`'s generic `Expr::Call`
    arm and fail some other, less clear way downstream.
 
 **Named follow-on, not designed here:** once `Result(T, E)` exists, a `?`

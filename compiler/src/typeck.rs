@@ -228,6 +228,29 @@ pub enum TypeErrorKind {
     /// (`nirdosha_row11_amendment.md` §3.4), so exhaustiveness means
     /// "every declared variant, exactly once."
     NonExhaustiveMatch { enum_name: String, missing: Vec<String> },
+    /// A `struct`/`enum` declares the same type-parameter name twice
+    /// (`struct Pair(A, A) { .. }`) — layer 6, generics.
+    DuplicateTypeParam(String),
+    /// A `Ty::Named` use — a `let`/param/return/field/payload annotation,
+    /// or a generic type applied to arguments in source — supplied the
+    /// wrong number of type arguments for what `name` actually declares
+    /// (`want` type parameters, `got` arguments supplied). Also used for
+    /// the (nonsensical) case of applying arguments to a bare reference
+    /// to the *enclosing* declaration's own type parameter, where `want`
+    /// is always `0`.
+    WrongTypeArity { name: String, want: usize, got: usize },
+    /// A generic struct/enum constructor call (`Pair(1, "one")`, `Some(5)`)
+    /// appeared somewhere its type arguments can't be pinned down —
+    /// neither from an expected type at the call site (`check`, which
+    /// substitutes directly and never reaches this) nor from the
+    /// constructor's own arguments (`nirdosha_row11_amendment.md` has no
+    /// turbofish-style explicit-type-argument syntax at a call site at
+    /// all — §3.1's "Nirdosha never uses `<...>` for type application" —
+    /// so there is no third way to supply one). The same shape of gap
+    /// `chan`'s own `ChannelNeedsExplicitType` already has, generalized
+    /// from "no expected type at all" to "no expected type *and* the
+    /// arguments alone don't determine every parameter."
+    GenericConstructorNeedsExplicitType { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -443,6 +466,18 @@ impl std::fmt::Display for TypeError {
                 "{line}:{col}: `match` on `{enum_name}` doesn't cover: {}",
                 missing.join(", ")
             ),
+            TypeErrorKind::DuplicateTypeParam(p) => {
+                write!(f, "{line}:{col}: type parameter `{p}` is declared more than once")
+            }
+            TypeErrorKind::WrongTypeArity { name, want, got } => write!(
+                f,
+                "{line}:{col}: `{name}` expects {want} type argument(s), got {got}"
+            ),
+            TypeErrorKind::GenericConstructorNeedsExplicitType { name } => write!(
+                f,
+                "{line}:{col}: `{name}`'s type argument(s) can't be inferred here — \
+                 an expected type is needed (e.g. an explicit `let` annotation)"
+            ),
         }
     }
 }
@@ -502,6 +537,13 @@ pub struct Checker<'a> {
     /// Row 11's declaration table (`ast::TypeRegistry`) — built once, up
     /// front, from the same `&'a Program` this whole pass borrows.
     registry: TypeRegistry<'a>,
+    /// Set during a throwaway structural-inference pass over a generic
+    /// constructor's own arguments (`resolve_type_args`'s fallback path)
+    /// — diagnostics found there are discarded; the *real* pass that
+    /// immediately follows in the caller (this time non-silent) is what
+    /// actually reports them. Mirrors `ownership.rs`'s identically-named,
+    /// identically-purposed field.
+    silent: bool,
 }
 
 /// Type-check a whole program. `Ok(())` means every function body is well
@@ -510,7 +552,7 @@ pub struct Checker<'a> {
 /// rejects.
 pub fn typecheck(program: &Program) -> Result<(), Vec<TypeError>> {
     let registry = TypeRegistry::build(program);
-    let mut c = Checker { sigs: HashMap::new(), errors: Vec::new(), registry };
+    let mut c = Checker { sigs: HashMap::new(), errors: Vec::new(), registry, silent: false };
 
     // ---- Row 11: register struct/enum type names + their constructors --
     // Two independent namespaces, per `nirdosha_row11_amendment.md` §3.1-
@@ -531,6 +573,7 @@ pub fn typecheck(program: &Program) -> Result<(), Vec<TypeError>> {
         } else {
             callable_names.insert(s.name.as_str(), s.span);
         }
+        c.check_duplicate_type_params(&s.type_params, s.span);
         let mut field_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for field in &s.fields {
             if !field_names.insert(field.name.as_str()) {
@@ -545,6 +588,7 @@ pub fn typecheck(program: &Program) -> Result<(), Vec<TypeError>> {
         if type_names.insert(e.name.as_str(), e.span).is_some() {
             c.error(TypeErrorKind::DuplicateType(e.name.clone()), e.span);
         }
+        c.check_duplicate_type_params(&e.type_params, e.span);
         let mut variant_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for v in &e.variants {
             if !variant_names.insert(v.name.as_str()) {
@@ -561,16 +605,18 @@ pub fn typecheck(program: &Program) -> Result<(), Vec<TypeError>> {
 
     // Every syntactically-declared type (struct fields, enum payloads) is
     // validated against the registry now, so a bogus `Ty::Named` never
-    // silently reaches construction/field-access checking below.
+    // silently reaches construction/field-access checking below — each
+    // declaration's own `type_params` are in scope for its own fields/
+    // payloads (layer 6, generics), nowhere else.
     for s in &program.structs {
         for field in &s.fields {
-            c.validate_ty(&field.ty, s.span);
+            c.validate_ty(&field.ty, s.span, &s.type_params);
         }
     }
     for e in &program.enums {
         for v in &e.variants {
             for t in &v.payload {
-                c.validate_ty(t, v.span);
+                c.validate_ty(t, v.span, &e.type_params);
             }
         }
     }
@@ -588,10 +634,13 @@ pub fn typecheck(program: &Program) -> Result<(), Vec<TypeError>> {
             c.error(TypeErrorKind::DuplicateConstructor(f.name.clone()), f.span);
             continue;
         }
+        // Functions have no type-parameter list of their own
+        // (`nirdosha_row11_amendment.md` §2.2/§3.3 scopes generics to
+        // struct/enum declarations only) — empty scope.
         for p in &f.params {
-            c.validate_ty(&p.ty, f.span);
+            c.validate_ty(&p.ty, f.span, &[]);
         }
-        c.validate_ty(&f.ret, f.span);
+        c.validate_ty(&f.ret, f.span, &[]);
         c.sigs.insert(
             f.name.clone(),
             FnSig { params: f.params.iter().map(|p| p.ty.clone()).collect(), ret: f.ret.clone() },
@@ -636,28 +685,71 @@ pub fn typecheck(program: &Program) -> Result<(), Vec<TypeError>> {
 
 impl<'a> Checker<'a> {
     fn error(&mut self, kind: TypeErrorKind, span: Span) {
-        self.errors.push(TypeError { kind, span });
+        if !self.silent {
+            self.errors.push(TypeError { kind, span });
+        }
     }
 
-    /// Recursively checks every `Ty::Named` leaf inside `ty` resolves to a
-    /// declared struct/enum — the one thing `expect_type` (`parser.rs`)
-    /// can't itself verify (see `Ty::Named`'s doc comment: the parser has
-    /// no declaration table). Called on every *syntactically declared*
-    /// type (fn params/return, struct fields, enum payloads, `let`
-    /// annotations) — never on an *inferred* type, which can only ever
-    /// carry a `Ty::Named` this pass already proved real (see
-    /// `infer_struct_construction`/`infer_variant_construction`).
-    fn validate_ty(&mut self, ty: &Ty, span: Span) {
+    fn check_duplicate_type_params(&mut self, type_params: &[String], span: Span) {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for p in type_params {
+            if !seen.insert(p.as_str()) {
+                self.error(TypeErrorKind::DuplicateTypeParam(p.clone()), span);
+            }
+        }
+    }
+
+    /// Recursively checks every `Ty::Named` leaf inside `ty` resolves —
+    /// either to one of `in_scope_params` (the enclosing struct/enum
+    /// declaration's own type-parameter names, empty everywhere else —
+    /// see `typecheck`'s call sites) or to a real declared struct/enum
+    /// with a matching type-argument count — the one thing `expect_type`
+    /// (`parser.rs`) can't itself verify (see `Ty::Named`'s doc comment:
+    /// the parser has no declaration table). Called on every
+    /// *syntactically declared* type (fn params/return, struct fields,
+    /// enum payloads, `let` annotations) — never on an *inferred* type,
+    /// which can only ever carry a `Ty::Named` this pass already proved
+    /// real (see `infer_struct_construction`/`infer_variant_construction`).
+    fn validate_ty(&mut self, ty: &Ty, span: Span, in_scope_params: &[String]) {
         match ty {
-            Ty::Named(name) => {
-                if !self.registry.is_struct(name) && !self.registry.is_enum(name) {
-                    self.error(TypeErrorKind::UnknownType(name.clone()), span);
+            Ty::Named(name, args) => {
+                for a in args {
+                    self.validate_ty(a, span, in_scope_params);
+                }
+                // A bare reference to the enclosing declaration's own type
+                // parameter (`A` inside `struct Pair(A, B) { .. }`) is
+                // never itself further applied to arguments — nothing in
+                // this grammar can write "A(B)" as a *use* of a type
+                // parameter, only as a declaration of one.
+                if in_scope_params.iter().any(|p| p == name) {
+                    if !args.is_empty() {
+                        self.error(
+                            TypeErrorKind::WrongTypeArity { name: name.clone(), want: 0, got: args.len() },
+                            span,
+                        );
+                    }
+                    return;
+                }
+                let want_arity = if let Some(p) = self.registry.struct_type_params(name) {
+                    Some(p.len())
+                } else {
+                    self.registry.enum_type_params(name).map(|p| p.len())
+                };
+                match want_arity {
+                    None => self.error(TypeErrorKind::UnknownType(name.clone()), span),
+                    Some(want) if want != args.len() => {
+                        self.error(
+                            TypeErrorKind::WrongTypeArity { name: name.clone(), want, got: args.len() },
+                            span,
+                        );
+                    }
+                    Some(_) => {}
                 }
             }
             Ty::Box(inner) | Ty::Ref(inner) | Ty::Thread(inner) | Ty::Channel(inner) => {
-                self.validate_ty(inner, span)
+                self.validate_ty(inner, span, in_scope_params)
             }
-            Ty::Vector(inner, _) | Ty::Matrix(inner, _, _) => self.validate_ty(inner, span),
+            Ty::Vector(inner, _) | Ty::Matrix(inner, _, _) => self.validate_ty(inner, span, in_scope_params),
             _ => {}
         }
     }
@@ -691,7 +783,7 @@ impl<'a> Checker<'a> {
     fn check_stmt(&mut self, stmt: &Stmt, expected_ret: &Ty, scopes: &mut Scopes) {
         match stmt {
             Stmt::Let { name, ty, value, span } => {
-                self.validate_ty(ty, *span);
+                self.validate_ty(ty, *span, &[]);
                 self.check(value, ty, expected_ret, scopes);
                 scopes.define(name, ty.clone());
             }
@@ -780,6 +872,21 @@ impl<'a> Checker<'a> {
             self.check_match(scrutinee, arms, *span, MatchWant::Check(want), expected_ret, scopes);
             return;
         }
+        // A call in value position gets `want` threaded down as its
+        // `expected` type — the *only* place a generic struct/variant
+        // constructor's type arguments can come from other than
+        // structural inference (Row 11 layer 6: `resolve_type_args`'s
+        // doc comment). Builtin/user-function calls ignore `expected`
+        // entirely (their return type comes from their own signature
+        // regardless), so this is a strict superset of what plain
+        // `infer(e, ...)` would have done for every other `Expr::Call`.
+        if let Expr::Call(name, args, span) = e {
+            let found = self.infer_call(name, args, expected_ret, scopes, *span, Some(want));
+            if found != Ty::Error && found != *want {
+                self.error(TypeErrorKind::TypeMismatch { expected: want.clone(), found }, e.span());
+            }
+            return;
+        }
         // `chan` has no sub-expression to infer a payload type from — it's
         // only well-typed against an expected `chan T`. Handled here,
         // top-down, the same reason `Expr::If`'s value-position case is
@@ -842,7 +949,7 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Binary(op, lhs, rhs, span) => self.infer_binary(*op, lhs, rhs, expected_ret, scopes, *span),
-            Expr::Call(name, args, span) => self.infer_call(name, args, expected_ret, scopes, *span),
+            Expr::Call(name, args, span) => self.infer_call(name, args, expected_ret, scopes, *span, None),
             Expr::If { cond, then_block, else_block, span } => {
                 self.check_if(cond, then_block, else_block.as_deref(), *span, None, expected_ret, scopes)
             }
@@ -1065,9 +1172,22 @@ impl<'a> Checker<'a> {
                 let bt = self.infer(base, expected_ret, scopes);
                 match &bt {
                     Ty::Error => Ty::Error,
-                    Ty::Named(name) => match self.registry.struct_fields(name) {
+                    Ty::Named(name, args) => match self.registry.struct_fields(name) {
                         Some(fields) => match fields.iter().find(|f| &f.name == field) {
-                            Some(f) => f.ty.clone(),
+                            // Substituted against this specific
+                            // instantiation's own type arguments (layer
+                            // 6, generics) — `Pair(i64, str).first`'s
+                            // declared type is the bare parameter `A`;
+                            // the value this access actually produces is
+                            // `i64`, `Pair`'s own first argument here.
+                            Some(f) => {
+                                let type_params = self
+                                    .registry
+                                    .struct_type_params(name)
+                                    .expect("just found this struct's own fields above");
+                                let subst = zip_type_params(type_params, args);
+                                substitute_ty(&f.ty, &subst)
+                            }
                             None => {
                                 self.error(
                                     TypeErrorKind::NoSuchField { struct_name: name.clone(), field: field.clone() },
@@ -1133,7 +1253,7 @@ impl<'a> Checker<'a> {
                 }
             }
         }
-        let ret = self.infer_call(name, args, expected_ret, scopes, span);
+        let ret = self.infer_call(name, args, expected_ret, scopes, span, None);
         if ret == Ty::Error {
             Ty::Error
         } else {
@@ -1162,7 +1282,7 @@ impl<'a> Checker<'a> {
             }
             return Ty::Error;
         }
-        let ret = self.infer_call(name, args, expected_ret, scopes, span);
+        let ret = self.infer_call(name, args, expected_ret, scopes, span, None);
         if ret == Ty::Error {
             Ty::Error
         } else {
@@ -1230,10 +1350,27 @@ impl<'a> Checker<'a> {
             }
             return Ty::Error;
         }
-        self.infer_call(&slot.name, &slot.args, expected_ret, scopes, slot.span)
+        self.infer_call(&slot.name, &slot.args, expected_ret, scopes, slot.span, None)
     }
 
-    fn infer_call(&mut self, name: &str, args: &[Expr], expected_ret: &Ty, scopes: &mut Scopes, span: Span) -> Ty {
+    /// `expected` is `Some(want)` only when called from a real value
+    /// position with a known target type (`check`'s own `Expr::Call`
+    /// handling) — every other caller here (`infer`'s own `Expr::Call`
+    /// arm, `infer_spawn`, `infer_sandbox_spawn`, `infer_transact_slot`)
+    /// passes `None`, the same "no specific expected type" position
+    /// they've always been. Only struct/variant construction (layer 6,
+    /// generics) ever consults it — builtins and user functions resolve
+    /// their return type from their own signature regardless of context,
+    /// unaffected either way.
+    fn infer_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        expected_ret: &Ty,
+        scopes: &mut Scopes,
+        span: Span,
+        expected: Option<&Ty>,
+    ) -> Ty {
         if is_builtin(name) {
             return self.infer_builtin_call(name, args, expected_ret, scopes, span);
         }
@@ -1244,12 +1381,12 @@ impl<'a> Checker<'a> {
         // proved these names can't collide with a function/builtin, so
         // checking them ahead of `self.sigs` is safe and unambiguous.
         if self.registry.is_struct(name) {
-            return self.infer_struct_construction(name, args, expected_ret, scopes, span);
+            return self.infer_struct_construction(name, args, expected, expected_ret, scopes, span);
         }
         if let Some((enum_name, variant)) = self.registry.find_variant(name) {
             let enum_name = enum_name.to_string();
             let variant = variant.clone();
-            return self.infer_variant_construction(&enum_name, &variant, args, expected_ret, scopes, span);
+            return self.infer_variant_construction(&enum_name, &variant, args, expected, expected_ret, scopes, span);
         }
         let Some(sig) = self.sigs.get(name) else {
             self.error(TypeErrorKind::UnknownFn(name.to_string()), span);
@@ -1283,63 +1420,156 @@ impl<'a> Checker<'a> {
     /// positional-only against the struct's declared field types
     /// (`nirdosha_row11_amendment.md` §3.1, §3.5's "extends the boundary
     /// set" — a field's own integer-literal bounds get exactly the same
-    /// `check` treatment a `let`/param does). Produces `Ty::Named(name)`.
+    /// `check` treatment a `let`/param does), substituted for this
+    /// specific instantiation first if the struct is generic (layer 6 —
+    /// see `resolve_type_args`). Produces `Ty::Named(name, type_args)`.
     fn infer_struct_construction(
         &mut self,
         name: &str,
         args: &[Expr],
+        expected: Option<&Ty>,
         expected_ret: &Ty,
         scopes: &mut Scopes,
         span: Span,
     ) -> Ty {
-        let fields = self.registry.struct_fields(name).expect("just proved this is a struct").to_vec();
+        let decl_fields = self.registry.struct_fields(name).expect("just proved this is a struct").to_vec();
+        let type_params = self.registry.struct_type_params(name).expect("just proved this is a struct").to_vec();
+        let decl_tys: Vec<Ty> = decl_fields.iter().map(|f| f.ty.clone()).collect();
+        let type_args =
+            self.resolve_type_args(name, &type_params, &decl_tys, args, expected, expected_ret, scopes, span);
+        let subst = zip_type_params(&type_params, &type_args);
+        let fields: Vec<Ty> = decl_tys.iter().map(|t| substitute_ty(t, &subst)).collect();
+
         if fields.len() != args.len() {
             self.error(
                 TypeErrorKind::ConstructorArityMismatch { name: name.to_string(), want: fields.len(), got: args.len() },
                 span,
             );
         }
-        for (arg, field) in args.iter().zip(fields.iter()) {
-            self.check(arg, &field.ty, expected_ret, scopes);
+        for (arg, field_ty) in args.iter().zip(fields.iter()) {
+            self.check(arg, field_ty, expected_ret, scopes);
         }
         for extra in args.iter().skip(fields.len()) {
             self.infer(extra, expected_ret, scopes);
         }
-        Ty::Named(name.to_string())
+        Ty::Named(name.to_string(), type_args)
     }
 
     /// `Some(5)` / `None()` — an enum variant constructor call, same
     /// positional-argument-list treatment as `infer_struct_construction`,
-    /// against the variant's declared payload types. Produces
-    /// `Ty::Named(enum_name)` — the *enum's* name, not the variant's; a
-    /// variant has no type of its own (`nirdosha_row11_amendment.md`
-    /// §3.2).
+    /// against the variant's declared payload types, substituted the same
+    /// way if the owning enum is generic. Produces `Ty::Named(enum_name,
+    /// type_args)` — the *enum's* name, not the variant's; a variant has
+    /// no type of its own (`nirdosha_row11_amendment.md` §3.2).
+    #[allow(clippy::too_many_arguments)]
     fn infer_variant_construction(
         &mut self,
         enum_name: &str,
         variant: &Variant,
         args: &[Expr],
+        expected: Option<&Ty>,
         expected_ret: &Ty,
         scopes: &mut Scopes,
         span: Span,
     ) -> Ty {
-        if variant.payload.len() != args.len() {
+        let type_params = self.registry.enum_type_params(enum_name).expect("just proved this is an enum").to_vec();
+        let type_args = self.resolve_type_args(
+            enum_name,
+            &type_params,
+            &variant.payload,
+            args,
+            expected,
+            expected_ret,
+            scopes,
+            span,
+        );
+        let subst = zip_type_params(&type_params, &type_args);
+        let payload: Vec<Ty> = variant.payload.iter().map(|t| substitute_ty(t, &subst)).collect();
+
+        if payload.len() != args.len() {
             self.error(
                 TypeErrorKind::ConstructorArityMismatch {
                     name: variant.name.clone(),
-                    want: variant.payload.len(),
+                    want: payload.len(),
                     got: args.len(),
                 },
                 span,
             );
         }
-        for (arg, want) in args.iter().zip(variant.payload.iter()) {
+        for (arg, want) in args.iter().zip(payload.iter()) {
             self.check(arg, want, expected_ret, scopes);
         }
-        for extra in args.iter().skip(variant.payload.len()) {
+        for extra in args.iter().skip(payload.len()) {
             self.infer(extra, expected_ret, scopes);
         }
-        Ty::Named(enum_name.to_string())
+        Ty::Named(enum_name.to_string(), type_args)
+    }
+
+    /// Resolves the concrete type arguments for constructing `name` (a
+    /// struct's own name, or the *owning enum's* name for a variant) —
+    /// Row 11 layer 6. Two sources, tried in order, since there is no
+    /// explicit-type-argument call syntax at all
+    /// (`nirdosha_row11_amendment.md` §3.1: "Nirdosha never uses `<...>`
+    /// for type application"):
+    ///
+    /// 1. `expected` — if it's `Ty::Named(name, args)` with the right
+    ///    arity, those are the args, full stop. The common case: a
+    ///    `let`/`return`/call-argument boundary already pins the exact
+    ///    instantiation, the same way `Some(5)` needs no annotation
+    ///    "passed where an `Option(i64)` is expected" (§3.2).
+    /// 2. Structural inference from the arguments themselves — infers
+    ///    each argument's own type (silently: `self.silent`, mirroring
+    ///    `ownership.rs`'s identically-purposed field, so this doesn't
+    ///    double-report an argument's own internal errors before the
+    ///    real `self.check` pass that follows in the caller), then walks
+    ///    each declared field/payload type opposite it (`bind_type_params`),
+    ///    binding any type parameter found bare. A parameter that never
+    ///    appears bare in any field/payload type (`Result(T, E)`'s `T`
+    ///    when constructing `Err(msg)` alone) can't be recovered this way.
+    ///
+    /// Reports `GenericConstructorNeedsExplicitType` and fills any
+    /// still-unresolved parameter with `Ty::Error` if neither source
+    /// resolves every one — the same error-recovery shape (report once,
+    /// keep checking with a poison type) every other failure in this file
+    /// already uses.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_type_args(
+        &mut self,
+        name: &str,
+        type_params: &[String],
+        decl_tys: &[Ty],
+        args: &[Expr],
+        expected: Option<&Ty>,
+        expected_ret: &Ty,
+        scopes: &mut Scopes,
+        span: Span,
+    ) -> Vec<Ty> {
+        if type_params.is_empty() {
+            return Vec::new();
+        }
+        if let Some(Ty::Named(want_name, want_args)) = expected
+            && want_name == name
+            && want_args.len() == type_params.len()
+        {
+            return want_args.clone();
+        }
+        let mut subst: HashMap<String, Ty> = HashMap::new();
+        let was_silent = self.silent;
+        self.silent = true;
+        for (decl_ty, arg) in decl_tys.iter().zip(args.iter()) {
+            let arg_ty = self.infer(arg, expected_ret, scopes);
+            if arg_ty != Ty::Error {
+                bind_type_params(decl_ty, &arg_ty, type_params, &mut subst);
+            }
+        }
+        self.silent = was_silent;
+        match type_params.iter().map(|p| subst.get(p).cloned()).collect::<Option<Vec<_>>>() {
+            Some(resolved) => resolved,
+            None => {
+                self.error(TypeErrorKind::GenericConstructorNeedsExplicitType { name: name.to_string() }, span);
+                type_params.iter().map(|_| Ty::Error).collect()
+            }
+        }
     }
 
     /// `match scrutinee { variant(bindings) => body, ... }`. Exhaustiveness
@@ -1357,14 +1587,23 @@ impl<'a> Checker<'a> {
         scopes: &mut Scopes,
     ) -> Ty {
         let st = self.infer(scrutinee, expected_ret, scopes);
-        let enum_name = match &st {
-            Ty::Error => None,
-            Ty::Named(name) if self.registry.is_enum(name) => Some(name.clone()),
+        // `enum_name`/`type_args` are the scrutinee's own already-concrete
+        // instantiation (layer 6, generics) — a `match` scrutinee is
+        // always a fully-inferred *value*, never a fresh construction, so
+        // there's no `resolve_type_args`-style ambiguity here: `st` is
+        // simply `Ty::Named(enum_name, type_args)` already, straight from
+        // whatever produced this value.
+        let (enum_name, type_args) = match &st {
+            Ty::Error => (None, Vec::new()),
+            Ty::Named(name, args) if self.registry.is_enum(name) => (Some(name.clone()), args.clone()),
             other => {
                 self.error(TypeErrorKind::NotAnEnum { found: other.clone() }, scrutinee.span());
-                None
+                (None, Vec::new())
             }
         };
+        let enum_type_params =
+            enum_name.as_deref().and_then(|en| self.registry.enum_type_params(en)).unwrap_or(&[]).to_vec();
+        let enum_subst = zip_type_params(&enum_type_params, &type_args);
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut result: Option<Ty> = None;
@@ -1372,7 +1611,9 @@ impl<'a> Checker<'a> {
         for arm in arms {
             let payload: Vec<Ty> = match &enum_name {
                 Some(en) => match self.registry.find_variant(&arm.variant) {
-                    Some((owner, v)) if owner == en => v.payload.clone(),
+                    Some((owner, v)) if owner == en => {
+                        v.payload.iter().map(|t| substitute_ty(t, &enum_subst)).collect()
+                    }
                     _ => {
                         self.error(
                             TypeErrorKind::UnknownVariant { enum_name: en.clone(), variant: arm.variant.clone() },
@@ -2157,6 +2398,38 @@ impl<'a> Checker<'a> {
 /// `return`" analysis. An `if` counts only when it has an `else` and both
 /// branches definitely return — an `if` with no `else` never counts, since
 /// the no-else path falls through.
+/// Row 11 layer 6's structural type-parameter binder — `resolve_type_args`'s
+/// fallback path. Walks `decl_ty` (a struct/enum's own declared field/
+/// payload type, possibly containing bare references to `type_params`)
+/// opposite `concrete_ty` (that same position's actual, already-inferred
+/// argument type), binding any `type_params` member found bare in
+/// `decl_ty` to its counterpart in `concrete_ty`. A parameter already
+/// bound keeps its first binding — a *conflicting* second binding
+/// (`Pair(A, A)`-shaped field reuse with disagreeing argument types)
+/// isn't specially diagnosed here; the caller's own `self.check` against
+/// the resulting substitution catches the disagreement as an ordinary
+/// `TypeMismatch` on whichever argument doesn't fit.
+fn bind_type_params(decl_ty: &Ty, concrete_ty: &Ty, type_params: &[String], subst: &mut HashMap<String, Ty>) {
+    match (decl_ty, concrete_ty) {
+        (Ty::Named(name, args), _) if args.is_empty() && type_params.iter().any(|p| p == name) => {
+            subst.entry(name.clone()).or_insert_with(|| concrete_ty.clone());
+        }
+        (Ty::Box(a), Ty::Box(b))
+        | (Ty::Ref(a), Ty::Ref(b))
+        | (Ty::Thread(a), Ty::Thread(b))
+        | (Ty::Channel(a), Ty::Channel(b)) => bind_type_params(a, b, type_params, subst),
+        (Ty::Vector(a, _), Ty::Vector(b, _)) | (Ty::Matrix(a, _, _), Ty::Matrix(b, _, _)) => {
+            bind_type_params(a, b, type_params, subst)
+        }
+        (Ty::Named(dn, dargs), Ty::Named(cn, cargs)) if dn == cn && dargs.len() == cargs.len() => {
+            for (da, ca) in dargs.iter().zip(cargs.iter()) {
+                bind_type_params(da, ca, type_params, subst);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn definitely_returns(stmts: &[Stmt]) -> bool {
     for stmt in stmts {
         match stmt {
@@ -2270,7 +2543,7 @@ pub fn validate_fragment(json: &str, expected_ty: &Ty, env: &FragmentEnv) -> Res
         })]
     })?;
 
-    let mut checker = Checker { sigs: HashMap::new(), errors: Vec::new(), registry: TypeRegistry::empty() };
+    let mut checker = Checker { sigs: HashMap::new(), errors: Vec::new(), registry: TypeRegistry::empty(), silent: false };
     let mut scopes = Scopes::new();
     for (name, ty) in &env.0 {
         scopes.define(name, ty.clone());

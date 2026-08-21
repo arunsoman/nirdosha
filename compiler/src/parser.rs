@@ -144,18 +144,38 @@ impl Parser {
                 self.bump();
                 Ok(ty)
             }
-            // A declared `struct`/`enum` name (Row 11) — accepted
-            // syntactically for *any* identifier here, same as a function
-            // call name; whether it actually names a real declared type
-            // is `typeck.rs`'s job (`TypeErrorKind::UnknownType`), not
-            // this parser's — it has no declaration table to check
-            // against, and Nirdosha's functions/types are already
-            // resolved by name in a table built after parsing completes
-            // (`LANGUAGE.md` §6), not as each name is scanned.
+            // A declared `struct`/`enum` name (Row 11), optionally applied
+            // to concrete type arguments (layer 6, generics —
+            // `nirdosha_row11_amendment.md` §3.3's "the same production
+            // shape `Vector(T, N)`/`Matrix(T, R, C)` already use"). Bare
+            // `ident` is accepted syntactically for *any* identifier here,
+            // same as a function call name; whether it actually names a
+            // real declared type, and whether the argument count matches
+            // that declaration's own type-parameter count, is `typeck.rs`'s
+            // job (`TypeErrorKind::UnknownType`/`WrongTypeArity`), not this
+            // parser's — it has no declaration table to check against, and
+            // Nirdosha's functions/types are already resolved by name in a
+            // table built after parsing completes (`LANGUAGE.md` §6), not
+            // as each name is scanned.
             Tok::Ident(name) => {
                 let n = name.clone();
                 self.bump();
-                Ok(Ty::Named(n))
+                let mut args = Vec::new();
+                if self.peek().tok == Tok::LParen {
+                    self.bump();
+                    if self.peek().tok != Tok::RParen {
+                        loop {
+                            args.push(self.expect_type()?);
+                            if self.peek().tok == Tok::Comma {
+                                self.bump();
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    self.expect(&Tok::RParen, "`)`")?;
+                }
+                Ok(Ty::Named(n, args))
             }
             other => Err(ParseError {
                 message: format!("expected a type, found {other:?}"),
@@ -168,7 +188,10 @@ impl Parser {
     pub fn parse_program(&mut self) -> PResult<Program> {
         let mut fns = Vec::new();
         let mut structs = Vec::new();
-        let mut enums = Vec::new();
+        // Row 11 layer 7's prelude (`ast::prelude_enums`'s doc comment):
+        // `Option(T)`/`Result(T, E)`, prepended as if the user had
+        // written them — no special-casing anywhere downstream.
+        let mut enums = prelude_enums();
         while self.peek().tok != Tok::Eof {
             match self.peek().tok {
                 Tok::Struct => structs.push(self.parse_struct_decl()?),
@@ -179,12 +202,38 @@ impl Parser {
         Ok(Program { fns, structs, enums })
     }
 
-    // struct_decl ::= "struct" ident "{" field ("," field)* ","? "}"
+    // A `struct`/`enum` declaration's optional type-parameter list --
+    // just bare names (`(A, B)`), never types (contrast a *use* of a
+    // generic type, `Pair(i64, str)`, which is `expect_type`'s own
+    // argument-list parsing). Empty `Vec` when absent, same "omitted
+    // entirely" convention every other optional Row 11 production uses.
+    fn parse_type_param_list(&mut self) -> PResult<Vec<String>> {
+        let mut params = Vec::new();
+        if self.peek().tok == Tok::LParen {
+            self.bump();
+            if self.peek().tok != Tok::RParen {
+                loop {
+                    params.push(self.expect_ident()?);
+                    if self.peek().tok == Tok::Comma {
+                        self.bump();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            self.expect(&Tok::RParen, "`)`")?;
+        }
+        Ok(params)
+    }
+
+    // struct_decl ::= "struct" ident ("(" ident ("," ident)* ")")?
+    //                 "{" field ("," field)* ","? "}"
     // field       ::= ident ":" type
     fn parse_struct_decl(&mut self) -> PResult<StructDecl> {
         let span = self.span();
         self.expect(&Tok::Struct, "`struct`")?;
         let name = self.expect_ident()?;
+        let type_params = self.parse_type_param_list()?;
         self.expect(&Tok::LBrace, "`{`")?;
         let mut fields = Vec::new();
         if self.peek().tok != Tok::RBrace {
@@ -204,15 +253,17 @@ impl Parser {
             }
         }
         self.expect(&Tok::RBrace, "`}`")?;
-        Ok(StructDecl { name, fields, span })
+        Ok(StructDecl { name, type_params, fields, span })
     }
 
-    // enum_decl ::= "enum" ident "{" variant ("," variant)* ","? "}"
+    // enum_decl ::= "enum" ident ("(" ident ("," ident)* ")")?
+    //               "{" variant ("," variant)* ","? "}"
     // variant   ::= ident ("(" type ("," type)* ")")?
     fn parse_enum_decl(&mut self) -> PResult<EnumDecl> {
         let span = self.span();
         self.expect(&Tok::Enum, "`enum`")?;
         let name = self.expect_ident()?;
+        let type_params = self.parse_type_param_list()?;
         self.expect(&Tok::LBrace, "`{`")?;
         let mut variants = Vec::new();
         if self.peek().tok != Tok::RBrace {
@@ -246,7 +297,7 @@ impl Parser {
             }
         }
         self.expect(&Tok::RBrace, "`}`")?;
-        Ok(EnumDecl { name, variants, span })
+        Ok(EnumDecl { name, type_params, variants, span })
     }
 
     // fn_decl ::= "fn" ident "(" params? ")" ("->" type)? block

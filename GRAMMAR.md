@@ -12,14 +12,15 @@ transport for sandboxed processes ("Fourteenth update"), and `str`/`tcp`/
 `connect` (a real TCP client — the prerequisite for orchestrating an
 *arbitrary* containerized workload, not just another Nirdosha process;
 see `PHASE0.md`'s "Fifteenth update"), plus Row 11
-(`nirdosha_row11_amendment.md`) — `struct`/`enum` declarations, `match`,
-and `expr.field` access, layer 1: fixed concrete fields, no
-type-parameter list on a declaration yet (that's a later layer). Note
-that `spawn`/`join`/`thread`/`chan`/`send`/`recv`/`sandbox`/`stop`/
-`connect`/`struct`/`enum`/`match` are, so far, interpreter-only (`str`/
-`tcp` included) — `codegen.rs` rejects them explicitly, the same "reject,
-don't mis-compile" treatment `box`/`&` got before their own codegen
-support existed.
+(`nirdosha_row11_amendment.md`) — `struct`/`enum` declarations (with
+type-parameter lists — layer 6, generics: `Pair(A, B)`), `match`,
+`expr.field` access, and the `Option(T)`/`Result(T, E)` prelude (layer
+7), injected into every program at parse time. Note that
+`spawn`/`join`/`thread`/`chan`/`send`/`recv`/`sandbox`/`stop`/`connect`/
+`struct`/`enum`/`match` are, so far, interpreter-only (`str`/`tcp`
+included) — `codegen.rs` rejects them explicitly, the same "reject, don't
+mis-compile" treatment `box`/`&` got before their own codegen support
+existed.
 
 ## Row 7 claim, stated precisely
 
@@ -91,26 +92,32 @@ item        ::= fn_decl | struct_decl | enum_decl
 
 fn_decl     ::= "fn" ident "(" params? ")" ("->" type)? block
 
-// Row 11 (`nirdosha_row11_amendment.md`) — product and sum types. Layer 1:
-// fixed concrete fields, no type-parameter list yet (`Pair(A, B)` is a
-// later layer, not this production). A struct's `name` is registered in
-// *two* namespaces: as a type (usable in `type` below) and, via ordinary
+// Row 11 (`nirdosha_row11_amendment.md`) — product and sum types.
+// `type_params` (layer 6, generics) is an optional bare-name list, empty
+// for a fully concrete struct (`Point`); `struct Pair(A, B) { .. }`'s `A`/
+// `B` are just names here, never `type`s — contrast a *use* of a generic
+// type (`type`'s own `ident "(" type ... ")"` alternative below), which
+// takes concrete `type`s. A struct's `name` is registered in *two*
+// namespaces: as a type (usable in `type` below) and, via ordinary
 // `Expr::Call`, as its own positional constructor — "construction is an
 // ordinary call, not a new literal form" (§3.1), so there is no separate
 // struct-literal production here. `field`'s trailing comma is optional,
 // unlike `params`/`args` above (a real, deliberate ergonomic difference:
 // multi-line field lists are the common case, so a dangling comma from
 // reordering fields shouldn't be a parse error).
-struct_decl ::= "struct" ident "{" field ("," field)* ","? "}"
+struct_decl ::= "struct" ident type_param_list? "{" field ("," field)* ","? "}"
 field       ::= ident ":" type
+type_param_list ::= "(" ident ("," ident)* ")"
 
 // An enum's own name is a type only — never itself callable; each
 // `variant` is what's callable (`Some(5)`, `None()`), registered in the
 // same flat namespace `struct_decl`'s name is. A zero-payload variant
 // still takes `()` at both declaration and call site (`None`, not
 // `None()`'s omission) — one fewer special case, not a missing
-// convenience (§3.2).
-enum_decl   ::= "enum" ident "{" variant ("," variant)* ","? "}"
+// convenience (§3.2). Same `type_param_list` shape and meaning as
+// `struct_decl`'s, shared across every variant — there's no per-variant
+// parameter list; `T` in `Some(T)` names the *enum's* own type parameter.
+enum_decl   ::= "enum" ident type_param_list? "{" variant ("," variant)* ","? "}"
 variant     ::= ident ("(" type ("," type)* ")")?
 
 // No trailing comma — `params`/`args` (below) both require a following
@@ -165,13 +172,22 @@ param       ::= ident ":" type
 // (the plan's §2) means the shape is fixed at compile time, the same way
 // every other `type` production here is a closed grammar, not a runtime
 // value.
-// `ident` (last alternative) is Row 11's one addition to this production
-// — a declared `struct`/`enum` name, accepted syntactically for *any*
-// identifier here (the parser has no declaration table to check against
-// — `LANGUAGE.md` §6's "functions are looked up by name in a table"
-// applies equally to types now); an identifier that doesn't actually name
-// a real struct/enum is `TypeErrorKind::UnknownType`, caught by
-// `typeck.rs`, not this grammar.
+// `ident` and `ident "(" type ("," type)* ")"` (last two alternatives)
+// are Row 11's addition to this production — a declared `struct`/`enum`
+// name, optionally applied to concrete type arguments (layer 6,
+// generics: `Pair(i64, str)`, the same "type name applied to arguments"
+// shape `Vector(T, N)`/`Matrix(T, R, C)` already use — deliberately, to
+// avoid `<...>`-style type application: Nirdosha never uses it anywhere,
+// and introducing it here would be the one genuinely new source of
+// parsing ambiguity in an otherwise LL(1) grammar, the same "turbofish"
+// problem this reuse sidesteps — `nirdosha_row11_amendment.md` §3.1).
+// Accepted syntactically for *any* identifier here (the parser has no
+// declaration table to check against — `LANGUAGE.md` §6's "functions are
+// looked up by name in a table" applies equally to types now); an
+// identifier that doesn't actually name a real struct/enum is
+// `TypeErrorKind::UnknownType`, and a real one applied to the wrong
+// number of type arguments is `TypeErrorKind::WrongTypeArity` — both
+// caught by `typeck.rs`, not this grammar.
 type        ::= "&" type
               | "box" type
               | "thread" type
@@ -182,7 +198,7 @@ type        ::= "&" type
               | "i8" | "i16" | "i32" | "i64"
               | "u8" | "u16" | "u32" | "u64" | "usize" | "f64"
               | "bool" | "unit" | "str" | "tcp" | "tcp_listener"
-              | ident
+              | ident ("(" type ("," type)* ")")?
 
 // A block's *value* (relevant wherever a block sits in an expression
 // position — an `if`'s branches, most concretely) is its last
@@ -481,15 +497,19 @@ ident       ::= alpha (alpha | digit | "_")*
   user-defined names." Row 11 (`nirdosha_row11_amendment.md`) changed
   that: `struct_decl`/`enum_decl`/`match_expr` above are real,
   interpreter-checked and -executed (`typeck.rs`, `ownership.rs`,
-  `interpreter.rs`), layer 1 of that amendment's own rollout — fixed
-  concrete fields/payloads only, no type-parameter list on a declaration
-  yet (`Pair(A, B)` is layer 6, not built). `Vector`/`Matrix` (dense,
+  `interpreter.rs`), through layer 6 of that amendment's own rollout —
+  including generics (`struct Pair(A, B) { .. }`, `type_param_list`
+  above) with real structural-per-instantiation type identity
+  (`Pair(i64, str)` and `Pair(f64, bool)` are different, unrelated
+  `Ty`s — no monomorphizer pass exists or is needed; see
+  `ast::substitute_ty`) and the `Option(T)`/`Result(T, E)` prelude
+  (layer 7 — `ast::prelude_enums`, injected into every program at parse
+  time, no special-casing anywhere downstream). `Vector`/`Matrix` (dense,
   fixed-shape 1-D/2-D arrays — `type`'s `"Vector" "(" ... ")"`/
   `"Matrix" "(" ... ")"` productions above) remain a separate, older
   mechanism, not unified with `struct`/`enum` — what's still missing for
   *them* specifically is dynamically-sized arrays and generic dimensions
-  (`Matrix{T,N}`-style), which needs the same real generics Row 11's own
-  layer 6 would bring, not attempted here.
+  (`Matrix{T,N}`-style), a bigger, separate ask than Row 11 covers.
 - No `unsafe`/`audited` block syntax yet — that's the Tier-3 escape valve
   from `goal.md` §4, which presupposes Tier 1/2 (the SMT-discharged
   refinement layer) existing first.

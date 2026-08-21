@@ -42,18 +42,25 @@ of the others (§1, §7).
 > (`struct`/`enum`/`match`, no traits, no HKTs, no subtyping) so it doesn't
 > become the research project rows 1–10 already warn against.
 >
-> **Update, 21 Aug 2026:** the first slice of row 11 has actually shipped
-> — non-generic `struct`/`enum`/`match`, with affinity propagating through
-> struct/enum fields the same way it already does through `box`
+> **Update, 21 Aug 2026:** row 11 has actually shipped, all the way
+> through the items it was meant to unlock — `struct`/`enum`/`match`,
+> generics on a declaration with real structural-per-instantiation type
+> identity (`Pair(i64, str)` and `Pair(f64, bool)` are different,
+> unrelated types — no monomorphizer pass exists or is needed), and
+> `Option(T)`/`Result(T, E)` themselves as ordinary generic `enum`s
+> injected into every program, with affinity propagating through struct/
+> enum fields (including through a generic instantiation's own concrete
+> type arguments) the same way it already does through `box`
 > (`compiler/src/typeck.rs`, `ownership.rs`, `interpreter.rs`;
-> `compiler/tests/structs_enums.rs`; `nirdosha_row11_amendment.md`'s §3.6
-> layers 1–4). What isn't built yet is exactly what makes row 11
-> genuinely useful for the items it was meant to unlock: generics on a
-> declaration (layer 6) and `Option`/`Result` as ordinary generic `enum`s
-> on top of that (layer 7) — every `enum` written today has to be fully
-> concrete. Codegen doesn't compile any of it — `struct`/`enum`/`match`
-> join the existing interpreter-only list (`box`/`thread`/`chan`/
-> `sandbox`/`tcp`/`str`), rejected explicitly, not silently mis-compiled.
+> `compiler/tests/structs_enums.rs`, `compiler/tests/generics.rs`;
+> `nirdosha_row11_amendment.md`'s §3.6 layers 1–4, 6–7). Only layer 5
+> (extending `refine.rs`/`smt.rs`'s static-proof boundary set — the
+> Tier-1 bonus prover, not required for correctness) is still open.
+> Codegen doesn't compile any of it — `struct`/`enum`/`match` join the
+> existing interpreter-only list (`box`/`thread`/`chan`/`sandbox`/`tcp`/
+> `str`), rejected explicitly, not silently mis-compiled; a program that
+> never actually constructs/matches one still compiles normally, since
+> the `Option`/`Result` prelude's mere presence isn't itself a use.
 
 ---
 

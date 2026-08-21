@@ -233,7 +233,7 @@ fn llvm_ty(ty: &Ty) -> Result<String, CodegenError> {
         // gives the interpreter. Both lower to the same `i64` regardless
         // of which one they are (`nir_tcp_stop` closes either uniformly).
         Ty::Tcp | Ty::TcpListener => Ok("i64".to_string()),
-        Ty::Named(name) => unsupported(format!(
+        Ty::Named(name, _) => unsupported(format!(
             "codegen doesn't support `{name}` yet — struct/enum/match (Row 11) are interpreter-only \
              for now, see nirdosha_row11_amendment.md"
         )),
@@ -314,70 +314,78 @@ fn agg_layout(ty: &Ty) -> (&Ty, usize, u64) {
 /// would reject — run once, up front, so codegen itself can assume every
 /// type/expression it encounters is in the supported subset.
 pub fn check_supported(program: &Program) -> Result<(), CodegenError> {
-    // Row 11 (struct/enum/match) is interpreter-only, full stop — rejected
-    // here up front rather than relying on `llvm_ty`/`check_expr`'s own
-    // per-site rejections to catch every path (a struct constructor call,
-    // `Point(1.0, 2.0)`, is syntactically just `Expr::Call` and would
-    // otherwise slip past `check_expr`'s `Expr::Call` arm, which has no
-    // way to tell a constructor call from an ordinary one without a
-    // declaration table). Same "interpreter-only, rejected not
-    // mis-compiled" list `box`/`thread`/`chan`/`sandbox`/`tcp`/`file`
-    // already join (module doc; `nirdosha_row11_amendment.md` §3.6, step
-    // 8: "codegen is out of scope until the interpreter version is
-    // proven").
-    if !program.structs.is_empty() || !program.enums.is_empty() {
-        return unsupported(
-            "codegen doesn't support struct/enum/match yet (Row 11) — interpreter-only for now, \
-             see nirdosha_row11_amendment.md",
-        );
+    // Row 11 (struct/enum/match) is interpreter-only, full stop — but
+    // `program.enums` is never actually empty any more (`Option`/
+    // `Result` are injected into *every* program at parse time —
+    // `ast::prelude_enums`'s doc comment), so a blanket "any struct/enum
+    // declared at all" check would reject every program unconditionally,
+    // not just ones that actually use Row 11. This instead rejects a
+    // program only if it actually *uses* a struct/enum: `llvm_ty`
+    // already rejects any `Ty::Named` reaching a param/let/return type,
+    // and `check_expr`'s own `Expr::FieldAccess`/`Expr::Match` arms
+    // already reject those forms directly — `ctor_names` (struct names
+    // and every enum's variant names, prelude included) is the one
+    // remaining gap: a struct/variant constructor call is syntactically
+    // just `Expr::Call`, indistinguishable from an ordinary function
+    // call without a declaration table to check the callee's name
+    // against, which `check_expr` doesn't otherwise have access to.
+    let mut ctor_names: std::collections::HashSet<&str> = program.structs.iter().map(|s| s.name.as_str()).collect();
+    for e in &program.enums {
+        ctor_names.extend(e.variants.iter().map(|v| v.name.as_str()));
     }
     for f in &program.fns {
         for p in &f.params {
             llvm_ty(&p.ty)?;
         }
         llvm_ty(&f.ret)?;
-        check_stmts(&f.body.stmts)?;
+        check_stmts(&f.body.stmts, &ctor_names)?;
     }
     Ok(())
 }
 
-fn check_stmts(stmts: &[Stmt]) -> Result<(), CodegenError> {
+fn check_stmts(stmts: &[Stmt], ctor_names: &std::collections::HashSet<&str>) -> Result<(), CodegenError> {
     for s in stmts {
-        check_stmt(s)?;
+        check_stmt(s, ctor_names)?;
     }
     Ok(())
 }
 
-fn check_stmt(s: &Stmt) -> Result<(), CodegenError> {
+fn check_stmt(s: &Stmt, ctor_names: &std::collections::HashSet<&str>) -> Result<(), CodegenError> {
     match s {
         Stmt::Let { ty, value, .. } => {
             llvm_ty(ty)?;
-            check_expr(value)
+            check_expr(value, ctor_names)
         }
-        Stmt::Return { value: Some(e), .. } => check_expr(e),
+        Stmt::Return { value: Some(e), .. } => check_expr(e, ctor_names),
         Stmt::Return { value: None, .. } => Ok(()),
         Stmt::While { cond, body, .. } => {
-            check_expr(cond)?;
-            check_stmts(&body.stmts)
+            check_expr(cond, ctor_names)?;
+            check_stmts(&body.stmts, ctor_names)
         }
-        Stmt::Expr(e) => check_expr(e),
+        Stmt::Expr(e) => check_expr(e, ctor_names),
         // `audited` only suppresses guard *emission* (`Codegen::audited`,
         // checked inside `guard_in_range`/the division trap) -- every
         // statement inside still has to be otherwise codegen-supported,
         // so this walks in exactly like `While`'s body.
-        Stmt::Audited { body, .. } => check_stmts(body),
+        Stmt::Audited { body, .. } => check_stmts(body, ctor_names),
     }
 }
 
-fn check_expr(e: &Expr) -> Result<(), CodegenError> {
+fn check_expr(e: &Expr, ctor_names: &std::collections::HashSet<&str>) -> Result<(), CodegenError> {
     match e {
         Expr::Int(_, _) | Expr::Bool(_, _) | Expr::Ident(_, _) | Expr::Float(_, _) | Expr::Str(_, _) => Ok(()),
-        Expr::Unary(_, inner, _) => check_expr(inner),
+        Expr::Unary(_, inner, _) => check_expr(inner, ctor_names),
         Expr::Binary(_, l, r, _) => {
-            check_expr(l)?;
-            check_expr(r)
+            check_expr(l, ctor_names)?;
+            check_expr(r, ctor_names)
         }
         Expr::Call(name, args, _) => {
+            if ctor_names.contains(name.as_str()) {
+                return unsupported(format!(
+                    "codegen doesn't support `{name}` yet — struct/enum construction (Row 11) is \
+                     interpreter-only for now, see nirdosha_row11_amendment.md"
+                ));
+            }
             if name == "print" {
                 for a in args {
                     if !is_printable_expr(a) {
@@ -405,25 +413,25 @@ fn check_expr(e: &Expr) -> Result<(), CodegenError> {
                 ));
             }
             for a in args {
-                check_expr(a)?;
+                check_expr(a, ctor_names)?;
             }
             Ok(())
         }
         Expr::If { cond, then_block, else_block, .. } => {
-            check_expr(cond)?;
-            check_stmts(&then_block.stmts)?;
+            check_expr(cond, ctor_names)?;
+            check_stmts(&then_block.stmts, ctor_names)?;
             match else_block.as_deref() {
-                Some(ElseBranch::Block(b)) => check_stmts(&b.stmts),
-                Some(ElseBranch::If(e2)) => check_expr(e2),
+                Some(ElseBranch::Block(b)) => check_stmts(&b.stmts, ctor_names),
+                Some(ElseBranch::If(e2)) => check_expr(e2, ctor_names),
                 None => Ok(()),
             }
         }
-        Expr::Assign(_, rhs, _) => check_expr(rhs),
-        // Unreachable in practice — `check_supported` already rejects any
-        // program that declares a `struct`/`enum` at all, and neither of
-        // these can type-check without one — but the match still has to
-        // be exhaustive, so this names the reason explicitly rather than
-        // `unreachable!()`ing past a real, if currently-dead, code path.
+        Expr::Assign(_, rhs, _) => check_expr(rhs, ctor_names),
+        // Row 11's other two unsupported forms, rejected directly —
+        // neither can type-check without a real struct/enum somewhere
+        // (`typeck.rs`), but unlike a bare constructor call, both are
+        // their own dedicated `Expr` variants, easy to reject by shape
+        // alone with no `ctor_names` lookup needed.
         Expr::FieldAccess(..) | Expr::Match { .. } => unsupported(
             "codegen doesn't support struct/enum/match yet (Row 11) — interpreter-only for now",
         ),
@@ -434,7 +442,7 @@ fn check_expr(e: &Expr) -> Result<(), CodegenError> {
         // job, at real IR-gen time), so it just recurses into whatever's
         // inside — same "walk, don't reject" treatment every other
         // already-supported unary-ish construct gets.
-        Expr::Box(inner, _) | Expr::Deref(inner, _) | Expr::Ref(inner, _) => check_expr(inner),
+        Expr::Box(inner, _) | Expr::Deref(inner, _) | Expr::Ref(inner, _) => check_expr(inner, ctor_names),
         Expr::Spawn(_, _, _) | Expr::Join(_, _) => {
             unsupported("codegen doesn't support `spawn`/`join` yet — interpreter-only for now")
         }
@@ -451,10 +459,10 @@ fn check_expr(e: &Expr) -> Result<(), CodegenError> {
         // actually see its type via `local_ty_of`.
         Expr::Chan(_) => unsupported("codegen doesn't support `chan` yet — interpreter-only for now"),
         Expr::Send(chan, value, _) => {
-            check_expr(chan)?;
-            check_expr(value)
+            check_expr(chan, ctor_names)?;
+            check_expr(value, ctor_names)
         }
-        Expr::Recv(chan, _) => check_expr(chan),
+        Expr::Recv(chan, _) => check_expr(chan, ctor_names),
         // Same reasoning as `send`/`recv` above: `stop` is one AST node
         // (`Expr::StopSandbox`) shared by `sandbox`/`tcp`/`tcp_listener`,
         // dispatched on the operand's type — `sandbox` itself stays
@@ -464,7 +472,7 @@ fn check_expr(e: &Expr) -> Result<(), CodegenError> {
         Expr::SpawnSandbox(_, _, _) => {
             unsupported("codegen doesn't support `sandbox` yet — interpreter-only for now")
         }
-        Expr::StopSandbox(inner, _) => check_expr(inner),
+        Expr::StopSandbox(inner, _) => check_expr(inner, ctor_names),
         // `open`/file I/O is interpreter-only for now, same treatment
         // `Expr::Chan`/`Expr::SpawnSandbox` above get — no type info at
         // this structural pre-pass, so straight rejection rather than
@@ -473,11 +481,11 @@ fn check_expr(e: &Expr) -> Result<(), CodegenError> {
             unsupported("codegen doesn't support `open`/file I/O yet — interpreter-only for now")
         }
         Expr::Connect(host, port, _) => {
-            check_expr(host)?;
-            check_expr(port)
+            check_expr(host, ctor_names)?;
+            check_expr(port, ctor_names)
         }
-        Expr::Listen(port, _) => check_expr(port),
-        Expr::Accept(listener, _) => check_expr(listener),
+        Expr::Listen(port, _) => check_expr(port, ctor_names),
+        Expr::Accept(listener, _) => check_expr(listener, ctor_names),
         // Vector/Matrix indexing lands as of this phase — the base and
         // every index expression are walked the same way `ArrayLit`'s
         // elements are, so a still-unsupported construct nested inside
@@ -485,9 +493,9 @@ fn check_expr(e: &Expr) -> Result<(), CodegenError> {
         // rejection reason instead of being silently accepted because
         // `Expr::Index` itself is now fine.
         Expr::Index(base, indices, _) => {
-            check_expr(base)?;
+            check_expr(base, ctor_names)?;
             for idx in indices {
-                check_expr(idx)?;
+                check_expr(idx, ctor_names)?;
             }
             Ok(())
         }
@@ -499,7 +507,7 @@ fn check_expr(e: &Expr) -> Result<(), CodegenError> {
         // `ArrayLit` shape itself is now fine.
         Expr::ArrayLit(elements, _) => {
             for e in elements {
-                check_expr(e)?;
+                check_expr(e, ctor_names)?;
             }
             Ok(())
         }

@@ -393,16 +393,49 @@ impl<'a> Checker<'a> {
     /// merged post-state has to account for a move down *any* arm — the
     /// same "branches merge, conservatively" rule `check_if_branches`
     /// already establishes, generalized from two branches to N.
-    fn check_match_arms(&mut self, arms: &[MatchArm]) {
+    ///
+    /// **Generic payloads (layer 6):** a variant's declared payload type
+    /// may be a bare reference to the enum's own type parameter (`Some(T)`)
+    /// — substituted against the *scrutinee's* concrete type arguments
+    /// before a binding's affinity can be judged correctly. This pass does
+    /// no general type inference (it trusts `typeck.rs` to have already
+    /// proved every type resolves — module doc), so it can only recover
+    /// those concrete arguments when the scrutinee is a plain bound
+    /// identifier (`match o { ... }`); anything else (a function-call
+    /// result, say) falls back to a conservative substitution that treats
+    /// every one of the enum's type parameters as affine regardless — a
+    /// real, always-affine `Ty` (`box unit`) used purely as a sentinel,
+    /// the same "assume the worse one" direction `check_if_branches`'s own
+    /// branch-merge conservatism already takes. This can only ever
+    /// over-restrict (reject some valid reuse this pass can't prove safe),
+    /// never under-restrict (accept an actual double-move).
+    fn check_match_arms(&mut self, scrutinee: &Expr, arms: &[MatchArm]) {
         let pre = self.scopes.clone();
+
+        let concrete_args: Option<Vec<Ty>> = match scrutinee {
+            Expr::Ident(name, _) => match pre.lookup(name) {
+                Some((Ty::Named(_, args), _)) => Some(args),
+                _ => None,
+            },
+            _ => None,
+        };
+        let sentinel = Ty::Box(Box::new(Ty::Unit));
+
         let mut merged: Option<Vec<HashMap<String, (Ty, bool)>>> = None;
 
         for arm in arms {
             self.scopes = pre.clone();
             self.scopes.push();
-            let payload = self.registry.find_variant(&arm.variant).map(|(_, v)| v.payload.clone()).unwrap_or_default();
-            for (name, ty) in arm.bindings.iter().zip(payload.iter()) {
-                self.scopes.define(name, ty.clone());
+            if let Some((owner, v)) = self.registry.find_variant(&arm.variant) {
+                let type_params = self.registry.enum_type_params(owner).unwrap_or(&[]);
+                let subst: HashMap<&str, &Ty> = match &concrete_args {
+                    Some(args) if args.len() == type_params.len() => zip_type_params(type_params, args),
+                    _ => type_params.iter().map(|p| (p.as_str(), &sentinel)).collect(),
+                };
+                let payload: Vec<Ty> = v.payload.iter().map(|t| substitute_ty(t, &subst)).collect();
+                for (name, ty) in arm.bindings.iter().zip(payload.iter()) {
+                    self.scopes.define(name, ty.clone());
+                }
             }
             self.touch_expr(&arm.body, true);
             self.scopes.pop();
@@ -656,12 +689,22 @@ impl<'a> Checker<'a> {
                 // generalized from "the one field a box has" to "one of
                 // several named fields."
                 if let Expr::Ident(name, span) = base.as_ref() {
+                    // Substituted against the base's own concrete type
+                    // arguments (layer 6, generics) before checking
+                    // affinity — a `Wrapper(box i64)`'s field `v: T` is
+                    // affine for *this* binding even though `T` alone,
+                    // unsubstituted, isn't a real type to ask about at all.
                     let extracting_affine_field = self
                         .scopes
                         .lookup(name)
                         .and_then(|(ty, _)| match ty {
-                            Ty::Named(struct_name) => self.registry.struct_fields(&struct_name).and_then(|fields| {
-                                fields.iter().find(|f| &f.name == field).map(|f| self.registry.is_affine(&f.ty))
+                            Ty::Named(struct_name, args) => self.registry.struct_fields(&struct_name).and_then(|fields| {
+                                let type_params = self.registry.struct_type_params(&struct_name).unwrap_or(&[]);
+                                let subst = zip_type_params(type_params, &args);
+                                fields
+                                    .iter()
+                                    .find(|f| &f.name == field)
+                                    .map(|f| self.registry.is_affine(&substitute_ty(&f.ty, &subst)))
                             }),
                             _ => None,
                         })
@@ -677,7 +720,7 @@ impl<'a> Checker<'a> {
                 // "moves as a whole" rule struct/enum affinity already
                 // gets (§3.5).
                 self.touch_expr(scrutinee, true);
-                self.check_match_arms(arms);
+                self.check_match_arms(scrutinee, arms);
             }
         }
     }
