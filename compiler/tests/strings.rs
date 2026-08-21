@@ -77,11 +77,11 @@ fn an_unterminated_string_is_a_lex_error() {
 #[test]
 fn strings_pass_through_function_parameters_and_returns_unchanged() {
     let src = r#"
-        fn identity(s: str) -> str {
+        fn pass_through(s: str) -> str {
             return s
         }
         fn main() -> str {
-            return identity("passed through")
+            return pass_through("passed through")
         }
     "#;
     match run(src) {

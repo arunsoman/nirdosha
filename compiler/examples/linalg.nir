@@ -1,0 +1,31 @@
+// Exercises: Phase 2's dense linear algebra builtins -- transpose, dot,
+// cross, zeros/ones/identity, sum/len/norm, trace/det/inv/solve/rank,
+// is_symmetric/is_diag/is_square. Textbook examples with known-good
+// numeric output, checked by hand in the comments.
+fn main() {
+    let v: Vector(f64, 3) = [1.0, 2.0, 3.0]
+    let w: Vector(f64, 3) = [4.0, 5.0, 6.0]
+    print(dot(v, w))    // 1*4 + 2*5 + 3*6 = 32
+    print(cross(v, w))  // [2*6-3*5, 3*4-1*6, 1*5-2*4] = [-3, 6, -3]
+    print(len(v))       // 3
+    print(sum(v))       // 6
+    print(norm(v))      // sqrt(1+4+9) = sqrt(14)
+
+    let m: Matrix(f64, 2, 2) = [[1.0, 2.0], [3.0, 4.0]]
+    print(transpose(m)) // [[1, 3], [2, 4]]
+    print(trace(m))     // 1 + 4 = 5
+    print(det(m))       // 1*4 - 2*3 = -2
+    print(is_square(m)) // true
+
+    let sym: Matrix(f64, 2, 2) = [[1.0, 2.0], [2.0, 1.0]]
+    print(is_symmetric(sym)) // true
+
+    print(zeros(3))     // [0, 0, 0]
+    print(ones(2, 2))   // [[1, 1], [1, 1]]
+    print(identity(3))  // [[1,0,0],[0,1,0],[0,0,1]]
+
+    // Solve [[2,0],[0,3]] * x = [4,9] -- x = [2, 3]
+    let a: Matrix(f64, 2, 2) = [[2.0, 0.0], [0.0, 3.0]]
+    let b: Vector(f64, 2) = [4.0, 9.0]
+    print(solve(a, b))
+}

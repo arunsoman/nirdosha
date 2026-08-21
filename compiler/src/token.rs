@@ -5,7 +5,9 @@
 
 // `Hash` is for `refine.rs`, which keys a `HashSet<Span>` of proven-safe
 // sites — every other consumer only needed equality/ordering before this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// `Serialize`/`Deserialize` are for `lib.rs::Diagnostic` — every
+// structured diagnostic (goal.md row 9) carries a `Span`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Span {
     pub line: usize,
     pub col: usize,
@@ -15,6 +17,11 @@ pub struct Span {
 pub enum Tok {
     // literals & identifiers
     Int(i64),
+    /// A decimal float literal (`3.14`) — digits, a `.`, digits, no
+    /// scientific notation. Lexed as its own token, not `Int` followed by
+    /// `Dot` followed by `Int`, so the parser never has to reassemble one
+    /// (and never confuses it with, say, a future field-access `.`).
+    Float(f64),
     Str(String),
     True,
     False,
@@ -37,16 +44,59 @@ pub enum Tok {
     Sandbox,
     Stop,
     Connect,
-    TypeName(String), // i8/i16/.../usize/bool/unit/str — validated by the parser
+    Listen,
+    Accept,
+    /// `open(path, mode)` — see `Expr::Open`. A dedicated keyword, not
+    /// folded into the generic builtin-call machinery, for the same
+    /// reason `connect`/`listen` aren't: its result type (`Ty::File`)
+    /// isn't inferable from a plain `ident(args)` call shape, so it needs
+    /// its own grammar production the parser can special-case.
+    Open,
+    /// `effect(...)` — a `fn` declaration's optional effect annotation
+    /// (`PROTOLANG_PORT.md`'s "Locked design 1"). The five names inside
+    /// the parens (`pure`/`rng`/`io`/`concurrent`/`network`) are
+    /// deliberately **not** reserved keywords of their own — matched by
+    /// identifier text inside `effect(...)`'s parens only
+    /// (`parser.rs::parse_effect_annotation`), the same "keyword only
+    /// within one specific syntactic slot" treatment `transact`'s own
+    /// slot names (`network`/`verify`/`commit`/...) already get, so
+    /// using `io` or `network` as an ordinary variable/function name
+    /// elsewhere in a program stays legal.
+    Effect,
+    Audited,
+    Transact,
+    /// Row 11 (`nirdosha_row11_amendment.md`) — `struct`/`enum`
+    /// declarations and `match` expressions.
+    Struct,
+    Enum,
+    Match,
+    /// `Vector`/`Matrix` in *type* position (`Vector(f64, 3)`) — deliberately
+    /// capitalized, distinct from the lowercase `TypeName` scalars, matching
+    /// the surface syntax the unified plan's architecture table already
+    /// uses. Recognized by exact case-sensitive spelling in the identifier
+    /// scanner (below), not folded into `TYPE_NAMES` since these two take
+    /// `(...)` arguments — a genuinely different production, not another
+    /// bare keyword.
+    VectorKw,
+    MatrixKw,
+    TypeName(String), // i8/i16/.../usize/f64/bool/unit/str — validated by the parser
 
     // symbols
     LParen,
     RParen,
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
     Colon,
     Comma,
-    Arrow, // ->
+    /// `expr.field` — Row 11 field access (`Expr::FieldAccess`). Not
+    /// produced by digit-scanning (a float literal's own `.` is a
+    /// separate, earlier lexer branch — see `Lexer::tokenize`'s digit
+    /// case), only by this literal one-character symbol.
+    Dot,
+    Arrow,    // ->
+    FatArrow, // => (a `match` arm's separator)
     Assign,
     Plus,
     Minus,
@@ -62,6 +112,8 @@ pub enum Tok {
     OrOr,
     Bang,
     Amp,
+    DotStar,  // .*
+    DotSlash, // ./
 
     Eof,
 }
@@ -73,7 +125,8 @@ pub struct Token {
 }
 
 const TYPE_NAMES: &[&str] = &[
-    "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "bool", "unit", "str", "tcp",
+    "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "f64", "bool", "unit", "str",
+    "tcp", "tcp_listener", "file",
 ];
 
 #[derive(Debug, Clone)]
@@ -208,6 +261,28 @@ impl<'a> Lexer<'a> {
                 while self.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
                     self.bump();
                 }
+                // A `.` immediately followed by a digit turns this into a
+                // float literal instead — checked with `peek2`, not just
+                // `peek`, so a bare trailing `.` (nothing this language
+                // has a use for yet — no method-call/field-access syntax)
+                // doesn't get swallowed into a malformed float. `1..` or
+                // `1.` alone stays a plain `Int(1)` followed by whatever
+                // the `.` actually is (currently: a lex error, same as
+                // today — no production accepts a bare `.` yet).
+                let is_float = self.peek() == Some(b'.') && self.peek2().map(|c| c.is_ascii_digit()).unwrap_or(false);
+                if is_float {
+                    self.bump(); // '.'
+                    while self.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                        self.bump();
+                    }
+                    let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
+                    let f: f64 = text.parse().map_err(|_| LexError {
+                        message: format!("float literal `{text}` is not valid"),
+                        span,
+                    })?;
+                    out.push(Token { tok: Tok::Float(f), span });
+                    continue;
+                }
                 let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
                 let n: i64 = text.parse().map_err(|_| LexError {
                     message: format!("integer literal `{text}` out of range"),
@@ -244,6 +319,17 @@ impl<'a> Lexer<'a> {
                     "sandbox" => Tok::Sandbox,
                     "stop" => Tok::Stop,
                     "connect" => Tok::Connect,
+                    "listen" => Tok::Listen,
+                    "accept" => Tok::Accept,
+                    "open" => Tok::Open,
+                    "effect" => Tok::Effect,
+                    "audited" => Tok::Audited,
+                    "transact" => Tok::Transact,
+                    "struct" => Tok::Struct,
+                    "enum" => Tok::Enum,
+                    "match" => Tok::Match,
+                    "Vector" => Tok::VectorKw,
+                    "Matrix" => Tok::MatrixKw,
                     "true" => Tok::True,
                     "false" => Tok::False,
                     t if TYPE_NAMES.contains(&t) => Tok::TypeName(t.to_string()),
@@ -257,20 +343,26 @@ impl<'a> Lexer<'a> {
             let two = self.peek2();
             let (tok, len) = match (c, two) {
                 (b'-', Some(b'>')) => (Tok::Arrow, 2),
+                (b'=', Some(b'>')) => (Tok::FatArrow, 2),
                 (b'=', Some(b'=')) => (Tok::EqEq, 2),
                 (b'!', Some(b'=')) => (Tok::NotEq, 2),
                 (b'<', Some(b'=')) => (Tok::LtEq, 2),
                 (b'>', Some(b'=')) => (Tok::GtEq, 2),
                 (b'&', Some(b'&')) => (Tok::AndAnd, 2),
                 (b'|', Some(b'|')) => (Tok::OrOr, 2),
+                (b'.', Some(b'*')) => (Tok::DotStar, 2),
+                (b'.', Some(b'/')) => (Tok::DotSlash, 2),
                 _ => {
                     let single = match c {
                         b'(' => Tok::LParen,
                         b')' => Tok::RParen,
                         b'{' => Tok::LBrace,
                         b'}' => Tok::RBrace,
+                        b'[' => Tok::LBracket,
+                        b']' => Tok::RBracket,
                         b':' => Tok::Colon,
                         b',' => Tok::Comma,
+                        b'.' => Tok::Dot,
                         b'=' => Tok::Assign,
                         b'+' => Tok::Plus,
                         b'-' => Tok::Minus,

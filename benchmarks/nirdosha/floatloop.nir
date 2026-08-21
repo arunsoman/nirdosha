@@ -1,0 +1,10 @@
+fn main() {
+    let acc: f64 = 0.0
+    let i: i64 = 0
+    while i < 200000000 {
+        acc = acc + 1.5
+        acc = acc * 0.999999
+        i = i + 1
+    }
+    print(acc)
+}

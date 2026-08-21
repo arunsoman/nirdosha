@@ -1,0 +1,34 @@
+// Row 11 (`nirdosha_row11_amendment.md`) -- struct/enum/match. Layer 1:
+// fixed concrete fields, no generics yet (that's layer 6). Construction is
+// an ordinary call, field access is `expr.field`, and `match` destructures
+// a closed, exhaustively-checked set of variants.
+
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+enum Shape {
+    Circle(f64),
+    Rectangle(f64, f64),
+}
+
+fn dist_from_origin(p: Point) -> f64 {
+    return norm([p.x, p.y])
+}
+
+fn area(s: Shape) -> f64 {
+    return match s {
+        Circle(r) => 3.14159 * r * r,
+        Rectangle(w, h) => w * h,
+    }
+}
+
+fn main() -> f64 {
+    let p: Point = Point(3.0, 4.0)
+    let d: f64 = dist_from_origin(p)
+
+    let c: Shape = Circle(2.0)
+    let r: Shape = Rectangle(3.0, 4.0)
+    return d + area(c) + area(r)
+}

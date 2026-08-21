@@ -45,6 +45,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use crate::ast::*;
 use crate::token::Span;
 
@@ -63,6 +65,24 @@ use crate::token::Span;
 #[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
+    /// A fixed-length dense array (`Ty::Vector`). `Arc<[Value]>`, not
+    /// `Vec<Value>` -- the same cheap-clone-on-read reasoning
+    /// `Value::Str`'s `Arc<str>` already documents: `Env::get` clones
+    /// every `Value` on read, and this phase declares `Vector`/`Matrix`
+    /// non-affine (see `ast.rs::Ty::is_affine`'s doc comment), so every
+    /// read of a vector-typed binding is a real clone, not just a
+    /// borrow — `Arc` makes that a refcount bump instead of an
+    /// element-by-element copy.
+    Vector(Arc<[Value]>),
+    /// A fixed-shape dense array (`Ty::Matrix`), row-major, flattened
+    /// into one contiguous `Arc<[Value]>` — element `(i, j)` lives at
+    /// `i * cols + j`. Same `Arc` reasoning as `Value::Vector`.
+    Matrix(Arc<[Value]>, usize, usize),
+    /// IEEE 754 double (`Ty::F64`). No range/overflow story the way
+    /// `Value::Int` needs one (`check_ty` just matches the type tag, no
+    /// `in_range` call) -- floats saturate to `inf`/`NaN` instead of
+    /// trapping, per this phase's float semantics (see `ast.rs::Ty::F64`).
+    Float(f64),
     Bool(bool),
     Unit,
     Boxed(Box<Value>),
@@ -120,6 +140,36 @@ pub enum Value {
     /// help required (there's no analog to a leaked OS *process* to
     /// guard against; a dropped socket is just... closed).
     Tcp(Arc<Mutex<Option<std::net::TcpStream>>>),
+    /// A handle to a real, listening TCP server socket (`listen(port)` —
+    /// see `Ty::TcpListener`'s doc comment). `Mutex<Option<..>>`, same
+    /// shape as `Value::Tcp`: `stop` needs to `.take()` it out exactly
+    /// once. `accept` reads through the `Mutex` without taking, since
+    /// the listener stays usable across many `accept` calls.
+    TcpListener(Arc<Mutex<Option<std::net::TcpListener>>>),
+    /// A handle to a real, local file (`open(path, mode)` — see
+    /// `Ty::File`'s doc comment). `Mutex<Option<..>>`, same shape and
+    /// reason as `Value::Tcp`: `stop` needs to `.take()` the file out
+    /// exactly once. Same as `Value::Tcp`, no custom `Drop` is needed —
+    /// a `std::fs::File` closes its own descriptor on drop with no help
+    /// required.
+    File(Arc<Mutex<Option<std::fs::File>>>),
+    /// A `struct` value (Row 11) — the declared struct's name plus its
+    /// field values, positional, in declaration order (construction is
+    /// positional-only — `ast::StructDecl`'s doc comment). `Arc<[Value]>`,
+    /// not `Vec<Value>`, same cheap-clone-on-read reasoning `Value::
+    /// Vector`'s doc comment already gives: `Env::get` clones every
+    /// `Value` on read, and a struct is non-affine unless one of its
+    /// fields is (`ownership.rs`'s `TypeRegistry::is_affine`), so most
+    /// reads of a struct-typed binding are a real, if rare, deep clone —
+    /// `Arc` at least makes the *handle* itself a refcount bump. The name
+    /// is carried for `ty_name`/`render`/`check_ty`'s own diagnostics;
+    /// nothing here re-derives it by looking the value up in `Program`.
+    Struct(Arc<str>, Arc<[Value]>),
+    /// An `enum` value (Row 11) — the declared enum's name, which variant
+    /// this value actually is, and that variant's payload, positional
+    /// (same shape as `Value::Struct`, plus the variant tag `match`
+    /// dispatches on).
+    Enum(Arc<str>, Arc<str>, Arc<[Value]>),
 }
 
 /// A spawned computation's raw join handle. Its own alias, not just inline
@@ -372,6 +422,27 @@ fn read_tcp(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
         .map_err(|_| std::io::Error::other("tcp connection received bytes that were not valid UTF-8"))
 }
 
+/// `send(file, s)`'s implementation — reuses `Expr::Send`, same as `tcp`.
+fn write_file(file: &mut std::fs::File, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    file.write_all(text.as_bytes())
+}
+
+/// `recv(file)`'s implementation — one read syscall into a fixed 64KiB
+/// buffer, same shape as `read_tcp`, but with the opposite EOF
+/// convention: a live TCP peer closing the connection is a genuine error
+/// (`read_tcp`'s `n == 0` check), while a file simply running out of
+/// bytes to read is the normal, expected way a file ends. `recv` on a
+/// `file` therefore returns `Ok("")` at EOF, not an error — see
+/// `PROTOLANG_PORT.md`'s file I/O design for this exact convention.
+fn read_file(file: &mut std::fs::File) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut buf = [0u8; 65536];
+    let n = file.read(&mut buf)?;
+    String::from_utf8(buf[..n].to_vec())
+        .map_err(|_| std::io::Error::other("file contained bytes that were not valid UTF-8"))
+}
+
 /// A sandboxed process, plus the temp file its source was written to
 /// (removed once the process is known to have exited — not before, since
 /// the child re-reads that file at its own startup and deleting it out
@@ -440,6 +511,9 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Vector(a), Value::Vector(b)) => a == b,
+            (Value::Matrix(a, ar, ac), Value::Matrix(b, br, bc)) => ar == br && ac == bc && a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Unit, Value::Unit) => true,
             (Value::Boxed(a), Value::Boxed(b)) => a == b,
@@ -449,6 +523,9 @@ impl PartialEq for Value {
             (Value::Sandbox(a), Value::Sandbox(b)) => Arc::ptr_eq(a, b),
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Tcp(a), Value::Tcp(b)) => Arc::ptr_eq(a, b),
+            (Value::TcpListener(a), Value::TcpListener(b)) => Arc::ptr_eq(a, b),
+            (Value::Struct(an, af), Value::Struct(bn, bf)) => an == bn && af == bf,
+            (Value::Enum(an, av, af), Value::Enum(bn, bv, bf)) => an == bn && av == bv && af == bf,
             _ => false,
         }
     }
@@ -458,6 +535,9 @@ impl Value {
     fn ty_name(&self) -> &'static str {
         match self {
             Value::Int(_) => "int",
+            Value::Float(_) => "f64",
+            Value::Vector(_) => "vector",
+            Value::Matrix(..) => "matrix",
             Value::Bool(_) => "bool",
             Value::Unit => "unit",
             Value::Boxed(_) => "box",
@@ -467,12 +547,34 @@ impl Value {
             Value::Sandbox(_) => "sandbox",
             Value::Str(_) => "str",
             Value::Tcp(_) => "tcp",
+            Value::TcpListener(_) => "tcp_listener",
+            Value::File(_) => "file",
+            // A generic tag, not the real declared name — every real call
+            // site that needs the *actual* struct/enum name already has
+            // the `Ty::Named`/`Value::Struct`/`Value::Enum` name field
+            // directly at hand and doesn't need to go through this
+            // generic method; this exists only so `ty_name` stays total.
+            Value::Struct(..) => "struct",
+            Value::Enum(..) => "enum",
         }
     }
 
     fn render(&self) -> String {
         match self {
             Value::Int(n) => n.to_string(),
+            Value::Float(n) => n.to_string(),
+            Value::Vector(elems) => {
+                format!("[{}]", elems.iter().map(Value::render).collect::<Vec<_>>().join(", "))
+            }
+            Value::Matrix(elems, rows, cols) => {
+                let rows_rendered: Vec<String> = (0..*rows)
+                    .map(|i| {
+                        let row = &elems[i * cols..(i + 1) * cols];
+                        format!("[{}]", row.iter().map(Value::render).collect::<Vec<_>>().join(", "))
+                    })
+                    .collect();
+                format!("[{}]", rows_rendered.join(", "))
+            }
             Value::Bool(b) => b.to_string(),
             Value::Unit => "()".to_string(),
             Value::Boxed(inner) => format!("box({})", inner.render()),
@@ -482,11 +584,20 @@ impl Value {
             Value::Sandbox(_) => "sandbox(..)".to_string(),
             Value::Str(s) => s.to_string(),
             Value::Tcp(_) => "tcp(..)".to_string(),
+            Value::TcpListener(_) => "tcp_listener(..)".to_string(),
+            Value::File(_) => "file(..)".to_string(),
+            Value::Struct(name, fields) => {
+                format!("{name}({})", fields.iter().map(Value::render).collect::<Vec<_>>().join(", "))
+            }
+            Value::Enum(_, variant, payload) => {
+                format!("{variant}({})", payload.iter().map(Value::render).collect::<Vec<_>>().join(", "))
+            }
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
 pub enum ErrorKind {
     UnknownFn(String),
     UnknownVar(String),
@@ -528,9 +639,24 @@ pub enum ErrorKind {
     /// real-world I/O transport, the same failure category, not a
     /// separate one.
     ChannelIoError { message: String },
+    /// `v[i]`/`m[i, j]`'s Tier-2 runtime bounds check (goal.md §4) —
+    /// `typeck.rs` proves the index is *an integer*, not that it's *in
+    /// range*; SMT-proven bounds (Tier 1) are Phase 5.
+    IndexOutOfBounds { index: i64, len: usize },
+    /// `inv`/`solve` -- the matrix is (numerically) singular, detected by
+    /// Gaussian elimination hitting a zero (below-tolerance) pivot after
+    /// partial pivoting already tried every remaining row. A *value*-
+    /// dependent failure, not a shape one -- `typeck.rs` already proved
+    /// the matrix is square, but squareness doesn't imply invertibility.
+    SingularMatrix,
+    /// `rand_f64`/`rand_gaussian` called before `rand_seed` -- no
+    /// implicit default seed exists (see `Interpreter::rng`'s doc
+    /// comment): "deterministic by default" means every draw traces
+    /// back to an explicit seed, not a silently-chosen one.
+    RngNotSeeded,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeError {
     pub kind: ErrorKind,
     pub span: Span,
@@ -571,12 +697,672 @@ impl std::fmt::Display for RuntimeError {
             ErrorKind::ChannelIoError { message } => {
                 write!(f, "{line}:{col}: channel I/O error: {message}")
             }
+            ErrorKind::IndexOutOfBounds { index, len } => write!(
+                f,
+                "{line}:{col}: index {index} out of bounds (length {len}) (Tier-2 checked op — \
+                 see goal.md §4; not yet proved absent at compile time)"
+            ),
+            ErrorKind::SingularMatrix => write!(f, "{line}:{col}: matrix is singular"),
+            ErrorKind::RngNotSeeded => {
+                write!(f, "{line}:{col}: rand_f64/rand_gaussian called before rand_seed")
+            }
         }
     }
 }
 
 fn err<T>(kind: ErrorKind, span: Span) -> Result<T, RuntimeError> {
     Err(RuntimeError { kind, span })
+}
+
+/// A single scalar arithmetic step, shared by `eval_binary`'s elementwise
+/// (`+`/`-`), Hadamard (`.*`/`./`), and matrix-product (`*`, via repeated
+/// multiply-accumulate) array arms — `a`/`b` are individual `Vector`/
+/// `Matrix` elements, not the arrays themselves. `typeck.rs` already
+/// proved both are the same numeric scalar type, so this never needs to
+/// handle a type mismatch, only (for `Int`) the same `DivByZero` a plain
+/// scalar `/` already checks — `Vector`/`Matrix` division doesn't exist
+/// this phase, but Hadamard `./` on integer elements can still divide by
+/// zero, so this can't be infallible the way `Value`'s own `PartialEq`
+/// is.
+fn scalar_binop(op: BinOp, a: &Value, b: &Value, span: Span) -> Result<Value, RuntimeError> {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => match op {
+            BinOp::Add => Ok(Value::Int(x + y)),
+            BinOp::Sub => Ok(Value::Int(x - y)),
+            BinOp::Mul | BinOp::ElemMul => Ok(Value::Int(x * y)),
+            BinOp::Div | BinOp::ElemDiv => {
+                if *y == 0 {
+                    err(ErrorKind::DivByZero, span)
+                } else {
+                    Ok(Value::Int(x / y))
+                }
+            }
+            _ => unreachable!("scalar_binop is only ever called with Add/Sub/Mul/Div/ElemMul/ElemDiv"),
+        },
+        (Value::Float(x), Value::Float(y)) => match op {
+            BinOp::Add => Ok(Value::Float(x + y)),
+            BinOp::Sub => Ok(Value::Float(x - y)),
+            BinOp::Mul | BinOp::ElemMul => Ok(Value::Float(x * y)),
+            BinOp::Div | BinOp::ElemDiv => Ok(Value::Float(x / y)),
+            _ => unreachable!("scalar_binop is only ever called with Add/Sub/Mul/Div/ElemMul/ElemDiv"),
+        },
+        _ => unreachable!("typeck.rs already proved matching, numeric-scalar element types"),
+    }
+}
+
+fn as_f64(v: &Value) -> f64 {
+    match v {
+        Value::Float(f) => *f,
+        _ => unreachable!("typeck.rs already proved this element is f64"),
+    }
+}
+
+/// Sum of a nonempty scalar slice via repeated `scalar_binop(Add, ..)` --
+/// shared by `sum`, `dot`'s and matrix-multiply's accumulation, and
+/// `trace`. Never called on an empty slice: a `Value::Vector`/`Matrix`
+/// only exists via `Expr::ArrayLit`, which always has at least one
+/// element/row (see `Expr::ArrayLit`'s doc comment in ast.rs).
+fn sum_all(elems: &[Value], span: Span) -> Result<Value, RuntimeError> {
+    let mut acc = elems[0].clone();
+    for v in &elems[1..] {
+        acc = scalar_binop(BinOp::Add, &acc, v, span)?;
+    }
+    Ok(acc)
+}
+
+/// Gaussian elimination with partial pivoting, row-major `n x n`.
+/// Returns the determinant; `0.0` for a singular matrix (a real,
+/// legitimate answer for `det` specifically — unlike `inv`/`solve`,
+/// there's no result to fail to produce).
+fn matrix_det(elems: &[f64], n: usize) -> f64 {
+    let mut a: Vec<f64> = elems.to_vec();
+    let mut det = 1.0;
+    for col in 0..n {
+        let mut pivot_row = col;
+        let mut max_val = a[col * n + col].abs();
+        for row in (col + 1)..n {
+            let v = a[row * n + col].abs();
+            if v > max_val {
+                max_val = v;
+                pivot_row = row;
+            }
+        }
+        if max_val == 0.0 {
+            return 0.0;
+        }
+        if pivot_row != col {
+            for k in 0..n {
+                a.swap(col * n + k, pivot_row * n + k);
+            }
+            det = -det;
+        }
+        det *= a[col * n + col];
+        for row in (col + 1)..n {
+            let factor = a[row * n + col] / a[col * n + col];
+            for k in col..n {
+                a[row * n + k] -= factor * a[col * n + k];
+            }
+        }
+    }
+    det
+}
+
+/// Numerically-singular threshold shared by `inv`/`solve`/`rank`'s pivot
+/// checks — a plain `== 0.0` would accept a pivot that's technically
+/// nonzero but so small that dividing by it produces garbage; this is
+/// the standard "close enough to singular to refuse" tolerance, not a
+/// principled bound.
+const SINGULAR_EPSILON: f64 = 1e-10;
+
+/// Gauss-Jordan elimination with partial pivoting, augmenting with the
+/// identity matrix. Returns `None` for a singular matrix.
+fn matrix_inv(elems: &[f64], n: usize) -> Option<Vec<f64>> {
+    let mut a: Vec<f64> = elems.to_vec();
+    let mut inv = vec![0.0; n * n];
+    for i in 0..n {
+        inv[i * n + i] = 1.0;
+    }
+    for col in 0..n {
+        let mut pivot_row = col;
+        let mut max_val = a[col * n + col].abs();
+        for row in (col + 1)..n {
+            let v = a[row * n + col].abs();
+            if v > max_val {
+                max_val = v;
+                pivot_row = row;
+            }
+        }
+        if max_val < SINGULAR_EPSILON {
+            return None;
+        }
+        if pivot_row != col {
+            for k in 0..n {
+                a.swap(col * n + k, pivot_row * n + k);
+                inv.swap(col * n + k, pivot_row * n + k);
+            }
+        }
+        let pivot = a[col * n + col];
+        for k in 0..n {
+            a[col * n + k] /= pivot;
+            inv[col * n + k] /= pivot;
+        }
+        for row in 0..n {
+            if row == col {
+                continue;
+            }
+            let factor = a[row * n + col];
+            if factor != 0.0 {
+                for k in 0..n {
+                    a[row * n + k] -= factor * a[col * n + k];
+                    inv[row * n + k] -= factor * inv[col * n + k];
+                }
+            }
+        }
+    }
+    Some(inv)
+}
+
+/// Gaussian elimination with partial pivoting, then back substitution.
+/// Returns `None` for a singular `a`.
+fn matrix_solve(a_elems: &[f64], n: usize, b_elems: &[f64]) -> Option<Vec<f64>> {
+    let mut a: Vec<f64> = a_elems.to_vec();
+    let mut b: Vec<f64> = b_elems.to_vec();
+    for col in 0..n {
+        let mut pivot_row = col;
+        let mut max_val = a[col * n + col].abs();
+        for row in (col + 1)..n {
+            let v = a[row * n + col].abs();
+            if v > max_val {
+                max_val = v;
+                pivot_row = row;
+            }
+        }
+        if max_val < SINGULAR_EPSILON {
+            return None;
+        }
+        if pivot_row != col {
+            for k in 0..n {
+                a.swap(col * n + k, pivot_row * n + k);
+            }
+            b.swap(col, pivot_row);
+        }
+        for row in (col + 1)..n {
+            let factor = a[row * n + col] / a[col * n + col];
+            for k in col..n {
+                a[row * n + k] -= factor * a[col * n + k];
+            }
+            b[row] -= factor * b[col];
+        }
+    }
+    let mut x = vec![0.0; n];
+    for row in (0..n).rev() {
+        let mut sum = b[row];
+        for k in (row + 1)..n {
+            sum -= a[row * n + k] * x[k];
+        }
+        x[row] = sum / a[row * n + row];
+    }
+    Some(x)
+}
+
+/// Row-echelon reduction, `rows x cols` (not necessarily square) —
+/// returns the number of nonzero pivot rows found.
+fn matrix_rank(elems: &[f64], rows: usize, cols: usize) -> usize {
+    let mut a: Vec<f64> = elems.to_vec();
+    let mut rank = 0;
+    let mut pivot_row = 0;
+    for col in 0..cols {
+        if pivot_row >= rows {
+            break;
+        }
+        let mut best_row = pivot_row;
+        let mut max_val = a[pivot_row * cols + col].abs();
+        for row in (pivot_row + 1)..rows {
+            let v = a[row * cols + col].abs();
+            if v > max_val {
+                max_val = v;
+                best_row = row;
+            }
+        }
+        if max_val < SINGULAR_EPSILON {
+            continue; // this column contributes no new pivot
+        }
+        if best_row != pivot_row {
+            for k in 0..cols {
+                a.swap(pivot_row * cols + k, best_row * cols + k);
+            }
+        }
+        for row in (pivot_row + 1)..rows {
+            let factor = a[row * cols + col] / a[pivot_row * cols + col];
+            for k in col..cols {
+                a[row * cols + k] -= factor * a[pivot_row * cols + k];
+            }
+        }
+        pivot_row += 1;
+        rank += 1;
+    }
+    rank
+}
+
+// ---- geometry (WGS84) -------------------------------------------------
+
+/// WGS84 ellipsoid semi-major axis (meters) and flattening — the
+/// standard reference ellipsoid every GPS/GNSS coordinate is already
+/// expressed against, so this is the only sane default rather than a
+/// configurable parameter this phase doesn't otherwise need.
+const WGS84_A: f64 = 6_378_137.0;
+const WGS84_F: f64 = 1.0 / 298.257_223_563;
+
+fn wgs84_e2() -> f64 {
+    WGS84_F * (2.0 - WGS84_F)
+}
+
+/// `[lat_deg, lon_deg, alt_m]` -> `[x, y, z]` ECEF meters.
+fn lla_to_ecef(lat_deg: f64, lon_deg: f64, alt: f64) -> (f64, f64, f64) {
+    let lat = lat_deg.to_radians();
+    let lon = lon_deg.to_radians();
+    let e2 = wgs84_e2();
+    let n = WGS84_A / (1.0 - e2 * lat.sin().powi(2)).sqrt();
+    let x = (n + alt) * lat.cos() * lon.cos();
+    let y = (n + alt) * lat.cos() * lon.sin();
+    let z = (n * (1.0 - e2) + alt) * lat.sin();
+    (x, y, z)
+}
+
+/// `[x, y, z]` ECEF meters -> `[lat_deg, lon_deg, alt_m]` — iterative
+/// (a fixed-point refinement on latitude/altitude), not a closed-form
+/// solution: simpler to get right than Bowring's method, and five
+/// iterations converges to sub-millimeter accuracy for any point near
+/// Earth's surface, the only regime this builtin is for.
+fn ecef_to_lla(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
+    let e2 = wgs84_e2();
+    let lon = y.atan2(x);
+    let p = (x * x + y * y).sqrt();
+    let mut lat = z.atan2(p * (1.0 - e2));
+    let mut alt = 0.0;
+    for _ in 0..5 {
+        let n = WGS84_A / (1.0 - e2 * lat.sin().powi(2)).sqrt();
+        alt = p / lat.cos() - n;
+        lat = z.atan2(p * (1.0 - e2 * n / (n + alt)));
+    }
+    (lat.to_degrees(), lon.to_degrees(), alt)
+}
+
+/// The rotation from ECEF-relative-to-reference into local East-North-Up
+/// — shared by `ecef_to_enu`/`enu_to_ecef`, which apply it (and its
+/// transpose/inverse, the same rotation matrix run backwards) in
+/// opposite directions.
+fn enu_rotation(ref_lat_deg: f64, ref_lon_deg: f64) -> [[f64; 3]; 3] {
+    let lat = ref_lat_deg.to_radians();
+    let lon = ref_lon_deg.to_radians();
+    [
+        [-lon.sin(), lon.cos(), 0.0],
+        [-lat.sin() * lon.cos(), -lat.sin() * lon.sin(), lat.cos()],
+        [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()],
+    ]
+}
+
+fn ecef_to_enu(ecef: (f64, f64, f64), ref_lla: (f64, f64, f64)) -> (f64, f64, f64) {
+    let ref_ecef = lla_to_ecef(ref_lla.0, ref_lla.1, ref_lla.2);
+    let d = (ecef.0 - ref_ecef.0, ecef.1 - ref_ecef.1, ecef.2 - ref_ecef.2);
+    let r = enu_rotation(ref_lla.0, ref_lla.1);
+    (
+        r[0][0] * d.0 + r[0][1] * d.1 + r[0][2] * d.2,
+        r[1][0] * d.0 + r[1][1] * d.1 + r[1][2] * d.2,
+        r[2][0] * d.0 + r[2][1] * d.1 + r[2][2] * d.2,
+    )
+}
+
+fn enu_to_ecef(enu: (f64, f64, f64), ref_lla: (f64, f64, f64)) -> (f64, f64, f64) {
+    let ref_ecef = lla_to_ecef(ref_lla.0, ref_lla.1, ref_lla.2);
+    let r = enu_rotation(ref_lla.0, ref_lla.1);
+    // The inverse of a rotation matrix is its transpose.
+    let d = (
+        r[0][0] * enu.0 + r[1][0] * enu.1 + r[2][0] * enu.2,
+        r[0][1] * enu.0 + r[1][1] * enu.1 + r[2][1] * enu.2,
+        r[0][2] * enu.0 + r[1][2] * enu.1 + r[2][2] * enu.2,
+    );
+    (ref_ecef.0 + d.0, ref_ecef.1 + d.1, ref_ecef.2 + d.2)
+}
+
+/// Initial great-circle bearing (degrees, `[0, 360)`) from `(lat1,lon1)`
+/// to `(lat2,lon2)`, both in decimal degrees.
+fn bearing_deg(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let lat1 = lat1.to_radians();
+    let lat2 = lat2.to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let y = dlon.sin() * lat2.cos();
+    let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
+    let deg = y.atan2(x).to_degrees();
+    (deg + 360.0) % 360.0
+}
+
+// ---- linear Kalman filter ----------------------------------------------
+
+fn mat_mul_f64(a: &[f64], ar: usize, ac: usize, b: &[f64], bc: usize) -> Vec<f64> {
+    let mut out = vec![0.0; ar * bc];
+    for i in 0..ar {
+        for j in 0..bc {
+            out[i * bc + j] = (0..ac).map(|k| a[i * ac + k] * b[k * bc + j]).sum();
+        }
+    }
+    out
+}
+
+fn mat_vec_mul_f64(a: &[f64], ar: usize, ac: usize, v: &[f64]) -> Vec<f64> {
+    (0..ar).map(|i| (0..ac).map(|k| a[i * ac + k] * v[k]).sum()).collect()
+}
+
+fn mat_transpose_f64(a: &[f64], r: usize, c: usize) -> Vec<f64> {
+    let mut out = vec![0.0; r * c];
+    for i in 0..r {
+        for j in 0..c {
+            out[j * r + i] = a[i * c + j];
+        }
+    }
+    out
+}
+
+fn vec_add_f64(a: &[f64], b: &[f64]) -> Vec<f64> {
+    a.iter().zip(b).map(|(x, y)| x + y).collect()
+}
+
+fn vec_sub_f64(a: &[f64], b: &[f64]) -> Vec<f64> {
+    a.iter().zip(b).map(|(x, y)| x - y).collect()
+}
+
+/// `x' = F x`, `P' = F P F^T + Q` — the linear KF prediction step.
+fn kf_predict(x: &[f64], p: &[f64], f: &[f64], q: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+    let x_new = mat_vec_mul_f64(f, n, n, x);
+    let ft = mat_transpose_f64(f, n, n);
+    let fp = mat_mul_f64(f, n, n, p, n);
+    let fpft = mat_mul_f64(&fp, n, n, &ft, n);
+    let p_new = vec_add_f64(&fpft, q);
+    (x_new, p_new)
+}
+
+/// `y = z - Hx`, `S = HPH^T + R`, `K = PH^T S^-1`, `x' = x + Ky`,
+/// `P' = (I - KH)P` — the linear KF update step. `None` if `S` is
+/// singular (reuses `matrix_inv`'s own Gauss-Jordan directly, now that
+/// both take plain `&[f64]` — see `eval_builtin`'s `kf_update_state`/
+/// `kf_update_cov` arm).
+fn kf_update(x: &[f64], p: &[f64], z: &[f64], h: &[f64], r: &[f64], n: usize, m: usize) -> Option<(Vec<f64>, Vec<f64>)> {
+    let hx = mat_vec_mul_f64(h, m, n, x);
+    let y = vec_sub_f64(z, &hx);
+    let ht = mat_transpose_f64(h, m, n);
+    let hp = mat_mul_f64(h, m, n, p, n);
+    let hpht = mat_mul_f64(&hp, m, n, &ht, m);
+    let s = vec_add_f64(&hpht, r);
+    let s_inv = matrix_inv(&s, m)?;
+    let pht = mat_mul_f64(p, n, n, &ht, m);
+    let k = mat_mul_f64(&pht, n, m, &s_inv, m);
+    let ky = mat_vec_mul_f64(&k, n, m, &y);
+    let x_new = vec_add_f64(x, &ky);
+    let kh = mat_mul_f64(&k, n, m, h, n);
+    let mut i_minus_kh = vec![0.0; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            i_minus_kh[i * n + j] = if i == j { 1.0 } else { 0.0 } - kh[i * n + j];
+        }
+    }
+    let p_new = mat_mul_f64(&i_minus_kh, n, n, p, n);
+    Some((x_new, p_new))
+}
+
+/// Every builtin's evaluation, dispatched by name — `typeck.rs`'s
+/// `infer_builtin_call` already proved `args`' shapes/types are legal
+/// for whichever `name` this is (see `ast.rs::BUILTIN_NAMES`'s doc
+/// comment for why the two dispatches are independent, not a shared
+/// table), so every arm here just computes; a mismatched pattern is
+/// `unreachable!()`, the same "the checker is the real gate" convention
+/// this whole file already follows.
+fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell<Option<RngState>>) -> Result<Value, RuntimeError> {
+    match name {
+        "rand_seed" => {
+            let Value::Int(seed) = &args[0] else { unreachable!("typeck.rs already proved this is an integer") };
+            *rng.borrow_mut() = Some(RngState::seed(*seed as u64));
+            Ok(Value::Unit)
+        }
+        "rand_f64" => match rng.borrow_mut().as_mut() {
+            Some(r) => Ok(Value::Float(r.next_f64())),
+            None => Err(RuntimeError { kind: ErrorKind::RngNotSeeded, span }),
+        },
+        "rand_gaussian" => {
+            let (Value::Float(mean), Value::Float(stddev)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are f64")
+            };
+            match rng.borrow_mut().as_mut() {
+                Some(r) => Ok(Value::Float(r.next_gaussian(*mean, *stddev))),
+                None => Err(RuntimeError { kind: ErrorKind::RngNotSeeded, span }),
+            }
+        }
+        "distance" => {
+            let (Value::Vector(a), Value::Vector(b)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are Vector(f64, _) of matching length")
+            };
+            let sum_sq: f64 = a.iter().zip(b.iter()).map(|(x, y)| (as_f64(x) - as_f64(y)).powi(2)).sum();
+            Ok(Value::Float(sum_sq.sqrt()))
+        }
+        "bearing" => {
+            let (Value::Vector(from), Value::Vector(to)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are Vector(f64, 2)")
+            };
+            Ok(Value::Float(bearing_deg(as_f64(&from[0]), as_f64(&from[1]), as_f64(&to[0]), as_f64(&to[1]))))
+        }
+        "lla_to_ecef" => {
+            let Value::Vector(lla) = &args[0] else { unreachable!("typeck.rs already proved this is a Vector(f64, 3)") };
+            let (x, y, z) = lla_to_ecef(as_f64(&lla[0]), as_f64(&lla[1]), as_f64(&lla[2]));
+            Ok(Value::Vector(Arc::from(vec![Value::Float(x), Value::Float(y), Value::Float(z)])))
+        }
+        "ecef_to_lla" => {
+            let Value::Vector(ecef) = &args[0] else { unreachable!("typeck.rs already proved this is a Vector(f64, 3)") };
+            let (lat, lon, alt) = ecef_to_lla(as_f64(&ecef[0]), as_f64(&ecef[1]), as_f64(&ecef[2]));
+            Ok(Value::Vector(Arc::from(vec![Value::Float(lat), Value::Float(lon), Value::Float(alt)])))
+        }
+        "ecef_to_enu" | "enu_to_ecef" => {
+            let (Value::Vector(a), Value::Vector(refp)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are Vector(f64, 3)")
+            };
+            let av = (as_f64(&a[0]), as_f64(&a[1]), as_f64(&a[2]));
+            let refv = (as_f64(&refp[0]), as_f64(&refp[1]), as_f64(&refp[2]));
+            let out = if name == "ecef_to_enu" { ecef_to_enu(av, refv) } else { enu_to_ecef(av, refv) };
+            Ok(Value::Vector(Arc::from(vec![Value::Float(out.0), Value::Float(out.1), Value::Float(out.2)])))
+        }
+        "kf_predict_state" | "kf_predict_cov" => {
+            let (Value::Vector(x), Value::Matrix(p, n, _), Value::Matrix(f, _, _), Value::Matrix(q, _, _)) =
+                (&args[0], &args[1], &args[2], &args[3])
+            else {
+                unreachable!("typeck.rs already proved x/P/F/Q are Vector(f64,n)/Matrix(f64,n,n) each")
+            };
+            let n = *n;
+            let xv: Vec<f64> = x.iter().map(as_f64).collect();
+            let pv: Vec<f64> = p.iter().map(as_f64).collect();
+            let fv: Vec<f64> = f.iter().map(as_f64).collect();
+            let qv: Vec<f64> = q.iter().map(as_f64).collect();
+            let (x_new, p_new) = kf_predict(&xv, &pv, &fv, &qv, n);
+            if name == "kf_predict_state" {
+                Ok(Value::Vector(Arc::from(x_new.into_iter().map(Value::Float).collect::<Vec<_>>())))
+            } else {
+                Ok(Value::Matrix(Arc::from(p_new.into_iter().map(Value::Float).collect::<Vec<_>>()), n, n))
+            }
+        }
+        "kf_update_state" | "kf_update_cov" => {
+            let (Value::Vector(x), Value::Matrix(p, n, _), Value::Vector(z), Value::Matrix(h, m, _), Value::Matrix(r, _, _)) =
+                (&args[0], &args[1], &args[2], &args[3], &args[4])
+            else {
+                unreachable!("typeck.rs already proved x/P/z/H/R have matching dimensions")
+            };
+            let (n, m) = (*n, *m);
+            let xv: Vec<f64> = x.iter().map(as_f64).collect();
+            let pv: Vec<f64> = p.iter().map(as_f64).collect();
+            let zv: Vec<f64> = z.iter().map(as_f64).collect();
+            let hv: Vec<f64> = h.iter().map(as_f64).collect();
+            let rv: Vec<f64> = r.iter().map(as_f64).collect();
+            match kf_update(&xv, &pv, &zv, &hv, &rv, n, m) {
+                Some((x_new, p_new)) => {
+                    if name == "kf_update_state" {
+                        Ok(Value::Vector(Arc::from(x_new.into_iter().map(Value::Float).collect::<Vec<_>>())))
+                    } else {
+                        Ok(Value::Matrix(Arc::from(p_new.into_iter().map(Value::Float).collect::<Vec<_>>()), n, n))
+                    }
+                }
+                None => Err(RuntimeError { kind: ErrorKind::SingularMatrix, span }),
+            }
+        }
+        "print" => {
+            let rendered: Vec<String> = args.iter().map(Value::render).collect();
+            println!("{}", rendered.join(" "));
+            Ok(Value::Unit)
+        }
+        "transpose" => {
+            let Value::Matrix(elems, rows, cols) = &args[0] else {
+                unreachable!("typeck.rs already proved this is a Matrix")
+            };
+            let (rows, cols) = (*rows, *cols);
+            let mut out: Vec<Value> = Vec::with_capacity(rows * cols);
+            // SAFETY-free equivalent: build row-major output for the
+            // transposed (cols x rows) shape by reading source
+            // column-major -- simplest correct way to write this without
+            // an uninitialized buffer.
+            for j in 0..cols {
+                for i in 0..rows {
+                    out.push(elems[i * cols + j].clone());
+                }
+            }
+            Ok(Value::Matrix(Arc::from(out), cols, rows))
+        }
+        "dot" => {
+            let (Value::Vector(a), Value::Vector(b)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are Vectors")
+            };
+            let mut acc = scalar_binop(BinOp::Mul, &a[0], &b[0], span)?;
+            for i in 1..a.len() {
+                let prod = scalar_binop(BinOp::Mul, &a[i], &b[i], span)?;
+                acc = scalar_binop(BinOp::Add, &acc, &prod, span)?;
+            }
+            Ok(acc)
+        }
+        "cross" => {
+            let (Value::Vector(a), Value::Vector(b)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are Vector(_, 3)")
+            };
+            let term = |i: usize, j: usize, k: usize, l: usize| -> Result<Value, RuntimeError> {
+                let p1 = scalar_binop(BinOp::Mul, &a[i], &b[j], span)?;
+                let p2 = scalar_binop(BinOp::Mul, &a[k], &b[l], span)?;
+                scalar_binop(BinOp::Sub, &p1, &p2, span)
+            };
+            let c0 = term(1, 2, 2, 1)?;
+            let c1 = term(2, 0, 0, 2)?;
+            let c2 = term(0, 1, 1, 0)?;
+            Ok(Value::Vector(Arc::from(vec![c0, c1, c2])))
+        }
+        "zeros" => match args {
+            [Value::Int(n)] => Ok(Value::Vector(Arc::from(vec![Value::Float(0.0); *n as usize]))),
+            [Value::Int(r), Value::Int(c)] => {
+                Ok(Value::Matrix(Arc::from(vec![Value::Float(0.0); (*r as usize) * (*c as usize)]), *r as usize, *c as usize))
+            }
+            _ => unreachable!("typeck.rs already validated zeros' arity and argument types"),
+        },
+        "ones" => match args {
+            [Value::Int(n)] => Ok(Value::Vector(Arc::from(vec![Value::Float(1.0); *n as usize]))),
+            [Value::Int(r), Value::Int(c)] => {
+                Ok(Value::Matrix(Arc::from(vec![Value::Float(1.0); (*r as usize) * (*c as usize)]), *r as usize, *c as usize))
+            }
+            _ => unreachable!("typeck.rs already validated ones' arity and argument types"),
+        },
+        "identity" => {
+            let [Value::Int(n)] = args else { unreachable!("typeck.rs already validated identity's argument") };
+            let n = *n as usize;
+            let mut out = vec![Value::Float(0.0); n * n];
+            for i in 0..n {
+                out[i * n + i] = Value::Float(1.0);
+            }
+            Ok(Value::Matrix(Arc::from(out), n, n))
+        }
+        "sum" => match &args[0] {
+            Value::Vector(elems) => sum_all(elems, span),
+            Value::Matrix(elems, _, _) => sum_all(elems, span),
+            _ => unreachable!("typeck.rs already proved this is a Vector or Matrix"),
+        },
+        "len" => {
+            let Value::Vector(elems) = &args[0] else { unreachable!("typeck.rs already proved this is a Vector") };
+            Ok(Value::Int(elems.len() as i64))
+        }
+        "norm" => {
+            let Value::Vector(elems) = &args[0] else { unreachable!("typeck.rs already proved this is a Vector(f64, _)") };
+            let sum_sq: f64 = elems.iter().map(|v| as_f64(v) * as_f64(v)).sum();
+            Ok(Value::Float(sum_sq.sqrt()))
+        }
+        "norm1" => {
+            let Value::Vector(elems) = &args[0] else { unreachable!("typeck.rs already proved this is a Vector(f64, _)") };
+            Ok(Value::Float(elems.iter().map(|v| as_f64(v).abs()).sum()))
+        }
+        "norm_inf" => {
+            let Value::Vector(elems) = &args[0] else { unreachable!("typeck.rs already proved this is a Vector(f64, _)") };
+            let m = elems.iter().map(|v| as_f64(v).abs()).fold(0.0_f64, f64::max);
+            Ok(Value::Float(m))
+        }
+        "frobenius_norm" => {
+            let Value::Matrix(elems, _, _) = &args[0] else { unreachable!("typeck.rs already proved this is a Matrix(f64, _, _)") };
+            let sum_sq: f64 = elems.iter().map(|v| as_f64(v) * as_f64(v)).sum();
+            Ok(Value::Float(sum_sq.sqrt()))
+        }
+        "trace" => {
+            let Value::Matrix(elems, n, _) = &args[0] else { unreachable!("typeck.rs already proved this is a square Matrix") };
+            let n = *n;
+            let mut acc = elems[0].clone();
+            for i in 1..n {
+                acc = scalar_binop(BinOp::Add, &acc, &elems[i * n + i], span)?;
+            }
+            Ok(acc)
+        }
+        "det" => {
+            let Value::Matrix(elems, n, _) = &args[0] else { unreachable!("typeck.rs already proved this is a square Matrix(f64, _, _)") };
+            let a: Vec<f64> = elems.iter().map(as_f64).collect();
+            Ok(Value::Float(matrix_det(&a, *n)))
+        }
+        "inv" => {
+            let Value::Matrix(elems, n, _) = &args[0] else { unreachable!("typeck.rs already proved this is a square Matrix(f64, _, _)") };
+            let a: Vec<f64> = elems.iter().map(as_f64).collect();
+            match matrix_inv(&a, *n) {
+                Some(v) => Ok(Value::Matrix(Arc::from(v.into_iter().map(Value::Float).collect::<Vec<_>>()), *n, *n)),
+                None => Err(RuntimeError { kind: ErrorKind::SingularMatrix, span }),
+            }
+        }
+        "solve" => {
+            let (Value::Matrix(a, n, _), Value::Vector(b)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are a square Matrix(f64,_,_) and a matching Vector(f64,_)")
+            };
+            let a: Vec<f64> = a.iter().map(as_f64).collect();
+            let b: Vec<f64> = b.iter().map(as_f64).collect();
+            match matrix_solve(&a, *n, &b) {
+                Some(x) => Ok(Value::Vector(Arc::from(x.into_iter().map(Value::Float).collect::<Vec<_>>()))),
+                None => Err(RuntimeError { kind: ErrorKind::SingularMatrix, span }),
+            }
+        }
+        "rank" => {
+            let Value::Matrix(elems, rows, cols) = &args[0] else { unreachable!("typeck.rs already proved this is a Matrix(f64, _, _)") };
+            let a: Vec<f64> = elems.iter().map(as_f64).collect();
+            Ok(Value::Int(matrix_rank(&a, *rows, *cols) as i64))
+        }
+        "is_symmetric" => {
+            let Value::Matrix(elems, n, _) = &args[0] else { unreachable!("typeck.rs already proved this is a square Matrix(f64, _, _)") };
+            let n = *n;
+            let sym = (0..n).all(|i| (0..n).all(|j| as_f64(&elems[i * n + j]) == as_f64(&elems[j * n + i])));
+            Ok(Value::Bool(sym))
+        }
+        "is_diag" => {
+            let Value::Matrix(elems, n, _) = &args[0] else { unreachable!("typeck.rs already proved this is a square Matrix(f64, _, _)") };
+            let n = *n;
+            let diag = (0..n).all(|i| (0..n).all(|j| i == j || as_f64(&elems[i * n + j]) == 0.0));
+            Ok(Value::Bool(diag))
+        }
+        "is_square" => {
+            let Value::Matrix(_, rows, cols) = &args[0] else { unreachable!("typeck.rs already proved this is a Matrix") };
+            Ok(Value::Bool(rows == cols))
+        }
+        _ => unreachable!("ast::BUILTIN_NAMES and eval_builtin's match must stay in sync"),
+    }
 }
 
 fn mismatch(expected: impl Into<String>, found: impl Into<String>, span: Span) -> Signal {
@@ -672,12 +1458,79 @@ pub struct Interpreter {
     /// used by `tests/sandbox.rs` to point sandboxed children at the
     /// real, separately-built `nirdosha` binary instead.
     sandbox_exe: Option<std::path::PathBuf>,
+    /// `rand_seed`/`rand_f64`/`rand_gaussian`'s state — "carried in the
+    /// interpreter environment, not a global" (unified plan §4.3.1):
+    /// this is per-`Interpreter`-*instance* state, not a Rust `static`,
+    /// so independent runs (including concurrent `cargo test` runs)
+    /// never share or race on a stream. `RefCell`, not `Mutex`: every
+    /// `eval_expr`-family method already takes `&self`, and unlike
+    /// `Value::Thread`/`Sandbox`/`Tcp` (which cross a real thread
+    /// boundary), no single `Interpreter` *instance* is ever shared
+    /// between threads — `Expr::Spawn`'s closure builds a brand new
+    /// `Interpreter` for the spawned thread (see its doc comment below),
+    /// so this field is only ever touched from the one thread that owns
+    /// it. A spawned function's own RNG is therefore independent by
+    /// default, un-seeded until it calls `rand_seed` itself — an honest,
+    /// documented gap, not a claim that concurrent draws replay in a
+    /// fixed order across nondeterministic OS thread scheduling.
+    /// `None` until the first `rand_seed` call; `rand_f64`/
+    /// `rand_gaussian` before that is `ErrorKind::RngNotSeeded`, not a
+    /// silent implicit seed that would quietly undercut "deterministic
+    /// by default."
+    rng: std::cell::RefCell<Option<RngState>>,
+}
+
+/// A from-scratch, dependency-free, byte-for-byte-reproducible PRNG —
+/// SplitMix64 (public domain; Vigna, 2015) for the underlying stream,
+/// Box-Muller for `rand_gaussian`. Deliberately hand-rolled rather than
+/// pulling in the `rand` crate's trait ecosystem: the entire point of
+/// this builtin is bitwise reproducibility across runs, which a small,
+/// fully-specified algorithm implemented directly is easier to *keep*
+/// reproducible (no risk of a transitive dependency bump silently
+/// changing its output) than a general-purpose RNG crate's default
+/// algorithm, which upstream reserves the right to change between
+/// versions.
+struct RngState {
+    state: u64,
+}
+
+impl RngState {
+    fn seed(seed: u64) -> Self {
+        RngState { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in `[0, 1)` — the standard "top 53 bits / 2^53" technique
+    /// (53, not 64: that's exactly `f64`'s mantissa width, so every bit
+    /// drawn is significant and the result is uniform over the floats
+    /// actually representable in `[0, 1)`, not just the integers).
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
+
+    /// Box-Muller transform — `next_f64()` is clamped away from exactly
+    /// `0.0` (vanishingly unlikely, but `ln(0.0)` is `-inf`, which would
+    /// propagate rather than erroring, the one sharp edge this transform
+    /// has) before taking its log.
+    fn next_gaussian(&mut self, mean: f64, stddev: f64) -> f64 {
+        let u1 = self.next_f64().max(f64::MIN_POSITIVE);
+        let u2 = self.next_f64();
+        let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+        mean + stddev * z0
+    }
 }
 
 impl Interpreter {
     pub fn new(program: Arc<Program>, source: Arc<str>) -> Self {
         let fn_index = program.fns.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect();
-        Interpreter { program, fn_index, source, sandbox_exe: None }
+        Interpreter { program, fn_index, source, sandbox_exe: None, rng: std::cell::RefCell::new(None) }
     }
 
     pub fn with_sandbox_exe(mut self, path: std::path::PathBuf) -> Self {
@@ -706,9 +1559,40 @@ impl Interpreter {
         self.fn_index.get(name).map(|&i| &self.program.fns[i])
     }
 
+    /// Row 11 — `typeck.rs` already proved `name` is a real, uniquely
+    /// registered struct name before any `Expr::Call`/`Ty::Named` this
+    /// file evaluates could carry it, so this is a plain linear lookup,
+    /// not a name-index table the way `find_fn` needs one (no spawned-
+    /// thread call path ever looks a struct up by name the way a
+    /// function is).
+    fn find_struct(&self, name: &str) -> Option<&StructDecl> {
+        self.program.structs.iter().find(|s| s.name == name)
+    }
+
+    /// `(owning EnumDecl, the variant itself)` for a variant name —
+    /// mirrors `ast::TypeRegistry::find_variant`'s flat-namespace lookup,
+    /// just over `&self.program` directly instead of a registry (this
+    /// file has no `TypeRegistry` of its own to build; `typeck.rs`
+    /// already proved every name it evaluates resolves).
+    fn find_variant(&self, name: &str) -> Option<(&EnumDecl, &Variant)> {
+        self.program.enums.iter().find_map(|e| e.variants.iter().find(|v| v.name == name).map(|v| (e, v)))
+    }
+
     /// The one place `Signal::Return` gets caught and turned back into a
     /// plain value — every nested `if`/block/expression underneath just
     /// propagates it with `?`.
+    /// Evaluates one `transact` slot's arguments, then invokes its named
+    /// function. `typeck.rs::infer_transact_slot` already proved this
+    /// name isn't a builtin, so — unlike `Expr::Call`'s own arm, which
+    /// has to dispatch both ways — this always goes through `self.call`.
+    fn eval_transact_slot(&self, slot: &TransactSlot, env: &mut Env) -> SResult<Value> {
+        let mut vals = Vec::with_capacity(slot.args.len());
+        for a in &slot.args {
+            vals.push(self.eval_expr(a, env)?);
+        }
+        self.call(&slot.name, &vals, slot.span).map_err(Signal::Err)
+    }
+
     fn call(&self, name: &str, arg_vals: &[Value], span: Span) -> Result<Value, RuntimeError> {
         let f = self.find_fn(name).ok_or_else(|| RuntimeError {
             kind: ErrorKind::UnknownFn(name.to_string()),
@@ -770,6 +1654,61 @@ impl Interpreter {
             (Value::Sandbox(_), Ty::Sandbox) => Ok(()),
             (Value::Str(_), Ty::Str) => Ok(()),
             (Value::Tcp(_), Ty::Tcp) => Ok(()),
+            (Value::TcpListener(_), Ty::TcpListener) => Ok(()),
+            (Value::File(_), Ty::File) => Ok(()),
+            (Value::Float(_), Ty::F64) => Ok(()),
+            (Value::Vector(elems), Ty::Vector(elem_ty, n)) => {
+                if elems.len() != *n {
+                    return err(
+                        ErrorKind::TypeMismatch { expected: ty.name(), found: format!("Vector of length {}", elems.len()) },
+                        span,
+                    );
+                }
+                for e in elems.iter() {
+                    self.check_ty(e, elem_ty, span)?;
+                }
+                Ok(())
+            }
+            (Value::Matrix(elems, rows, cols), Ty::Matrix(elem_ty, want_rows, want_cols)) => {
+                if rows != want_rows || cols != want_cols {
+                    return err(
+                        ErrorKind::TypeMismatch { expected: ty.name(), found: format!("Matrix {rows}x{cols}") },
+                        span,
+                    );
+                }
+                for e in elems.iter() {
+                    self.check_ty(e, elem_ty, span)?;
+                }
+                Ok(())
+            }
+            // Row 11 -- a struct/enum value checked against its declared
+            // name, recursing into each field/payload the same way
+            // `Ty::Vector`/`Ty::Matrix` already recurse into their
+            // elements above. `typeck.rs` already proved a `Value::
+            // Struct`/`Value::Enum` reaching here carries the right
+            // *count* of fields/payload values (construction is checked
+            // exactly like a function call's argument list) -- this is
+            // the runtime Tier-2 backstop for each individual value's
+            // range/shape, same "checker is the real gate, this is the
+            // backstop" shape every other arm here already has.
+            (Value::Struct(name, fields), Ty::Named(want_name)) if name.as_ref() == want_name.as_str() => {
+                let decl = self
+                    .find_struct(want_name)
+                    .expect("typeck.rs already proved this struct name is declared");
+                for (v, field) in fields.iter().zip(decl.fields.iter()) {
+                    self.check_ty(v, &field.ty, span)?;
+                }
+                Ok(())
+            }
+            (Value::Enum(name, variant, payload), Ty::Named(want_name)) if name.as_ref() == want_name.as_str() => {
+                let (_, v) = self
+                    .find_variant(variant)
+                    .expect("typeck.rs already proved this variant name is declared");
+                for (val, want) in payload.iter().zip(v.payload.iter()) {
+                    self.check_ty(val, want, span)?;
+                }
+                Ok(())
+            }
             (Value::Int(n), _) if ty.is_integer() => {
                 if ty.in_range(*n) {
                     Ok(())
@@ -827,6 +1766,20 @@ impl Interpreter {
                 Stmt::Expr(e) => {
                     last = self.eval_expr(e, env)?;
                 }
+                // `audited` only changes what `codegen.rs` emits (it
+                // suppresses Tier-1/2 *guard* insertion in compiled
+                // code) -- the interpreter has no such guards to
+                // suppress in the first place (every `check_ty` call
+                // always runs, unconditionally, everywhere), so this is
+                // just a transparent nested scope, the same shape as a
+                // `Block`.
+                Stmt::Audited { body, .. } => {
+                    env.push();
+                    let result = self.exec_stmts(body, env);
+                    env.pop();
+                    result?;
+                    last = Value::Unit;
+                }
             }
         }
         Ok(last)
@@ -835,6 +1788,32 @@ impl Interpreter {
     fn eval_expr(&self, expr: &Expr, env: &mut Env) -> SResult<Value> {
         match expr {
             Expr::Int(n, _) => Ok(Value::Int(*n)),
+            Expr::Float(n, _) => Ok(Value::Float(*n)),
+            Expr::ArrayLit(elements, _span) => {
+                let mut vals = Vec::with_capacity(elements.len());
+                for e in elements {
+                    vals.push(self.eval_expr(e, env)?);
+                }
+                // Vector vs. matrix is decided by `typeck.rs` already
+                // (`infer_array_lit`) -- at runtime, a matrix literal is
+                // just one whose elements are themselves `Value::Vector`
+                // rows, all the same length (already proven equal), so
+                // flattening them row-major is all that's left to do.
+                if let Some(Value::Vector(first_row)) = vals.first() {
+                    let cols = first_row.len();
+                    let rows = vals.len();
+                    let mut flat = Vec::with_capacity(rows * cols);
+                    for v in vals {
+                        match v {
+                            Value::Vector(row) => flat.extend(row.iter().cloned()),
+                            _ => unreachable!("typeck.rs already proved every row is the same Vector shape"),
+                        }
+                    }
+                    Ok(Value::Matrix(Arc::from(flat), rows, cols))
+                } else {
+                    Ok(Value::Vector(Arc::from(vals)))
+                }
+            }
             Expr::Bool(b, _) => Ok(Value::Bool(*b)),
             Expr::Ident(name, span) => env.get(name).ok_or_else(|| {
                 Signal::Err(RuntimeError { kind: ErrorKind::UnknownVar(name.clone()), span: *span })
@@ -843,21 +1822,43 @@ impl Interpreter {
                 let v = self.eval_expr(inner, env)?;
                 match (op, v) {
                     (UnOp::Neg, Value::Int(n)) => Ok(Value::Int(-n)),
+                    (UnOp::Neg, Value::Float(n)) => Ok(Value::Float(-n)),
                     (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
-                    (UnOp::Neg, v) => Err(mismatch("int", v.ty_name(), *span)),
+                    (UnOp::Neg, v) => Err(mismatch("int or f64", v.ty_name(), *span)),
                     (UnOp::Not, v) => Err(mismatch("bool", v.ty_name(), *span)),
                 }
             }
             Expr::Binary(op, lhs, rhs, span) => self.eval_binary(*op, lhs, rhs, env, *span),
             Expr::Call(name, arg_exprs, span) => {
-                if name == "print" {
+                if is_builtin(name) {
                     let mut vals = Vec::with_capacity(arg_exprs.len());
                     for a in arg_exprs {
                         vals.push(self.eval_expr(a, env)?);
                     }
-                    let rendered: Vec<String> = vals.iter().map(Value::render).collect();
-                    println!("{}", rendered.join(" "));
-                    return Ok(Value::Unit);
+                    return eval_builtin(name, &vals, *span, &self.rng).map_err(Signal::Err);
+                }
+                // Row 11: a struct's own name, or an enum variant's name,
+                // called like a function, constructs a value -- "an
+                // ordinary call, not a new literal form"
+                // (`nirdosha_row11_amendment.md` §3.1). `typeck.rs`
+                // already proved these names can't collide with a
+                // function/builtin, so checking them first is safe and
+                // unambiguous, same order `Expr::Call`'s typeck
+                // counterpart (`infer_call`) already uses.
+                if self.find_struct(name).is_some() {
+                    let mut vals = Vec::with_capacity(arg_exprs.len());
+                    for a in arg_exprs {
+                        vals.push(self.eval_expr(a, env)?);
+                    }
+                    return Ok(Value::Struct(Arc::from(name.as_str()), Arc::from(vals)));
+                }
+                if let Some((enum_decl, _)) = self.find_variant(name) {
+                    let enum_name: Arc<str> = Arc::from(enum_decl.name.as_str());
+                    let mut vals = Vec::with_capacity(arg_exprs.len());
+                    for a in arg_exprs {
+                        vals.push(self.eval_expr(a, env)?);
+                    }
+                    return Ok(Value::Enum(enum_name, Arc::from(name.as_str()), Arc::from(vals)));
                 }
                 let mut vals = Vec::with_capacity(arg_exprs.len());
                 for a in arg_exprs {
@@ -917,6 +1918,55 @@ impl Interpreter {
             Expr::Ref(inner, _span) => {
                 let v = self.eval_expr(inner, env)?;
                 Ok(Value::Ref(Box::new(v)))
+            }
+            Expr::Transact { network, verify, commit, compensate, log, .. } => {
+                // TRANSACT.md's five-step protocol, Layer 1 slice: no
+                // durability log, no retry/timeout — `network` runs
+                // exactly once. `env.push()`/`pop()` scopes `network`/
+                // `verify`'s implicit bindings to just this block, same
+                // as `TRANSACT.md`'s "scoped only inside the transact
+                // block."
+                env.push();
+
+                // Steps 1-2: `network` runs, its result becomes an
+                // implicit local binding visible to every slot after it.
+                // typeck already proved `network.name` resolves to a
+                // user function (`infer_transact_slot` rejects builtins),
+                // so `find_fn` is guaranteed to succeed here.
+                let network_val = self.eval_transact_slot(network, env)?;
+                let network_ty = self
+                    .find_fn(&network.name)
+                    .expect("typeck already proved this resolves to a user fn")
+                    .ret
+                    .clone();
+                env.define("network", network_val, network_ty);
+
+                // Step 3: `verify` runs, sees `network`.
+                let verify_val = self.eval_transact_slot(verify, env)?;
+                let verified = match &verify_val {
+                    Value::Bool(b) => *b,
+                    v => return Err(mismatch("bool", v.ty_name(), verify.span)),
+                };
+                env.define("verify", verify_val, Ty::Bool);
+
+                // Step 4/5: commit-or-compensate, then a best-effort
+                // `log` (never itself part of the durability contract —
+                // there is no durability log yet in Layer 1).
+                let committed = if verified {
+                    self.eval_transact_slot(commit, env)?;
+                    true
+                } else {
+                    if let Some(c) = compensate {
+                        self.eval_transact_slot(c, env)?;
+                    }
+                    false
+                };
+                if let Some(l) = log {
+                    self.eval_transact_slot(l, env)?;
+                }
+
+                env.pop();
+                Ok(Value::Bool(committed))
             }
             Expr::Spawn(name, arg_exprs, span) => {
                 let mut vals = Vec::with_capacity(arg_exprs.len());
@@ -1015,6 +2065,27 @@ impl Interpreter {
                             },
                         }
                     }
+                    Value::File(slot) => {
+                        let Value::Str(text) = v else {
+                            unreachable!("typeck.rs already restricted file send payloads to str")
+                        };
+                        let mut guard = slot.lock().unwrap();
+                        match guard.as_mut() {
+                            None => Err(Signal::Err(RuntimeError {
+                                kind: ErrorKind::ChannelIoError {
+                                    message: "this file was already stopped".to_string(),
+                                },
+                                span: *span,
+                            })),
+                            Some(file) => match write_file(file, &text) {
+                                Ok(()) => Ok(Value::Unit),
+                                Err(e) => Err(Signal::Err(RuntimeError {
+                                    kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                                    span: *span,
+                                })),
+                            },
+                        }
+                    }
                     other => Err(mismatch("chan", other.ty_name(), *span)),
                 }
             }
@@ -1042,6 +2113,24 @@ impl Interpreter {
                                 span: *span,
                             })),
                             Some(stream) => match read_tcp(stream) {
+                                Ok(s) => Ok(Value::Str(Arc::from(s.as_str()))),
+                                Err(e) => Err(Signal::Err(RuntimeError {
+                                    kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                                    span: *span,
+                                })),
+                            },
+                        }
+                    }
+                    Value::File(slot) => {
+                        let mut guard = slot.lock().unwrap();
+                        match guard.as_mut() {
+                            None => Err(Signal::Err(RuntimeError {
+                                kind: ErrorKind::ChannelIoError {
+                                    message: "this file was already stopped".to_string(),
+                                },
+                                span: *span,
+                            })),
+                            Some(file) => match read_file(file) {
                                 Ok(s) => Ok(Value::Str(Arc::from(s.as_str()))),
                                 Err(e) => Err(Signal::Err(RuntimeError {
                                     kind: ErrorKind::ChannelIoError { message: e.to_string() },
@@ -1080,6 +2169,85 @@ impl Interpreter {
                     })),
                 }
             }
+            Expr::Listen(port_expr, span) => {
+                let port = match self.eval_expr(port_expr, env)? {
+                    Value::Int(n) => match u16::try_from(n) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            return Err(Signal::Err(RuntimeError {
+                                kind: ErrorKind::ChannelIoError {
+                                    message: format!("port {n} is not a valid 0-65535 TCP port"),
+                                },
+                                span: *span,
+                            }));
+                        }
+                    },
+                    v => return Err(mismatch("i64", v.ty_name(), *span)),
+                };
+                // Binds all interfaces (`0.0.0.0`), not just loopback --
+                // "simulation nodes can talk to each other" (unified plan
+                // §4.3.3) means across real machines/network namespaces,
+                // not just within one process.
+                match std::net::TcpListener::bind(("0.0.0.0", port)) {
+                    Ok(listener) => Ok(Value::TcpListener(Arc::new(Mutex::new(Some(listener))))),
+                    Err(e) => Err(Signal::Err(RuntimeError {
+                        kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                        span: *span,
+                    })),
+                }
+            }
+            Expr::Accept(listener_expr, span) => {
+                let lv = self.eval_expr(listener_expr, env)?;
+                let Value::TcpListener(slot) = lv else {
+                    unreachable!("typeck.rs already proved this is a TcpListener")
+                };
+                let guard = slot.lock().unwrap();
+                match guard.as_ref() {
+                    None => Err(Signal::Err(RuntimeError {
+                        kind: ErrorKind::ChannelIoError {
+                            message: "this tcp_listener was already stopped".to_string(),
+                        },
+                        span: *span,
+                    })),
+                    Some(listener) => match listener.accept() {
+                        Ok((stream, _addr)) => Ok(Value::Tcp(Arc::new(Mutex::new(Some(stream))))),
+                        Err(e) => Err(Signal::Err(RuntimeError {
+                            kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                            span: *span,
+                        })),
+                    },
+                }
+            }
+            Expr::Open(path_expr, mode_expr, span) => {
+                let path = match self.eval_expr(path_expr, env)? {
+                    Value::Str(s) => s,
+                    v => return Err(mismatch("str", v.ty_name(), *span)),
+                };
+                let mode = match self.eval_expr(mode_expr, env)? {
+                    Value::Str(s) => s,
+                    v => return Err(mismatch("str", v.ty_name(), *span)),
+                };
+                let opened = match mode.as_ref() {
+                    "r" => std::fs::File::open(path.as_ref()),
+                    "w" => std::fs::File::create(path.as_ref()),
+                    "a" => std::fs::OpenOptions::new().append(true).create(true).open(path.as_ref()),
+                    other => {
+                        return Err(Signal::Err(RuntimeError {
+                            kind: ErrorKind::ChannelIoError {
+                                message: format!("invalid file mode {other:?} — expected \"r\", \"w\", or \"a\""),
+                            },
+                            span: *span,
+                        }));
+                    }
+                };
+                match opened {
+                    Ok(file) => Ok(Value::File(Arc::new(Mutex::new(Some(file))))),
+                    Err(e) => Err(Signal::Err(RuntimeError {
+                        kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                        span: *span,
+                    })),
+                }
+            }
             Expr::SpawnSandbox(name, arg_exprs, span) => {
                 let mut vals = Vec::with_capacity(arg_exprs.len());
                 for a in arg_exprs {
@@ -1112,8 +2280,105 @@ impl Interpreter {
                         drop(slot.lock().unwrap().take());
                         Ok(Value::Unit)
                     }
+                    // Same "just drop it, double-stop is Unit not an
+                    // error" treatment as `Value::Tcp` above.
+                    Value::TcpListener(slot) => {
+                        drop(slot.lock().unwrap().take());
+                        Ok(Value::Unit)
+                    }
+                    // Same "just drop it, double-stop is Unit not an
+                    // error" treatment as `Value::Tcp`/`Value::TcpListener`
+                    // above — a `std::fs::File` closes its own descriptor
+                    // on drop with no help required.
+                    Value::File(slot) => {
+                        drop(slot.lock().unwrap().take());
+                        Ok(Value::Unit)
+                    }
                     other => Err(mismatch("sandbox", other.ty_name(), *span)),
                 }
+            }
+            Expr::Index(base, indices, span) => {
+                let bv = self.eval_expr(base, env)?;
+                match bv {
+                    Value::Vector(elems) => {
+                        debug_assert_eq!(indices.len(), 1, "typeck.rs already proved a Vector takes exactly one index");
+                        let iv = self.eval_expr(&indices[0], env)?;
+                        let Value::Int(i) = iv else {
+                            unreachable!("typeck.rs already proved the index is an integer")
+                        };
+                        match usize::try_from(i).ok().and_then(|i| elems.get(i)) {
+                            Some(v) => Ok(v.clone()),
+                            None => Err(Signal::Err(RuntimeError {
+                                kind: ErrorKind::IndexOutOfBounds { index: i, len: elems.len() },
+                                span: *span,
+                            })),
+                        }
+                    }
+                    Value::Matrix(elems, rows, cols) => {
+                        debug_assert_eq!(indices.len(), 2, "typeck.rs already proved a Matrix takes exactly two indices");
+                        let riv = self.eval_expr(&indices[0], env)?;
+                        let civ = self.eval_expr(&indices[1], env)?;
+                        let (Value::Int(r), Value::Int(c)) = (riv, civ) else {
+                            unreachable!("typeck.rs already proved both indices are integers")
+                        };
+                        let Some(r) = usize::try_from(r).ok().filter(|r| *r < rows) else {
+                            return Err(Signal::Err(RuntimeError {
+                                kind: ErrorKind::IndexOutOfBounds { index: r, len: rows },
+                                span: *span,
+                            }));
+                        };
+                        let Some(c) = usize::try_from(c).ok().filter(|c| *c < cols) else {
+                            return Err(Signal::Err(RuntimeError {
+                                kind: ErrorKind::IndexOutOfBounds { index: c, len: cols },
+                                span: *span,
+                            }));
+                        };
+                        Ok(elems[r * cols + c].clone())
+                    }
+                    v => unreachable!("typeck.rs already proved this is a Vector or Matrix, got {}", v.ty_name()),
+                }
+            }
+            Expr::FieldAccess(base, field, span) => {
+                let bv = self.eval_expr(base, env)?;
+                let Value::Struct(name, fields) = &bv else {
+                    unreachable!("typeck.rs already proved this is a struct, got {}", bv.ty_name())
+                };
+                let decl = self
+                    .find_struct(name)
+                    .expect("typeck.rs already proved this struct name is declared");
+                let idx = decl
+                    .fields
+                    .iter()
+                    .position(|f| &f.name == field)
+                    .expect("typeck.rs already proved this field exists");
+                let _ = span;
+                Ok(fields[idx].clone())
+            }
+            Expr::Match { scrutinee, arms, span } => {
+                let sv = self.eval_expr(scrutinee, env)?;
+                let Value::Enum(_, variant, payload) = &sv else {
+                    unreachable!("typeck.rs already proved this is an enum, got {}", sv.ty_name())
+                };
+                let arm = arms
+                    .iter()
+                    .find(|a| a.variant.as_str() == variant.as_ref())
+                    .expect("typeck.rs already proved every match is exhaustive");
+                let (_, decl_variant) = self
+                    .find_variant(variant)
+                    .expect("typeck.rs already proved this variant name is declared");
+                env.push();
+                // Bound with the variant's real declared payload type
+                // (not a placeholder) -- a binding is an ordinary local
+                // like any other, and `Expr::Assign` inside the arm body
+                // needs `get_ty` to answer with something real to check
+                // a reassignment against.
+                for ((name, val), ty) in arm.bindings.iter().zip(payload.iter()).zip(decl_variant.payload.iter()) {
+                    env.define(name, val.clone(), ty.clone());
+                }
+                let result = self.eval_expr(&arm.body, env);
+                env.pop();
+                let _ = span;
+                result
             }
         }
     }
@@ -1237,14 +2502,32 @@ impl Interpreter {
             (Value::Int(a), Value::Int(b)) => match op {
                 BinOp::Add => Ok(Value::Int(a + b)),
                 BinOp::Sub => Ok(Value::Int(a - b)),
-                BinOp::Mul => Ok(Value::Int(a * b)),
-                BinOp::Div => {
+                BinOp::Mul | BinOp::ElemMul => Ok(Value::Int(a * b)),
+                BinOp::Div | BinOp::ElemDiv => {
                     if b == 0 {
                         err(ErrorKind::DivByZero, span)
                     } else {
                         Ok(Value::Int(a / b))
                     }
                 }
+                BinOp::Eq => Ok(Value::Bool(a == b)),
+                BinOp::NotEq => Ok(Value::Bool(a != b)),
+                BinOp::Lt => Ok(Value::Bool(a < b)),
+                BinOp::Gt => Ok(Value::Bool(a > b)),
+                BinOp::LtEq => Ok(Value::Bool(a <= b)),
+                BinOp::GtEq => Ok(Value::Bool(a >= b)),
+                BinOp::And | BinOp::Or => unreachable!("handled above"),
+            },
+            // No `DivByZero` guard, unlike the `Int` arm above -- IEEE 754
+            // division by zero saturates to `inf`/`-inf`/`NaN` rather than
+            // trapping, the float semantics this phase deliberately
+            // chose (see `Ty::F64`'s doc comment): there's no error case
+            // to construct here at all.
+            (Value::Float(a), Value::Float(b)) => match op {
+                BinOp::Add => Ok(Value::Float(a + b)),
+                BinOp::Sub => Ok(Value::Float(a - b)),
+                BinOp::Mul | BinOp::ElemMul => Ok(Value::Float(a * b)),
+                BinOp::Div | BinOp::ElemDiv => Ok(Value::Float(a / b)),
                 BinOp::Eq => Ok(Value::Bool(a == b)),
                 BinOp::NotEq => Ok(Value::Bool(a != b)),
                 BinOp::Lt => Ok(Value::Bool(a < b)),
@@ -1275,6 +2558,71 @@ impl Interpreter {
                     span,
                 ),
             },
+            // Elementwise `+`/`-`/`.*`/`./`, plus structural `==`/`!=` --
+            // `typeck.rs` already proved the two operands have exactly
+            // the same shape (a `Vector(T, n)` and a `Vector(T, m)` are
+            // different `Ty`s, so `n == m` here isn't re-validated, just
+            // asserted), so every arm below just computes.
+            (Value::Vector(a), Value::Vector(b)) => match op {
+                BinOp::Add | BinOp::Sub | BinOp::ElemMul | BinOp::ElemDiv => {
+                    debug_assert_eq!(a.len(), b.len(), "typeck.rs already proved equal Vector shapes");
+                    let out: Result<Vec<Value>, RuntimeError> =
+                        a.iter().zip(b.iter()).map(|(x, y)| scalar_binop(op, x, y, span)).collect();
+                    Ok(Value::Vector(Arc::from(out?)))
+                }
+                BinOp::Eq => Ok(Value::Bool(a == b)),
+                BinOp::NotEq => Ok(Value::Bool(a != b)),
+                _ => unreachable!("typeck.rs already restricted Vector's other operators"),
+            },
+            (Value::Matrix(a, ar, ac), Value::Matrix(b, br, bc)) => match op {
+                BinOp::Add | BinOp::Sub | BinOp::ElemMul | BinOp::ElemDiv => {
+                    debug_assert_eq!((ar, ac), (br, bc), "typeck.rs already proved equal Matrix shapes");
+                    let out: Result<Vec<Value>, RuntimeError> =
+                        a.iter().zip(b.iter()).map(|(x, y)| scalar_binop(op, x, y, span)).collect();
+                    Ok(Value::Matrix(Arc::from(out?), ar, ac))
+                }
+                // matrix * matrix -- typeck.rs already proved the inner
+                // dimensions (`ac`/`br`) match.
+                BinOp::Mul => {
+                    let mut out = Vec::with_capacity(ar * bc);
+                    for i in 0..ar {
+                        for j in 0..bc {
+                            let mut sum = scalar_binop(BinOp::Mul, &a[i * ac], &b[j], span)?;
+                            for k in 1..ac {
+                                let prod = scalar_binop(BinOp::Mul, &a[i * ac + k], &b[k * bc + j], span)?;
+                                sum = scalar_binop(BinOp::Add, &sum, &prod, span)?;
+                            }
+                            out.push(sum);
+                        }
+                    }
+                    Ok(Value::Matrix(Arc::from(out), ar, bc))
+                }
+                BinOp::Eq => Ok(Value::Bool(ar == br && ac == bc && a == b)),
+                BinOp::NotEq => Ok(Value::Bool(!(ar == br && ac == bc && a == b))),
+                _ => unreachable!("typeck.rs already restricted Matrix's other operators"),
+            },
+            // matrix * vector -- typeck.rs already proved the matrix's
+            // column count equals the vector's length.
+            (Value::Matrix(m, rows, cols), Value::Vector(v)) => {
+                let mut out = Vec::with_capacity(rows);
+                for i in 0..rows {
+                    let mut sum = scalar_binop(BinOp::Mul, &m[i * cols], &v[0], span)?;
+                    for k in 1..cols {
+                        let prod = scalar_binop(BinOp::Mul, &m[i * cols + k], &v[k], span)?;
+                        sum = scalar_binop(BinOp::Add, &sum, &prod, span)?;
+                    }
+                    out.push(sum);
+                }
+                Ok(Value::Vector(Arc::from(out)))
+            }
+            // scalar * matrix, either order -- typeck.rs already proved
+            // the scalar's type matches the matrix's element type.
+            (s @ (Value::Int(_) | Value::Float(_)), Value::Matrix(elems, rows, cols))
+            | (Value::Matrix(elems, rows, cols), s @ (Value::Int(_) | Value::Float(_))) => {
+                let out: Result<Vec<Value>, RuntimeError> =
+                    elems.iter().map(|x| scalar_binop(BinOp::Mul, x, &s, span)).collect();
+                Ok(Value::Matrix(Arc::from(out?), rows, cols))
+            }
             (l, r) => err(
                 ErrorKind::TypeMismatch {
                     expected: l.ty_name().to_string(),

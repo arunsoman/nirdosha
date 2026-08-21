@@ -1,0 +1,18 @@
+// `file`/`open` -- PROTOLANG_PORT.md's "Locked design 2" file I/O port.
+//
+// `send`/`recv`/`stop` are reused verbatim from `tcp`/`sandbox`, exactly
+// the way `tcp` itself reused them from `chan` -- no new I/O keywords,
+// only one new type-former (`file`) and one new expression (`open`).
+
+fn main() -> str {
+    let out: file = open("/tmp/nirdosha_file_io_example.txt", "w")
+    send(out, "hello from nirdosha")
+    stop out
+
+    let inp: file = open("/tmp/nirdosha_file_io_example.txt", "r")
+    let content: str = recv(inp)
+    stop inp
+
+    print(content)
+    return content
+}

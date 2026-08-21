@@ -1,0 +1,18 @@
+// `effect(...)` -- PROTOLANG_PORT.md's "Locked design 1", goal.md's
+// "Effects" synthesis layer (rows 4, 9). Fully inferred by default (no
+// annotation, no notational cost); a declared annotation is checked
+// against what the body actually does -- an effect the body performs but
+// didn't declare is a compile error, not a silent gap.
+
+fn add(a: i64, b: i64) -> i64 effect(pure) {
+    return a + b
+}
+
+fn log_result(n: i64) -> unit effect(io) {
+    print(n)
+}
+
+fn main() -> unit {
+    let sum: i64 = add(2, 3)
+    log_result(sum)
+}

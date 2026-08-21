@@ -1,0 +1,119 @@
+# Nirdosha — GBNF grammar for constrained decoding.
+#
+# Hand-translated from GRAMMAR.md's EBNF, production-for-production, the
+# same discipline `grammar_check/src/nirdosha.lalrpop` already follows for
+# its own (different-purpose) cross-check. This is **not** a mechanical
+# export — there is no tool that turns `parser.rs`'s hand-written
+# recursive descent, or GRAMMAR.md's EBNF, into GBNF automatically. See
+# the unified development plan's §4.2.3, and `../grammar_export/README.md`
+# for the full story of what's actually been checked and how (a real
+# llama.cpp grammar-parser dependency, plus a fidelity corpus comparing
+# accept/reject behavior against the real lexer+parser).
+#
+# Found by that real check, not by re-reading this file more carefully:
+# llama.cpp's GBNF parser does **not** treat a bare `|` at the start of a
+# continuation line as "keep extending the previous rule" — every
+# multi-line alternation below (`type`, `scalar-type-name`, `unary`,
+# `primary`) is wrapped in `(...)`, which it does accept, instead of the
+# bare leading-`|` continuation style `GRAMMAR.md`'s EBNF uses. Nothing
+# in GBNF's documentation makes this obvious in advance.
+#
+# Known, deliberate imprecision: `ident` accepts any identifier-shaped
+# text, including this language's keywords (`let`, `fn`, `if`, ...) —
+# GBNF has no clean negative-lookahead/"not a keyword" primitive without
+# enumerating every keyword as an explicit exclusion, which would roughly
+# double this file's size for a property that costs nothing to get wrong
+# in the direction this does: a constrained decoder that occasionally
+# permits `let` as a bare identifier where the real grammar wouldn't is
+# *safe* (the real parser/typeck still rejects it — same "over-permissive
+# in a safe direction" tradeoff `GRAMMAR.md`'s own LALR(1) cross-check
+# documents for the statement-separator ambiguity), whereas a decoder
+# that's ever *too strict* would block a legal completion outright. The
+# fidelity corpus (`tests/gbnf.rs`) tests real programs, not adversarial
+# keyword-as-identifier cases, so this gap doesn't show up there.
+
+root        ::= ws program ws
+
+program     ::= (fn-decl ws)*
+
+fn-decl     ::= "fn" ws ident ws "(" ws params? ws ")" ws ret-type? ws block
+
+params      ::= param (ws "," ws param)*
+param       ::= ident ws ":" ws type
+
+ret-type    ::= "->" ws type
+
+type        ::= (
+                  "&" ws type
+                | "box" ws type
+                | "thread" ws type
+                | "chan" ws type
+                | "sandbox"
+                | "Vector" ws "(" ws type ws "," ws int-lit ws ")"
+                | "Matrix" ws "(" ws type ws "," ws int-lit ws "," ws int-lit ws ")"
+                | scalar-type-name
+              )
+
+scalar-type-name ::= (
+                    "i8" | "i16" | "i32" | "i64"
+                  | "u8" | "u16" | "u32" | "u64" | "usize" | "f64"
+                  | "bool" | "unit" | "str" | "tcp"
+                  )
+
+block       ::= "{" ws stmt* ws "}"
+
+stmt        ::= (let-stmt | return-stmt | while-stmt | expr-stmt) ws
+
+let-stmt    ::= "let" ws ident ws ":" ws type ws "=" ws expr
+return-stmt ::= "return" (ws expr)?
+while-stmt  ::= "while" ws expr ws block
+expr-stmt   ::= expr
+
+expr        ::= if-expr | assignment
+
+if-expr     ::= "if" ws expr ws block (ws "else" ws (block | if-expr))?
+
+assignment  ::= (ident ws "=" ws assignment) | logic-or
+
+logic-or    ::= logic-and (ws "||" ws logic-and)*
+logic-and   ::= equality (ws "&&" ws equality)*
+equality    ::= comparison (ws ("==" | "!=") ws comparison)*
+comparison  ::= additive (ws ("<=" | ">=" | "<" | ">") ws additive)*
+additive    ::= multiplicative (ws ("+" | "-") ws multiplicative)*
+multiplicative ::= unary (ws (".*" | "./" | "*" | "/") ws unary)*
+
+unary       ::= (
+                  ("!" | "-" | "*" | "box" | "&") ws unary
+                | "spawn" ws call
+                | "join" ws unary
+                | "chan"
+                | "send" ws "(" ws expr ws "," ws expr ws ")"
+                | "recv" ws "(" ws expr ws ")"
+                | "sandbox" ws call
+                | "stop" ws unary
+                | "connect" ws "(" ws expr ws "," ws expr ws ")"
+                | call
+              )
+
+call        ::= postfix (ws "(" ws args? ws ")")?
+args        ::= expr (ws "," ws expr)*
+
+postfix     ::= primary (ws "[" ws expr (ws "," ws expr)* ws "]")*
+
+primary     ::= (
+                  float-lit | int-lit | str-lit | "true" | "false" | ident
+                | "(" ws expr ws ")"
+                | array-lit
+              )
+
+array-lit   ::= "[" ws expr (ws "," ws expr)* ws "]"
+
+str-lit     ::= "\"" str-char* "\""
+str-char    ::= [^"\\] | "\\" ["\\ntr]
+
+int-lit     ::= [0-9]+
+float-lit   ::= [0-9]+ "." [0-9]+
+
+ident       ::= [a-zA-Z_] [a-zA-Z0-9_]*
+
+ws          ::= ( [ \t\r\n] | "//" [^\n]* "\n" )*

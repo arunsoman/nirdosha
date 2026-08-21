@@ -61,6 +61,15 @@ use crate::token::Span;
 pub struct SmtReport {
     pub proven_in_range: HashSet<Span>,
     pub proven_nonzero_divisor: HashSet<Span>,
+    /// `refine.rs::RefineReport::proven_index_bounds`'s Z3-backed
+    /// counterpart — unified plan §4.5.1. Real Z3 can discharge proofs
+    /// interval analysis can't (e.g. an index narrowed by an `if`
+    /// condition — this file already tracks per-branch constraints the
+    /// way `refine.rs` deliberately doesn't; see its module doc), so the
+    /// two reports aren't expected to always agree on which spans are
+    /// proven, the same relationship they already have for
+    /// `proven_in_range`/`proven_nonzero_divisor`.
+    pub proven_index_bounds: HashSet<Span>,
 }
 
 /// One binding's declared type plus the Z3 term currently standing for
@@ -141,6 +150,30 @@ fn prove_nonzero(solver: &Solver, term: &Int) -> bool {
     result == SatResult::Unsat
 }
 
+/// Same technique as `prove_in_range`, against a literal `[0, dim)`
+/// instead of a `Ty`'s bounds — `Expr::Index`'s proof obligation for one
+/// dimension of a `Vector`/`Matrix` access.
+fn prove_index_in_bounds(solver: &Solver, term: &Int, dim: usize) -> bool {
+    solver.push();
+    solver.assert(term.lt(0) | term.ge(dim as i64));
+    let result = solver.check();
+    solver.pop(1);
+    result == SatResult::Unsat
+}
+
+/// `Vector(_, N)`'s `[N]`, `Matrix(_, R, C)`'s `[R, C]`, or `None` —
+/// mirrors `refine.rs`'s free function of the same name exactly (kept
+/// duplicated, not shared, for the same reason `assigned_names` already
+/// is in both files: the two passes' walks are only superficially
+/// identical today, not guaranteed to stay that way).
+fn ty_dims(ty: &Ty) -> Option<Vec<usize>> {
+    match ty {
+        Ty::Vector(_, n) => Some(vec![*n]),
+        Ty::Matrix(_, r, c) => Some(vec![*r, *c]),
+        _ => None,
+    }
+}
+
 struct Checker<'s> {
     solver: &'s Solver,
     report: &'s mut SmtReport,
@@ -188,6 +221,13 @@ impl Checker<'_> {
             Stmt::While { cond, body, .. } => self.while_loop(cond, body, scopes),
             Stmt::Expr(e) => {
                 self.expr_stmt(e, scopes);
+            }
+            Stmt::Audited { body, .. } => {
+                scopes.push();
+                for s in body {
+                    self.stmt(s, scopes);
+                }
+                scopes.pop();
             }
         }
     }
@@ -337,7 +377,95 @@ impl Checker<'_> {
                 self.expr(port, scopes);
                 Int::fresh_const("unknown")
             }
-            Expr::Bool(_, _) | Expr::Str(_, _) => Int::fresh_const("unknown"),
+            Expr::Listen(port, _) => {
+                self.expr(port, scopes);
+                Int::fresh_const("unknown")
+            }
+            Expr::Accept(listener, _) => {
+                self.expr(listener, scopes);
+                Int::fresh_const("unknown")
+            }
+            Expr::Open(path, mode, _) => {
+                self.expr(path, scopes);
+                self.expr(mode, scopes);
+                Int::fresh_const("unknown")
+            }
+            Expr::Index(base, indices, span) => {
+                self.expr(base, scopes);
+                let idx_terms: Vec<Int> = indices.iter().map(|idx| self.expr(idx, scopes)).collect();
+                // Same "only the direct `ident[...]` shape is provable"
+                // restriction as `refine.rs`'s counterpart, and for the
+                // same reason: this pass has no real type-inference pass
+                // of its own to fall back on for an arbitrary base
+                // expression.
+                if let Expr::Ident(name, _) = base.as_ref() {
+                    if let Some((ty, _)) = scopes.get(name) {
+                        if let Some(dims) = ty_dims(&ty) {
+                            let all_in_bounds = dims.len() == idx_terms.len()
+                                && dims.iter().zip(idx_terms.iter()).all(|(&dim, term)| prove_index_in_bounds(self.solver, term, dim));
+                            if all_in_bounds {
+                                self.report.proven_index_bounds.insert(*span);
+                            }
+                        }
+                    }
+                }
+                Int::fresh_const("unknown")
+            }
+            Expr::ArrayLit(elements, _) => {
+                for e in elements {
+                    self.expr(e, scopes);
+                }
+                Int::fresh_const("unknown")
+            }
+            Expr::Bool(_, _) | Expr::Str(_, _) | Expr::Float(_, _) => Int::fresh_const("unknown"),
+            // Same treatment as `Expr::Call` above: `transact`'s own
+            // result isn't a number this pass models (`typeck.rs` fixes
+            // it at `bool`), but every slot's arguments still get walked
+            // for their own proofs.
+            Expr::Transact { network, verify, commit, compensate, log, .. } => {
+                for a in &network.args {
+                    self.expr(a, scopes);
+                }
+                for a in &verify.args {
+                    self.expr(a, scopes);
+                }
+                for a in &commit.args {
+                    self.expr(a, scopes);
+                }
+                if let Some(c) = compensate {
+                    for a in &c.args {
+                        self.expr(a, scopes);
+                    }
+                }
+                if let Some(l) = log {
+                    for a in &l.args {
+                        self.expr(a, scopes);
+                    }
+                }
+                Int::fresh_const("transact_result")
+            }
+            // Row 11 -- neither is a number this pass models (a struct/
+            // enum value, never an integer), but every sub-expression is
+            // still walked for its own nested proofs, same treatment
+            // `Expr::Transact`'s slot arguments already get above. A
+            // `match` arm's own payload bindings aren't added to `scopes`
+            // (this pass has no declaration table to look their real type
+            // up from — same scope limit `Expr::Index`'s base-expression
+            // restriction elsewhere in this file already documents); a
+            // reference to one inside an arm body falls back to `Int::
+            // fresh_const("unknown")` via `scopes.get`'s existing
+            // `unwrap_or_else` default, not an error.
+            Expr::FieldAccess(base, _, _) => {
+                self.expr(base, scopes);
+                Int::fresh_const("unknown")
+            }
+            Expr::Match { scrutinee, arms, .. } => {
+                self.expr(scrutinee, scopes);
+                for arm in arms {
+                    self.expr(&arm.body, scopes);
+                }
+                Int::fresh_const("unknown")
+            }
         }
     }
 
@@ -386,7 +514,8 @@ impl Checker<'_> {
                 // doc's "what didn't change" note.
                 Int::fresh_const("div_result")
             }
-            BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq | BinOp::And | BinOp::Or => {
+            BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq | BinOp::And | BinOp::Or
+            | BinOp::ElemMul | BinOp::ElemDiv => {
                 self.expr(lhs, scopes);
                 self.expr(rhs, scopes);
                 Int::fresh_const("unknown")
@@ -465,12 +594,13 @@ fn assigned_names(stmts: &[Stmt]) -> HashSet<String> {
                     walk_stmts(&body.stmts, names);
                 }
                 Stmt::Expr(e) => walk_expr(e, names),
+                Stmt::Audited { body, .. } => walk_stmts(body, names),
             }
         }
     }
     fn walk_expr(e: &Expr, names: &mut HashSet<String>) {
         match e {
-            Expr::Int(_, _) | Expr::Bool(_, _) | Expr::Str(_, _) | Expr::Ident(_, _) | Expr::Chan(_) => {}
+            Expr::Int(_, _) | Expr::Float(_, _) | Expr::Bool(_, _) | Expr::Str(_, _) | Expr::Ident(_, _) | Expr::Chan(_) => {}
             Expr::Unary(_, inner, _)
             | Expr::Box(inner, _)
             | Expr::Deref(inner, _)
@@ -487,9 +617,22 @@ fn assigned_names(stmts: &[Stmt]) -> HashSet<String> {
                     walk_expr(a, names);
                 }
             }
-            Expr::Send(chan, value, _) | Expr::Connect(chan, value, _) => {
+            Expr::Send(chan, value, _) | Expr::Connect(chan, value, _) | Expr::Open(chan, value, _) => {
                 walk_expr(chan, names);
                 walk_expr(value, names);
+            }
+            Expr::Listen(port, _) => walk_expr(port, names),
+            Expr::Accept(listener, _) => walk_expr(listener, names),
+            Expr::Index(base, indices, _) => {
+                walk_expr(base, names);
+                for idx in indices {
+                    walk_expr(idx, names);
+                }
+            }
+            Expr::ArrayLit(elements, _) => {
+                for e in elements {
+                    walk_expr(e, names);
+                }
             }
             Expr::If { cond, then_block, else_block, .. } => {
                 walk_expr(cond, names);
@@ -503,6 +646,34 @@ fn assigned_names(stmts: &[Stmt]) -> HashSet<String> {
             Expr::Assign(name, rhs, _) => {
                 names.insert(name.clone());
                 walk_expr(rhs, names);
+            }
+            Expr::Transact { network, verify, commit, compensate, log, .. } => {
+                for a in &network.args {
+                    walk_expr(a, names);
+                }
+                for a in &verify.args {
+                    walk_expr(a, names);
+                }
+                for a in &commit.args {
+                    walk_expr(a, names);
+                }
+                if let Some(c) = compensate {
+                    for a in &c.args {
+                        walk_expr(a, names);
+                    }
+                }
+                if let Some(l) = log {
+                    for a in &l.args {
+                        walk_expr(a, names);
+                    }
+                }
+            }
+            Expr::FieldAccess(base, _, _) => walk_expr(base, names),
+            Expr::Match { scrutinee, arms, .. } => {
+                walk_expr(scrutinee, names);
+                for arm in arms {
+                    walk_expr(&arm.body, names);
+                }
             }
         }
     }

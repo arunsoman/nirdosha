@@ -316,8 +316,113 @@ fn analyze_does_not_panic_on_any_example() {
         include_str!("../examples/sandbox_channels.nir"),
         include_str!("../examples/strings.nir"),
         include_str!("../examples/tcp_client.nir"),
+        include_str!("../examples/floats.nir"),
+        include_str!("../examples/matrices.nir"),
+        include_str!("../examples/linalg.nir"),
+        include_str!("../examples/sensor_fusion.nir"),
+        include_str!("../examples/wargame_agents.nir"),
     ] {
         let program = parse(src);
         let _ = analyze(&program); // just must not panic
     }
+}
+
+// ---- Phase 5: SMT-proven index bounds (unified plan §4.5.1) ---------------
+
+/// The `Span` of the `n`th `Expr::Index` site found anywhere in `main`'s
+/// body, in the order the parser encounters them.
+fn nth_index_span(program: &Program, n: usize) -> nirdosha::token::Span {
+    use nirdosha::ast::Expr;
+    fn walk(e: &Expr, out: &mut Vec<nirdosha::token::Span>) {
+        if let Expr::Index(base, indices, span) = e {
+            walk(base, out);
+            for i in indices {
+                walk(i, out);
+            }
+            out.push(*span);
+            return;
+        }
+        match e {
+            Expr::Binary(_, l, r, _) => {
+                walk(l, out);
+                walk(r, out);
+            }
+            Expr::Unary(_, inner, _) | Expr::Assign(_, inner, _) => walk(inner, out),
+            Expr::ArrayLit(elements, _) => {
+                for el in elements {
+                    walk(el, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let main = program.fns.iter().find(|f| f.name == "main").expect("no main");
+    let mut out = Vec::new();
+    for s in &main.body.stmts {
+        if let Stmt::Let { value, .. } = s {
+            walk(value, &mut out);
+        }
+    }
+    out.into_iter().nth(n).expect("not enough index sites")
+}
+
+#[test]
+fn a_literal_index_within_bounds_is_proven() {
+    let program = parse(
+        r#"
+        fn main() {
+            let v: Vector(f64, 3) = [1.0, 2.0, 3.0]
+            let x: f64 = v[1]
+        }
+    "#,
+    );
+    let report = analyze(&program);
+    assert!(report.proven_index_bounds.contains(&nth_index_span(&program, 0)));
+}
+
+#[test]
+fn a_literal_index_out_of_bounds_is_not_proven() {
+    // Statically out of range -- typeck.rs doesn't reject this (no
+    // literal-index-arity check exists there), so it's exactly the kind
+    // of case that would trap at runtime (Tier 2) -- this proof pass
+    // must not claim it's safe.
+    let program = parse(
+        r#"
+        fn main() {
+            let v: Vector(f64, 3) = [1.0, 2.0, 3.0]
+            let x: f64 = v[5]
+        }
+    "#,
+    );
+    let report = analyze(&program);
+    assert!(!report.proven_index_bounds.contains(&nth_index_span(&program, 0)));
+}
+
+#[test]
+fn an_unconstrained_index_is_not_proven() {
+    let program = parse(
+        r#"
+        fn main() {
+            let v: Vector(f64, 3) = [1.0, 2.0, 3.0]
+            let n: i64 = 10
+            let x: f64 = v[n]
+        }
+    "#,
+    );
+    let report = analyze(&program);
+    assert!(!report.proven_index_bounds.contains(&nth_index_span(&program, 0)));
+}
+
+#[test]
+fn a_matrix_index_within_bounds_on_both_axes_is_proven() {
+    let program = parse(
+        r#"
+        fn main() {
+            let m: Matrix(f64, 2, 2) = [[1.0, 2.0], [3.0, 4.0]]
+            let x: f64 = m[1, 0]
+        }
+    "#,
+    );
+    let report = analyze(&program);
+    assert!(report.proven_index_bounds.contains(&nth_index_span(&program, 0)));
 }

@@ -1,0 +1,27 @@
+// Exercises: `Vector`/`Matrix` -- literals, indexing, elementwise +/-,
+// Hadamard .*/./,  linear-algebra * (scalar*matrix, matrix*vector,
+// matrix*matrix), equality. No `dot()`/`transpose`/`zeros`/etc yet --
+// those are Phase 2's dense linear algebra builtins.
+fn main() {
+    let v: Vector(f64, 3) = [1.0, 2.0, 3.0]
+    let w: Vector(f64, 3) = [10.0, 20.0, 30.0]
+    print(v)
+    print(v[0])
+    print(v[2])
+    print(v + w)   // [11, 22, 33]
+    print(v - w)   // [-9, -18, -27]
+    print(v .* w)  // [10, 40, 90]
+    print(v == v)  // true
+    print(v == w)  // false
+
+    let m: Matrix(f64, 2, 2) = [[1.0, 2.0], [3.0, 4.0]]
+    print(m)
+    print(m[0, 1]) // 2
+    print(m[1, 1]) // 4
+    print(2.0 * m) // [[2, 4], [6, 8]]
+
+    let a: Matrix(f64, 2, 3) = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+    let b: Matrix(f64, 3, 2) = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+    print(a * v)   // matrix * vector -- [14, 32]
+    print(a * b)   // matrix * matrix -- [[22, 28], [49, 64]]
+}

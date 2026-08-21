@@ -11,15 +11,15 @@ plus a first slice of `SANDBOXING.md`'s sandboxing extension: `sandbox`/
 transport for sandboxed processes ("Fourteenth update"), and `str`/`tcp`/
 `connect` (a real TCP client — the prerequisite for orchestrating an
 *arbitrary* containerized workload, not just another Nirdosha process;
-see `PHASE0.md`'s "Fifteenth update"). Still no effects or refinement
-types; those remain later-phase additions layered on top of this grammar
-without changing it, which was the point of getting the grammar's shape
-right early (§6 Phase 0 note: retrofitting parseability later is
-expensive). Note that `spawn`/`join`/`thread`/`chan`/`send`/`recv`/
-`sandbox`/`stop`/`connect` are, so far, interpreter-only (`str`/`tcp`
-included) — `codegen.rs` rejects them explicitly, the same "reject, don't
-mis-compile" treatment `box`/`&` got before their own
-codegen support existed.
+see `PHASE0.md`'s "Fifteenth update"), plus Row 11
+(`nirdosha_row11_amendment.md`) — `struct`/`enum` declarations, `match`,
+and `expr.field` access, layer 1: fixed concrete fields, no
+type-parameter list on a declaration yet (that's a later layer). Note
+that `spawn`/`join`/`thread`/`chan`/`send`/`recv`/`sandbox`/`stop`/
+`connect`/`struct`/`enum`/`match` are, so far, interpreter-only (`str`/
+`tcp` included) — `codegen.rs` rejects them explicitly, the same "reject,
+don't mis-compile" treatment `box`/`&` got before their own codegen
+support existed.
 
 ## Row 7 claim, stated precisely
 
@@ -87,9 +87,31 @@ parses as `return (x - y)` — one statement, a subtraction — never as
 ```ebnf
 program     ::= item*
 
-item        ::= fn_decl
+item        ::= fn_decl | struct_decl | enum_decl
 
 fn_decl     ::= "fn" ident "(" params? ")" ("->" type)? block
+
+// Row 11 (`nirdosha_row11_amendment.md`) — product and sum types. Layer 1:
+// fixed concrete fields, no type-parameter list yet (`Pair(A, B)` is a
+// later layer, not this production). A struct's `name` is registered in
+// *two* namespaces: as a type (usable in `type` below) and, via ordinary
+// `Expr::Call`, as its own positional constructor — "construction is an
+// ordinary call, not a new literal form" (§3.1), so there is no separate
+// struct-literal production here. `field`'s trailing comma is optional,
+// unlike `params`/`args` above (a real, deliberate ergonomic difference:
+// multi-line field lists are the common case, so a dangling comma from
+// reordering fields shouldn't be a parse error).
+struct_decl ::= "struct" ident "{" field ("," field)* ","? "}"
+field       ::= ident ":" type
+
+// An enum's own name is a type only — never itself callable; each
+// `variant` is what's callable (`Some(5)`, `None()`), registered in the
+// same flat namespace `struct_decl`'s name is. A zero-payload variant
+// still takes `()` at both declaration and call site (`None`, not
+// `None()`'s omission) — one fewer special case, not a missing
+// convenience (§3.2).
+enum_decl   ::= "enum" ident "{" variant ("," variant)* ","? "}"
+variant     ::= ident ("(" type ("," type)* ")")?
 
 // No trailing comma — `params`/`args` (below) both require a following
 // item after every comma, so `fn f(a: i64,)` and `f(1, 2,)` are both
@@ -134,14 +156,33 @@ param       ::= ident ":" type
 // appear in *expression* position at all (`connect`, not a bare `tcp`
 // keyword, is what produces a `tcp` value — see `unary` below), so it
 // didn't need `sandbox`'s dual-use token treatment either.
+// `Vector`/`Matrix` are deliberately capitalized, unlike every lowercase
+// scalar `TypeName` — a genuinely different production (both take `(...)`
+// arguments: an element type plus one or two fixed dimensions), not
+// another bare keyword, and the surface syntax the unified plan's
+// architecture table already uses (`Matrix(f64, 3, 3)`). Dimensions are
+// plain integer literals, not arbitrary expressions — "Sized by Default"
+// (the plan's §2) means the shape is fixed at compile time, the same way
+// every other `type` production here is a closed grammar, not a runtime
+// value.
+// `ident` (last alternative) is Row 11's one addition to this production
+// — a declared `struct`/`enum` name, accepted syntactically for *any*
+// identifier here (the parser has no declaration table to check against
+// — `LANGUAGE.md` §6's "functions are looked up by name in a table"
+// applies equally to types now); an identifier that doesn't actually name
+// a real struct/enum is `TypeErrorKind::UnknownType`, caught by
+// `typeck.rs`, not this grammar.
 type        ::= "&" type
               | "box" type
               | "thread" type
               | "chan" type
               | "sandbox"
+              | "Vector" "(" type "," int_lit ")"
+              | "Matrix" "(" type "," int_lit "," int_lit ")"
               | "i8" | "i16" | "i32" | "i64"
-              | "u8" | "u16" | "u32" | "u64" | "usize"
-              | "bool" | "unit" | "str" | "tcp"
+              | "u8" | "u16" | "u32" | "u64" | "usize" | "f64"
+              | "bool" | "unit" | "str" | "tcp" | "tcp_listener"
+              | ident
 
 // A block's *value* (relevant wherever a block sits in an expression
 // position — an `if`'s branches, most concretely) is its last
@@ -159,28 +200,87 @@ block       ::= "{" stmt* "}"
 stmt        ::= let_stmt
               | return_stmt
               | while_stmt
+              | audited_stmt
               | expr_stmt
 
 let_stmt    ::= "let" ident ":" type "=" expr
 return_stmt ::= "return" expr?
 while_stmt  ::= "while" expr block
+// goal.md §4's Tier-3 escape hatch (unified plan §4.3.4): suppresses
+// codegen's Tier-1/2 guard *emission* inside `body` (`guard_in_range`,
+// the division-by-zero trap) — has no effect in the interpreter, which
+// always runs its own runtime checks unconditionally regardless of
+// `audited`. `justification` must be non-empty (checked in `typeck.rs`,
+// not this grammar — an empty string is still syntactically valid here).
+// `body`'s statements share the enclosing function's scope machinery
+// exactly like a `block`'s would, but `body` is a bare `stmt*`, not a
+// `block` — this construct has no value of its own to produce.
+audited_stmt ::= "audited" str_lit "{" stmt* "}"
 expr_stmt   ::= expr
 
 expr        ::= if_expr
+              | transact_expr
+              | match_expr
               | assignment
 
 if_expr     ::= "if" expr block ("else" (block | if_expr))?
+
+// Row 11's `match` — an `expr`, not a `stmt`, for the same reason `if`/
+// `transact` already are: `return match o { ... }` has to work.
+// `scrutinee` is full `expr` (same as `if`'s own `cond`), not just
+// `assignment` — no ambiguity from that with a following `{`, since this
+// grammar has no brace-delimited struct-literal expression to confuse it
+// with (construction is always `Ident(args)` — see `struct_decl` above).
+// Exhaustiveness (every variant of the scrutinee's specific enum, exactly
+// once) and "every arm head resolves to a real variant name" are both
+// `typeck.rs` checks, not this grammar's — there is deliberately no
+// wildcard/binding-only catch-all pattern in v1 (§3.4), so every arm's
+// leading `ident` here is required to be exactly one of the enum's own
+// variant names, the same closed-identifier-resolution discipline
+// `call`'s own callee name already gets.
+match_expr  ::= "match" expr "{" match_arm ("," match_arm)* ","? "}"
+match_arm   ::= ident ("(" ident ("," ident)* ")")? "=>" expr
+
+// `TRANSACT.md`'s durable-effect construct — **Layer 1 only** (this
+// repo's staged rollout): in-process, no durability log, no `retry`/
+// `timeout` on `network` (those are Layer 2+, and not part of this
+// production yet). Slot order is fixed — `network`, `verify`, `commit`,
+// then optional `compensate`, then optional `log` — never permutation-
+// parsed, the same fixed-arity discipline every other multi-part
+// construct in this grammar already has. `network`/`verify`/`commit`/
+// `compensate`/`log` are matched by identifier *text* here, not
+// reserved as `Tok` keywords (see `parser.rs::parse_transact_slot`) —
+// the same non-keyword treatment `TYPE_NAMES` (token.rs) already gives
+// scalar type names. `call` is `ident "(" (expr ("," expr)*)? ")"` —
+// exactly `Expr::Call`'s own shape, the same "parse normally, then
+// validate what came out" restriction `spawn`/`sandbox` already enforce
+// on their own operand: a slot is one named call, never an arbitrary
+// expression. `transact { ... }` is itself a value (`bool`) — an `expr`
+// production, not a `stmt` one, specifically so `return transact {
+// ... }` works exactly like `return if c {..} else {..}` already does.
+transact_expr ::= "transact" "{"
+                     "network"    ":" call
+                     "verify"     ":" call
+                     "commit"     ":" call
+                     ("compensate" ":" call)?
+                     ("log"        ":" call)?
+                   "}"
 
 // Right-associative, lowest precedence among non-`if` expressions — same
 // shape as C/Rust's assignment-expression. The `ident` restriction on the
 // left side is a real *grammar* restriction, not merely an artifact of
 // how the parser happens to be written — there is no production anywhere
 // that lets a general expression (`foo.bar`, `foo[0]`, ...) appear as an
-// assignment target, and in fact neither of those exists as an
-// expression *at all* yet (no field access, no indexing — see the
-// omissions list). If/when either is added, extending `assignment`'s
-// left side to more than `ident` is a real grammar change, not just a
-// parser one.
+// assignment target. **Corrected, since both now exist as plain
+// expressions (postfix's `[...]`/`.ident` above), unlike when this note
+// was first written:** `foo[0] = x`/`foo.bar = x` are still rejected —
+// `parse_assignment` parses the left side as a full `logic_or` (see the
+// implementation note below) and only accepts the result if it's exactly
+// an `Expr::Ident`; an `Expr::Index`/`Expr::FieldAccess` there is
+// `"left-hand side of \`=\` must be a plain variable name"`, checked
+// directly. Widening `assignment`'s left side to either is a real
+// grammar change this document would need to update, not just a parser
+// one, if it's ever done.
 //
 // Implementation note, distinct from the grammar restriction above: the
 // parser doesn't try `ident "="` as a distinct alternative (that would
@@ -200,7 +300,16 @@ logic_and   ::= equality ("&&" equality)*
 equality    ::= comparison (("==" | "!=") comparison)*
 comparison  ::= additive (("<" | ">" | "<=" | ">=") additive)*
 additive    ::= multiplicative (("+" | "-") multiplicative)*
-multiplicative ::= unary (("*" | "/") unary)*
+// `.*`/`./` (Hadamard/elementwise multiply-divide) sit at the same
+// precedence as `*`/`/` — Julia's own convention for broadcast operators,
+// and there's no ambiguity to resolve either way since `.` never starts
+// anything else at this position (a float literal's `.` is consumed
+// entirely inside `float_lit` below, never left dangling for the
+// expression grammar to see). No `.+`/`.-`: elementwise is already the
+// *only* sensible meaning of `+`/`-` for two matching-shape operands, so
+// a dotted spelling would just be a redundant second name for the same
+// operation `+`/`-` already do.
+multiplicative ::= unary (("*" | "/" | ".*" | "./") unary)*
 // `*` is unary deref here, not multiplication — `multiplicative` only ever
 // sees `*` in infix position, after a full `unary` is already parsed, so
 // there's no ambiguity: which meaning applies is determined purely by
@@ -267,6 +376,17 @@ unary       ::= ("!" | "-" | "*" | "box" | "&") unary
               | "sandbox" call
               | "stop" unary
               | "connect" "(" expr "," expr ")"
+              // `listen(port)` binds a real TCP listening socket and
+              // returns a `tcp_listener` handle — same fixed-arity shape
+              // as `connect`, one operand instead of two. `accept
+              // (listener)` blocks for the next client and returns an
+              // ordinary `tcp` handle (unified plan §4.3.3: "same
+              // `Channel<T>` semantics over TCP as over Unix sockets" —
+              // no separate server-connection type). Unlike `stop`,
+              // `accept` does not consume its operand: a listener
+              // accepts many connections over its lifetime.
+              | "listen" "(" expr ")"
+              | "accept" "(" expr ")"
               | call
 
 // Exactly zero or one call, not "zero or more" — `f()()` is a **parse
@@ -283,14 +403,51 @@ unary       ::= ("!" | "-" | "*" | "box" | "&") unary
 // lookup, not evaluated as a first-class value. Found the same way the
 // statement-separator ambiguity was: by writing the case out and running
 // it, not by re-reading the code more carefully.
-call        ::= primary ("(" args? ")")?
+call        ::= postfix ("(" args? ")")?
 args        ::= expr ("," expr)*
+
+// `v[i]` and `m[i, j]` are one bracket group each — a single `postfix`
+// step, not `v[i][j]`-style chained subscripting as one production (that
+// shape doesn't exist; see `ast.rs::Expr::Index`, which carries one
+// `Vec<expr>` of indices per bracket group, not a nested `Index` per
+// index) — though the loop below does still let `v[i][j]` *parse* as two
+// separate `Index` steps chained (`typeck.rs`'s `NotIndexable` rejects it
+// unless the first index's own result is itself indexable). **Corrected
+// claim, checked directly against `parser.rs`, not assumed:** an earlier
+// version of this doc said `f()[i]` parses — it doesn't. `postfix` runs
+// once, on `primary`, *before* `call`'s own trailing `(args)` check
+// (`parser.rs::parse_call`: `parse_postfix()` first, then look for `(`),
+// and `parse_call` never re-enters `postfix` on the `Call` it just built
+// — so a `[...]`/`.ident` immediately after a call's closing `)` is
+// parsed as the start of a *new* statement instead (this grammar's "always
+// prefer to extend the current expression" rule, above, doesn't reach
+// across a completed `call` production) — `return f()\n[0]` type-checks
+// as `return f()` followed by a second, discarded `[0]` statement, not
+// `return f()[0]`, which is exactly what happens if you actually try it.
+// `.ident` (Row 11 field access, `Expr::FieldAccess`) is the one new
+// alternative here, chaining through this same loop exactly like `[...]`
+// already does (`a.b.c`, `p.x[0]` both parse); it inherits the identical
+// "doesn't chain past a `call`" limitation just corrected above, not a
+// new one.
+postfix     ::= primary (("[" expr ("," expr)* "]") | ("." ident))*
 
 // `"(" expr ")"` requires a real `expr` inside — `()` alone (an empty
 // parenthesized group) is not a valid `primary`, and isn't a way to
 // spell a `unit` *value* either; see the omissions list for what that
 // means for `unit`.
-primary     ::= int_lit | str_lit | "true" | "false" | ident | "(" expr ")"
+//
+// `array_lit` is a `Vector` literal (`[1.0, 2.0, 3.0]`) if every element
+// is a plain scalar, or a `Matrix` literal, row-major (`[[1.0, 2.0],
+// [3.0, 4.0]]`), if every element is itself a same-shaped `Vector` —
+// `typeck.rs::infer_array_lit` decides which, from the *value*, not the
+// grammar: there is only one production here, not two. Always at least
+// one element — no `[]` alternative, the same "requires a real
+// sub-production" restriction `"(" expr ")"` already has; there would be
+// no way to infer an element type for an empty literal. Deliberately
+// **not** Julia's space-sensitive `[1 2; 3 4]` — that grammar isn't
+// LL(1)/LALR-parseable (see this file's row-7 discipline above).
+primary     ::= int_lit | float_lit | str_lit | "true" | "false" | ident | "(" expr ")" | array_lit
+array_lit   ::= "[" expr ("," expr)* "]"
 
 // `"` ... `"`, with a deliberately small escape set (`\"`, `\\`, `\n`,
 // `\t`, `\r` — nothing else, no `\u{...}`/`\x..`/`\0`; see `token.rs`'s
@@ -303,6 +460,13 @@ str_lit     ::= '"' (any_char | escape)* '"'
 // separators (`1_000`). Not needed for Phase 0's examples; listed in
 // omissions rather than silently absent.
 int_lit     ::= digit+
+
+// Digits, a required `.`, more digits — no scientific notation (`1e10`),
+// no bare trailing `.` (`1.` is a lex error, not `Int(1)` followed by
+// something else), no leading-dot form (`.5`). `token.rs`'s lexer decides
+// int-vs-float with one extra character of lookahead past the integer
+// part: a `.` immediately followed by a digit.
+float_lit   ::= digit+ "." digit+
 ident       ::= alpha (alpha | digit | "_")*
 ```
 
@@ -312,10 +476,20 @@ ident       ::= alpha (alpha | digit | "_")*
   until the design decides whether `for` is sugar over `while` (compositional,
   row 8) or a separate construct (simpler to read, row 6). Undecided on
   purpose rather than guessed.
-- No structs/enums/arrays yet — `type` is a closed keyword set, not a
-  grammar production, because refinement types (row 4, Phase 2) will change
-  how array/index types are spelled and it's cheaper to add that once than
-  to add arrays now and redesign them in Phase 2.
+- **Superseded, kept for history:** this used to say "no general
+  structs/enums yet — `type` is still a closed grammar, not open to
+  user-defined names." Row 11 (`nirdosha_row11_amendment.md`) changed
+  that: `struct_decl`/`enum_decl`/`match_expr` above are real,
+  interpreter-checked and -executed (`typeck.rs`, `ownership.rs`,
+  `interpreter.rs`), layer 1 of that amendment's own rollout — fixed
+  concrete fields/payloads only, no type-parameter list on a declaration
+  yet (`Pair(A, B)` is layer 6, not built). `Vector`/`Matrix` (dense,
+  fixed-shape 1-D/2-D arrays — `type`'s `"Vector" "(" ... ")"`/
+  `"Matrix" "(" ... ")"` productions above) remain a separate, older
+  mechanism, not unified with `struct`/`enum` — what's still missing for
+  *them* specifically is dynamically-sized arrays and generic dimensions
+  (`Matrix{T,N}`-style), which needs the same real generics Row 11's own
+  layer 6 would bring, not attempted here.
 - No `unsafe`/`audited` block syntax yet — that's the Tier-3 escape valve
   from `goal.md` §4, which presupposes Tier 1/2 (the SMT-discharged
   refinement layer) existing first.
@@ -367,3 +541,18 @@ construction." It's what found the statement-separator ambiguity
 documented above. It does not build cleanly, on purpose and by design —
 see its README for why that's the actual, informative result, not a
 broken build waiting to be fixed.
+
+## Machine-readable grammar artifact (goal.md row 7)
+
+`compiler/nirdosha.gbnf` is a hand translation of this EBNF into GBNF, a
+constrained-decoding grammar format — the artifact that lets an LLM's
+sampler guarantee every token it emits stays inside Nirdosha's syntax,
+not just hope the model learned the grammar from training data.
+`grammar_export/` (top-level, sibling to `compiler/` — see
+[`../grammar_export/README.md`](../grammar_export/README.md)) is what
+actually checked it: a real dependency on llama.cpp's own grammar parser
+confirms the file is valid, loadable GBNF (and caught a real translation
+bug — llama.cpp doesn't accept a bare `|` starting a continuation line
+the way this EBNF's own visual style does), and a fidelity corpus
+compares accept/reject behavior against the real lexer+parser for every
+shipped example plus a set of hand-written positive/negative snippets.

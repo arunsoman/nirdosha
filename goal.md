@@ -15,6 +15,46 @@ previously a "secondary" wishlist into the same requirement set the safety
 properties belong to, because none of the ten actually stands independently
 of the others (§1, §7).
 
+> **Honest correction (added during the unified development plan's Phase
+> 5, §4.5.3 — see `Nirdosha_Unified_Plan.md`):** this brief references
+> `src/capability.rs` and `src/ledger.rs` as already existing in this
+> codebase (§1 row 10, §5, §8) — an exhaustive repo search found no such
+> files. Row 10's full ambition (reproducible builds, content-addressed
+> source, capability manifests enforced at the kernel boundary, a signed
+> provenance chain) remains **aspirational**, not built, and should be
+> read that way everywhere it's mentioned below. What *is* real and
+> checkable today is a narrower, concrete slice: `rand_seed`/`rand_f64`/
+> `rand_gaussian` (Phase 3) make a simulation run's random draws
+> byte-for-byte reproducible from a seed — no OS entropy, no hidden
+> global state (see `interpreter.rs`'s `Interpreter::rng` field and
+> `compiler/tests/mission_critical.rs`'s determinism tests). That's the
+> honest foundation a future row-10 implementation pass would extend,
+> not a claim that row 10 itself is done.
+
+> **Row 11, added 21 Aug 2026** (see `nirdosha_row11_amendment.md`, itself
+> checked against `PROTOLANG_PORT.md`'s porting exercise): the ten rows
+> above are necessary but were not sufficient — Nirdosha had no product
+> types, sum types, or generics, and three "Blocked" verdicts plus four
+> "Rejected" ones in the porting exercise traced back to exactly that one
+> missing layer, not to Rice's theorem or to any of rows 1–10. Row 11 is
+> now part of the requirement set (§1's table, §3's synthesis layer, §6's
+> phase plan, §7's formalization all updated below) — narrowly scoped
+> (`struct`/`enum`/`match`, no traits, no HKTs, no subtyping) so it doesn't
+> become the research project rows 1–10 already warn against.
+>
+> **Update, 21 Aug 2026:** the first slice of row 11 has actually shipped
+> — non-generic `struct`/`enum`/`match`, with affinity propagating through
+> struct/enum fields the same way it already does through `box`
+> (`compiler/src/typeck.rs`, `ownership.rs`, `interpreter.rs`;
+> `compiler/tests/structs_enums.rs`; `nirdosha_row11_amendment.md`'s §3.6
+> layers 1–4). What isn't built yet is exactly what makes row 11
+> genuinely useful for the items it was meant to unlock: generics on a
+> declaration (layer 6) and `Option`/`Result` as ordinary generic `enum`s
+> on top of that (layer 7) — every `enum` written today has to be fully
+> concrete. Codegen doesn't compile any of it — `struct`/`enum`/`match`
+> join the existing interpreter-only list (`box`/`thread`/`chan`/
+> `sandbox`/`tcp`/`str`), rejected explicitly, not silently mis-compiled.
+
 ---
 
 ## 0. The constraint that shapes everything
@@ -51,7 +91,7 @@ through.
 
 ## 1. The requirements, as one set
 
-Ten items. Each is independently studied, with its own literature and its
+Eleven items (row 11 added 21 Aug 2026, see the note above). Each is independently studied, with its own literature and its
 own shipped examples — but they're listed together, in one table, because
 that's the actual claim of this document: none of them is optional relative
 to the others, and — see the **Class** column — roughly half are things a
@@ -73,8 +113,9 @@ half is the "real" goal; the requirement is both, at once, in one language.
 | 8 | Logical, composable syntax — complex operations built from fundamental blocks | **Hard** — provable, as a property of the semantics | Require the semantic function to be *compositional*: `⟦compose(a,b)⟧ = F(⟦a⟧,⟦b⟧)` for one fixed `F` — a minimal orthogonal primitive set, no special-cased rule per feature | Lisp/Scheme's minimal-core-plus-macros, Bird & Meertens's algebra of programming, Smalltalk's "everything is an object" | Compositionality fights performance-motivated special cases (SIMD intrinsics, in-place mutation) — the same tension ownership types (row 1) already manage |
 | 9 | AI as a first-class citizen, not a guest | **Soft** — measured, interface is **hard**-typed | Agents emit typed AST/IR fragments the compiler validates before splicing, not raw text; compiler errors return structured, machine-checkable proof obligations, not English prose | LSP-guided completion, Copilot-style compiler-feedback loops, measured self-repair gains from re-prompting with diagnostics, proof-assistant tactic states (Lean/Coq) | Breaks down exactly at Tier-3 `audited` blocks (§4), which need a natural-language justification — the one place a human review gate should stay mandatory, not delegated |
 | 10 | Tamper-evidence — detect "alien" code in the binary | **Hard** — proof / hash equality | Reproducible builds (compiler is a deterministic function of source + flags) + content-addressed source (hash the AST) + capability manifests enforced at the kernel boundary + signed provenance chain | Reproducible-Builds project (Debian, Tor), SLSA / in-toto, `src/capability.rs` + `src/ledger.rs` already in this codebase | Detects *deviation from attested source*, not "hacking" in general — side channels, hardware faults, and social engineering sit outside every mechanism on this list |
+| 11 | Closed product types, sum types, and generics | **Hard** — proof (decidable) | `struct`/`enum` type formers plus a `match` expression; type parameters are concrete-per-instantiation (no erasure), the same way `Vector(f64,3)` and `Vector(f64,4)` are already different types | ML family (records, tagged unions), Rust (`enum`, exhaustive `match`) — see `nirdosha_row11_amendment.md` | No traits/typeclasses, no HKTs, no subtyping, no wildcard/binding patterns in `match` (v1) — the algebra of data, and nothing past it |
 
-Nobody has shipped a language that clears all ten rows — not because any row
+Nobody has shipped a language that clears all eleven rows — not because any row
 is unproven in isolation, but because the "Hard" and "Soft" columns have
 historically been treated as separate projects by separate communities
 (formal-methods languages vs. ergonomic mainstream ones), never assembled
@@ -152,7 +193,7 @@ not every entry here is a language, and that's the point: rows 6, 7, 9, and
 
 ## 3. The synthesis
 
-None of the ten rows conflict with each other — they sit at different
+None of the eleven rows conflict with each other — they sit at different
 layers of the same compiler and toolchain. Stacking them, from what a human
 or model actually types down to the binary:
 
@@ -160,6 +201,7 @@ or model actually types down to the binary:
 |---|---|---|
 | **Surface syntax & tooling** | rows 6, 7, 9 | LL(1)/LALR grammar (a decidable property, checked by the parser generator itself), keyword-heavy over symbol-heavy, one canonical formatting (`gofmt`-style, kills bikeshedding), structured/machine-parseable diagnostics, a shipped grammar + constrained-decoder spec so tools don't depend on training-corpus frequency to get syntax right |
 | **Core language** | rows 1, 8 | Strict, expression-based; no null, no implicit conversions, structured control flow only, sized integers by default (`i8`…`i64`, `usize`) — no untyped `int` to smuggle a proof gap through |
+| **Type formers** | row 11 | `struct`/`enum`/`match`, nominal, no traits or subtyping; generics are concrete-per-instantiation (no erasure) rather than a separate monomorphizer pass — the closed algebra of data the rest of user code is written in, distinct from row 8's compositional-semantics requirement on the language itself |
 | **Ownership & regions** | row 1 | Austral + Vale: affine by default; region/lifetime scopes *inferred*, not hand-annotated, for the common case. Bulk region alloc/free — no per-object `malloc`, no GC, ever |
 | **Concurrency** | rows 2, 3 | Pony by default: objects live in isolated domains, cross-domain traffic is only typed async messages, so races are unrepresentable. Shared-memory locks are opt-in, gated by a static lock-rank check — not the default path |
 | **Refinement types** | row 4 | SPARK + Idris2 QTT: integers and byte arrays carry SMT-checked bounds (`byte[n] where n < cap`), discharged at compile time by a bundled solver (three-tier resolution, §4) |
@@ -251,7 +293,7 @@ here" that nobody — human or model — can find later.
 Worth naming since a capability kernel is already sitting right here: this
 design isn't hypothetical infrastructure to bolt on afterward, it overlaps
 with what `src/capability.rs` and `src/ledger.rs` already do — for two of
-the ten rows, not one:
+the eleven rows, not one:
 
 - **Region alloc/free** (row 1) wants one bulk syscall (`region_alloc(pages)
   → capability`, `region_free(capability)`) rather than page-by-page
@@ -304,6 +346,7 @@ capability system), not new research.
 |---|---|---|
 | Weeks | **0 — Narrow the core, draft the grammar** | Straight-line and structured control flow only, no unbounded recursion or higher-order closures yet (keeps the checker decidable), fixed-size integers and arrays only. LL(1)/LALR-checkable grammar drafted in parallel — it's cheap to check early and expensive to retrofit later (rows 1, 6, 7) |
 | Months | **1 — Ownership, no GC** | Regions + affine bindings, single-threaded, compiles via LLVM to native. The load-bearing memory-safety layer everything else sits on (row 1) |
+| Months | **1.5 — Closed algebraic data types** | `struct`/`enum`/`match`, generics as concrete-per-instantiation types (no erasure). Sits between ownership and refinement types because it needs affinity propagation from Phase 1 (a struct with an affine field is affine) and feeds refinement's boundary-checking in Phase 2 (a struct/enum constructor is one more call site to check). See `nirdosha_row11_amendment.md` (row 11) |
 | Months | **2 — Refinement types** | Bind a Z3-class solver at compile time for integer and array bounds. Comparable in scope to what LiquidHaskell and Dafny each took roughly a person-year or two to reach usable state on (row 4) |
 | Quarters | **3 — Concurrency** | Actor model with capability-typed mailboxes, Pony-style. The one-person precedent above is the reason to attempt this rather than defer it (rows 2, 3) |
 | Quarters | **3.5 — Surface & AI interface** | Grammar-constrained decoder, structured/machine-parseable diagnostics, an LLM-benchmark suite tracked as a real metric (not a launch afterthought), typed AST/IR splicing for agents. Independent of Phase 3's kernel-facing work, so it runs in parallel, not after (rows 6, 7, 9) |
@@ -311,7 +354,7 @@ capability system), not new research.
 
 ---
 
-## 7. The ten requirements as one optimization problem
+## 7. The eleven requirements as one optimization problem
 
 Given the split in §1's Class column, it's worth being precise about what
 "one cohesive set of requirements" actually means mathematically, rather
@@ -336,6 +379,9 @@ hard constraints — proof, not measurement, no partial credit:
         T_compositional (row 8)  ⟦compose(a,b)⟧ = F(⟦a⟧,⟦b⟧) for one fixed F
         T_reproducible  (row 10) compile(s, flags) is a deterministic function of (s, flags)
         T_confinement   (row 10) the kernel grants binary β only capabilities in manifest(β)
+        T_data          (row 11) every struct/enum construction is field/payload-type-checked;
+                                  match exhaustiveness is a decidable check over a closed,
+                                  finite variant set — no undecidable residue, unlike rows 1-4
 
 soft objective — measurement, degrees not booleans, still binding:
     maximize  Σⱼ wⱼ · mⱼ(D)   over every D that satisfies every hard constraint above
@@ -359,7 +405,11 @@ Two things this formulation makes explicit that a flat checklist doesn't:
    ship without a safety regression. Row 5 (native speed) and row 5's
    codegen aren't listed as a `Tᵢ` because they're an engineering
    requirement on the backend, not a semantic theorem about `D` — but they
-   still gate which `D` are admissible, the same way the others do.
+   still gate which `D` are admissible, the same way the others do. Row 11
+   (`T_data`) is the opposite kind of exception to the pattern below: it
+   *is* a `Tᵢ`, but — by design (§2.2 of `nirdosha_row11_amendment.md`,
+   deliberately no traits/HKTs/subtyping) — one with no Rice's-theorem-driven
+   undecidable residue, so it never needs rows 1–4's Tier-2/3 escape valve.
 2. **The soft objective only ever ranks *among* feasible designs.** There is
    no way to trade a hard constraint for a better learning-curve score — a
    `D` that's easier to learn but lets a data race through isn't a
@@ -372,7 +422,9 @@ Two things this formulation makes explicit that a flat checklist doesn't:
 This is a real formalization, but notice what kind: a **constrained,
 multi-objective optimization over a combinatorial, partly-qualitative design
 space with no closed form** — there is no algebraic "solve for x," and nine
-of the ten rows already told you why (§0). It's solved the way every real
+of the eleven rows already told you why (§0) — rows 5 and 11 are the two
+exceptions, each decidable/engineering rather than Rice's-theorem-limited.
+It's solved the way every real
 engineering optimization with a non-differentiable, partly-empirical
 objective landscape is solved: **iterative search, not inversion.**
 
@@ -423,12 +475,68 @@ using `src/capability.rs`/`src/ledger.rs` rather than building new
 supply-chain infrastructure. Target **LLVM from day one** rather than a
 bespoke ISA (row 5); the "minimal instruction set" instinct is already
 satisfied by everything proven statically above it, and a custom backend is
-R&D that will swallow the rest of the project.
+R&D that will swallow the rest of the project. Add **closed `struct`/`enum`
+types with concrete-per-instantiation generics** (row 11) underneath the
+ownership and refinement layers — no traits, no HKTs, no subtyping — so
+that everything rows 1–5 already prove statically has a user-facing data
+shape to prove it *about*, not just scalars and fixed-size arrays.
 
-None of these six moves is optional relative to the others — leave out the
+None of these seven moves is optional relative to the others — leave out the
 grammar work and rows 1–4's safety machinery becomes the reason nobody
 adopts the language (Idris2's fate); leave out the safety machinery and the
-grammar work produces a faster Go, not Nirdosha.
+grammar work produces a faster Go, not Nirdosha; leave out row 11 and rows
+1–4's proofs stay confined to a toy language with no records or options.
+
+---
+
+## 9. The honest gap, and the three things that close it
+
+*Added 20 Aug 2026, after benchmarking the current implementation against
+Julia and C (`benchmarks/RESULTS.md`) and asking plainly why anyone should
+adopt Nirdosha today.* The honest answer at that point in time: they
+shouldn't, not yet. Pre-alpha, no ecosystem, half the language doesn't
+compile (§10 of `LANGUAGE.md`), no mechanized safety proof, no real user or
+model has written real programs in it. The pitch — provable safety *and*
+LLM-native design, together, which nobody has shipped — is a thesis, not a
+track record. Three things turn it into one, and this is now the standing
+goal, worked until each is true, not until the calendar says stop:
+
+1. **Finish the compiler.** `Vector`/`Matrix` codegen — **done, 21 Aug
+   2026**: value representation + sret/pointer calling convention, dynamic
+   indexing wired to the bounds proofs `refine.rs`/`smt.rs` already
+   produced (now actually consumed, not just proved), every unrollable
+   operator/builtin as straight-line IR, `det`/`inv`/`solve`/`rank`/
+   `kf_update_*` via a linked native runtime call. Payoff was measured, not
+   assumed, and held: Group A (`matmul`/`det`/`dot`/`kalman`) went from a
+   2–2 split against Julia (interpreted) to beating it 36×–441× across all
+   four, compiled (`benchmarks/RESULTS.md`). One real bug found and fixed
+   along the way — loop-body allocas weren't hoisted to the function entry
+   block, so tight loops building `Vector`/`Matrix` values blew the stack
+   past a few thousand iterations; fixed by hoisting all allocas
+   unconditionally, the standard technique, with a regression test added.
+   `box`/`thread`/`chan`/`sandbox`/`tcp`/`str` are still interpreter-only —
+   "hardware-native speed" (row 5) now covers scalars and dense linear
+   algebra, not yet those. That's the next slice of this item, not a new
+   item — row 5 isn't fully closed until they compile too.
+2. **Prove the safety claims formally.** Row 1–4's "no GC, no races, no
+   deadlocks, no overflow" is currently "the type system is believed to
+   guarantee this," backed by tests, not a mechanized proof. §7 already
+   names the target: discharge the core calculus's hard constraints once,
+   in Lean4 or Coq, the way CompCert and RustBelt did — after that, each
+   later design change is a cheap re-check, not a re-proof from scratch.
+3. **Get a real LLM benchmark and real users writing real programs.** Row
+   7/9's "easy for an LLM to write" is designed-for, not measured-yet —
+   `bench/`'s scoring loop is real plumbing wired to two mock models
+   (`bench/README.md`), not a real model integration. Wire in an actual
+   model, run the corpus, publish pass@1 and self-repair numbers; get
+   people outside this project writing real Nirdosha programs and see
+   where the design actually breaks under real use, not assumed use.
+
+No deadline attached to any of the three on purpose — each is done when
+it's actually true, verified the same way this project already insists on
+verifying everything else (a real benchmark, a real proof, a real model,
+not a claim). This section is the checkpoint to come back to and update as
+each closes.
 
 ---
 

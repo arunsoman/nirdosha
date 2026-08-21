@@ -1,0 +1,15 @@
+// 8-element dot product, repeated N times with slightly varying inputs.
+fn main() {
+    let n: i64 = 0
+    let n_max: i64 = 200000
+    let t: f64 = 0.0
+    let checksum: f64 = 0.0
+    while n < n_max {
+        let a: Vector(f64, 8) = [t, t + 1.0, t + 2.0, t + 3.0, t + 4.0, t + 5.0, t + 6.0, t + 7.0]
+        let b: Vector(f64, 8) = [t + 1.0, t, t + 3.0, t + 2.0, t + 5.0, t + 4.0, t + 7.0, t + 6.0]
+        checksum = checksum + dot(a, b)
+        t = t + 0.0001
+        n = n + 1
+    }
+    print(checksum)
+}

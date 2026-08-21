@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 z3 = "0.20.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

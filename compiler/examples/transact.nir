@@ -1,0 +1,80 @@
+// `transact { ... }` -- TRANSACT.md's durable-effect construct.
+//
+// This example exercises Layer 1 only (TRANSACT.md's own staged rollout):
+// in-process, no durability log, no `retry`/`timeout` on `network` -- those
+// are Layer 2+. What Layer 1 proves: the five-step protocol's control flow
+// is right --
+//
+//   1. `network` runs once, its result becomes an implicit local binding
+//      (`network`) visible to every slot after it.
+//   2. `verify` runs, sees `network`, must return `bool` -- its result
+//      becomes another implicit binding (`verify`).
+//   3. `verify == true`  -> `commit` runs, then `transact` yields `true`.
+//   4. `verify == false` -> `compensate` runs (if present), then
+//      `transact` yields `false`.
+//   5. `log` (if present) always runs last, best-effort -- not part of any
+//      durability contract yet (there is no durability log in Layer 1).
+//
+// `transact` is an *expression* (not a statement) that produces `bool` --
+// the same "block-value convention `if` already uses" TRANSACT.md names
+// explicitly, which is why `return transact { ... }` below works exactly
+// like `return if c {..} else {..}` already does.
+
+fn call_api(amount: i64) -> i64 {
+    // Stand-in for a real network call -- Layer 5 (cross-process
+    // `network`/`commit`) lets this internally use `sandbox`/`connect`/
+    // `tcp` with no grammar change at all, since the restriction is only
+    // "one named `Expr::Call`", not "no side effects inside it".
+    return amount
+}
+
+fn check(resp: i64) -> bool {
+    return resp > 0
+}
+
+fn update_db(amount: i64) -> i64 {
+    print("committing", amount)
+    return amount
+}
+
+fn refund(amount: i64) -> i64 {
+    print("compensating", amount)
+    return amount
+}
+
+fn write_log(amount: i64, ok: bool) -> unit {
+    print("logged", amount, ok)
+}
+
+fn checkout(amount: i64) -> bool {
+    return transact {
+        network:    call_api(amount)
+        verify:     check(network)
+        commit:     update_db(amount)
+        compensate: refund(amount)
+        log:        write_log(amount, verify)
+    }
+}
+
+// A `transact` with no `compensate`/`log` slot at all -- both are
+// optional (TRANSACT.md's grammar), and `verify == false` with no
+// `compensate` present still yields `false`, it just has nothing to run
+// on the way there.
+fn minimal(amount: i64) -> bool {
+    return transact {
+        network: call_api(amount)
+        verify:  check(network)
+        commit:  update_db(amount)
+    }
+}
+
+fn main() -> unit {
+    let committed: bool = checkout(10)
+    print("checkout(10) committed:", committed)
+
+    let compensated: bool = checkout(-5)
+    print("checkout(-5) committed:", compensated)
+
+    let minimal_ok: bool = minimal(1)
+    print("minimal(1) committed:", minimal_ok)
+}

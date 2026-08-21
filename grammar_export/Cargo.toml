@@ -1,0 +1,11 @@
+[package]
+name = "nirdosha-grammar-export"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+llama-cpp-gbnf = "0.12.0"
+nirdosha = { path = "../compiler" }

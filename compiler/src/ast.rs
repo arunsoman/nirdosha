@@ -5,6 +5,8 @@
 //! exactly one `eval_expr` match arm per `Expr` variant here, and no variant
 //! reaches back into a sibling's internals — composition, not entanglement.
 
+use std::collections::HashMap;
+
 use crate::token::Span;
 
 /// Not `Copy` — deliberately. `Ty::Box` owns a nested `Ty`, and giving the
@@ -12,7 +14,14 @@ use crate::token::Span;
 /// duplicable, which is exactly the property `Ty::Box` exists to *not*
 /// have (see `is_affine`, and the real move-checker in `ownership.rs`).
 /// `Clone` stays cheap for everything else since only `Box` recurses.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` (not just `Serialize`) exist from this phase
+/// on, ahead of the full AST-export work row 9 asks for (Phase 2): every
+/// `TypeErrorKind`/`OwnershipErrorKind` field that names a type embeds a
+/// `Ty` directly, so a diagnostic can't serialize at all — let alone
+/// round-trip — without this. Phase 2 doesn't have to add anything here;
+/// it just adds the same derive to `Expr`/`Stmt`/`Program`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Ty {
     I8,
     I16,
@@ -23,6 +32,27 @@ pub enum Ty {
     U32,
     U64,
     Usize,
+    /// IEEE 754 double precision. Unlike the integer types, there is only
+    /// one float width — no `f32` — so there's no literal-flexibility
+    /// story to design (contrast `is_integer()`'s declared-width-only
+    /// widening): a float literal is just `F64`, the same way a string
+    /// literal is just `Str`. Not affine, not in `bounds()`'s domain
+    /// (`is_integer()` is false for this on purpose — see `is_numeric()`).
+    F64,
+    /// A fixed-length, dense, homogeneous 1-D array — `Vector(f64, 3)`.
+    /// "Sized by Default" (the unified plan's §2): the length is part of
+    /// the type, so `Vector(f64, 3)` and `Vector(f64, 4)` are different
+    /// types and a shape mismatch is a compile-time `TypeMismatch` for
+    /// free, the same way two different integer widths already are — no
+    /// separate `ShapeMismatch` machinery needed for `+`/`-`/literal
+    /// construction, only for `*`'s inner-dimension check (see
+    /// `typeck.rs::infer_mul`), where the two operand types are
+    /// legitimately different `Ty`s by design.
+    Vector(Box<Ty>, usize),
+    /// A fixed-shape, dense, homogeneous 2-D array, row-major —
+    /// `Matrix(f64, 3, 3)`. Same "shape is part of the type" reasoning as
+    /// `Vector`, two dimensions instead of one.
+    Matrix(Box<Ty>, usize, usize),
     Bool,
     Unit,
     /// A heap-allocated single-value cell — `box i64`, `box bool`, even
@@ -103,6 +133,40 @@ pub enum Ty {
     /// only, the same "smallest thing that's actually needed" scope
     /// `chan`'s sandbox-crossing payload restriction already set.
     Tcp,
+    /// A handle to a real, listening TCP server socket (`listen(port)` —
+    /// see `Expr::Listen`). Affine, same reason as `Ty::Tcp`: exactly
+    /// one owner, and `stop` (reused again, same "one-time consuming
+    /// close" shape) is how it's torn down. `accept` (`Expr::Accept`)
+    /// doesn't consume it — a listener accepts many connections over its
+    /// lifetime, only the listener *handle itself* is single-owner.
+    /// SANDBOXING.md/the unified plan's §4.3.3: "same `Channel<T>`
+    /// semantics over TCP as over Unix sockets/VSOCK" — `accept` returns
+    /// an ordinary `Ty::Tcp`, so every `send`/`recv`/`stop` a client
+    /// connection already supports works identically on the server side,
+    /// no separate server-connection type needed.
+    TcpListener,
+    /// A handle to a real, local file (`open(path, mode)` — see
+    /// `Expr::Open`). Affine, same reason as `Ty::Tcp`: a file has
+    /// exactly one owner, and `stop`ping it (reusing `Expr::StopSandbox`'s
+    /// keyword — same one-time consuming close every other affine handle
+    /// here shares) is how it's closed. Payloads read/written through a
+    /// `File` are `str` only, same "smallest thing that's actually
+    /// needed" scope `Ty::Tcp`'s payload restriction already set — this
+    /// language has no `bytes` type to carry anything richer yet.
+    File,
+    /// A user-declared `struct`/`enum` name (`nirdosha_row11_amendment.md`
+    /// — Row 11). Carries just the name, not its fields/variants: what a
+    /// given name actually means (struct vs. enum, its field/payload
+    /// types) lives in `Program::structs`/`Program::enums`, looked up
+    /// through a `TypeRegistry` built once per checking pass, the same
+    /// "each pass redoes its own minimal shadow walk" idiom `refine.rs`/
+    /// `smt.rs`/`effects.rs` already establish — not carried inline here,
+    /// since a `Ty` has no access to the declaration table that would let
+    /// it resolve itself. No type-parameter list yet (`Point`, not
+    /// `Pair(A, B)`) — Row 11's own rollout layers scope generics to a
+    /// later layer (`nirdosha_row11_amendment.md` §3.6, step 6); this is
+    /// "layer 1: fixed concrete fields, no generics yet."
+    Named(String),
     /// Poison type: stands in for an expression that already produced a
     /// type error, so the checker (`typeck.rs`) doesn't cascade a dozen
     /// follow-on diagnostics from one root cause. Never produced by the
@@ -124,10 +188,13 @@ impl Ty {
             "u32" => Ty::U32,
             "u64" => Ty::U64,
             "usize" => Ty::Usize,
+            "f64" => Ty::F64,
             "bool" => Ty::Bool,
             "unit" => Ty::Unit,
             "str" => Ty::Str,
             "tcp" => Ty::Tcp,
+            "tcp_listener" => Ty::TcpListener,
+            "file" => Ty::File,
             _ => return None,
         })
     }
@@ -145,6 +212,9 @@ impl Ty {
             Ty::U32 => "u32".to_string(),
             Ty::U64 => "u64".to_string(),
             Ty::Usize => "usize".to_string(),
+            Ty::F64 => "f64".to_string(),
+            Ty::Vector(inner, n) => format!("Vector({}, {n})", inner.name()),
+            Ty::Matrix(inner, r, c) => format!("Matrix({}, {r}, {c})", inner.name()),
             Ty::Bool => "bool".to_string(),
             Ty::Unit => "unit".to_string(),
             Ty::Box(inner) => format!("box {}", inner.name()),
@@ -154,6 +224,9 @@ impl Ty {
             Ty::Sandbox => "sandbox".to_string(),
             Ty::Str => "str".to_string(),
             Ty::Tcp => "tcp".to_string(),
+            Ty::TcpListener => "tcp_listener".to_string(),
+            Ty::File => "file".to_string(),
+            Ty::Named(name) => name.clone(),
             Ty::Error => "<error>".to_string(),
         }
     }
@@ -171,7 +244,37 @@ impl Ty {
                 | Ty::Sandbox
                 | Ty::Str
                 | Ty::Tcp
+                | Ty::TcpListener
+                | Ty::File
+                | Ty::Named(_)
+                | Ty::F64
+                | Ty::Vector(_, _)
+                | Ty::Matrix(_, _, _)
         )
+    }
+
+    /// `is_integer() || self == F64` — the gate every arithmetic operator
+    /// (`typeck.rs::infer_binary`) now checks instead of `is_integer()`
+    /// alone. Kept as its own named predicate, not inlined at each call
+    /// site, because "numeric" and "integer" mean different things from
+    /// this phase on: literal-widening (`unify_operands`'s `in_range`
+    /// check) is still integer-only — there's no second float width to
+    /// widen *to* — so code that needs "can this hold a bare int literal"
+    /// still has to ask `is_integer()` specifically, not this.
+    pub fn is_numeric(&self) -> bool {
+        self.is_integer() || *self == Ty::F64
+    }
+
+    /// True for the two fixed-shape aggregate types (`Vector`/`Matrix`) --
+    /// every other `Ty` in this language is a single scalar value that
+    /// lives in one SSA register. `codegen.rs` uses this to decide, at
+    /// every call site that produces or consumes a value, whether to use
+    /// `Codegen::expr` (returns a bare SSA value) or `Codegen::expr_ptr`
+    /// (returns a pointer to a stack-allocated array) -- see that module's
+    /// doc comment for why a `Vector`/`Matrix` genuinely can't live in one
+    /// register the way everything else here does.
+    pub fn is_aggregate(&self) -> bool {
+        matches!(self, Ty::Vector(_, _) | Ty::Matrix(_, _, _))
     }
 
     /// The property that makes ownership meaningful: an affine value has
@@ -183,6 +286,17 @@ impl Ty {
     /// owners believing they alone are responsible for freeing the same
     /// allocation, which is exactly the class of bug row 1 exists to rule
     /// out statically.
+    /// **Deliberately blind to `Ty::Named`'s real affinity** — a `struct`/
+    /// `enum` is affine iff one of its fields/payload types is
+    /// (`nirdosha_row11_amendment.md` §3.5), which this method has no way
+    /// to know (no declaration table to consult, see `Ty::Named`'s doc
+    /// comment) — so it just falls through the `matches!` below to
+    /// `false`, same as every other pattern this list doesn't name. The
+    /// three call sites that actually need a struct/enum's real affinity
+    /// (`typeck.rs`'s `Expr::Deref` arm, `ownership.rs`'s `Expr::Deref`
+    /// and `touch_ident`) go through `TypeRegistry::is_affine` instead,
+    /// which delegates to this method for every other `Ty` and only
+    /// special-cases `Ty::Named`.
     pub fn is_affine(&self) -> bool {
         // `Ty::Ref` is deliberately excluded: a shared borrow is always
         // freely copyable (unlimited simultaneous readers is sound), even
@@ -196,7 +310,7 @@ impl Ty {
         // computation at once, so it has to be freely copyable — see its
         // own doc comment for where the actual ownership-transfer happens
         // instead (a channel's *payload*, at `send`, not the handle).
-        matches!(self, Ty::Box(_) | Ty::Thread(_) | Ty::Sandbox | Ty::Tcp)
+        matches!(self, Ty::Box(_) | Ty::Thread(_) | Ty::Sandbox | Ty::Tcp | Ty::TcpListener | Ty::File)
     }
 
     /// goal.md row 4's runtime fallback (Tier 2, §4): `interpreter.rs`
@@ -250,40 +364,169 @@ impl Ty {
             | Ty::Sandbox
             | Ty::Str
             | Ty::Tcp
+            | Ty::TcpListener
+            | Ty::File
+            | Ty::Named(_)
+            | Ty::F64
+            | Ty::Vector(_, _)
+            | Ty::Matrix(_, _, _)
             | Ty::Error => (i64::MIN, i64::MAX),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Param {
     pub name: String,
     pub ty: Ty,
 }
 
-#[derive(Debug, Clone)]
+/// Row 11 (`nirdosha_row11_amendment.md` §3.1) — one `name: type` field of
+/// a `struct` declaration. Also doubles as an enum variant's payload
+/// element carries its own `Ty` directly (`Variant::payload: Vec<Ty>`),
+/// not `Vec<Field>` — a variant's payload is positional-only, same as a
+/// struct's constructor call (§3.1's "positional-only... no named-field
+/// construction in v1"), so there's no field *name* to carry there.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Field {
+    pub name: String,
+    pub ty: Ty,
+}
+
+/// `struct Point { x: f64, y: f64 }` — Row 11's product type. No type
+/// parameters yet (`nirdosha_row11_amendment.md` §3.6, layer 1: "fixed
+/// concrete fields, no generics yet") — `name` is registered both as a
+/// type name (`Ty::Named(name)`) and, via `Expr::Call`, as a constructor
+/// (§3.1: "construction is an ordinary call, not a new literal form").
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StructDecl {
+    pub name: String,
+    pub fields: Vec<Field>,
+    pub span: Span,
+}
+
+/// One `enum` variant — `Some(T)`, `None`, `Circle(f64)`. `payload` is
+/// empty for a zero-payload variant (`None`); construction is still
+/// `Expr::Call("None", [], _)`, never a bare identifier (§3.2: "a
+/// zero-payload variant still takes `()`, no bare-identifier special
+/// case needed").
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Variant {
+    pub name: String,
+    pub payload: Vec<Ty>,
+    pub span: Span,
+}
+
+/// `enum Option(T) { Some(T), None }` — Row 11's sum type. Same "no type
+/// parameters yet" scope limit as `StructDecl`. Unlike a struct, an
+/// enum's own name is never itself callable — only its variants are;
+/// `TypeRegistry` and `typeck.rs`'s registration pass both keep this
+/// distinction (a struct name doubles as its own constructor, an enum
+/// name never does).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EnumDecl {
+    pub name: String,
+    pub variants: Vec<Variant>,
+    pub span: Span,
+}
+
+/// `goal.md`'s "Effects" synthesis layer (row 4, 9) — `PROTOLANG_PORT.md`'s
+/// "Locked design 1". A Koka-style **set**, not ProtoLang's own total
+/// order (`pure < mutates < io < network`): Nirdosha's real effectful
+/// builtins don't nest the way that lattice assumes (`network` isn't a
+/// superset of `concurrent`), so membership in this set is the only
+/// ordering fact, other than `pure` (the empty set) being a subset of
+/// every other set — see `effects.rs`'s module doc for the full
+/// classification. Deliberately just four tags, no `mutates`/`io`
+/// distinction ProtoLang draws: Nirdosha's actual effectful operations
+/// sort cleanly into these four, and adding a tag with no builtin that
+/// produces it yet would be notation with nothing to check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+pub enum Effect {
+    /// `rand_seed`/`rand_f64`/`rand_gaussian` — deterministic given a
+    /// seed (`LANGUAGE.md` §9), but mutates the interpreter's own RNG
+    /// stream, a different fact from "talks to the outside world" and
+    /// so kept out of `Io` on purpose.
+    Rng,
+    /// `print`, and `file`'s `open`/`send`/`recv`/`stop`.
+    Io,
+    /// `spawn`/`join`, `chan`'s `send`/`recv`, `sandbox`/`stop`.
+    Concurrent,
+    /// `connect`/`listen`/`accept`, `tcp`'s `send`/`recv`/`stop`.
+    Network,
+}
+
+impl Effect {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Effect::Rng => "rng",
+            Effect::Io => "io",
+            Effect::Concurrent => "concurrent",
+            Effect::Network => "network",
+        }
+    }
+}
+
+/// One `name(args)` call — a `transact { ... }` slot (`TRANSACT.md`).
+/// Restricted to a bare call, never an arbitrary expression: the same
+/// "parse normally, then validate what came out" restriction `Expr::Spawn`/
+/// `Expr::SpawnSandbox` already enforce (see `parser.rs::parse_transact_slot`)
+/// — a slot that needs a real network/process effect wraps it in a named
+/// function, the same as every worked example in `TRANSACT.md` already does.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TransactSlot {
+    pub name: String,
+    pub args: Vec<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FnDecl {
     pub name: String,
     pub params: Vec<Param>,
     pub ret: Ty,
     pub body: Block,
     pub span: Span,
+    /// `effect(pure)` / `effect(io, network)` / ... — `None` when the
+    /// declaration has no `effect(...)` annotation at all (the common
+    /// case: fully inferred, nothing checked against, zero notational
+    /// cost — `goal.md` row 6/7). `Some(set)` — including `Some({})` for
+    /// a bare `effect(pure)` — means `effects::infer_effects`'s result
+    /// for this function must be a *subset* of `set` (`typeck::typecheck`
+    /// enforces this); an effect this function actually performs but
+    /// didn't declare is `TypeErrorKind::EffectNotDeclared`. A declared
+    /// effect the body never actually uses is not an error — the same
+    /// generosity ProtoLang's own effect-subsumption rule gives.
+    pub declared_effects: Option<std::collections::BTreeSet<Effect>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Stmt {
     Let { name: String, ty: Ty, value: Expr, span: Span },
     Return { value: Option<Expr>, span: Span },
     While { cond: Expr, body: Block, span: Span },
     Expr(Expr),
+    /// `audited "<justification>" { <stmts> }` — goal.md §4's Tier-3
+    /// escape hatch: inside `body`, `codegen.rs` suppresses Tier-1/2
+    /// guard emission (`guard_in_range`, the division-by-zero trap) it
+    /// would otherwise insert. `justification` must be non-empty
+    /// (`typeck.rs` checks this) — the compiler enforces syntax and
+    /// non-emptiness only; judging the justification's *content*, or
+    /// gating who may write one, is a CI/review-process rule, not
+    /// compiler code (unified plan §4.3.4). Every escape hatch stays
+    /// greppable: `grep -rn "audited"` finds all of them. `body` is a
+    /// bare `Vec<Stmt>`, not a `Block` — this is purely a statement-level
+    /// construct with no value of its own to produce, unlike a real
+    /// block used in expression position (an `if`'s branches).
+    Audited { justification: String, body: Vec<Stmt>, span: Span },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BinOp {
     Add,
     Sub,
@@ -297,17 +540,33 @@ pub enum BinOp {
     GtEq,
     And,
     Or,
+    /// `.*` — Hadamard (elementwise) multiply. Distinct from `*`, which
+    /// means linear-algebra product for `Vector`/`Matrix` operands (see
+    /// `typeck.rs::infer_mul`) — `.{*,/}` exist specifically because
+    /// plain `*`/`/` already mean something else for those types, the
+    /// same reason Julia keeps the two families separate. No `.+`/`.-`:
+    /// elementwise is already the *only* sensible meaning of `+`/`-` for
+    /// matching-shape operands, so a dotted form would just be a
+    /// redundant second spelling of the same operation.
+    ElemMul,
+    /// `./` — Hadamard (elementwise) divide.
+    ElemDiv,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UnOp {
     Neg,
     Not,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Expr {
     Int(i64, Span),
+    /// A float literal (`3.14`). Not covered by `literal_value` — unlike
+    /// `Expr::Int`, there is only one float type to flex against (see
+    /// `Ty::F64`'s doc comment), so there's nothing for width-flexibility
+    /// to do here; this always types as `Ty::F64`, full stop.
+    Float(f64, Span),
     Str(String, Span),
     Bool(bool, Span),
     Ident(String, Span),
@@ -393,9 +652,92 @@ pub enum Expr {
     /// expression, not a special grammar position" treatment `send`'s
     /// operands already get.
     Connect(Box<Expr>, Box<Expr>, Span),
+    /// `listen(port)` — binds a real TCP listening socket on all
+    /// interfaces and returns a `Ty::TcpListener` handle. `port` is an
+    /// ordinary `i64` expression, same treatment `connect`'s operands
+    /// get.
+    Listen(Box<Expr>, Span),
+    /// `accept(listener)` — blocks until a client connects, then returns
+    /// a `Ty::Tcp` handle for that connection. Does not consume the
+    /// listener (unlike `stop`) — a listener accepts many connections
+    /// over its lifetime.
+    Accept(Box<Expr>, Span),
+    /// `open(path, mode)` — opens a real local file and returns a
+    /// `Ty::File` handle. `path`/`mode` are `str` expressions (`mode` is
+    /// one of `"r"`/`"w"`/`"a"`, checked at runtime, not by the grammar —
+    /// see `PROTOLANG_PORT.md`'s file I/O design for why a string tag
+    /// rather than a real enum: this language has no closed-choice type
+    /// former yet). Same "an ordinary expression, not a special grammar
+    /// position" treatment `connect`'s operands already get.
+    Open(Box<Expr>, Box<Expr>, Span),
+    /// `v[i]` or `m[i, j]` — one bracket group, one or more comma-
+    /// separated index expressions, never chained (`m[i][j]` isn't this;
+    /// see `parser.rs`'s `parse_postfix`). `v[i]` needs exactly one index,
+    /// `m[i, j]` exactly two (`TypeErrorKind::WrongIndexArity` otherwise);
+    /// indexing anything else at all is `TypeErrorKind::NotIndexable`.
+    Index(Box<Expr>, Vec<Expr>, Span),
+    /// `[e1, e2, ...]` — a vector literal (`[1.0, 2.0, 3.0]`) if every
+    /// element is a plain scalar, or a matrix literal, row-major
+    /// (`[[1.0, 2.0], [3.0, 4.0]]`), if every element is itself a
+    /// same-shaped vector — `typeck.rs::infer_array_lit` is what decides
+    /// which. Always at least one element: the parser requires a real
+    /// `expr` inside `[` `]` (see `parser.rs::parse_primary`), so an
+    /// empty `[]` is a parse error, not a value this variant can hold —
+    /// there would be no way to infer an element type for it.
+    ArrayLit(Vec<Expr>, Span),
+    /// `transact { network: call verify: call commit: call (compensate:
+    /// call)? (log: call)? }` — `TRANSACT.md`'s durable-effect construct.
+    /// **Layer 1 only** (this repo's staged rollout, `TRANSACT.md`'s own
+    /// "layers, not a syntax spec" section): in-process, no durability
+    /// log, no `retry`/`timeout` on `network` — those are Layer 2+.
+    /// `network` and `verify` become implicit local bindings (typed from
+    /// each call's own declared return type), visible to every slot after
+    /// them; this is an `Expr`, not a `Stmt`, specifically so `return
+    /// transact { ... }` works exactly like `return if c {..} else {..}`
+    /// already does — "the same block-value convention `if` already
+    /// uses," per `TRANSACT.md`. Evaluates to `true` if `commit` ran
+    /// (`verify` was `true`), `false` if `compensate` ran or would have
+    /// (`verify` was `false`, whether or not a `compensate` slot exists)
+    /// — see `interpreter.rs`'s `Expr::Transact` arm for the exact
+    /// five-step protocol, and `typeck.rs::infer_transact_slot` for why
+    /// every slot's callee is restricted to a user-defined function
+    /// (never a builtin).
+    Transact {
+        network: TransactSlot,
+        verify: TransactSlot,
+        commit: TransactSlot,
+        compensate: Option<TransactSlot>,
+        log: Option<TransactSlot>,
+        span: Span,
+    },
+    /// `expr.field` — Row 11's one genuinely new expression form
+    /// (`nirdosha_row11_amendment.md` §3.1: "no field access exists
+    /// today"). `expr` must type to a `Ty::Named` struct; construction
+    /// itself reuses `Expr::Call`, so there's no dedicated "struct
+    /// literal" node to pair this with.
+    FieldAccess(Box<Expr>, String, Span),
+    /// `match scrutinee { variant(bindings) => body, ... }`
+    /// (`nirdosha_row11_amendment.md` §3.4). An `expr`, not a `stmt`, for
+    /// the same reason `if`/`transact` already are: `return match o {
+    /// ... }` has to work. Exhaustiveness (every variant of the
+    /// scrutinee's specific enum, exactly once, no wildcard/binding-only
+    /// catch-all in v1) is `typeck.rs`'s job, not this type's.
+    Match { scrutinee: Box<Expr>, arms: Vec<MatchArm>, span: Span },
 }
 
-#[derive(Debug, Clone)]
+/// One `variant(bindings) => body` arm of a `match`. `bindings` names the
+/// variant's payload positionally (empty for a zero-payload variant) —
+/// same positional-only convention `StructDecl`'s fields and `Variant`'s
+/// payload already use, no named-field binding in v1.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MatchArm {
+    pub variant: String,
+    pub bindings: Vec<String>,
+    pub body: Box<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ElseBranch {
     Block(Block),
     If(Expr),
@@ -405,6 +747,7 @@ impl Expr {
     pub fn span(&self) -> Span {
         match self {
             Expr::Int(_, s)
+            | Expr::Float(_, s)
             | Expr::Str(_, s)
             | Expr::Bool(_, s)
             | Expr::Ident(_, s)
@@ -423,14 +766,123 @@ impl Expr {
             | Expr::Recv(_, s)
             | Expr::SpawnSandbox(_, _, s)
             | Expr::StopSandbox(_, s)
-            | Expr::Connect(_, _, s) => *s,
+            | Expr::Connect(_, _, s)
+            | Expr::Listen(_, s)
+            | Expr::Accept(_, s)
+            | Expr::Open(_, _, s)
+            | Expr::Index(_, _, s)
+            | Expr::ArrayLit(_, s)
+            | Expr::Transact { span: s, .. }
+            | Expr::FieldAccess(_, _, s)
+            | Expr::Match { span: s, .. } => *s,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Program {
     pub fns: Vec<FnDecl>,
+    pub structs: Vec<StructDecl>,
+    pub enums: Vec<EnumDecl>,
+}
+
+/// Resolves `Ty::Named` references against a program's own `struct`/
+/// `enum` declarations — Row 11's registry, built once per checking pass
+/// (`typeck.rs`, `ownership.rs`, `effects.rs` each build their own over
+/// the same `&Program`, the same "each pass redoes its own minimal shadow
+/// walk" idiom `refine.rs`/`smt.rs` already establish). Doesn't validate
+/// anything itself (a name colliding with a function, or a struct/enum
+/// declared twice, is `typeck.rs`'s job — see its `TypeErrorKind::
+/// DuplicateType`/`DuplicateConstructor`) — this just answers "what
+/// fields does this struct have" / "what payload does this variant
+/// carry."
+pub struct TypeRegistry<'a> {
+    structs: HashMap<&'a str, &'a [Field]>,
+    enums: HashMap<&'a str, &'a [Variant]>,
+    /// `(owning enum's name, the variant itself)`, keyed by variant name
+    /// — variant names live in the same flat callable namespace as
+    /// functions/struct constructors (`nirdosha_row11_amendment.md` §3.2:
+    /// "a variant is just a constructor, registered by name exactly like
+    /// a struct's"), so a bare variant name alone is enough to look this
+    /// up without also knowing which enum it belongs to ahead of time.
+    variant_owner: HashMap<&'a str, (&'a str, &'a Variant)>,
+}
+
+impl<'a> TypeRegistry<'a> {
+    /// No struct/enum declarations at all — every `HashMap` here is
+    /// empty, so this needs no real `&Program` to borrow from and works
+    /// at any lifetime (`typeck::validate_fragment` uses this: it checks
+    /// one isolated `Expr` fragment with no surrounding `Program`, so
+    /// there's no declaration table to build from a real one).
+    pub fn empty() -> Self {
+        TypeRegistry { structs: HashMap::new(), enums: HashMap::new(), variant_owner: HashMap::new() }
+    }
+
+    pub fn build(program: &'a Program) -> Self {
+        let mut structs = HashMap::new();
+        let mut enums = HashMap::new();
+        let mut variant_owner = HashMap::new();
+        for s in &program.structs {
+            structs.insert(s.name.as_str(), s.fields.as_slice());
+        }
+        for e in &program.enums {
+            enums.insert(e.name.as_str(), e.variants.as_slice());
+            for v in &e.variants {
+                variant_owner.insert(v.name.as_str(), (e.name.as_str(), v));
+            }
+        }
+        TypeRegistry { structs, enums, variant_owner }
+    }
+
+    pub fn struct_fields(&self, name: &str) -> Option<&'a [Field]> {
+        self.structs.get(name).copied()
+    }
+
+    pub fn enum_variants(&self, name: &str) -> Option<&'a [Variant]> {
+        self.enums.get(name).copied()
+    }
+
+    pub fn is_struct(&self, name: &str) -> bool {
+        self.structs.contains_key(name)
+    }
+
+    pub fn is_enum(&self, name: &str) -> bool {
+        self.enums.contains_key(name)
+    }
+
+    pub fn find_variant(&self, variant_name: &str) -> Option<(&'a str, &'a Variant)> {
+        self.variant_owner.get(variant_name).copied()
+    }
+
+    /// Registry-aware affinity — `Ty::is_affine`'s doc comment explains
+    /// why the plain method can't do this itself. Recurses "one level
+    /// through" a field/payload at a time, exactly as
+    /// `nirdosha_row11_amendment.md` §3.5 describes.
+    ///
+    /// **Known, deliberate non-issue, not a guarded-against case:** a
+    /// struct/enum that's directly self-referential with no `box`/`chan`/
+    /// etc. indirection (`struct A { b: B } struct B { a: A }`) would
+    /// recurse here forever — not defended against, because no program
+    /// could ever construct a value of such a type in the first place
+    /// (the constructor call itself could never terminate), so no
+    /// well-typed program can ever reach this path with one.
+    pub fn is_affine(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Named(name) => {
+                if let Some(fields) = self.structs.get(name.as_str()) {
+                    fields.iter().any(|f| self.is_affine(&f.ty))
+                } else if let Some(variants) = self.enums.get(name.as_str()) {
+                    variants.iter().any(|v| v.payload.iter().any(|t| self.is_affine(t)))
+                } else {
+                    // Unknown name -- `typeck.rs` reports this separately
+                    // (`TypeErrorKind::UnknownType`); nothing sound to say
+                    // here, so the safe default (not affine) stands.
+                    false
+                }
+            }
+            _ => ty.is_affine(),
+        }
+    }
 }
 
 /// Returns `Some(n)` if `e` is, syntactically, an integer literal or a
@@ -454,4 +906,69 @@ pub fn literal_value(e: &Expr) -> Option<i64> {
         Expr::Unary(UnOp::Neg, inner, _) => literal_value(inner).map(|n| -n),
         _ => None,
     }
+}
+
+/// The builtin-function name registry ("Builtins Are Native Rust" — §2 of
+/// the unified development plan): the single source of truth for "is
+/// this name a builtin." Before this existed, `if name == "print"` was
+/// independently special-cased six times across three files (`typeck.rs`,
+/// `interpreter.rs`, `codegen.rs` twice) — six separately-typed string
+/// literals that could silently drift. Every one of those sites now asks
+/// `is_builtin` instead of comparing to a literal directly.
+///
+/// Deliberately just a name list, not a shared type-check/eval table the
+/// way an earlier revision of this tried (`print` alone made a uniform
+/// `fn(&[Ty]) -> Ty` signature look sufficient). Phase 2's dense linear
+/// algebra builtins broke that assumption two different ways: `zeros`/
+/// `ones`/`identity`'s result *shape* comes from an argument's literal
+/// *value* (`zeros(3)` needs to see the `3`, not just "an `i64`"), which
+/// a type-only signature can't see; and `Ty`-producing logic
+/// (`typeck.rs`) and `Value`-producing logic (`interpreter.rs`) live in
+/// modules with a one-way dependency (`interpreter` on `typeck` would
+/// create a cycle back through here). Each of those two files now owns
+/// its own per-builtin dispatch (`typeck.rs::infer_builtin_call`,
+/// `interpreter.rs`'s `Expr::Call` arm) — a smaller, honest duplication
+/// (one name list, two independent bodies of *logic* that were always
+/// going to differ anyway) rather than a forced abstraction leaking
+/// implementation details across the module boundary it exists to keep
+/// clean.
+pub const BUILTIN_NAMES: &[&str] = &[
+    "print",
+    "transpose",
+    "dot",
+    "cross",
+    "zeros",
+    "ones",
+    "identity",
+    "sum",
+    "len",
+    "norm",
+    "norm1",
+    "norm_inf",
+    "frobenius_norm",
+    "trace",
+    "det",
+    "inv",
+    "solve",
+    "rank",
+    "is_symmetric",
+    "is_diag",
+    "is_square",
+    "rand_seed",
+    "rand_f64",
+    "rand_gaussian",
+    "distance",
+    "bearing",
+    "lla_to_ecef",
+    "ecef_to_lla",
+    "ecef_to_enu",
+    "enu_to_ecef",
+    "kf_predict_state",
+    "kf_predict_cov",
+    "kf_update_state",
+    "kf_update_cov",
+];
+
+pub fn is_builtin(name: &str) -> bool {
+    BUILTIN_NAMES.contains(&name)
 }

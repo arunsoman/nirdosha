@@ -68,6 +68,25 @@ impl Parser {
         }
     }
 
+    /// A bare non-negative integer literal in *type* position — a
+    /// `Vector`/`Matrix` dimension. Dimensions are fixed at compile time
+    /// ("Sized by Default" — the unified plan's §2), so this only ever
+    /// accepts a literal, never an arbitrary expression the way an array
+    /// index does.
+    fn expect_usize_literal(&mut self) -> PResult<usize> {
+        let span = self.span();
+        match self.peek().tok.clone() {
+            Tok::Int(n) => {
+                self.bump();
+                usize::try_from(n).map_err(|_| ParseError {
+                    message: format!("`{n}` is not a valid Vector/Matrix dimension (must be non-negative)"),
+                    span,
+                })
+            }
+            other => Err(ParseError { message: format!("expected a dimension, found {other:?}"), span }),
+        }
+    }
+
     // type ::= "&" type | "box" type | i8 | i16 | ... | bool | unit
     fn expect_type(&mut self) -> PResult<Ty> {
         if self.peek().tok == Tok::Amp {
@@ -99,11 +118,44 @@ impl Parser {
             self.bump();
             return Ok(Ty::Sandbox);
         }
+        if self.peek().tok == Tok::VectorKw {
+            self.bump();
+            self.expect(&Tok::LParen, "`(`")?;
+            let elem = self.expect_type()?;
+            self.expect(&Tok::Comma, "`,`")?;
+            let n = self.expect_usize_literal()?;
+            self.expect(&Tok::RParen, "`)`")?;
+            return Ok(Ty::Vector(Box::new(elem), n));
+        }
+        if self.peek().tok == Tok::MatrixKw {
+            self.bump();
+            self.expect(&Tok::LParen, "`(`")?;
+            let elem = self.expect_type()?;
+            self.expect(&Tok::Comma, "`,`")?;
+            let rows = self.expect_usize_literal()?;
+            self.expect(&Tok::Comma, "`,`")?;
+            let cols = self.expect_usize_literal()?;
+            self.expect(&Tok::RParen, "`)`")?;
+            return Ok(Ty::Matrix(Box::new(elem), rows, cols));
+        }
         match &self.peek().tok {
             Tok::TypeName(name) => {
                 let ty = Ty::from_name(name).expect("lexer only emits valid type names");
                 self.bump();
                 Ok(ty)
+            }
+            // A declared `struct`/`enum` name (Row 11) — accepted
+            // syntactically for *any* identifier here, same as a function
+            // call name; whether it actually names a real declared type
+            // is `typeck.rs`'s job (`TypeErrorKind::UnknownType`), not
+            // this parser's — it has no declaration table to check
+            // against, and Nirdosha's functions/types are already
+            // resolved by name in a table built after parsing completes
+            // (`LANGUAGE.md` §6), not as each name is scanned.
+            Tok::Ident(name) => {
+                let n = name.clone();
+                self.bump();
+                Ok(Ty::Named(n))
             }
             other => Err(ParseError {
                 message: format!("expected a type, found {other:?}"),
@@ -115,10 +167,86 @@ impl Parser {
     // program ::= item*
     pub fn parse_program(&mut self) -> PResult<Program> {
         let mut fns = Vec::new();
+        let mut structs = Vec::new();
+        let mut enums = Vec::new();
         while self.peek().tok != Tok::Eof {
-            fns.push(self.parse_fn_decl()?);
+            match self.peek().tok {
+                Tok::Struct => structs.push(self.parse_struct_decl()?),
+                Tok::Enum => enums.push(self.parse_enum_decl()?),
+                _ => fns.push(self.parse_fn_decl()?),
+            }
         }
-        Ok(Program { fns })
+        Ok(Program { fns, structs, enums })
+    }
+
+    // struct_decl ::= "struct" ident "{" field ("," field)* ","? "}"
+    // field       ::= ident ":" type
+    fn parse_struct_decl(&mut self) -> PResult<StructDecl> {
+        let span = self.span();
+        self.expect(&Tok::Struct, "`struct`")?;
+        let name = self.expect_ident()?;
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut fields = Vec::new();
+        if self.peek().tok != Tok::RBrace {
+            loop {
+                let fname = self.expect_ident()?;
+                self.expect(&Tok::Colon, "`:`")?;
+                let fty = self.expect_type()?;
+                fields.push(Field { name: fname, ty: fty });
+                if self.peek().tok == Tok::Comma {
+                    self.bump();
+                    if self.peek().tok == Tok::RBrace {
+                        break; // trailing comma
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(StructDecl { name, fields, span })
+    }
+
+    // enum_decl ::= "enum" ident "{" variant ("," variant)* ","? "}"
+    // variant   ::= ident ("(" type ("," type)* ")")?
+    fn parse_enum_decl(&mut self) -> PResult<EnumDecl> {
+        let span = self.span();
+        self.expect(&Tok::Enum, "`enum`")?;
+        let name = self.expect_ident()?;
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut variants = Vec::new();
+        if self.peek().tok != Tok::RBrace {
+            loop {
+                let vspan = self.span();
+                let vname = self.expect_ident()?;
+                let mut payload = Vec::new();
+                if self.peek().tok == Tok::LParen {
+                    self.bump();
+                    if self.peek().tok != Tok::RParen {
+                        loop {
+                            payload.push(self.expect_type()?);
+                            if self.peek().tok == Tok::Comma {
+                                self.bump();
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    self.expect(&Tok::RParen, "`)`")?;
+                }
+                variants.push(Variant { name: vname, payload, span: vspan });
+                if self.peek().tok == Tok::Comma {
+                    self.bump();
+                    if self.peek().tok == Tok::RBrace {
+                        break; // trailing comma
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(EnumDecl { name, variants, span })
     }
 
     // fn_decl ::= "fn" ident "(" params? ")" ("->" type)? block
@@ -148,8 +276,65 @@ impl Parser {
         } else {
             Ty::Unit
         };
+        let declared_effects = self.parse_effect_annotation()?;
         let body = self.parse_block()?;
-        Ok(FnDecl { name, params, ret, body, span })
+        Ok(FnDecl { name, params, ret, body, span, declared_effects })
+    }
+
+    /// `effect(pure)` / `effect(io, network)` / ... — `None` if there's no
+    /// `effect(...)` at all (the common, fully-inferred case). `pure`
+    /// denotes the empty set and must appear alone (`effect(pure, io)` is
+    /// a parse error, not silently "just `io`") — see `ast::FnDecl::
+    /// declared_effects`'s doc comment for what an empty set means.
+    fn parse_effect_annotation(&mut self) -> PResult<Option<std::collections::BTreeSet<Effect>>> {
+        if self.peek().tok != Tok::Effect {
+            return Ok(None);
+        }
+        let ann_span = self.span();
+        self.bump();
+        self.expect(&Tok::LParen, "`(`")?;
+        let mut saw_pure = false;
+        let mut set = std::collections::BTreeSet::new();
+        loop {
+            let span = self.span();
+            let name = self.expect_ident()?;
+            match name.as_str() {
+                "pure" => saw_pure = true,
+                "rng" => {
+                    set.insert(Effect::Rng);
+                }
+                "io" => {
+                    set.insert(Effect::Io);
+                }
+                "concurrent" => {
+                    set.insert(Effect::Concurrent);
+                }
+                "network" => {
+                    set.insert(Effect::Network);
+                }
+                other => {
+                    return Err(ParseError {
+                        message: format!(
+                            "unknown effect `{other}` — expected `pure`, `rng`, `io`, `concurrent`, or `network`"
+                        ),
+                        span,
+                    });
+                }
+            }
+            if self.peek().tok == Tok::Comma {
+                self.bump();
+                continue;
+            }
+            break;
+        }
+        self.expect(&Tok::RParen, "`)`")?;
+        if saw_pure && !set.is_empty() {
+            return Err(ParseError {
+                message: "`pure` declares the empty effect set and can't be combined with other effects".to_string(),
+                span: ann_span,
+            });
+        }
+        Ok(Some(set))
     }
 
     // block ::= "{" stmt* "}"
@@ -169,8 +354,29 @@ impl Parser {
             Tok::Let => self.parse_let_stmt(),
             Tok::Return => self.parse_return_stmt(),
             Tok::While => self.parse_while_stmt(),
+            Tok::Audited => self.parse_audited_stmt(),
             _ => Ok(Stmt::Expr(self.parse_expr()?)),
         }
+    }
+
+    // audited_stmt ::= "audited" str_lit block
+    fn parse_audited_stmt(&mut self) -> PResult<Stmt> {
+        let span = self.span();
+        self.expect(&Tok::Audited, "`audited`")?;
+        let justification = match self.peek().tok.clone() {
+            Tok::Str(s) => {
+                self.bump();
+                s
+            }
+            other => {
+                return Err(ParseError {
+                    message: format!("expected a string literal justification after `audited`, found {other:?}"),
+                    span: self.span(),
+                })
+            }
+        };
+        let body = self.parse_block()?;
+        Ok(Stmt::Audited { justification, body: body.stmts, span })
     }
 
     fn parse_let_stmt(&mut self) -> PResult<Stmt> {
@@ -203,12 +409,132 @@ impl Parser {
         Ok(Stmt::While { cond, body, span })
     }
 
-    // expr ::= if_expr | assignment
+    // expr ::= if_expr | transact_expr | match_expr | assignment
     fn parse_expr(&mut self) -> PResult<Expr> {
         if self.peek().tok == Tok::If {
             self.parse_if_expr()
+        } else if self.peek().tok == Tok::Transact {
+            self.parse_transact_expr()
+        } else if self.peek().tok == Tok::Match {
+            self.parse_match_expr()
         } else {
             self.parse_assignment()
+        }
+    }
+
+    // match_expr ::= "match" expr "{" match_arm ("," match_arm)* ","? "}"
+    // match_arm  ::= ident ("(" ident ("," ident)* ")")? "=>" expr
+    // Scrutinee uses full `parse_expr`, same as `if`'s own `cond` does —
+    // no struct-literal-shaped expression exists in this grammar to make
+    // "expr immediately followed by `{`" ambiguous the way it can be in
+    // languages with brace-delimited struct literals (construction here
+    // is always `Ident(args)`, never `Ident { .. }` — see `StructDecl`'s
+    // doc comment).
+    fn parse_match_expr(&mut self) -> PResult<Expr> {
+        let span = self.span();
+        self.expect(&Tok::Match, "`match`")?;
+        let scrutinee = Box::new(self.parse_expr()?);
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut arms = Vec::new();
+        loop {
+            let arm_span = self.span();
+            let variant = self.expect_ident()?;
+            let mut bindings = Vec::new();
+            if self.peek().tok == Tok::LParen {
+                self.bump();
+                if self.peek().tok != Tok::RParen {
+                    loop {
+                        bindings.push(self.expect_ident()?);
+                        if self.peek().tok == Tok::Comma {
+                            self.bump();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.expect(&Tok::RParen, "`)`")?;
+            }
+            self.expect(&Tok::FatArrow, "`=>`")?;
+            let body = Box::new(self.parse_expr()?);
+            arms.push(MatchArm { variant, bindings, body, span: arm_span });
+            if self.peek().tok == Tok::Comma {
+                self.bump();
+                if self.peek().tok == Tok::RBrace {
+                    break; // trailing comma
+                }
+                continue;
+            }
+            break;
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(Expr::Match { scrutinee, arms, span })
+    }
+
+    // transact_expr ::= "transact" "{"
+    //                      "network"    ":" call
+    //                      "verify"     ":" call
+    //                      "commit"     ":" call
+    //                      ("compensate" ":" call)?
+    //                      ("log"        ":" call)?
+    //                    "}"
+    // TRANSACT.md's Layer 1 grammar -- no `retry`/`timeout` on `network`
+    // yet (Layer 2), no durability log (Layer 3+). Slot order is fixed,
+    // not permutation-parsed: "no permutation parsing, keeps this LL(1)
+    // the same way every other fixed-arity form in this grammar already
+    // is" (TRANSACT.md).
+    fn parse_transact_expr(&mut self) -> PResult<Expr> {
+        let span = self.span();
+        self.expect(&Tok::Transact, "`transact`")?;
+        self.expect(&Tok::LBrace, "`{`")?;
+        let network = self.parse_transact_slot("network")?;
+        let verify = self.parse_transact_slot("verify")?;
+        let commit = self.parse_transact_slot("commit")?;
+        let compensate = self.parse_optional_transact_slot("compensate")?;
+        let log = self.parse_optional_transact_slot("log")?;
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(Expr::Transact { network, verify, commit, compensate, log, span })
+    }
+
+    // One `label ":" call` slot. `label` is a fixed word, matched by
+    // identifier text rather than promoted to a global `Tok` keyword: it
+    // only ever appears in this one fixed grammar position, so reserving
+    // it everywhere would cost every other identifier position the
+    // ability to use it, for no benefit — the same reasoning `TYPE_NAMES`
+    // (token.rs) already applies to scalar type names, which aren't `Tok`
+    // keywords either.
+    fn parse_transact_slot(&mut self, label: &str) -> PResult<TransactSlot> {
+        let span = self.span();
+        match &self.peek().tok {
+            Tok::Ident(s) if s == label => {
+                self.bump();
+            }
+            other => {
+                return Err(ParseError {
+                    message: format!("expected `{label}` in `transact`, found {other:?}"),
+                    span,
+                });
+            }
+        }
+        self.expect(&Tok::Colon, "`:`")?;
+        // Same "parse normally, then validate what came out" restriction
+        // `spawn`/`sandbox` already enforce — a slot is exactly one named
+        // call, never an arbitrary expression (TRANSACT.md's "Decisions").
+        let call = self.parse_call()?;
+        match call {
+            Expr::Call(name, args, call_span) => Ok(TransactSlot { name, args, span: call_span }),
+            _ => Err(ParseError {
+                message: format!(
+                    "`{label}` in `transact` requires a plain function call, e.g. `{label}: worker(x)`"
+                ),
+                span,
+            }),
+        }
+    }
+
+    fn parse_optional_transact_slot(&mut self, label: &str) -> PResult<Option<TransactSlot>> {
+        match &self.peek().tok {
+            Tok::Ident(s) if s == label => Ok(Some(self.parse_transact_slot(label)?)),
+            _ => Ok(None),
         }
     }
 
@@ -334,6 +660,8 @@ impl Parser {
             let op = match self.peek().tok {
                 Tok::Star => BinOp::Mul,
                 Tok::Slash => BinOp::Div,
+                Tok::DotStar => BinOp::ElemMul,
+                Tok::DotSlash => BinOp::ElemDiv,
                 _ => break,
             };
             let span = self.span();
@@ -452,12 +780,35 @@ impl Parser {
                 self.expect(&Tok::RParen, "`)`")?;
                 Ok(Expr::Connect(Box::new(host), Box::new(port), span))
             }
+            Tok::Listen => {
+                self.bump();
+                self.expect(&Tok::LParen, "`(`")?;
+                let port = self.parse_expr()?;
+                self.expect(&Tok::RParen, "`)`")?;
+                Ok(Expr::Listen(Box::new(port), span))
+            }
+            Tok::Accept => {
+                self.bump();
+                self.expect(&Tok::LParen, "`(`")?;
+                let listener = self.parse_expr()?;
+                self.expect(&Tok::RParen, "`)`")?;
+                Ok(Expr::Accept(Box::new(listener), span))
+            }
+            Tok::Open => {
+                self.bump();
+                self.expect(&Tok::LParen, "`(`")?;
+                let path = self.parse_expr()?;
+                self.expect(&Tok::Comma, "`,`")?;
+                let mode = self.parse_expr()?;
+                self.expect(&Tok::RParen, "`)`")?;
+                Ok(Expr::Open(Box::new(path), Box::new(mode), span))
+            }
             _ => self.parse_call(),
         }
     }
 
     fn parse_call(&mut self) -> PResult<Expr> {
-        let primary = self.parse_primary()?;
+        let primary = self.parse_postfix()?;
         if self.peek().tok == Tok::LParen {
             let span = primary.span();
             let name = match &primary {
@@ -488,13 +839,55 @@ impl Parser {
         }
     }
 
-    // primary ::= int_lit | "true" | "false" | ident | "(" expr ")"
+    // postfix ::= primary ("[" expr ("," expr)* "]" | "." ident)*
+    // Sits between `call` and `primary` (module doc): `v[i]` and `m[i, j]`
+    // are one bracket group each, not chained `[i][j]` subscripting — see
+    // `Expr::Index`'s doc comment for why a single `Vec<Expr>` is the
+    // right shape for that, rather than nesting `Expr::Index` inside
+    // itself per index. `.ident` (Row 11 field access) is the one new
+    // alternative here — `a.b.c` chains naturally through the same loop,
+    // same as `v[i][j]` already does; neither can follow a *call*'s
+    // result (`f().field`/`f()[i]`), since `parse_call` only invokes this
+    // once, on `primary`, before ever seeing a trailing `(` — a real,
+    // pre-existing limitation this doesn't newly introduce.
+    fn parse_postfix(&mut self) -> PResult<Expr> {
+        let mut e = self.parse_primary()?;
+        loop {
+            match self.peek().tok {
+                Tok::LBracket => {
+                    let span = self.span();
+                    self.bump();
+                    let mut indices = vec![self.parse_expr()?];
+                    while self.peek().tok == Tok::Comma {
+                        self.bump();
+                        indices.push(self.parse_expr()?);
+                    }
+                    self.expect(&Tok::RBracket, "`]`")?;
+                    e = Expr::Index(Box::new(e), indices, span);
+                }
+                Tok::Dot => {
+                    let span = self.span();
+                    self.bump();
+                    let field = self.expect_ident()?;
+                    e = Expr::FieldAccess(Box::new(e), field, span);
+                }
+                _ => break,
+            }
+        }
+        Ok(e)
+    }
+
+    // primary ::= int_lit | float_lit | "true" | "false" | ident | "(" expr ")"
     fn parse_primary(&mut self) -> PResult<Expr> {
         let span = self.span();
         match self.peek().tok.clone() {
             Tok::Int(n) => {
                 self.bump();
                 Ok(Expr::Int(n, span))
+            }
+            Tok::Float(f) => {
+                self.bump();
+                Ok(Expr::Float(f, span))
             }
             Tok::Str(s) => {
                 self.bump();
@@ -517,6 +910,21 @@ impl Parser {
                 let e = self.parse_expr()?;
                 self.expect(&Tok::RParen, "`)`")?;
                 Ok(e)
+            }
+            // `[e1, e2, ...]` -- a vector or matrix literal (`Expr::
+            // ArrayLit`'s doc comment; `typeck.rs` decides which). Always
+            // at least one element -- no `[]` alternative, the same
+            // "requires a real expr inside" restriction `"(" expr ")"`
+            // above already has for parens.
+            Tok::LBracket => {
+                self.bump();
+                let mut elements = vec![self.parse_expr()?];
+                while self.peek().tok == Tok::Comma {
+                    self.bump();
+                    elements.push(self.parse_expr()?);
+                }
+                self.expect(&Tok::RBracket, "`]`")?;
+                Ok(Expr::ArrayLit(elements, span))
             }
             other => Err(ParseError {
                 message: format!("expected an expression, found {other:?}"),

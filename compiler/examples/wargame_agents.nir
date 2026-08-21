@@ -1,0 +1,38 @@
+// Exercises: the actor-based simulation pattern the unified plan's
+// §4.3.2 describes -- "no new language primitives," just `spawn`/`chan`
+// used as a library convention. Each simulated entity is an ordinary
+// spawned function with its own seeded RNG (deterministic *per actor*,
+// even though the order two independent actors' messages arrive in
+// isn't -- an honest limitation, not a bug; see the unified plan's
+// amended §4.3.1 dependency note). Fixed entity count (2), per this
+// phase's "cap entity counts to fixed-size handle lists" honest gap --
+// a later generics pass removes this cap.
+
+fn sensor_actor(id: i64, seed: i64, report: chan f64) {
+    rand_seed(seed)
+    let reading: f64 = rand_gaussian(100.0, 5.0)
+    send(report, reading)
+}
+
+fn clock_actor(a: chan f64, b: chan f64, done: chan f64) {
+    let ra: f64 = recv(a)
+    let rb: f64 = recv(b)
+    send(done, ra + rb)
+}
+
+fn main() {
+    let chan_a: chan f64 = chan
+    let chan_b: chan f64 = chan
+    let chan_done: chan f64 = chan
+
+    let t1: thread unit = spawn sensor_actor(1, 11, chan_a)
+    let t2: thread unit = spawn sensor_actor(2, 22, chan_b)
+    let tc: thread unit = spawn clock_actor(chan_a, chan_b, chan_done)
+
+    let total: f64 = recv(chan_done)
+    print(total)
+
+    join(t1)
+    join(t2)
+    join(tc)
+}

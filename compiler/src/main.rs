@@ -5,7 +5,16 @@ use nirdosha::ast::Ty;
 use nirdosha::interpreter::{Interpreter, Value};
 
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
+    // `--format=json` is scanned out of the raw args *before* dispatch,
+    // not treated as a subcommand or as `build`/`emit-llvm`-style
+    // per-command flag — it's an interpret-only, agent-facing switch
+    // (goal.md row 9: structured diagnostics), and scanning it up front
+    // means it can appear anywhere on the command line (`nirdosha
+    // --format=json f.nir` or `nirdosha f.nir --format=json`) without
+    // `cmd_interpret`'s caller needing its own flag-parsing loop.
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let format_json = raw.iter().any(|a| a == "--format=json");
+    let mut args = raw.into_iter().filter(|a| a != "--format=json");
     let first = match args.next() {
         Some(a) => a,
         None => {
@@ -17,22 +26,25 @@ fn main() -> ExitCode {
     match first.as_str() {
         "build" => cmd_build(args),
         "emit-llvm" => cmd_emit_llvm(args),
+        "emit-ast" => cmd_emit_ast(args),
         // Not a user-facing subcommand — the *only* caller is a `sandbox`
         // handle's own `Expr::SpawnSandbox` (see interpreter.rs), which
         // execs this exact binary with this exact flag to become the
         // separate OS process a sandbox handle actually points at.
         // Deliberately absent from `print_usage()` for the same reason.
         "--sandbox-worker" => cmd_sandbox_worker(args),
-        path => cmd_interpret(path),
+        path => cmd_interpret(path, format_json),
     }
 }
 
 fn print_usage() {
     eprintln!("usage:");
-    eprintln!("  nirdosha <file.nir>                interpret");
+    eprintln!("  nirdosha <file.nir> [--format=json]  interpret");
+    eprintln!("                                      (--format=json: structured diagnostics on failure)");
     eprintln!("  nirdosha build <file.nir> -o <out> [--opt0]");
     eprintln!("                                      compile to a native binary (LLVM, -O2 by default)");
     eprintln!("  nirdosha emit-llvm <file.nir>       print the generated LLVM IR");
+    eprintln!("  nirdosha emit-ast <file.nir>        print the parsed AST as JSON (goal.md row 9)");
 }
 
 fn read_source(path: &str) -> Result<String, ExitCode> {
@@ -42,29 +54,58 @@ fn read_source(path: &str) -> Result<String, ExitCode> {
     })
 }
 
-fn cmd_interpret(path: &str) -> ExitCode {
+/// Renders a successful run's result the same way regardless of which
+/// entry point (`run`/`run_diagnostic`) produced it — `--format=json`
+/// only changes how *failures* are reported (goal.md row 9 is about
+/// diagnostics; a successful run has nothing to structure).
+fn print_value(v: &Value) -> ExitCode {
+    match v {
+        Value::Int(n) => println!("=> {n}"),
+        Value::Float(n) => println!("=> {n}"),
+        Value::Bool(b) => println!("=> {b}"),
+        Value::Unit => {}
+        Value::Str(s) => println!("=> {s:?}"),
+        Value::Boxed(_)
+        | Value::Ref(_)
+        | Value::Thread(_)
+        | Value::Channel(_)
+        | Value::Sandbox(_)
+        | Value::Tcp(_)
+        | Value::TcpListener(_)
+        | Value::File(_) => {
+            println!("=> {v:?}")
+        }
+        Value::Vector(_) | Value::Matrix(..) => println!("=> {v:?}"),
+        Value::Struct(..) | Value::Enum(..) => println!("=> {v:?}"),
+    }
+    ExitCode::SUCCESS
+}
+
+fn cmd_interpret(path: &str, format_json: bool) -> ExitCode {
     let src = match read_source(path) {
         Ok(s) => s,
         Err(code) => return code,
     };
+    if format_json {
+        return match nirdosha::run_diagnostic(&src) {
+            Ok(v) => print_value(&v),
+            // Lex/parse errors aren't part of `Diagnostic` yet (see
+            // `lib.rs`'s doc comment) — they stay plain text even under
+            // `--format=json`, an honest, documented gap rather than a
+            // silently-inconsistent flag.
+            Err(nirdosha::RunFailure::Lex(msg)) | Err(nirdosha::RunFailure::Parse(msg)) => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+            Err(nirdosha::RunFailure::Diagnostics(diags)) => {
+                let json = serde_json::to_string(&diags).expect("Diagnostic always serializes");
+                eprintln!("{json}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match nirdosha::run(&src) {
-        Ok(Value::Int(n)) => {
-            println!("=> {n}");
-            ExitCode::SUCCESS
-        }
-        Ok(Value::Bool(b)) => {
-            println!("=> {b}");
-            ExitCode::SUCCESS
-        }
-        Ok(Value::Unit) => ExitCode::SUCCESS,
-        Ok(Value::Str(s)) => {
-            println!("=> {s:?}");
-            ExitCode::SUCCESS
-        }
-        Ok(v @ (Value::Boxed(_) | Value::Ref(_) | Value::Thread(_) | Value::Channel(_) | Value::Sandbox(_) | Value::Tcp(_))) => {
-            println!("=> {v:?}");
-            ExitCode::SUCCESS
-        }
+        Ok(v) => print_value(&v),
         Err(msg) => {
             eprintln!("{msg}");
             ExitCode::FAILURE
@@ -166,6 +207,50 @@ fn cmd_emit_llvm(mut args: impl Iterator<Item = String>) -> ExitCode {
         }
         Err(e) => {
             eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// goal.md row 9: hands back the parsed `Program` as JSON, the same
+/// `Serialize`/`Deserialize`-derived shape `typeck.rs::validate_fragment`
+/// expects a single `Expr` fragment in (see its doc comment) — an agent
+/// or tool can round-trip a whole program's structure, or splice one
+/// fragment back in for isolated re-validation. Deliberately parse-only,
+/// not `typecheck_and_own`'s full pipeline: the AST of a program that
+/// doesn't yet typecheck is still a legitimate thing to want to inspect
+/// (e.g. debugging *why* generation went wrong), so this doesn't gate on
+/// it the way `build`/`emit-llvm` do.
+fn cmd_emit_ast(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let Some(path) = args.next() else {
+        eprintln!("usage: nirdosha emit-ast <file.nir>");
+        return ExitCode::FAILURE;
+    };
+    let src = match read_source(&path) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let toks = match nirdosha::token::Lexer::new(&src).tokenize() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("lex error at {}:{}: {}", e.span.line, e.span.col, e.message);
+            return ExitCode::FAILURE;
+        }
+    };
+    let program = match nirdosha::parser::Parser::new(toks).parse_program() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("parse error at {}:{}: {}", e.span.line, e.span.col, e.message);
+            return ExitCode::FAILURE;
+        }
+    };
+    match serde_json::to_string_pretty(&program) {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("failed to serialize AST: {e}");
             ExitCode::FAILURE
         }
     }

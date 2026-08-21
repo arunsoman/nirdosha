@@ -1,0 +1,140 @@
+[
+  {
+    "id": "arithmetic_basic",
+    "prompt": "Write a Nirdosha program whose main function computes (3 + 4) * 2 and returns the result as an i64.",
+    "expected_nir": "fn main() -> i64 {\n    return (3 + 4) * 2\n}\n",
+    "expected_value": 14
+  },
+  {
+    "id": "integer_division",
+    "prompt": "Write a Nirdosha program whose main function returns 17 / 5 using integer division.",
+    "expected_nir": "fn main() -> i64 {\n    return 17 / 5\n}\n",
+    "expected_value": 3
+  },
+  {
+    "id": "bool_logic",
+    "prompt": "Write a Nirdosha program whose main function returns true && !false.",
+    "expected_nir": "fn main() -> bool {\n    return true && !false\n}\n",
+    "expected_value": true
+  },
+  {
+    "id": "comparison_chain",
+    "prompt": "Write a Nirdosha program whose main function returns whether 5 is greater than 3 and 3 is greater than 1.",
+    "expected_nir": "fn main() -> bool {\n    return 5 > 3 && 3 > 1\n}\n",
+    "expected_value": true
+  },
+  {
+    "id": "if_expression_max",
+    "prompt": "Write a Nirdosha program with a function `max(a: i64, b: i64) -> i64` that returns the larger of the two, using an if-expression, and a main function that returns max(7, 12).",
+    "expected_nir": "fn max(a: i64, b: i64) -> i64 {\n    return if a > b { a } else { b }\n}\nfn main() -> i64 {\n    return max(7, 12)\n}\n",
+    "expected_value": 12
+  },
+  {
+    "id": "while_loop_sum",
+    "prompt": "Write a Nirdosha program whose main function sums the integers 1 through 10 (inclusive) using a while loop and returns the sum.",
+    "expected_nir": "fn main() -> i64 {\n    let sum: i64 = 0\n    let i: i64 = 1\n    while i <= 10 {\n        sum = sum + i\n        i = i + 1\n    }\n    return sum\n}\n",
+    "expected_value": 55
+  },
+  {
+    "id": "recursive_fibonacci",
+    "prompt": "Write a Nirdosha program with a recursive function `fib(n: i64) -> i64` computing the nth Fibonacci number (fib(0)=0, fib(1)=1), and a main function that returns fib(10).",
+    "expected_nir": "fn fib(n: i64) -> i64 {\n    if n < 2 {\n        return n\n    }\n    return fib(n - 1) + fib(n - 2)\n}\nfn main() -> i64 {\n    return fib(10)\n}\n",
+    "expected_value": 55
+  },
+  {
+    "id": "box_ownership",
+    "prompt": "Write a Nirdosha program whose main function heap-allocates the integer 41 with `box`, dereferences it, adds 1, and returns the result.",
+    "expected_nir": "fn main() -> i64 {\n    let b: box i64 = box 41\n    return *b + 1\n}\n",
+    "expected_value": 42
+  },
+  {
+    "id": "reference_borrow",
+    "prompt": "Write a Nirdosha program whose main function declares `let n: i64 = 9`, borrows it with `&`, reads through the reference, and returns the value doubled.",
+    "expected_nir": "fn main() -> i64 {\n    let n: i64 = 9\n    let r: &i64 = &n\n    return *r * 2\n}\n",
+    "expected_value": 18
+  },
+  {
+    "id": "string_equality",
+    "prompt": "Write a Nirdosha program whose main function returns whether the string \"nirdosha\" equals itself compared via two separate let bindings.",
+    "expected_nir": "fn main() -> bool {\n    let a: str = \"nirdosha\"\n    let b: str = \"nirdosha\"\n    return a == b\n}\n",
+    "expected_value": true
+  },
+  {
+    "id": "float_arithmetic",
+    "prompt": "Write a Nirdosha program whose main function returns 3.5 + 1.5 as an f64.",
+    "expected_nir": "fn main() -> f64 {\n    return 3.5 + 1.5\n}\n",
+    "expected_value": 5.0
+  },
+  {
+    "id": "float_comparison",
+    "prompt": "Write a Nirdosha program whose main function returns whether 1.5 is less than 2.5.",
+    "expected_nir": "fn main() -> bool {\n    return 1.5 < 2.5\n}\n",
+    "expected_value": true
+  },
+  {
+    "id": "vector_literal_and_index",
+    "prompt": "Write a Nirdosha program whose main function creates a Vector(f64, 3) literal [10.0, 20.0, 30.0] and returns its element at index 1.",
+    "expected_nir": "fn main() -> f64 {\n    let v: Vector(f64, 3) = [10.0, 20.0, 30.0]\n    return v[1]\n}\n",
+    "expected_value": 20.0
+  },
+  {
+    "id": "matrix_index",
+    "prompt": "Write a Nirdosha program whose main function creates a Matrix(f64, 2, 2) literal [[1.0, 2.0], [3.0, 4.0]] and returns the element at row 1, column 0.",
+    "expected_nir": "fn main() -> f64 {\n    let m: Matrix(f64, 2, 2) = [[1.0, 2.0], [3.0, 4.0]]\n    return m[1, 0]\n}\n",
+    "expected_value": 3.0
+  },
+  {
+    "id": "vector_addition",
+    "prompt": "Write a Nirdosha program whose main function adds two Vector(f64, 2) values [1.0, 2.0] and [10.0, 20.0] elementwise and returns the first component of the result.",
+    "expected_nir": "fn main() -> f64 {\n    let a: Vector(f64, 2) = [1.0, 2.0]\n    let b: Vector(f64, 2) = [10.0, 20.0]\n    let c: Vector(f64, 2) = a + b\n    return c[0]\n}\n",
+    "expected_value": 11.0
+  },
+  {
+    "id": "dot_product",
+    "prompt": "Write a Nirdosha program whose main function computes the dot product of Vector(f64, 3) values [1.0, 2.0, 3.0] and [4.0, 5.0, 6.0] using the dot() builtin.",
+    "expected_nir": "fn main() -> f64 {\n    let a: Vector(f64, 3) = [1.0, 2.0, 3.0]\n    let b: Vector(f64, 3) = [4.0, 5.0, 6.0]\n    return dot(a, b)\n}\n",
+    "expected_value": 32.0
+  },
+  {
+    "id": "matrix_determinant",
+    "prompt": "Write a Nirdosha program whose main function computes the determinant of Matrix(f64, 2, 2) [[1.0, 2.0], [3.0, 4.0]] using the det() builtin.",
+    "expected_nir": "fn main() -> f64 {\n    let m: Matrix(f64, 2, 2) = [[1.0, 2.0], [3.0, 4.0]]\n    return det(m)\n}\n",
+    "expected_value": -2.0
+  },
+  {
+    "id": "spawn_join",
+    "prompt": "Write a Nirdosha program with a function `double(x: i64) -> i64` that returns x * 2, and a main function that spawns it on 21 as a concurrent computation, joins it, and returns the result.",
+    "expected_nir": "fn double(x: i64) -> i64 {\n    return x * 2\n}\nfn main() -> i64 {\n    let t: thread i64 = spawn double(21)\n    return join(t)\n}\n",
+    "expected_value": 42
+  },
+  {
+    "id": "channel_send_recv",
+    "prompt": "Write a Nirdosha program whose main function creates a `chan i64`, sends the value 99 on it, receives it back, and returns the received value.",
+    "expected_nir": "fn main() -> i64 {\n    let c: chan i64 = chan\n    send(c, 99)\n    return recv(c)\n}\n",
+    "expected_value": 99
+  },
+  {
+    "id": "rng_determinism",
+    "prompt": "Write a Nirdosha program whose main function seeds the RNG with 42, draws a random f64, reseeds with 42 again, draws again, and returns whether the two draws are equal.",
+    "expected_nir": "fn main() -> bool {\n    rand_seed(42)\n    let a: f64 = rand_f64()\n    rand_seed(42)\n    let b: f64 = rand_f64()\n    return a == b\n}\n",
+    "expected_value": true
+  },
+  {
+    "id": "audited_block",
+    "prompt": "Write a Nirdosha program whose main function computes 1 + 2 inside an `audited` block with a non-empty justification and returns the result.",
+    "expected_nir": "fn main() -> i64 {\n    audited \"trusted, proven not to overflow\" {\n        return 1 + 2\n    }\n}\n",
+    "expected_value": 3
+  },
+  {
+    "id": "kalman_predict",
+    "prompt": "Write a Nirdosha program whose main function runs one linear Kalman filter prediction step with state x=[5.0], covariance P=[[2.0]], transition F=[[1.0]], and process noise Q=[[0.0]], then returns the first component of the predicted state.",
+    "expected_nir": "fn main() -> f64 {\n    let x: Vector(f64, 1) = [5.0]\n    let p: Matrix(f64, 1, 1) = [[2.0]]\n    let f: Matrix(f64, 1, 1) = [[1.0]]\n    let q: Matrix(f64, 1, 1) = [[0.0]]\n    let x1: Vector(f64, 1) = kf_predict_state(x, p, f, q)\n    return x1[0]\n}\n",
+    "expected_value": 5.0
+  },
+  {
+    "id": "geometry_distance",
+    "prompt": "Write a Nirdosha program whose main function converts lat/lon/alt [0.0, 0.0, 0.0] to ECEF coordinates and returns the distance from the ECEF origin [0.0, 0.0, 0.0].",
+    "expected_nir": "fn main() -> f64 {\n    let lla: Vector(f64, 3) = [0.0, 0.0, 0.0]\n    let ecef: Vector(f64, 3) = lla_to_ecef(lla)\n    let origin: Vector(f64, 3) = [0.0, 0.0, 0.0]\n    return distance(ecef, origin)\n}\n",
+    "expected_value": 6378137.0
+  }
+]

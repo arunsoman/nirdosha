@@ -1,0 +1,305 @@
+# Nirdosha — language and feature reference
+
+A practical reference to what Nirdosha actually supports today, mined
+directly from the implementation (`compiler/src/`) rather than from the
+design docs (`goal.md`, `Nirdosha_Unified_Plan.md`), which describe
+intent and aspiration as much as delivered fact. Where something is
+interpreter-only vs. compiled to native code, that's called out
+explicitly — it matters for anyone benchmarking or reasoning about
+performance.
+
+---
+
+## 1. Execution modes
+
+```sh
+nirdosha <file.nir> [--format=json]   # interpret (tree-walking)
+nirdosha build <file.nir> -o <out> [--opt0]   # compile to a native binary (LLVM, -O2 by default)
+nirdosha emit-llvm <file.nir>         # print the generated LLVM IR
+nirdosha emit-ast <file.nir>          # print the parsed AST as JSON
+```
+
+- **Interpret** — always works for every construct in this document.
+- **Build/emit-llvm** — only supports the subset covered in §10
+  ("What's compiled"). Everything else is rejected at compile time with
+  a specific reason (`codegen::check_supported`), never silently
+  mis-compiled.
+- `--format=json` — on failure, prints a structured `Diagnostic` (one
+  shape across type/ownership/runtime errors) instead of a plain-text
+  message. `emit-ast` always prints JSON — the same `Serialize`-derived
+  shape a fragment-validation caller (`typeck::validate_fragment`) can
+  deserialize back.
+
+---
+
+## 2. Types
+
+| Type | Spelling | Affine? | Notes |
+|---|---|---|---|
+| Signed integers | `i8` `i16` `i32` `i64` | no | Range-checked at every `let`/return/assign boundary (runtime; some proven away statically — see §8). |
+| Unsigned integers | `u8` `u16` `u32` `u64` `usize` | no | Same range-checking. **Not compiled** (`codegen.rs` needs a signed-vs-unsigned instruction choice it doesn't make yet). |
+| Float | `f64` | no | IEEE 754 double. One width — no `f32`, no literal-widening story. Saturates (`inf`/`NaN`), never traps. |
+| Boolean | `bool` | no | |
+| Unit | `unit` | no | No literal syntax — only reachable as a function's implicit return. |
+| String | `str` | no | UTF-8, `Arc<str>`-backed. Literal + escapes (`\"` `\\` `\n` `\t` `\r`) only — no concatenation, slicing, or indexing. |
+| Heap cell | `box T` | **yes** | Single-owner heap allocation. `*expr` dereferences. |
+| Shared reference | `&T` | no | Read-only borrow of a plain identifier only (`&x`, not `&(x+1)`). No `&mut`. |
+| Thread handle | `thread T` | **yes** | A spawned computation's real-OS-thread handle; `join` consumes it once. |
+| Channel | `chan T` | no | Unbounded MPMC queue; the handle is freely copyable, the *payload* moves through `send`. |
+| Sandbox handle | `sandbox` | **yes** | A real, separate OS process; `stop` consumes it once. |
+| TCP connection | `tcp` | **yes** | A real TCP socket (client or accepted server side); `stop` closes it once. |
+| TCP listener | `tcp_listener` | **yes** | A real bound+listening TCP socket; `accept` doesn't consume it, `stop` does. |
+| File handle | `file` | **yes** | A real local file (`open(path, mode)`); `send`/`recv`/`stop` reused verbatim from `tcp` — see `PROTOLANG_PORT.md`. |
+| Vector | `Vector(T, N)` | no | Fixed-length dense 1-D array, `N` a compile-time literal. `Vector(f64, 3) ≠ Vector(f64, 4)` — different types. |
+| Matrix | `Matrix(T, R, C)` | no | Fixed-shape dense 2-D array, row-major, `R`/`C` compile-time literals. |
+
+`Vector`/`Matrix` are generic over element type `T`, but every dense
+linear-algebra builtin (§5) requires `T = f64` specifically — integer- or
+bool-element vectors/matrices only support literal construction,
+indexing, and elementwise `+`/`-`/`.*`/`./`/`==`/`!=`.
+
+---
+
+## 3. Literals
+
+```
+42                  // i64 by default; flexes to a narrower declared width if it fits
+3.14                // f64 — decimal only, no scientific notation
+true  false
+"hello\nworld"      // \" \\ \n \t \r only
+[1.0, 2.0, 3.0]                       // Vector(f64, 3)
+[[1.0, 2.0], [3.0, 4.0]]              // Matrix(f64, 2, 2), row-major
+```
+
+Integer literals are the *only* thing with width flexibility — `let n:
+i8 = 100` needs no cast, but `let a: i64 = 1; let b: i32 = 2; a + b` is a
+type error (no implicit conversions, ever, between two already-typed
+values). A float literal is always exactly `f64`; there is no
+int↔float conversion operator at all.
+
+---
+
+## 4. Operators
+
+| Op | Meaning | Operand shapes |
+|---|---|---|
+| `+` `-` | Add/subtract | scalar↔scalar (same type); `Vector`/`Matrix` elementwise (exact same shape) |
+| `*` | Multiply | scalar↔scalar; scalar×`Matrix` (either order, scalar type = element type); `Matrix`×`Vector` (inner dims match); `Matrix`×`Matrix` (inner dims match) |
+| `/` | Divide | scalar↔scalar only. Int: traps on zero (Tier-2 runtime check, provable away — §8). Float: saturates to `inf`/`NaN`, never traps. |
+| `.*` `./` | Hadamard (elementwise) multiply/divide | scalar or `Vector`/`Matrix`, exact same shape |
+| `==` `!=` | Equality | any matching type, including `Vector`/`Matrix` (structural) |
+| `<` `>` `<=` `>=` | Ordering | numeric scalars only |
+| `&&` `\|\|` | Short-circuit bool | `bool` only |
+| `!` | Not | `bool` |
+| `-` (unary) | Negate | numeric scalar |
+| `*` (unary) | Deref | `box T` or `&T` |
+| `&` (unary) | Borrow | a plain identifier |
+
+`Vector * Vector` is a **type error** by design (ambiguous — inner vs.
+outer product) — use `dot()`.
+
+No `%` (modulo), no bitwise operators, no `f.(x)`-style broadcasting.
+
+---
+
+## 5. Builtins
+
+Every builtin is native Rust, registered by name (`ast::BUILTIN_NAMES`) —
+not expressible in Nirdosha source itself (no generics, no `for` loops
+to write them with). All require `f64` elements unless noted.
+
+**I/O**
+- `print(x)` — any number of args, any type, when interpreted. When
+  *compiled*, a narrower rule applies: a literal `true`/`false` can't be
+  printed directly (a `bool`-typed variable or a comparison result
+  prints fine either way) — a real, narrow codegen gap, not an
+  interpreter restriction.
+
+**Dense linear algebra** (Phase 2)
+- `transpose(m: Matrix) -> Matrix` — any element type.
+- `dot(a: Vector, b: Vector) -> T` — same length, numeric element.
+- `cross(a: Vector(T,3), b: Vector(T,3)) -> Vector(T,3)` — 3-vectors only.
+- `zeros(n)` / `zeros(r, c)` → `Vector(f64,n)` / `Matrix(f64,r,c)` — `n`/`r`/`c` **must be literal integers** (the result's shape has to be known at typecheck time).
+- `ones(n)` / `ones(r, c)` — same shape rule, filled with `1.0`.
+- `identity(n)` → `Matrix(f64, n, n)`.
+- `sum(v_or_m) -> T` — any numeric element type.
+- `len(v: Vector) -> i64`.
+- `norm(v: Vector(f64,_)) -> f64` — 2-norm. `norm1` — sum of `|x|`. `norm_inf` — max `|x|`. `frobenius_norm(m: Matrix(f64,_,_))`.
+- `trace(m: Matrix(T,n,n)) -> T` — square only (`NotSquare` otherwise), numeric element.
+- `det(m: Matrix(f64,n,n)) -> f64` — Gaussian elimination, partial pivoting.
+- `inv(m: Matrix(f64,n,n)) -> Matrix(f64,n,n)` — Gauss-Jordan; runtime error (`SingularMatrix`) if singular.
+- `solve(a: Matrix(f64,n,n), b: Vector(f64,n)) -> Vector(f64,n)` — `A \ b`; `SingularMatrix` if singular.
+- `rank(m: Matrix(f64,_,_)) -> i64` — row-echelon reduction, any shape.
+- `is_symmetric(m)` / `is_diag(m)` — square `Matrix(f64,n,n)` only. `is_square(m)` — any `Matrix`, any element type.
+
+**Deterministic simulation** (Phase 3)
+- `rand_seed(seed: <int>)` — resets the interpreter's own RNG stream (SplitMix64; see §9). Required before any draw.
+- `rand_f64() -> f64` — uniform `[0, 1)`.
+- `rand_gaussian(mean: f64, stddev: f64) -> f64` — Box-Muller.
+- `distance(a: Vector(f64,3), b: Vector(f64,3)) -> f64` — Euclidean.
+- `bearing(from: Vector(f64,3), to: Vector(f64,3)) -> f64` — initial great-circle bearing, degrees `[0,360)`; takes lat/lon/alt vectors, altitude ignored.
+- `lla_to_ecef(v: Vector(f64,3)) -> Vector(f64,3)` / `ecef_to_lla` — WGS84.
+- `ecef_to_enu(ecef, ref_lla) -> Vector(f64,3)` / `enu_to_ecef` — local East-North-Up relative to a reference point.
+- `kf_predict_state(x, P, F, Q) -> Vector` / `kf_predict_cov(x, P, F, Q) -> Matrix` — linear Kalman filter predict step (split in two — no tuple/struct return type exists).
+- `kf_update_state(x, P, z, H, R) -> Vector` / `kf_update_cov(...) -> Matrix` — update step.
+
+---
+
+## 6. Control flow, functions, ownership
+
+```
+fn name(param: Ty, ...) -> RetTy effect(...)? { ... }   // RetTy omitted => unit
+let x: Ty = expr
+x = expr                                    // reassignment, not a new binding
+return expr?
+while cond { ... }
+if cond { ... } else { ... }                // also usable as an expression: let x = if c {1} else {2}
+audited "non-empty justification" { ... }   // suppresses codegen's Tier-1/2 guards inside; interpreter unaffected
+```
+
+- **No `for` loops**, no closures/lambdas, no first-class functions
+  (`Expr::Call` names its callee by a resolved identifier, not a value).
+- **Recursion works** — functions are looked up by name in a table, so
+  direct and mutual recursion both work (see `fib` in `bench/corpus.json`).
+- **Ownership**: `box`/`thread`/`sandbox`/`tcp`/`tcp_listener`/`file` are
+  *affine* — using the binding by name moves it; a later use on the same
+  path is a static "use after move" error, checked by a real move-checker
+  (`ownership.rs`), not just at runtime. `&` borrows without moving.
+- **Effects** (`PROTOLANG_PORT.md`'s "Locked design 1", `effects.rs`): a
+  `fn` may optionally declare `effect(pure)` or `effect(t1, t2, ...)` where
+  each `t` is one of `rng`/`io`/`concurrent`/`network` — a Koka-style
+  *set*, not a total order. Omitted entirely (the common case): fully
+  inferred, nothing checked, zero notational cost. Declared: the real
+  effect set (computed by fixpoint iteration over the call graph, so
+  mutual recursion works) must be a *subset* of what's declared —
+  declaring more than the body uses is fine, an undeclared-but-performed
+  effect is `TypeErrorKind::EffectNotDeclared`. `pure` denotes the empty
+  set and can't be combined with other names. Typeck-only; no codegen
+  changes — the whole compiled subset (§10) is `pure` except `print`
+  (`io`).
+- **No structs, enums, tuples, or generics** — the entire type surface is
+  the closed list in §2. This is why `kf_predict`/`kf_update` are split
+  into two builtins each: there's no way to return two values as one.
+
+---
+
+## 7. Concurrency & I/O
+
+```
+spawn f(args)              // real OS thread, returns thread T
+join(t)                    // blocks, consumes the handle, returns T
+let c: chan T = chan
+send(c, v)                 // never blocks (unbounded queue)
+recv(c) -> T                // blocks until a value is available
+
+sandbox f(args)             // real, separate OS process (re-execs the nirdosha binary)
+stop(s) -> i64               // kills if still running, returns exit code
+
+connect(host: str, port: i64) -> tcp
+listen(port: i64) -> tcp_listener
+accept(l: tcp_listener) -> tcp   // blocks for the next client
+stop(conn)                       // closes a tcp or tcp_listener
+
+open(path: str, mode: str) -> file   // mode is "r", "w", or "a"
+send(f, s: str)                       // write (reuses tcp's keyword)
+recv(f) -> str                        // read all currently-available bytes; "" at EOF, not an error
+stop(f)                               // closes the file (reuses tcp's keyword)
+```
+
+`chan`/`sandbox` compose: a `chan T` (T a plain scalar) can cross into a
+sandboxed process as a real cross-process transport (a Unix domain
+socket under the hood). Race-freedom for concurrent code comes entirely
+from the ownership checker — an affine value moved into `spawn`/`send`
+can never be touched by the sender again.
+
+---
+
+## 8. Static guarantees
+
+- **Type checking** (`typeck.rs`) — every program is fully typed before
+  it runs; a type error is never discovered mid-execution.
+- **Ownership/move-checking** (`ownership.rs`) — affine values statically
+  proven single-owner, including across branches and loop iterations.
+- **Two independent static bounds-provers**, feeding the same two report
+  shapes:
+  - **Interval analysis** (`refine.rs`) — no SMT solver, straight-line
+    range propagation.
+  - **Real Z3** (`smt.rs`) — can prove things interval analysis can't
+    (e.g. an index narrowed by an `if` condition).
+  - Both prove: (1) an arithmetic result fits its declared integer type,
+    (2) a divisor is never zero, (3) a `Vector`/`Matrix` index falls
+    inside its declared bounds. **All three are now consumed by codegen**
+    (as of `Vector`/`Matrix` codegen landing, §10) — an unprovable index
+    still gets a real runtime bounds guard (same `abort()`-trap idiom as
+    (1)/(2)), a proven one emits no check at all.
+- **`audited "justification" { ... }`** — the one escape hatch: suppresses
+  codegen's guard emission inside the block. The compiler only enforces
+  that a justification exists and is non-empty; judging its content is a
+  review-process concern, not a compiler one.
+
+---
+
+## 9. Determinism
+
+`rand_seed`/`rand_f64`/`rand_gaussian` are backed by a from-scratch
+SplitMix64 stream stored **per `Interpreter` instance** (not a process
+global) — same seed, same OS, same run, byte-for-byte identical draws,
+every time. A `spawn`ed function gets its own independent, unseeded RNG
+by default (an honest, documented gap — see `Interpreter::rng`'s doc
+comment). No other source of nondeterminism exists in the language
+(no ambient clock/entropy reads anywhere in the builtin set).
+
+---
+
+## 10. What's compiled vs. interpreter-only
+
+**Updated 21 Aug 2026** — `Vector`/`Matrix` moved from "interpreter-only"
+to "compiled" (`goal.md` §9 item 1). `nirdosha build`/`emit-llvm` now
+support:
+
+- `i8`/`i16`/`i32`/`i64`, `bool`, `unit`, `f64` scalars.
+- All scalar arithmetic/comparison operators, `if`/`while`, function
+  calls (including recursion), `print` on integer/`f64`/`bool` args.
+- Tier-1/2 bounds and divide-by-zero guards (elided where proven safe —
+  see §8), and `audited`'s suppression of them.
+- **`Vector`/`Matrix`, fully** — literals, dynamic (runtime-expression)
+  indexing with a proven-or-checked bounds guard, all elementwise operators
+  and every legal shape of `*`, `==`/`!=`, and every dense-linear-algebra/
+  geometry/Kalman-filter builtin. Two different codegen strategies underly
+  this, worth knowing about if you're reasoning about performance: shape-driven
+  operations (elementwise ops, `*`, `transpose`, `dot`, `cross`, `zeros`/
+  `ones`/`identity`, `sum`, `len`, the norms, `trace`, `is_*`, the geometry
+  builtins, `kf_predict_*`) are **fully unrolled at compile time** into
+  straight-line IR — dimensions are always compile-time literals, so this
+  is always possible, and it's more aggressively optimizable than an
+  equivalent runtime loop. The genuinely data-dependent ones (`det`, `inv`,
+  `solve`, `rank`, `kf_update_*` — partial-pivot row selection is real,
+  value-dependent control flow) instead **call into a small native runtime
+  library** (`compiler/src/runtime_kernels.rs`, compiled once at `nirdosha`'s
+  own build time via `compiler/build.rs`, linked into every output binary)
+  rather than hand-emitting branchy LLVM IR — reusing the interpreter's own
+  proven-correct algorithms instead of a second, independently-written copy.
+  This is not a performance compromise (a native `call` costs what inlined
+  IR costs) but it is a real, measured tradeoff against hand-specialized C:
+  the runtime kernels are generic over matrix size `n`, so they can't be
+  specialized for a fixed small `n` the way C's `det4()` can — see
+  `benchmarks/RESULTS.md`'s Group A "honest asterisk" for the actual numbers
+  this produces (Nirdosha beats C on the fully-unrolled operations, loses to
+  it on the runtime-library ones).
+
+Interpreter-only (rejected by `check_supported` with a specific reason,
+never silently mis-compiled):
+
+- `u8..usize` (needs a signed/unsigned instruction choice not yet made).
+- `box`/`&`/`*` (pointer deref), `thread`/`spawn`/`join`, `chan`/`send`/`recv`,
+  `sandbox`/`stop`, `str`, `tcp`/`tcp_listener`/`connect`/`listen`/`accept`,
+  `file`/`open` (21 Aug 2026, `PROTOLANG_PORT.md`'s file I/O port — joins
+  this list, not an exception to it).
+
+**This matters directly for benchmarking**: a `Vector`/`Matrix` comparison
+against Julia is now compiled-vs-JIT, not interpreter-vs-JIT — see
+`benchmarks/RESULTS.md` for the re-run numbers (all four Group A benchmarks
+now decisively beat Julia; the historical interpreted numbers are kept there
+too, labeled, for the record). Everything involving `box`/`thread`/`chan`/
+`sandbox`/`tcp`/`str` is still necessarily interpreted for now — that
+remains the fair caveat for any benchmark touching those.

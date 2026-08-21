@@ -66,16 +66,19 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::ast::*;
 use crate::token::Span;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
 pub enum OwnershipErrorKind {
     /// The variable was already moved from earlier on this path.
     UseAfterMove { name: String },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OwnershipError {
     pub kind: OwnershipErrorKind,
     pub span: Span,
@@ -152,24 +155,118 @@ fn merge_moved(a: Vec<HashMap<String, (Ty, bool)>>, b: Vec<HashMap<String, (Ty, 
         .collect()
 }
 
-pub struct Checker {
+/// Where a real (non-cloning, LLVM-compiled) backend needs to insert
+/// `nir_free` for a `box`-typed binding — computed as a side effect of
+/// the exact same move-tracking traversal `Checker` already runs for
+/// error-checking (see `compute_free_map`), not a second, independently
+/// re-derived liveness analysis. Every entry answers "at this exact
+/// program point, which box-typed bindings are still owned (never moved
+/// away) and therefore need freeing here" — codegen looks each one up by
+/// the matching AST node's own span (or, for a whole function, its name)
+/// and emits a `call void @nir_free(...)` per name, using its own
+/// `Scopes` to find that name's current pointer register.
+#[derive(Debug, Clone, Default)]
+pub struct FreeMap {
+    /// Keyed by a `Stmt::Return`'s own span. A `return` unwinds every
+    /// currently-open scope at once, so (unlike the other three maps)
+    /// this holds bindings from *every* enclosing scope, not just the
+    /// innermost.
+    pub at_return: HashMap<Span, Vec<String>>,
+    /// Keyed by a `Stmt::While`'s own span — bindings declared directly
+    /// in that loop's own body scope, still owned at the end of one
+    /// representative (non-exploratory) pass over the body. Codegen emits
+    /// these once per iteration (the loop body's IR runs every time), not
+    /// once total — see `codegen.rs`'s `entry_allocas` doc for why the
+    /// binding's own stack slot is reused, not re-allocated, per
+    /// iteration; only the *heap* allocation a `box` inside the loop
+    /// produces is fresh each time, and only this map's entries know to
+    /// free the *previous* iteration's one before it's overwritten.
+    pub at_while_end: HashMap<Span, Vec<String>>,
+    /// Keyed by an `Expr::If`'s own span plus which branch (`true` =
+    /// `then`, `false` = `else`) — bindings declared directly in that one
+    /// branch's own block. Two independent entries per `if`, because each
+    /// branch is its own scope with its own independent moved-state; only
+    /// whichever branch actually runs at runtime frees what it itself
+    /// still owns.
+    pub at_if_branch_end: HashMap<(Span, bool), Vec<String>>,
+    /// Keyed by a `Stmt::Audited`'s own span — same idea as
+    /// `at_while_end`/`at_if_branch_end`, for an `audited { ... }` block's
+    /// own scope.
+    pub at_audited_end: HashMap<Span, Vec<String>>,
+    /// Keyed by function name (unique per `Program.fns`, per `typeck.rs`)
+    /// — bindings (including unused parameters) still owned when a
+    /// function's body finishes without having hit an explicit `return`
+    /// on that path. Codegen only ever consults this at the exact point
+    /// it was already about to emit an implicit `ret void`/`unreachable`
+    /// (`function()`'s `if !self.terminated` fallback) — a function every
+    /// path through which *does* end in an explicit `return` never
+    /// reaches that point, so there's no risk of this double-freeing
+    /// anything `at_return` already covered.
+    pub at_fn_end: HashMap<String, Vec<String>>,
+}
+
+/// The box-typed, not-yet-moved bindings in exactly one scope frame — the
+/// "free these when *this* scope closes" answer, used for every
+/// `FreeMap` field except `at_return` (which needs every open frame at
+/// once, since a `return` unwinds them all simultaneously — see
+/// `all_still_owned_boxes`).
+fn still_owned_boxes(scope: &HashMap<String, (Ty, bool)>) -> Vec<String> {
+    scope.iter().filter(|(_, (ty, moved))| matches!(ty, Ty::Box(_)) && !moved).map(|(name, _)| name.clone()).collect()
+}
+
+fn all_still_owned_boxes(scopes: &OwnScopes) -> Vec<String> {
+    scopes.0.iter().flat_map(still_owned_boxes).collect()
+}
+
+pub struct Checker<'a> {
     scopes: OwnScopes,
     errors: Vec<OwnershipError>,
     /// Set during the throwaway first pass over a `while` body (see module
     /// doc) — errors found there are discarded, only the resulting *state*
-    /// is kept, so the same mistake doesn't get reported twice.
+    /// is kept, so the same mistake doesn't get reported twice. Also
+    /// gates `FreeMap` recording, for the identical reason: a throwaway
+    /// exploratory pass has no real free-site to record either.
     silent: bool,
+    free_map: FreeMap,
+    /// Row 11's declaration table — the only thing this pass needs it
+    /// for is registry-aware affinity (`TypeRegistry::is_affine`, see its
+    /// doc comment for why `Ty::is_affine()` alone can't answer this for
+    /// a `Ty::Named`) and looking up a variant's payload types to bind a
+    /// `match` arm's names with their real type (`check_match_arms`,
+    /// below).
+    registry: TypeRegistry<'a>,
 }
 
-pub fn check_ownership(program: &Program) -> Result<(), Vec<OwnershipError>> {
-    let mut c = Checker { scopes: OwnScopes::new(), errors: Vec::new(), silent: false };
+/// The shared traversal both `check_ownership` and `compute_free_map`
+/// need — computing `FreeMap` piggybacks on the exact same move-tracking
+/// walk that already exists for error-checking (one `Checker`, one pass
+/// per function), not a second, independently re-derived analysis.
+fn run_checker(program: &Program) -> Checker<'_> {
+    let mut c = Checker {
+        scopes: OwnScopes::new(),
+        errors: Vec::new(),
+        silent: false,
+        free_map: FreeMap::default(),
+        registry: TypeRegistry::build(program),
+    };
     for f in &program.fns {
         c.scopes = OwnScopes::new();
         for p in &f.params {
             c.scopes.define(&p.name, p.ty.clone());
         }
         c.check_stmts(&f.body.stmts);
+        // Whatever's left in the function's own top-level scope once its
+        // body finishes (params plus any top-level `let`s — every nested
+        // block scope has already been popped by this point) is exactly
+        // what an implicit fall-off-the-end return needs freed.
+        let freed = still_owned_boxes(c.scopes.0.last().unwrap());
+        c.free_map.at_fn_end.insert(f.name.clone(), freed);
     }
+    c
+}
+
+pub fn check_ownership(program: &Program) -> Result<(), Vec<OwnershipError>> {
+    let c = run_checker(program);
     if c.errors.is_empty() {
         Ok(())
     } else {
@@ -177,7 +274,15 @@ pub fn check_ownership(program: &Program) -> Result<(), Vec<OwnershipError>> {
     }
 }
 
-impl Checker {
+/// Assumes `program` already passed `check_ownership` — like
+/// `codegen.rs`'s own `check_supported`, this trusts a prior pass rather
+/// than re-validating (the ownership-error path and the free-map path
+/// share the same traversal, but only one of them is a fallible gate).
+pub fn compute_free_map(program: &Program) -> FreeMap {
+    run_checker(program).free_map
+}
+
+impl<'a> Checker<'a> {
     fn error(&mut self, kind: OwnershipErrorKind, span: Span) {
         if !self.silent {
             self.errors.push(OwnershipError { kind, span });
@@ -190,10 +295,18 @@ impl Checker {
         }
     }
 
-    fn check_block(&mut self, block: &Block) {
+    /// Runs `block` in its own scope, exactly as before, and returns the
+    /// box-typed bindings declared directly in that block's own top scope
+    /// that are still owned once the block finishes — the "insert
+    /// `nir_free` here for these" answer `FreeMap`'s callers want at this
+    /// exact scope-closing point. Callers under a silent (throwaway)
+    /// exploration ignore this — see `Checker::silent`'s doc.
+    fn check_block(&mut self, block: &Block) -> Vec<String> {
         self.scopes.push();
         self.check_stmts(&block.stmts);
+        let freed = still_owned_boxes(self.scopes.0.last().unwrap());
         self.scopes.pop();
+        freed
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) {
@@ -202,16 +315,31 @@ impl Checker {
                 self.touch_expr(value, true);
                 self.scopes.define(name, ty.clone());
             }
-            Stmt::Return { value, .. } => {
+            Stmt::Return { value, span } => {
                 if let Some(e) = value {
                     self.touch_expr(e, true);
                 }
+                // A `return` unwinds every currently-open scope at once —
+                // unlike `check_block`'s single-frame snapshot, this needs
+                // everything still owned across the whole scope stack.
+                if !self.silent {
+                    self.free_map.at_return.insert(*span, all_still_owned_boxes(&self.scopes));
+                }
             }
-            Stmt::While { cond, body, .. } => {
+            Stmt::While { cond, body, span } => {
                 self.touch_expr(cond, true);
-                self.check_while(body);
+                self.check_while(*span, body);
             }
             Stmt::Expr(e) => self.check_stmt_expr(e),
+            Stmt::Audited { body, span, .. } => {
+                self.scopes.push();
+                self.check_stmts(body);
+                let freed = still_owned_boxes(self.scopes.0.last().unwrap());
+                self.scopes.pop();
+                if !self.silent {
+                    self.free_map.at_audited_end.insert(*span, freed);
+                }
+            }
         }
     }
 
@@ -222,22 +350,33 @@ impl Checker {
     /// (`want`/branch-type-agreement) typeck.rs has, since there's no
     /// value here to reason about.
     fn check_stmt_expr(&mut self, e: &Expr) {
-        if let Expr::If { cond, then_block, else_block, .. } = e {
+        if let Expr::If { cond, then_block, else_block, span } = e {
             self.touch_expr(cond, true);
-            self.check_if_branches(then_block, else_block.as_deref());
+            self.check_if_branches(*span, then_block, else_block.as_deref());
         } else {
             self.touch_expr(e, true);
         }
     }
 
-    fn check_if_branches(&mut self, then_block: &Block, else_block: Option<&ElseBranch>) {
+    fn check_if_branches(&mut self, span: Span, then_block: &Block, else_block: Option<&ElseBranch>) {
         let pre = self.scopes.clone();
 
-        self.check_block(then_block);
+        let then_freed = self.check_block(then_block);
         let after_then = std::mem::replace(&mut self.scopes, pre.clone()).0;
+        if !self.silent {
+            self.free_map.at_if_branch_end.insert((span, true), then_freed);
+        }
 
         match else_block {
-            Some(ElseBranch::Block(b)) => self.check_block(b),
+            Some(ElseBranch::Block(b)) => {
+                let else_freed = self.check_block(b);
+                if !self.silent {
+                    self.free_map.at_if_branch_end.insert((span, false), else_freed);
+                }
+            }
+            // An `else if` delegates to its own `Expr::If` — that nested
+            // call records its own branches under its own span; there's
+            // no separate "else" scope of this `if`'s own to record.
             Some(ElseBranch::If(e2)) => self.check_stmt_expr(e2),
             None => {}
         }
@@ -246,9 +385,41 @@ impl Checker {
         self.scopes = OwnScopes(merge_moved(after_then, after_else));
     }
 
+    /// `match`'s ownership treatment: every arm runs from the *same*
+    /// pre-match state (only one arm actually executes at runtime), each
+    /// arm's payload bindings are fresh (scoped to just that arm — an
+    /// affine payload, like `Some(box_val)`'s `box_val`, is a genuinely
+    /// new owned binding each time, not aliased across arms), and the
+    /// merged post-state has to account for a move down *any* arm — the
+    /// same "branches merge, conservatively" rule `check_if_branches`
+    /// already establishes, generalized from two branches to N.
+    fn check_match_arms(&mut self, arms: &[MatchArm]) {
+        let pre = self.scopes.clone();
+        let mut merged: Option<Vec<HashMap<String, (Ty, bool)>>> = None;
+
+        for arm in arms {
+            self.scopes = pre.clone();
+            self.scopes.push();
+            let payload = self.registry.find_variant(&arm.variant).map(|(_, v)| v.payload.clone()).unwrap_or_default();
+            for (name, ty) in arm.bindings.iter().zip(payload.iter()) {
+                self.scopes.define(name, ty.clone());
+            }
+            self.touch_expr(&arm.body, true);
+            self.scopes.pop();
+
+            let after = self.scopes.0.clone();
+            merged = Some(match merged {
+                None => after,
+                Some(prev) => merge_moved(prev, after),
+            });
+        }
+
+        self.scopes = OwnScopes(merged.unwrap_or(pre.0));
+    }
+
     /// See the module doc's "loops get checked twice" note for why this
     /// isn't just `self.check_block(body)`.
-    fn check_while(&mut self, body: &Block) {
+    fn check_while(&mut self, span: Span, body: &Block) {
         let pre = self.scopes.clone();
 
         // Pass 1, silent: find out what moving-state one iteration
@@ -266,7 +437,11 @@ impl Checker {
         // Pass 2, for real: re-check the body from that merged state, so a
         // variable that's only already-moved on a *second* iteration is
         // actually caught here, and any errors get reported this time.
-        self.check_block(body);
+        // This is also the pass whose result is real enough to record —
+        // codegen frees these once per loop iteration (the body's IR runs
+        // every time), reusing the same stack slot across iterations.
+        let freed = self.check_block(body);
+        self.free_map.at_while_end.insert(span, freed);
         let after_real_pass = self.scopes.0.clone();
         self.scopes = OwnScopes(merge_moved(pre.0, after_real_pass));
     }
@@ -278,7 +453,12 @@ impl Checker {
     /// box is exempt from move-checking (see module doc).
     fn touch_expr(&mut self, e: &Expr, consume: bool) {
         match e {
-            Expr::Int(_, _) | Expr::Bool(_, _) | Expr::Str(_, _) => {}
+            Expr::Int(_, _) | Expr::Float(_, _) | Expr::Bool(_, _) | Expr::Str(_, _) => {}
+            Expr::ArrayLit(elements, _) => {
+                for e in elements {
+                    self.touch_expr(e, true);
+                }
+            }
             Expr::Ident(name, span) => self.touch_ident(name, *span, consume),
             Expr::Unary(_, inner, _) => self.touch_expr(inner, true),
             Expr::Binary(_, lhs, rhs, _) => {
@@ -290,13 +470,52 @@ impl Checker {
                     self.touch_expr(a, true);
                 }
             }
-            Expr::If { cond, then_block, else_block, .. } => {
+            Expr::Transact { network, verify, commit, compensate, log, .. } => {
+                // `TRANSACT.md`'s own Layer 1 scope decision: "ownership
+                // — slots are ordinary calls — nothing new for
+                // ownership.rs to reason about, same as SANDBOXING.md's
+                // observation that spawn/chan cost zero new checker
+                // machinery." Each slot's *arguments* are touched exactly
+                // like an ordinary call's. Honest, narrow gap this
+                // leaves: the implicit `network`/`verify` bindings later
+                // slots can reference by name (`typeck.rs`/
+                // `interpreter.rs` both define them) are deliberately
+                // *not* registered in `self.scopes` here, so a
+                // `network`/`verify` value of an affine type (e.g. a
+                // slot returning `box i64`) referenced by name in two
+                // later slots would not be caught as a double-move by
+                // this pass — not a memory-safety hole (the
+                // interpreter's `Env::get` always hands out a real,
+                // independent `Value` clone, never a raw alias), just an
+                // enforcement gap left for a later layer if it matters
+                // in practice.
+                for a in &network.args {
+                    self.touch_expr(a, true);
+                }
+                for a in &verify.args {
+                    self.touch_expr(a, true);
+                }
+                for a in &commit.args {
+                    self.touch_expr(a, true);
+                }
+                if let Some(c) = compensate {
+                    for a in &c.args {
+                        self.touch_expr(a, true);
+                    }
+                }
+                if let Some(l) = log {
+                    for a in &l.args {
+                        self.touch_expr(a, true);
+                    }
+                }
+            }
+            Expr::If { cond, then_block, else_block, span } => {
                 self.touch_expr(cond, true);
                 // A value-position `if` (e.g. `let x = if c {..} else {..}`)
                 // still needs the same branch-merge treatment as a
                 // statement-position one — moves inside it are real moves
                 // either way.
-                self.check_if_branches(then_block, else_block.as_deref());
+                self.check_if_branches(*span, then_block, else_block.as_deref());
             }
             Expr::Assign(name, rhs, span) => {
                 self.touch_expr(rhs, true);
@@ -331,7 +550,7 @@ impl Checker {
                     let extracting_affine_content = self
                         .scopes
                         .lookup(name)
-                        .map(|(ty, _)| matches!(ty, Ty::Box(inner_ty) if inner_ty.is_affine()))
+                        .map(|(ty, _)| matches!(ty, Ty::Box(inner_ty) if self.registry.is_affine(&inner_ty)))
                         .unwrap_or(false);
                     self.touch_ident(name, *span, extracting_affine_content);
                 } else {
@@ -400,6 +619,66 @@ impl Checker {
                 self.touch_expr(host, true);
                 self.touch_expr(port, true);
             }
+            Expr::Listen(port, _) => {
+                self.touch_expr(port, true);
+            }
+            Expr::Accept(listener, _) => {
+                // The listener handle itself isn't consumed -- `accept`
+                // can be called on it repeatedly (see `Expr::Accept`'s
+                // doc comment), the same "read, don't move" treatment
+                // `send`'s channel operand already gets.
+                self.touch_expr(listener, false);
+            }
+            Expr::Open(path, mode, _) => {
+                // Neither operand is affine (`str`), so this is a no-op
+                // in practice, same as `Expr::Connect`'s operands above --
+                // touched anyway on principle.
+                self.touch_expr(path, true);
+                self.touch_expr(mode, true);
+            }
+            Expr::Index(base, indices, _) => {
+                // Neither the base nor an index is affine yet -- no
+                // indexable type exists (see `Expr::Index`'s doc comment
+                // in ast.rs) -- but every sub-expression still gets
+                // touched on principle, the same "no currently load-
+                // bearing reason, but consistent with every other form"
+                // treatment `Expr::Connect` already gets.
+                self.touch_expr(base, true);
+                for idx in indices {
+                    self.touch_expr(idx, true);
+                }
+            }
+            Expr::FieldAccess(base, field, _) => {
+                // Extracting a field moves the whole base struct only
+                // when the extracted field's own type is affine -- same
+                // "look one level through" rule `Expr::Deref` already
+                // applies to `box` (`nirdosha_row11_amendment.md` §3.5),
+                // generalized from "the one field a box has" to "one of
+                // several named fields."
+                if let Expr::Ident(name, span) = base.as_ref() {
+                    let extracting_affine_field = self
+                        .scopes
+                        .lookup(name)
+                        .and_then(|(ty, _)| match ty {
+                            Ty::Named(struct_name) => self.registry.struct_fields(&struct_name).and_then(|fields| {
+                                fields.iter().find(|f| &f.name == field).map(|f| self.registry.is_affine(&f.ty))
+                            }),
+                            _ => None,
+                        })
+                        .unwrap_or(false);
+                    self.touch_ident(name, *span, extracting_affine_field);
+                } else {
+                    self.touch_expr(base, false);
+                }
+            }
+            Expr::Match { scrutinee, arms, .. } => {
+                // The scrutinee is consumed as a whole -- matching
+                // destructures it into fresh payload bindings, the same
+                // "moves as a whole" rule struct/enum affinity already
+                // gets (§3.5).
+                self.touch_expr(scrutinee, true);
+                self.check_match_arms(arms);
+            }
         }
     }
 
@@ -407,7 +686,7 @@ impl Checker {
         let Some((ty, moved)) = self.scopes.lookup(name) else {
             return; // typeck.rs already reports unknown variables
         };
-        if !ty.is_affine() {
+        if !self.registry.is_affine(&ty) {
             return; // freely copyable — nothing to track
         }
         if moved {

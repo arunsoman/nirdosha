@@ -1,0 +1,24 @@
+// Exercises: `f64` -- literals, arithmetic, comparisons, negation,
+// function parameters/returns. Deliberately minimal, same scope as
+// strings.nir: no scientific notation, no int<->float conversion (see
+// ast.rs::Ty::F64's doc comment -- there is no cast operator yet).
+fn average(a: f64, b: f64) -> f64 {
+    return (a + b) / 2.0
+}
+
+fn main() {
+    let x: f64 = 3.5
+    let y: f64 = 1.5
+    print(x + y) // 5
+    print(x - y) // 2
+    print(x * y) // 5.25
+    print(x / y) // 2.3333333333333335
+
+    let neg: f64 = -x
+    print(neg) // -3.5
+
+    print(x > y)  // true
+    print(x == 3.5) // true
+
+    print(average(2.0, 4.0)) // 3
+}

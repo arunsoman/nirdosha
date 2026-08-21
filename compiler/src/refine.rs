@@ -158,9 +158,32 @@ pub struct RefineReport {
     pub proven_in_range: HashSet<Span>,
     /// Spans of `/` operations whose divisor is proven never zero.
     pub proven_nonzero_divisor: HashSet<Span>,
+    /// Spans of `Expr::Index` sites (`v[i]`/`m[i, j]`) whose index
+    /// expression(s) are proven to fall inside the base `Vector`/
+    /// `Matrix`'s declared bounds — goal.md row 4's Tier 1 generalized
+    /// from bytes (row 165's original `byte[n] where n < cap`) to every
+    /// fixed-size index (unified plan §4.5.1). Not wired to elide
+    /// `interpreter.rs`'s Tier-2 runtime check, for the same reason
+    /// `proven_in_range`/`proven_nonzero_divisor` weren't when this file
+    /// was first written (module doc) — Vector/Matrix codegen doesn't
+    /// exist yet either (`codegen.rs`), so there's no backend yet to
+    /// spend this proof's payoff on. The proof itself is real regardless.
+    pub proven_index_bounds: HashSet<Span>,
 }
 
-struct Scopes(Vec<HashMap<String, Interval>>);
+/// `Vector(_, N)`'s `[N]`, `Matrix(_, R, C)`'s `[R, C]`, or `None` for
+/// anything else — the declared shape `Expr::Index`'s bounds proof needs
+/// and nothing else about `ty` does, so this stays a tiny free function
+/// rather than growing `Scopes`' value type into a full `Ty` clone.
+fn ty_dims(ty: &Ty) -> Option<Vec<usize>> {
+    match ty {
+        Ty::Vector(_, n) => Some(vec![*n]),
+        Ty::Matrix(_, r, c) => Some(vec![*r, *c]),
+        _ => None,
+    }
+}
+
+struct Scopes(Vec<HashMap<String, (Interval, Option<Vec<usize>>)>>);
 
 impl Scopes {
     fn new() -> Self {
@@ -172,11 +195,18 @@ impl Scopes {
     fn pop(&mut self) {
         self.0.pop();
     }
-    fn define(&mut self, name: &str, iv: Interval) {
-        self.0.last_mut().unwrap().insert(name.to_string(), iv);
+    /// `dims` is `ty_dims(&declared_ty)` at the point of definition —
+    /// `None` for every plain scalar binding, which is the overwhelming
+    /// majority of call sites (only `Stmt::Let`/params need to compute
+    /// it at all).
+    fn define(&mut self, name: &str, iv: Interval, dims: Option<Vec<usize>>) {
+        self.0.last_mut().unwrap().insert(name.to_string(), (iv, dims));
     }
     fn get(&self, name: &str) -> Option<Interval> {
-        self.0.iter().rev().find_map(|s| s.get(name)).copied()
+        self.0.iter().rev().find_map(|s| s.get(name)).map(|(iv, _)| *iv)
+    }
+    fn get_dims(&self, name: &str) -> Option<Vec<usize>> {
+        self.0.iter().rev().find_map(|s| s.get(name)).and_then(|(_, d)| d.clone())
     }
     /// Overwrites `name`'s tracked interval in place, wherever it's
     /// declared — used both for an ordinary reassignment (the new
@@ -185,11 +215,14 @@ impl Scopes {
     /// (module doc; there the new interval is deliberately the maximally
     /// conservative `Interval::unknown()`). A no-op if the name isn't
     /// tracked, which is fine either way: an untracked name has no
-    /// existing claim to overwrite.
+    /// existing claim to overwrite. Leaves `dims` alone -- a `Vector`/
+    /// `Matrix`-typed binding is never affine-scalar-reassignable to a
+    /// *different* shape (typeck.rs's `check` requires an exact `Ty`
+    /// match), so its dims never change after `define`.
     fn set(&mut self, name: &str, iv: Interval) {
         for scope in self.0.iter_mut().rev() {
             if let Some(slot) = scope.get_mut(name) {
-                *slot = iv;
+                slot.0 = iv;
                 return;
             }
         }
@@ -205,7 +238,7 @@ pub fn analyze(program: &Program) -> RefineReport {
             // No interprocedural analysis — a parameter could be anything
             // the caller passed, so it starts at its declared type's full
             // range, not narrowed by any particular call site.
-            scopes.define(&p.name, Interval::full(&p.ty));
+            scopes.define(&p.name, Interval::full(&p.ty), ty_dims(&p.ty));
         }
         r.stmts(&f.body.stmts, &mut scopes);
     }
@@ -242,7 +275,7 @@ impl Refiner {
                 if iv.within(ty) {
                     self.report.proven_in_range.insert(*span);
                 }
-                scopes.define(name, iv);
+                scopes.define(name, iv, ty_dims(ty));
             }
             Stmt::Return { value: Some(e), span } => {
                 let iv = self.expr(e, scopes);
@@ -254,6 +287,13 @@ impl Refiner {
             Stmt::While { cond, body, .. } => self.while_loop(cond, body, scopes),
             Stmt::Expr(e) => {
                 self.expr(e, scopes);
+            }
+            Stmt::Audited { body, .. } => {
+                scopes.push();
+                for s in body {
+                    self.stmt(s, scopes);
+                }
+                scopes.pop();
             }
         }
     }
@@ -372,7 +412,95 @@ impl Refiner {
                 self.expr(port, scopes);
                 Interval::unknown()
             }
-            Expr::Bool(_, _) | Expr::Str(_, _) => Interval::unknown(),
+            Expr::Listen(port, _) => {
+                self.expr(port, scopes);
+                Interval::unknown()
+            }
+            Expr::Accept(listener, _) => {
+                self.expr(listener, scopes);
+                Interval::unknown()
+            }
+            Expr::Open(path, mode, _) => {
+                self.expr(path, scopes);
+                self.expr(mode, scopes);
+                Interval::unknown()
+            }
+            Expr::Index(base, indices, span) => {
+                self.expr(base, scopes);
+                let idx_intervals: Vec<Interval> = indices.iter().map(|idx| self.expr(idx, scopes)).collect();
+                // Only the direct `ident[...]` shape is provable here —
+                // an arbitrary base expression (`f()[i]`) has no declared
+                // shape this pass can look up without real type
+                // inference, which this pass deliberately doesn't do
+                // (module doc: interval analysis only). A real, narrow
+                // limitation, not silently assumed away.
+                if let Expr::Ident(name, _) = base.as_ref() {
+                    if let Some(dims) = scopes.get_dims(name) {
+                        let all_in_bounds = dims.len() == idx_intervals.len()
+                            && dims.iter().zip(idx_intervals.iter()).all(|(&dim, iv)| iv.lo >= 0 && iv.hi < dim as i128);
+                        if all_in_bounds {
+                            self.report.proven_index_bounds.insert(*span);
+                        }
+                    }
+                }
+                Interval::unknown()
+            }
+            Expr::ArrayLit(elements, _) => {
+                for e in elements {
+                    self.expr(e, scopes);
+                }
+                Interval::unknown()
+            }
+            // Row 11 -- neither is a number this pass has anything to say
+            // about (a struct/enum value, never an integer), but every
+            // sub-expression is still walked for its own nested proofs,
+            // the same "walk args for their own proofs" treatment
+            // `Expr::Call`'s arm already gives. A `match` arm's own
+            // payload bindings aren't added to `scopes` here (this pass
+            // has no declaration table to look their real type up from —
+            // same scope limit `Expr::Index`'s base-expression restriction
+            // above already documents); any reference to one inside an
+            // arm body just falls back to `Interval::unknown()` via
+            // `scopes.get`'s existing `unwrap_or` default, not an error.
+            Expr::FieldAccess(base, _, _) => {
+                self.expr(base, scopes);
+                Interval::unknown()
+            }
+            Expr::Match { scrutinee, arms, .. } => {
+                self.expr(scrutinee, scopes);
+                for arm in arms {
+                    self.expr(&arm.body, scopes);
+                }
+                Interval::unknown()
+            }
+            Expr::Bool(_, _) | Expr::Str(_, _) | Expr::Float(_, _) => Interval::unknown(),
+            // `transact`'s own result isn't a number this pass has
+            // anything to say about (`typeck.rs` already fixes it at
+            // `bool`) — but every slot's arguments still get walked, the
+            // same "walk args for their own proofs" treatment
+            // `Expr::Call`'s arm above already gives.
+            Expr::Transact { network, verify, commit, compensate, log, .. } => {
+                for a in &network.args {
+                    self.expr(a, scopes);
+                }
+                for a in &verify.args {
+                    self.expr(a, scopes);
+                }
+                for a in &commit.args {
+                    self.expr(a, scopes);
+                }
+                if let Some(c) = compensate {
+                    for a in &c.args {
+                        self.expr(a, scopes);
+                    }
+                }
+                if let Some(l) = log {
+                    for a in &l.args {
+                        self.expr(a, scopes);
+                    }
+                }
+                Interval::unknown()
+            }
         }
     }
 
@@ -420,7 +548,9 @@ impl Refiner {
             | BinOp::LtEq
             | BinOp::GtEq
             | BinOp::And
-            | BinOp::Or => Interval::unknown(),
+            | BinOp::Or
+            | BinOp::ElemMul
+            | BinOp::ElemDiv => Interval::unknown(),
         }
     }
 }
@@ -442,12 +572,13 @@ fn assigned_names(stmts: &[Stmt]) -> HashSet<String> {
                     walk_stmts(&body.stmts, names);
                 }
                 Stmt::Expr(e) => walk_expr(e, names),
+                Stmt::Audited { body, .. } => walk_stmts(body, names),
             }
         }
     }
     fn walk_expr(e: &Expr, names: &mut HashSet<String>) {
         match e {
-            Expr::Int(_, _) | Expr::Bool(_, _) | Expr::Str(_, _) | Expr::Ident(_, _) | Expr::Chan(_) => {}
+            Expr::Int(_, _) | Expr::Float(_, _) | Expr::Bool(_, _) | Expr::Str(_, _) | Expr::Ident(_, _) | Expr::Chan(_) => {}
             Expr::Unary(_, inner, _)
             | Expr::Box(inner, _)
             | Expr::Deref(inner, _)
@@ -464,9 +595,22 @@ fn assigned_names(stmts: &[Stmt]) -> HashSet<String> {
                     walk_expr(a, names);
                 }
             }
-            Expr::Send(chan, value, _) | Expr::Connect(chan, value, _) => {
+            Expr::Send(chan, value, _) | Expr::Connect(chan, value, _) | Expr::Open(chan, value, _) => {
                 walk_expr(chan, names);
                 walk_expr(value, names);
+            }
+            Expr::Listen(port, _) => walk_expr(port, names),
+            Expr::Accept(listener, _) => walk_expr(listener, names),
+            Expr::Index(base, indices, _) => {
+                walk_expr(base, names);
+                for idx in indices {
+                    walk_expr(idx, names);
+                }
+            }
+            Expr::ArrayLit(elements, _) => {
+                for e in elements {
+                    walk_expr(e, names);
+                }
             }
             Expr::If { cond, then_block, else_block, .. } => {
                 walk_expr(cond, names);
@@ -480,6 +624,34 @@ fn assigned_names(stmts: &[Stmt]) -> HashSet<String> {
             Expr::Assign(name, rhs, _) => {
                 names.insert(name.clone());
                 walk_expr(rhs, names);
+            }
+            Expr::Transact { network, verify, commit, compensate, log, .. } => {
+                for a in &network.args {
+                    walk_expr(a, names);
+                }
+                for a in &verify.args {
+                    walk_expr(a, names);
+                }
+                for a in &commit.args {
+                    walk_expr(a, names);
+                }
+                if let Some(c) = compensate {
+                    for a in &c.args {
+                        walk_expr(a, names);
+                    }
+                }
+                if let Some(l) = log {
+                    for a in &l.args {
+                        walk_expr(a, names);
+                    }
+                }
+            }
+            Expr::FieldAccess(base, _, _) => walk_expr(base, names),
+            Expr::Match { scrutinee, arms, .. } => {
+                walk_expr(scrutinee, names);
+                for arm in arms {
+                    walk_expr(&arm.body, names);
+                }
             }
         }
     }

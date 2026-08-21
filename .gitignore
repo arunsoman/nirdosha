@@ -1,2 +1,6 @@
 /compiler/target
 /grammar_check/target
+/grammar_export/target
+/bench/target
+/benchmarks/c/*_bin*
+/benchmarks/nirdosha/*_bin*

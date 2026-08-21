@@ -1,0 +1,55 @@
+// A 4-state constant-velocity 2D tracker (state = [px, py, vx, vy]),
+// position-only measurements, run for N predict+update steps against a
+// synthetic linearly-drifting target -- the realistic Nirdosha workload
+// shape (fixed-size, sequential, mission-critical simulation), not a
+// "solve one huge linear system" benchmark.
+fn main() {
+    let n: i64 = 0
+    let n_max: i64 = 200000
+    let t: f64 = 0.0
+
+    let x: Vector(f64, 4) = [0.0, 0.0, 0.0, 0.0]
+    let p: Matrix(f64, 4, 4) = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+    ]
+    let f: Matrix(f64, 4, 4) = [
+        [1.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+    ]
+    let q: Matrix(f64, 4, 4) = [
+        [0.01, 0.0, 0.0, 0.0],
+        [0.0, 0.01, 0.0, 0.0],
+        [0.0, 0.0, 0.01, 0.0],
+        [0.0, 0.0, 0.0, 0.01]
+    ]
+    let h: Matrix(f64, 2, 4) = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0]
+    ]
+    let r: Matrix(f64, 2, 2) = [
+        [0.25, 0.0],
+        [0.0, 0.25]
+    ]
+
+    while n < n_max {
+        let x1: Vector(f64, 4) = kf_predict_state(x, p, f, q)
+        let p1: Matrix(f64, 4, 4) = kf_predict_cov(x, p, f, q)
+
+        let z: Vector(f64, 2) = [t, t * 0.5]
+
+        let x2: Vector(f64, 4) = kf_update_state(x1, p1, z, h, r)
+        let p2: Matrix(f64, 4, 4) = kf_update_cov(x1, p1, z, h, r)
+
+        x = x2
+        p = p2
+        t = t + 0.01
+        n = n + 1
+    }
+    print(x[0])
+    print(x[1])
+}
