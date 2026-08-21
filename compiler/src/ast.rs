@@ -154,6 +154,23 @@ pub enum Ty {
     /// needed" scope `Ty::Tcp`'s payload restriction already set — this
     /// language has no `bytes` type to carry anything richer yet.
     File,
+    /// A handle to an already-parsed JSON document (`json_parse(s)` — see
+    /// `Expr::Call`'s `"json_parse"` arm). **Not** affine: like `Ty::Str`,
+    /// meant to be read freely — `Value::Json` wraps a `serde_json::Value`
+    /// in an `Arc`, the same cheap-clone-on-read reasoning `Value::Str`'s
+    /// `Arc<str>` already documents. Navigation (`json_get`, and the
+    /// per-target-type leaf accessors `json_get_str`/`_i64`/`_f64`/
+    /// `_bool`) reads the *already-parsed* tree, not the original text —
+    /// a genuinely lazy, zero-copy-from-source-text design (never
+    /// materializing anything until a field is actually asked for, no
+    /// index built up front) would need real byte-range string slicing
+    /// this language doesn't have yet; parsing once with the well-tested
+    /// `serde_json` crate (already a dependency, for AST export — see
+    /// `lib.rs::Diagnostic`) and navigating the resulting tree is the
+    /// honest, narrower version that ships today. Every fallible
+    /// accessor returns `Ty::Named("Result", [_, Ty::Str])` — a real
+    /// Nirdosha value, not a Rust-level trap.
+    Json,
     /// A user-declared `struct`/`enum` name, plus its concrete type
     /// arguments (`nirdosha_row11_amendment.md` — Row 11, layer 6:
     /// generics). `Point` is `Named("Point", [])`; `Pair(i64, str)` is
@@ -200,6 +217,7 @@ impl Ty {
             "tcp" => Ty::Tcp,
             "tcp_listener" => Ty::TcpListener,
             "file" => Ty::File,
+            "json" => Ty::Json,
             _ => return None,
         })
     }
@@ -231,6 +249,7 @@ impl Ty {
             Ty::Tcp => "tcp".to_string(),
             Ty::TcpListener => "tcp_listener".to_string(),
             Ty::File => "file".to_string(),
+            Ty::Json => "json".to_string(),
             Ty::Named(name, args) if args.is_empty() => name.clone(),
             Ty::Named(name, args) => {
                 format!("{name}({})", args.iter().map(Ty::name).collect::<Vec<_>>().join(", "))
@@ -254,6 +273,7 @@ impl Ty {
                 | Ty::Tcp
                 | Ty::TcpListener
                 | Ty::File
+                | Ty::Json
                 | Ty::Named(_, _)
                 | Ty::F64
                 | Ty::Vector(_, _)
@@ -374,6 +394,7 @@ impl Ty {
             | Ty::Tcp
             | Ty::TcpListener
             | Ty::File
+            | Ty::Json
             | Ty::Named(_, _)
             | Ty::F64
             | Ty::Vector(_, _)
@@ -488,6 +509,27 @@ pub fn prelude_enums() -> Vec<EnumDecl> {
             span,
         },
     ]
+}
+
+/// `struct HttpResponse { status: i64, body: str }` — `http_get`/
+/// `http_post`'s result shape, injected into every `Program.structs` at
+/// parse time the same way `prelude_enums` injects `Option`/`Result`
+/// (see that function's doc comment — same mechanism, same "no
+/// special-casing" reasoning, just a `struct` instead of an `enum`).
+/// Field order (`status` then `body`) is load-bearing: `interpreter.rs`'s
+/// `http_response_value` constructs the matching `Value::Struct`
+/// positionally, in this exact order.
+pub fn prelude_structs() -> Vec<StructDecl> {
+    let span = Span { line: 0, col: 0 };
+    vec![StructDecl {
+        name: "HttpResponse".to_string(),
+        type_params: vec![],
+        fields: vec![
+            Field { name: "status".to_string(), ty: Ty::I64 },
+            Field { name: "body".to_string(), ty: Ty::Str },
+        ],
+        span,
+    }]
 }
 
 /// `goal.md`'s "Effects" synthesis layer (row 4, 9) — `PROTOLANG_PORT.md`'s
@@ -975,6 +1017,21 @@ impl<'a> TypeRegistry<'a> {
 /// — `typeck.rs`'s own arity check (`TypeErrorKind::WrongTypeArity`) is
 /// what rejects that case; every other caller here just needs a sound
 /// (if partial) substitution to keep walking without crashing.
+/// `Ty::Named("Result", [ok, Str])` — every JSON builtin's return type
+/// shape (see e.g. `json_get_str`'s doc comment in `BUILTIN_NAMES`),
+/// spelled once so every caller agrees on it exactly: `typeck.rs`'s own
+/// `infer_builtin_call` arms, and `ownership.rs`'s `builtin_return_ty`
+/// (which needs the same shape *without* re-deriving it through real
+/// type inference — see that function's own doc comment for why).
+/// Reuses the real prelude `Result` (layer 7), with `str` as the fixed
+/// error type — the same flat, stringly-typed error convention
+/// `ErrorKind::ChannelIoError` already established for `chan`/`tcp`/
+/// `file` (`PROTOLANG_PORT.md`'s std_io §14 entry), not a bespoke
+/// `JsonError` type invented in parallel.
+pub fn result_of(ok: Ty) -> Ty {
+    Ty::Named("Result".to_string(), vec![ok, Ty::Str])
+}
+
 pub fn zip_type_params<'a, 'b>(type_params: &'a [String], args: &'b [Ty]) -> HashMap<&'a str, &'b Ty> {
     type_params.iter().map(String::as_str).zip(args.iter()).collect()
 }
@@ -1093,6 +1150,46 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "kf_predict_cov",
     "kf_update_state",
     "kf_update_cov",
+    // JSON (lazy-navigation design over an already-parsed `serde_json::
+    // Value` tree -- see `Ty::Json`'s doc comment): concrete, per-target-
+    // type accessors rather than one generic `json_get<T>`, the same
+    // "narrow, concrete, cheap to extend later" discipline every other
+    // builtin here already follows -- there is no generic-return-type
+    // resolution mechanism for plain builtin calls (unlike struct/variant
+    // *construction*, which Row 11 layer 6 does have one for). Every
+    // fallible one returns `Result(_, str)`, the same flat, stringly-
+    // typed error convention `ErrorKind::ChannelIoError` already
+    // established for `chan`/`tcp`/`file` (`PROTOLANG_PORT.md`'s std_io
+    // §14 entry) -- a real Nirdosha *value* now, not a Rust-level trap,
+    // since `Result` exists.
+    "json_parse",
+    "json_get",
+    "json_get_str",
+    "json_get_i64",
+    "json_get_f64",
+    "json_get_bool",
+    "json_array_len",
+    "json_array_get",
+    // HTTP (plain, client-only, layer 1 -- HTTPS/TLS is a real, deliberate
+    // gap: PROTOLANG_PORT.md's std_io §12 already says TLS should be a
+    // vetted library binding, not hand-rolled, and no such binding has
+    // been added yet). Built on the exact same `std::net::TcpStream`
+    // `connect` already uses. Every request sends `Connection: close`
+    // and reads to EOF -- no `Content-Length`/chunked-transfer-encoding
+    // parsing needed for a first cut, since the server closing the
+    // socket *is* the end-of-body signal. Returns `Result(HttpResponse,
+    // str)` (`ast::prelude_structs`) -- a network failure, a malformed
+    // status line, or a non-UTF-8 body are all `Err`, not a trap.
+    "http_get",
+    "http_post",
+    // HTTPS -- same request/response handling as http_get/http_post,
+    // over a `native_tls::TlsStream` wrapping the same real TCP socket.
+    // `TlsConnector::new()`'s defaults do the actual security-critical
+    // work (certificate-chain and hostname verification against the
+    // platform's trust store) -- a vetted library binding, not
+    // hand-rolled, per PROTOLANG_PORT.md's std_io §12 stance.
+    "https_get",
+    "https_post",
 ];
 
 pub fn is_builtin(name: &str) -> bool {

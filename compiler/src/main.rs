@@ -76,7 +76,7 @@ fn print_value(v: &Value) -> ExitCode {
             println!("=> {v:?}")
         }
         Value::Vector(_) | Value::Matrix(..) => println!("=> {v:?}"),
-        Value::Struct(..) | Value::Enum(..) => println!("=> {v:?}"),
+        Value::Struct(..) | Value::Enum(..) | Value::Json(_) => println!("=> {v:?}"),
     }
     ExitCode::SUCCESS
 }

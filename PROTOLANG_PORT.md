@@ -98,14 +98,14 @@ below:
 | 3.4 | Directories | **Deferred**, not rejected | Real and eventually wanted (an LLM-facing language will want to list a directory), but strictly after §3's plain `file` lands — same one-slice-at-a-time discipline as `TRANSACT.md`'s layering. |
 | 3.6 | Temp files | **Deferred**, same reason as directories | Sugar over `open` + "delete on close," which only makes sense once `open`/`close` exist. |
 | 4 | TCP / UDP / Unix sockets | **Mostly already native** | TCP client+server (`connect`/`listen`/`accept`/`stop`, `send`/`recv` reused) already exists (`LANGUAGE.md` §7). UDP and Unix domain sockets as a *user-facing* type don't exist (Unix sockets are already used *internally* for sandboxed `chan` IPC, just not exposed) — **deferred**, real but no example program has asked for either yet. |
-| 5 | HTTP / HTTPS | **Rejected**, for now | A correct HTTP client/server is a substantial parser + state machine (chunked encoding, redirects, keep-alive) that belongs as a library built *on top of* `tcp`, not a new language construct — `tcp`/`send`/`recv` already provide the substrate. Worth revisiting once file I/O and a real `str`-manipulation story (concatenation, slicing — both currently absent per `LANGUAGE.md` §2) exist, since an HTTP layer is unusable without them regardless of I/O primitives. |
+| 5 | HTTP / HTTPS | **Both shipped (plain client + TLS client)** | See "Locked design 4: HTTP" below. The original blocker (a real `str`-manipulation story) turned out to be avoidable for a first cut: `http_get`/`http_post`/`https_get`/`https_post` are Rust-native builtins over the same `tcp` substrate, not a Nirdosha-source-level parser built from string primitives — so no `str` concatenation/slicing was actually needed. HTTPS uses `native-tls` (a real, considered dependency decision — bundling the platform's own TLS via OpenSSL/Schannel/SecureTransport rather than a pure-Rust reimplementation), doing the actual security-critical work (certificate-chain and hostname verification) via its own vetted defaults, exactly the "vetted library binding, not hand-rolled" stance this document already committed to. |
 | 6 | WebSockets | **Rejected**, for now | Same substrate argument as HTTP, one layer further out; blocked on HTTP being worth doing first. |
 | 7 | Database / SQL as I/O | **Rejected** | Same verdict as reference-spec §8, restated here because `std_io` re-poses it as "just I/O" — it isn't just I/O, it needs compile-time schema access, which is its own subsystem. |
 | 8.1 | Standard streams (`stdin`/`stdout`/`stderr`) | **Port now**, small | `print` already covers `stdout` for every practical Nirdosha program today. A `read_line()` builtin (stdin) is a two-line addition once `file`'s `recv`-reuse pattern exists — folded into the file I/O design below rather than given its own section, since it's the same mechanism (a pre-opened, un-closeable `file`-shaped handle). |
 | 8.2 | Child process I/O (stdin/stdout/stderr streams) | **Already native, narrower** | `sandbox` already gives a real child-process handle with `stop` returning its exit code (`LANGUAGE.md` §7). Piping the child's stdout back as a `Reader` isn't built — `chan`-over-sandbox already gives typed cross-process communication for programs *written in Nirdosha itself*; piping an arbitrary external command's stdout is a different, deferred ask (no example program launches a non-Nirdosha binary today). |
 | 8.3 | Pipes | **Rejected** | `chan` already is Nirdosha's in-process pipe (typed, safer than raw bytes); an OS-level anonymous pipe has no motivating use case `chan` doesn't already cover. |
 | 9 | Streaming & backpressure (`Stream<T>`, `.map`/`.filter`/…) | **Blocked** on generics | `Stream<T>` and its combinators are exactly the higher-order, generic machinery `LANGUAGE.md` §6 says doesn't exist ("no closures/lambdas, no first-class functions... no structs, enums, tuples, or generics"). Not attempted piecemeal — needs its own planning pass, same as the unified plan already scopes for real generics (`goal.md`'s Phase references). |
-| 10 | Serialization I/O (JSON, protobuf, CSV) | **Blocked** on generics/sum types | `encode<T>`/`decode<T>` need generics; `Json` itself is a recursive variant type. A narrow, non-generic version (fixed schema, hand-written per record type) has no host type to serialize *from* yet, since Nirdosha has no `record`. Revisit after row 1 in the type-system table. |
+| 10 | Serialization I/O (JSON, protobuf, CSV) | **JSON shipped (read-only navigation); protobuf/CSV still rejected** | See "Locked design 3: JSON" below. Not the design this row originally sketched (`encode<T>`/`decode<T>` generic over an arbitrary Nirdosha type, `Json` as a Nirdosha-level recursive `enum`) — that would additionally need a growable/variable-length collection type, which still doesn't exist (`Vector`/`Matrix` are fixed-size). What shipped instead: `Ty::Json`, a handle over an already-parsed `serde_json::Value` tree, with concrete per-target-type accessors (`json_get_str`/`_i64`/`_f64`/`_bool`) — narrower, but real, and it composes with `Result` (Row 11 layer 7) for the first time. protobuf/CSV are unrelated formats with their own encoders; nothing here generalizes to them. |
 | 11 | Resource pools | **Rejected** | Solves connection-reuse cost for `tcp`/DB connections at a concurrency scale (thousands of short-lived connections) no Nirdosha program is anywhere near yet. A `Pool<T>` is also generic over `T: Resource`, same generics blocker as streaming. |
 | 12 | TLS/SSL | **Rejected**, for now | Depends on HTTP being worth doing first (§5's verdict), and TLS itself is the kind of security-critical protocol implementation that should be a vetted C library binding, not hand-rolled — out of scope for "port ProtoLang's design," which is a language-feature exercise, not a crypto-implementation one. |
 | 13 | I/O observability | **Rejected**, for now | Same verdict and same reasoning as reference-spec §11. |
@@ -362,6 +362,192 @@ named here so it isn't lost.
    proven** — `file` joins `box`/`thread`/`chan`/`sandbox`/`tcp` on the
    "interpreter-only, rejected not mis-compiled" list (`LANGUAGE.md` §10),
    not an exception to it.
+
+---
+
+## Locked design 3: JSON
+
+**Status: shipped (21 Aug 2026).** `Ty::Json`, `json_parse`, and the
+per-target-type accessors (`json_get`/`json_get_str`/`_i64`/`_f64`/
+`_bool`, `json_array_len`/`json_array_get`) are real, tested
+(`compiler/tests/json.rs`, `compiler/examples/json.nir`),
+interpreter-only per the same discipline every other affine-handle
+feature here already follows.
+
+### What it brings to the table, and what changed from `std_io` §10's original sketch
+
+The original design (`encode<T>`/`decode<T>` generic over an arbitrary
+Nirdosha type, `Json` as a Nirdosha-level recursive `enum` with `Array`/
+`Object` variants holding a Nirdosha-level list) needed two things Row 11
+still doesn't provide: reflection/derive machinery to make `encode<T>`
+generic over *any* struct, and a growable, variable-length collection
+type (`Vector`/`Matrix` are fixed-size — the dimension is part of the
+type). Neither showed up as newly available just because generics
+landed, and neither was worth inventing speculatively to unblock this.
+
+What shipped instead is narrower and more honest: `Ty::Json` is a handle
+over an **already-parsed** `serde_json::Value` tree (`serde_json` was
+already a dependency, for AST export — `lib.rs::Diagnostic`), navigated
+through concrete, per-target-type builtins rather than one generic
+`json_get<T>`. This was a deliberate design choice, not a fallback: there
+is no mechanism today for a plain builtin call's return type to be
+resolved generically the way struct/variant *construction* now is (Row
+11 layer 6's `want`-based resolution is specific to construction), so a
+family of concrete functions is the same "narrow, concrete, cheap to
+extend later" discipline every builtin in this language already follows,
+not an oversight to fix later.
+
+A true zero-copy design — cursors into the *original source text*,
+materializing nothing until a field is actually read, no parse tree at
+all — was considered and is a real, valid future optimization (this is
+what simdjson's On-Demand API and serde's zero-copy `Deserialize` do).
+It was set aside for this first cut for two concrete reasons: it needs
+real byte-range string slicing, which doesn't exist (see §5's own updated
+verdict for why that turned out to matter less for HTTP than expected,
+but JSON's *read* side genuinely does need it for that specific
+design); and hand-rolling a fully correct JSON scanner (escape
+sequences, UTF-8 boundaries, number formats) duplicates real, existing
+correctness work `serde_json` already has, for no concrete performance
+problem any Nirdosha program has hit yet — the same "don't build the
+escape valve speculatively" discipline `goal.md` §4 already asks for
+everywhere else. If a real program hits a real cost from full-tree
+parsing, the fix is entirely internal to `json_parse`'s Rust
+implementation — the Nirdosha-facing API (`Ty::Json`, the accessor
+functions, `Result(_, str)` on failure) doesn't have to change at all.
+
+Every fallible accessor returns `Result(_, str)` (Row 11 layer 7) — a
+missing key, a JSON value of the wrong shape, or malformed input to
+`json_parse` are all a real Nirdosha value a program can `match` on, not
+a `RuntimeError` trap. This is the first real consumer of `Result`
+outside the language's own prelude machinery, and it's what motivated
+one small fix to `ownership.rs` along the way: `match`ing directly on a
+call's result (`match json_parse(s) { .. }`, the natural idiom) needs the
+scrutinee's concrete type arguments resolved precisely, which the
+existing Ident-only resolution couldn't do for a bare call — see
+`ownership.rs::builtin_return_ty`.
+
+### Rollout layers
+
+1. **Shipped.** `json_parse`, `json_get`, and the four typed leaf
+   accessors, plus array navigation (`json_array_len`/`json_array_get`) —
+   object/array navigation over an eagerly-parsed tree.
+2. **Not designed, not scheduled.** True zero-copy/lazy navigation
+   (cursors into the original text, no parse tree) — a real future
+   optimization, not a current gap; see above for why it's deferred, not
+   forgotten.
+3. **Not designed, not scheduled.** JSON *construction*/serialization
+   (a Nirdosha value → JSON text) — no motivating example yet; every
+   shipped use case so far is reading a response, not building a request
+   body (`http_post`'s body is a plain, already-formed `str`).
+4. **Compiled backend is out of scope until the interpreter version is
+   proven** — `json` joins the existing interpreter-only list, not an
+   exception to it.
+
+---
+
+## Locked design 4: HTTP
+
+**Status: shipped (21 Aug 2026), both plain and TLS, client-only.**
+`http_get`/`http_post`/`https_get`/`https_post` are real, tested
+(`compiler/tests/http.rs`, `compiler/tests/https.rs`,
+`compiler/examples/http.nir`, `compiler/examples/https.nir`),
+interpreter-only.
+
+### What it brings to the table, and what changed from §5's original verdict
+
+§5's original "Rejected, for now" reasoned that an HTTP layer needs real
+`str` concatenation/slicing first, since it assumed HTTP would be a
+Nirdosha-*source*-level library built out of string primitives the way a
+user might eventually hand-roll one. That assumption turned out to be
+avoidable: `http_get`/`http_post` are Rust-native builtins — the request
+is built and the response is parsed entirely inside the builtin's own
+Rust implementation, over the same `std::net::TcpStream` `connect`
+already uses, the same "complex operation, thin Nirdosha-facing surface"
+treatment `det`/`inv`/`solve` (dense linear algebra) already get. No
+`str` concatenation or slicing was needed at the language level at all.
+
+The other original blocker — "a substantial parser + state machine
+(chunked encoding, redirects, keep-alive)" — is narrowed by a real design
+choice, not solved in general: every request sends `Connection: close`
+and reads the response to EOF. The peer closing the socket *is* the
+end-of-body signal, so there's no `Content-Length`/chunked-transfer-
+encoding parsing to get right for a first cut. Redirects and keep-alive
+are both real, named gaps, not attempted — a caller that needs to follow
+a redirect reads `HttpResponse.status` and issues a new `http_get`
+itself; nothing here does it automatically.
+
+`http_get(host, port, path)`/`http_post(host, port, path, body)` both
+return `Result(HttpResponse, str)`, reusing Row 11 layer 7's real
+`Result` the same way JSON's accessors do — a connection failure, a
+malformed status line, or a non-UTF-8 body are all `Err(message)`, never
+a trap. `HttpResponse { status: i64, body: str }` is a real, ordinary
+`struct`, injected into every program's prelude exactly the way
+`Option`/`Result` are (`ast::prelude_structs`) — the response body reads
+as a plain field access (`resp.body`) and composes directly with
+`json_parse` for a JSON API, which is the shape every test in
+`compiler/tests/http.rs` actually exercises.
+
+**HTTPS is shipped**, via `native-tls` (chosen deliberately over
+`rustls`: it binds the platform's own TLS — OpenSSL on Linux, Schannel
+on Windows, Secure Transport on macOS — rather than a pure-Rust
+reimplementation, matching this document's own "vetted library binding,
+not hand-rolled" stance in the most literal way available). `https_get`/
+`https_post` share `http_get`/`http_post`'s exact request-building and
+response-parsing code (`interpreter.rs`'s `build_http_request`/
+`parse_http_response`), generic over the transport
+(`send_and_receive<S: Read + Write + HalfCloseWrite>`) — a plain
+`TcpStream` for one, a `native_tls::TlsStream` wrapping one for the
+other. `TlsConnector::new()`'s untouched defaults do the actual
+security-critical work (certificate-chain and hostname verification
+against the platform's trust store); nothing here second-guesses or
+weakens them. Verified two ways: `compiler/tests/https.rs`'s own
+self-contained suite generates a throwaway self-signed certificate (via
+the system `openssl` CLI — this crate already requires the OpenSSL
+system *library* to build on Linux, so depending on its CLI too, for
+tests only, is a small addition on an already-required dependency, not a
+new one) and proves the handshake genuinely rejects it — if certificate
+verification were ever accidentally disabled, that test would start
+silently *passing* the connection instead of erroring, so it's a real
+regression guard. A genuine successful round trip needs a certificate
+signed by a real, trusted CA, which no offline test can produce — that
+was checked by hand instead, against a real server
+(`https_get("example.com", 443, "/")` → `Ok(HttpResponse { status: 200,
+.. })`, and `https_get("example.com", 80, "/")` — plaintext HTTP on the
+TLS call — → a clean `Err("TLS handshake failed: ...")`, not a hang or a
+panic).
+
+One real design wrinkle TLS introduces that plain TCP doesn't:
+`http_request`'s existing half-close of the write side (a courtesy for
+servers that wait for EOF before responding) has no safe equivalent over
+TLS — `TlsStream::shutdown` sends a `close_notify` and tears down the
+*whole* session, which would prevent ever reading the response about to
+be requested. `HalfCloseWrite` (a small trait, one real impl for
+`TcpStream`, one deliberate no-op impl for `TlsStream`) names this
+directly rather than papering over it — the request already tells the
+server exactly how much to expect (`Content-Length`, or the blank line
+ending a bodyless GET's headers), so a well-behaved server needs no
+half-close signal at all, over either transport.
+
+### Rollout layers
+
+1. **Shipped.** `http_get`/`http_post`, plain HTTP/1.1, `Connection:
+   close` + read-to-EOF, status code + body only (no header access).
+2. **Shipped.** `https_get`/`https_post`, same request/response handling,
+   over `native-tls`.
+3. **Not shipped, named explicitly.** Custom request headers (today's
+   fixed set — `Host`, `Connection`, `User-Agent`, `Accept`, and
+   `Content-Type`/`Content-Length` for the `_post` variants — covers
+   every test case that exists so far); response header access on
+   `HttpResponse`.
+4. **Not shipped, named explicitly.** An HTTP *server* (`listen`/`accept`
+   already exist as the substrate — SANDBOXING.md/the unified plan's
+   §4.3.3 — but constructing and writing a response is new work; nothing
+   here builds it). An HTTPS server would additionally need a real
+   certificate to present, a separate provisioning question this doesn't
+   touch.
+5. **Compiled backend is out of scope until the interpreter version is
+   proven** — `http_get`/`http_post`/`https_get`/`https_post` join the
+   existing interpreter-only list, not an exception to it.
 
 ---
 

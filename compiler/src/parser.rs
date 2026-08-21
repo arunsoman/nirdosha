@@ -187,10 +187,11 @@ impl Parser {
     // program ::= item*
     pub fn parse_program(&mut self) -> PResult<Program> {
         let mut fns = Vec::new();
-        let mut structs = Vec::new();
-        // Row 11 layer 7's prelude (`ast::prelude_enums`'s doc comment):
-        // `Option(T)`/`Result(T, E)`, prepended as if the user had
-        // written them — no special-casing anywhere downstream.
+        // Row 11 layer 7's prelude (`ast::prelude_enums`/`prelude_structs`'
+        // doc comments): `Option(T)`/`Result(T, E)`, and `HttpResponse`
+        // (`http_get`/`http_post`'s result shape), prepended as if the
+        // user had written them — no special-casing anywhere downstream.
+        let mut structs = prelude_structs();
         let mut enums = prelude_enums();
         while self.peek().tok != Tok::Eof {
             match self.peek().tok {

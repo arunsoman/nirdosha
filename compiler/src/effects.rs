@@ -183,6 +183,19 @@ fn builtin_effect(name: &str) -> EffectSet {
         "rand_seed" | "rand_f64" | "rand_gaussian" => {
             s.insert(Effect::Rng);
         }
+        // Same effect `connect`/`listen`/`accept`/`tcp`'s `send`/`recv`/
+        // `stop` already get -- `http_get`/`http_post` are a real TCP
+        // connection under the hood.
+        "http_get" | "http_post" | "https_get" | "https_post" => {
+            s.insert(Effect::Network);
+        }
+        // `json_*` builtins are pure: they only ever read the already-
+        // parsed tree an earlier `json_parse` call produced, never touch
+        // the outside world themselves (the classification's `_ => {}`
+        // default already gives them `EffectSet::new()`; named here only
+        // so a reader doesn't have to wonder whether they were missed).
+        "json_parse" | "json_get" | "json_get_str" | "json_get_i64" | "json_get_f64" | "json_get_bool"
+        | "json_array_len" | "json_array_get" => {}
         _ => {}
     }
     s

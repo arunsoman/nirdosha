@@ -1,0 +1,21 @@
+// JSON -- concrete, per-target-type accessors (json_get_str/_i64/_f64/
+// _bool) over an already-parsed document, every fallible one returning
+// a real Result(_, str) (Row 11 layer 7's prelude) rather than trapping.
+// No growable-collection type needed: array/object navigation reads the
+// already-parsed serde_json tree directly, never materializing a
+// Nirdosha-level Vector/Matrix for it.
+
+fn describe_user(doc: json) -> str {
+    return match json_get_str(doc, "name") {
+        Ok(name) => name,
+        Err(msg) => msg,
+    }
+}
+
+fn main() -> str {
+    let text: str = "{\"name\": \"nirdosha\", \"version\": 1, \"stable\": false, \"tags\": [\"lang\", \"compiler\"]}"
+    return match json_parse(text) {
+        Ok(doc) => describe_user(doc),
+        Err(msg) => msg,
+    }
+}

@@ -1,0 +1,25 @@
+// http_get/http_post -- plain HTTP, client-only, built on the same real
+// TcpStream `connect` already uses. Every fallible call returns
+// Result(HttpResponse, str) (Row 11 layer 7's prelude); a response body
+// composes directly with json_parse/json_get_str.
+//
+// Talks to 127.0.0.1:8977 -- compiler/tests/http.rs spins up its own
+// TcpListener on a fresh port and substitutes it in before running this
+// exact file, so this isn't a real, externally-reachable address.
+
+fn extract_message(doc: json) -> str {
+    return match json_get_str(doc, "message") {
+        Ok(msg) => msg,
+        Err(e) => e,
+    }
+}
+
+fn main() -> str {
+    return match http_get("127.0.0.1", 8977, "/ping") {
+        Ok(resp) => match json_parse(resp.body) {
+            Ok(doc) => extract_message(doc),
+            Err(e) => e,
+        },
+        Err(e) => e,
+    }
+}

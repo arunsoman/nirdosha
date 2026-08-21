@@ -50,6 +50,10 @@ use serde::{Deserialize, Serialize};
 use crate::ast::*;
 use crate::token::Span;
 
+/// Renamed on import — this file's own `Value` enum would otherwise
+/// collide with `serde_json::Value`'s name at every use site.
+use serde_json::Value as JsonDoc;
+
 /// Not `Copy` — `Value::Boxed` owns a heap allocation (a real Rust `Box`),
 /// and giving the enum a free bitwise-copy would let two `Value`s alias the
 /// same allocation with neither aware of the other, exactly the hazard
@@ -153,6 +157,12 @@ pub enum Value {
     /// a `std::fs::File` closes its own descriptor on drop with no help
     /// required.
     File(Arc<Mutex<Option<std::fs::File>>>),
+    /// An already-parsed JSON document or sub-document (`json_parse`,
+    /// and every navigation builtin's own result — see `Ty::Json`'s doc
+    /// comment). `Arc`, not owned directly, for the same cheap-clone-on-
+    /// read reason `Value::Str`'s `Arc<str>` already documents — not
+    /// affine, freely read many times.
+    Json(Arc<JsonDoc>),
     /// A `struct` value (Row 11) — the declared struct's name plus its
     /// field values, positional, in declaration order (construction is
     /// positional-only — `ast::StructDecl`'s doc comment). `Arc<[Value]>`,
@@ -524,6 +534,7 @@ impl PartialEq for Value {
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Tcp(a), Value::Tcp(b)) => Arc::ptr_eq(a, b),
             (Value::TcpListener(a), Value::TcpListener(b)) => Arc::ptr_eq(a, b),
+            (Value::Json(a), Value::Json(b)) => a == b,
             (Value::Struct(an, af), Value::Struct(bn, bf)) => an == bn && af == bf,
             (Value::Enum(an, av, af), Value::Enum(bn, bv, bf)) => an == bn && av == bv && af == bf,
             _ => false,
@@ -549,6 +560,7 @@ impl Value {
             Value::Tcp(_) => "tcp",
             Value::TcpListener(_) => "tcp_listener",
             Value::File(_) => "file",
+            Value::Json(_) => "json",
             // A generic tag, not the real declared name — every real call
             // site that needs the *actual* struct/enum name already has
             // the `Ty::Named`/`Value::Struct`/`Value::Enum` name field
@@ -586,6 +598,7 @@ impl Value {
             Value::Tcp(_) => "tcp(..)".to_string(),
             Value::TcpListener(_) => "tcp_listener(..)".to_string(),
             Value::File(_) => "file(..)".to_string(),
+            Value::Json(doc) => format!("json({doc})"),
             Value::Struct(name, fields) => {
                 format!("{name}({})", fields.iter().map(Value::render).collect::<Vec<_>>().join(", "))
             }
@@ -748,6 +761,205 @@ fn scalar_binop(op: BinOp, a: &Value, b: &Value, span: Span) -> Result<Value, Ru
         },
         _ => unreachable!("typeck.rs already proved matching, numeric-scalar element types"),
     }
+}
+
+/// `Ok(v)` as a real Nirdosha `Result(_, str)` value — every JSON and
+/// HTTP builtin's success case. Constructed directly, not through `find_
+/// variant` (this is a free function with no `&Interpreter`/`&Program`
+/// to look one up from, unlike `Expr::Call`'s own construction path) —
+/// sound because the shape is fixed and known up front: `Result`'s own
+/// prelude declaration (`ast::prelude_enums`) is never user-alterable.
+fn result_ok(v: Value) -> Value {
+    Value::Enum(Arc::from("Result"), Arc::from("Ok"), Arc::from(vec![v]))
+}
+
+/// `Err(message)` as a real Nirdosha `Result(_, str)` value — every JSON
+/// and HTTP builtin's failure case (a missing JSON key, a value of the
+/// wrong shape, malformed input to `json_parse`, a failed connection or
+/// malformed HTTP response). Never a Rust-level trap: `Result` is
+/// precisely the mechanism for a *recoverable* failure a Nirdosha
+/// program can `match` on, as opposed to `RuntimeError` (an
+/// unrecoverable one, per `ast.rs`'s own `12.5`-entry framing in
+/// `PROTOLANG_PORT.md`).
+fn result_err(message: impl Into<String>) -> Value {
+    let s: Arc<str> = Arc::from(message.into());
+    Value::Enum(Arc::from("Result"), Arc::from("Err"), Arc::from(vec![Value::Str(s)]))
+}
+
+/// A short, human-readable name for a JSON value's own dynamic shape --
+/// used only in error messages (`result_err`'s payload), never anywhere
+/// type-directed.
+fn json_kind(v: &JsonDoc) -> &'static str {
+    match v {
+        JsonDoc::Null => "null",
+        JsonDoc::Bool(_) => "a bool",
+        JsonDoc::Number(_) => "a number",
+        JsonDoc::String(_) => "a string",
+        JsonDoc::Array(_) => "an array",
+        JsonDoc::Object(_) => "an object",
+    }
+}
+
+fn json_type_err(key: &str, expected: &str, found: &JsonDoc) -> String {
+    format!("field `{key}` is not {expected} (found {})", json_kind(found))
+}
+
+/// `json_get`/`json_get_str`/`_i64`/`_f64`/`_bool`'s shared first step:
+/// look `key` up in `doc`, which must be a JSON object. `Err` carries a
+/// ready-to-wrap message, not a structured type -- matching every other
+/// JSON builtin's flat, stringly-typed `Result(_, str)` error convention.
+fn json_field<'a>(doc: &'a JsonDoc, key: &str) -> Result<&'a JsonDoc, String> {
+    match doc.as_object() {
+        None => Err(format!("expected a JSON object, found {}", json_kind(doc))),
+        Some(obj) => obj.get(key).ok_or_else(|| format!("no field `{key}`")),
+    }
+}
+
+/// Builds the raw request bytes `http_request`/`https_request` both send
+/// — one HTTP/1.1 request line, a fixed header set, and the body (if
+/// any). Shared so the two transports can never drift on what they
+/// actually put on the wire.
+fn build_http_request(method: &str, host: &str, path: &str, body: Option<&str>) -> Vec<u8> {
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: nirdosha\r\nAccept: */*\r\n"
+    );
+    let req_body_bytes = body.unwrap_or("").as_bytes();
+    if body.is_some() {
+        request.push_str(&format!("Content-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n", req_body_bytes.len()));
+    }
+    request.push_str("\r\n");
+    let mut request_bytes = request.into_bytes();
+    request_bytes.extend_from_slice(req_body_bytes);
+    request_bytes
+}
+
+/// Splits a raw HTTP response into a status code and a body — the other
+/// half of what `http_request`/`https_request` share. Every failure — a
+/// malformed status line, a non-UTF-8 body — is `Err(message)`, a real
+/// Nirdosha value, never a Rust-level trap.
+fn parse_http_response(raw: &[u8]) -> Value {
+    // Split at the first blank line -- CRLF CRLF, per RFC 7230 -- into
+    // the header block and the body. Headers are always ASCII; only the
+    // body might not be valid UTF-8 (`str` requires it -- `Ty::Str`'s
+    // doc comment).
+    let Some(sep) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return result_err("malformed HTTP response: no header/body separator found");
+    };
+    let header_block = match std::str::from_utf8(&raw[..sep]) {
+        Ok(s) => s,
+        Err(_) => return result_err("malformed HTTP response: headers are not valid UTF-8"),
+    };
+    let response_body = match std::str::from_utf8(&raw[sep + 4..]) {
+        Ok(s) => s.to_string(),
+        Err(_) => return result_err("HTTP response body is not valid UTF-8"),
+    };
+
+    let Some(status_line) = header_block.split("\r\n").next() else {
+        return result_err("malformed HTTP response: empty status line");
+    };
+    let Some(status) = status_line.split_whitespace().nth(1).and_then(|s| s.parse::<i64>().ok()) else {
+        return result_err(format!("malformed HTTP status line: {status_line:?}"));
+    };
+
+    result_ok(Value::Struct(
+        Arc::from("HttpResponse"),
+        Arc::from(vec![Value::Int(status), Value::Str(Arc::from(response_body))]),
+    ))
+}
+
+/// Half-closes a stream's write side once a request has been fully sent
+/// — a courtesy for servers that wait for EOF on their read end before
+/// responding to a `Connection: close` request, not a requirement (a
+/// well-behaved server already knows the request is complete from
+/// `Content-Length`, or from the blank line after a bodyless GET's
+/// headers). Meaningful for a plain `TcpStream`; deliberately a no-op
+/// over TLS (`native_tls::TlsStream`) — see that impl's own doc comment
+/// for why attempting one there would be actively wrong, not just
+/// unnecessary.
+trait HalfCloseWrite {
+    fn half_close_write(&mut self);
+}
+
+impl HalfCloseWrite for std::net::TcpStream {
+    fn half_close_write(&mut self) {
+        let _ = self.shutdown(std::net::Shutdown::Write);
+    }
+}
+
+/// **Deliberate no-op**, not a missing feature: TLS has no raw half-close
+/// the way TCP does — `TlsStream::shutdown` sends a `close_notify` and
+/// tears down the whole session in both directions, which would prevent
+/// ever reading the response that's about to be requested. The request
+/// itself already tells the server exactly how much to expect
+/// (`Content-Length` for a body, or the blank line terminating a
+/// bodyless GET's headers), so there's nothing this step needs to do for
+/// a well-behaved HTTPS server.
+impl<S: std::io::Read + std::io::Write> HalfCloseWrite for native_tls::TlsStream<S> {
+    fn half_close_write(&mut self) {}
+}
+
+/// `http_request`/`https_request`'s shared send/receive step, generic
+/// over the transport (a plain `TcpStream`, or a `native_tls::TlsStream`
+/// wrapping one) — writes the request, half-closes if the transport
+/// supports it, reads the response to EOF (the peer closing the
+/// connection *is* the end-of-body signal — no `Content-Length`/
+/// chunked-transfer-encoding parsing needed for this first cut, since
+/// `Connection: close` means there's no persistent connection to need it
+/// for), and parses it.
+fn send_and_receive<S: std::io::Read + std::io::Write + HalfCloseWrite>(mut stream: S, request: &[u8]) -> Value {
+    if let Err(e) = stream.write_all(request) {
+        return result_err(e.to_string());
+    }
+    stream.half_close_write();
+    let mut raw = Vec::new();
+    if let Err(e) = stream.read_to_end(&mut raw) {
+        return result_err(e.to_string());
+    }
+    parse_http_response(&raw)
+}
+
+/// `http_get`/`http_post`'s shared implementation (`ast::BUILTIN_NAMES`'s
+/// doc comment) — connects a real TCP socket (the same
+/// `std::net::TcpStream::connect` `Expr::Connect` already uses) and
+/// speaks plain HTTP over it.
+fn http_request(host: &str, port: i64, method: &str, path: &str, body: Option<&str>) -> Value {
+    let port = match u16::try_from(port) {
+        Ok(p) => p,
+        Err(_) => return result_err(format!("port {port} is not a valid 0-65535 TCP port")),
+    };
+    let stream = match std::net::TcpStream::connect((host, port)) {
+        Ok(s) => s,
+        Err(e) => return result_err(e.to_string()),
+    };
+    send_and_receive(stream, &build_http_request(method, host, path, body))
+}
+
+/// `https_get`/`https_post`'s shared implementation — same request/
+/// response handling as `http_request`, over a `native_tls::TlsStream`
+/// wrapping the same real `TcpStream` instead of a bare one.
+/// `TlsConnector::new()`'s defaults are what's actually doing the
+/// security-critical work here (certificate-chain and hostname
+/// verification against the platform's trust store) — deliberately not
+/// hand-rolled, per this design's own "TLS should be a vetted library
+/// binding" stance (`PROTOLANG_PORT.md`'s std_io §12 entry).
+fn https_request(host: &str, port: i64, method: &str, path: &str, body: Option<&str>) -> Value {
+    let port = match u16::try_from(port) {
+        Ok(p) => p,
+        Err(_) => return result_err(format!("port {port} is not a valid 0-65535 TCP port")),
+    };
+    let tcp = match std::net::TcpStream::connect((host, port)) {
+        Ok(s) => s,
+        Err(e) => return result_err(e.to_string()),
+    };
+    let connector = match native_tls::TlsConnector::new() {
+        Ok(c) => c,
+        Err(e) => return result_err(format!("failed to initialize TLS: {e}")),
+    };
+    let stream = match connector.connect(host, tcp) {
+        Ok(s) => s,
+        Err(e) => return result_err(format!("TLS handshake failed: {e}")),
+    };
+    send_and_receive(stream, &build_http_request(method, host, path, body))
 }
 
 fn as_f64(v: &Value) -> f64 {
@@ -1361,6 +1573,113 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
             let Value::Matrix(_, rows, cols) = &args[0] else { unreachable!("typeck.rs already proved this is a Matrix") };
             Ok(Value::Bool(rows == cols))
         }
+        "json_parse" => {
+            let Value::Str(s) = &args[0] else { unreachable!("typeck.rs already proved this is a str") };
+            match serde_json::from_str::<JsonDoc>(s) {
+                Ok(doc) => Ok(result_ok(Value::Json(Arc::new(doc)))),
+                Err(e) => Ok(result_err(e.to_string())),
+            }
+        }
+        "json_get" => {
+            let (Value::Json(doc), Value::Str(key)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are json and str")
+            };
+            match json_field(doc, key) {
+                Ok(v) => Ok(result_ok(Value::Json(Arc::new(v.clone())))),
+                Err(e) => Ok(result_err(e)),
+            }
+        }
+        "json_get_str" => {
+            let (Value::Json(doc), Value::Str(key)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are json and str")
+            };
+            match json_field(doc, key).and_then(|v| {
+                v.as_str().map(|s| Value::Str(Arc::from(s))).ok_or_else(|| json_type_err(key, "a string", v))
+            }) {
+                Ok(v) => Ok(result_ok(v)),
+                Err(e) => Ok(result_err(e)),
+            }
+        }
+        "json_get_i64" => {
+            let (Value::Json(doc), Value::Str(key)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are json and str")
+            };
+            match json_field(doc, key).and_then(|v| {
+                v.as_i64().map(Value::Int).ok_or_else(|| json_type_err(key, "an integer that fits in i64", v))
+            }) {
+                Ok(v) => Ok(result_ok(v)),
+                Err(e) => Ok(result_err(e)),
+            }
+        }
+        "json_get_f64" => {
+            let (Value::Json(doc), Value::Str(key)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are json and str")
+            };
+            match json_field(doc, key)
+                .and_then(|v| v.as_f64().map(Value::Float).ok_or_else(|| json_type_err(key, "a number", v)))
+            {
+                Ok(v) => Ok(result_ok(v)),
+                Err(e) => Ok(result_err(e)),
+            }
+        }
+        "json_get_bool" => {
+            let (Value::Json(doc), Value::Str(key)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are json and str")
+            };
+            match json_field(doc, key)
+                .and_then(|v| v.as_bool().map(Value::Bool).ok_or_else(|| json_type_err(key, "a bool", v)))
+            {
+                Ok(v) => Ok(result_ok(v)),
+                Err(e) => Ok(result_err(e)),
+            }
+        }
+        "json_array_len" => {
+            let Value::Json(doc) = &args[0] else { unreachable!("typeck.rs already proved this is json") };
+            match doc.as_array() {
+                Some(a) => Ok(result_ok(Value::Int(a.len() as i64))),
+                None => Ok(result_err(format!("expected a JSON array, found {}", json_kind(doc)))),
+            }
+        }
+        "json_array_get" => {
+            let (Value::Json(doc), Value::Int(i)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are json and an integer")
+            };
+            match doc.as_array() {
+                None => Ok(result_err(format!("expected a JSON array, found {}", json_kind(doc)))),
+                Some(a) => match usize::try_from(*i).ok().and_then(|i| a.get(i)) {
+                    Some(v) => Ok(result_ok(Value::Json(Arc::new(v.clone())))),
+                    None => Ok(result_err(format!("index {i} out of bounds (JSON array has {} element(s))", a.len()))),
+                },
+            }
+        }
+        "http_get" => {
+            let (Value::Str(host), Value::Int(port), Value::Str(path)) = (&args[0], &args[1], &args[2]) else {
+                unreachable!("typeck.rs already proved these are str/i64/str")
+            };
+            Ok(http_request(host, *port, "GET", path, None))
+        }
+        "http_post" => {
+            let (Value::Str(host), Value::Int(port), Value::Str(path), Value::Str(body)) =
+                (&args[0], &args[1], &args[2], &args[3])
+            else {
+                unreachable!("typeck.rs already proved these are str/i64/str/str")
+            };
+            Ok(http_request(host, *port, "POST", path, Some(body)))
+        }
+        "https_get" => {
+            let (Value::Str(host), Value::Int(port), Value::Str(path)) = (&args[0], &args[1], &args[2]) else {
+                unreachable!("typeck.rs already proved these are str/i64/str")
+            };
+            Ok(https_request(host, *port, "GET", path, None))
+        }
+        "https_post" => {
+            let (Value::Str(host), Value::Int(port), Value::Str(path), Value::Str(body)) =
+                (&args[0], &args[1], &args[2], &args[3])
+            else {
+                unreachable!("typeck.rs already proved these are str/i64/str/str")
+            };
+            Ok(https_request(host, *port, "POST", path, Some(body)))
+        }
         _ => unreachable!("ast::BUILTIN_NAMES and eval_builtin's match must stay in sync"),
     }
 }
@@ -1726,6 +2045,7 @@ impl Interpreter {
             (Value::Tcp(_), Ty::Tcp) => Ok(()),
             (Value::TcpListener(_), Ty::TcpListener) => Ok(()),
             (Value::File(_), Ty::File) => Ok(()),
+            (Value::Json(_), Ty::Json) => Ok(()),
             (Value::Float(_), Ty::F64) => Ok(()),
             (Value::Vector(elems), Ty::Vector(elem_ty, n)) => {
                 if elems.len() != *n {

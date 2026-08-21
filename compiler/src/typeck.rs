@@ -1948,6 +1948,67 @@ impl<'a> Checker<'a> {
                     _ => Ty::Error,
                 }
             }
+            // JSON (`Ty::Json`'s doc comment) -- every fallible accessor
+            // returns `Result(_, str)`, reusing the now-real prelude type
+            // (layer 7) rather than a bespoke error shape.
+            ("json_parse", 1) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes);
+                result_of(Ty::Json)
+            }
+            ("json_get", 2) | ("json_array_get", 2) => {
+                self.check(&args[0], &Ty::Json, expected_ret, scopes);
+                let key_ty = if name == "json_get" { Ty::Str } else { Ty::I64 };
+                self.check(&args[1], &key_ty, expected_ret, scopes);
+                result_of(Ty::Json)
+            }
+            ("json_get_str", 2) => {
+                self.check(&args[0], &Ty::Json, expected_ret, scopes);
+                self.check(&args[1], &Ty::Str, expected_ret, scopes);
+                result_of(Ty::Str)
+            }
+            ("json_get_i64", 2) => {
+                self.check(&args[0], &Ty::Json, expected_ret, scopes);
+                self.check(&args[1], &Ty::Str, expected_ret, scopes);
+                result_of(Ty::I64)
+            }
+            ("json_get_f64", 2) => {
+                self.check(&args[0], &Ty::Json, expected_ret, scopes);
+                self.check(&args[1], &Ty::Str, expected_ret, scopes);
+                result_of(Ty::F64)
+            }
+            ("json_get_bool", 2) => {
+                self.check(&args[0], &Ty::Json, expected_ret, scopes);
+                self.check(&args[1], &Ty::Str, expected_ret, scopes);
+                result_of(Ty::Bool)
+            }
+            ("json_array_len", 1) => {
+                self.check(&args[0], &Ty::Json, expected_ret, scopes);
+                result_of(Ty::I64)
+            }
+            // HTTP (plain, client-only -- `ast::BUILTIN_NAMES`'s doc
+            // comment). `HttpResponse` is `ast::prelude_structs`'
+            // non-generic struct, so `Ty::Named("HttpResponse", vec![])`
+            // needs no substitution the way a real generic construction
+            // would.
+            ("http_get", 3) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes); // host
+                self.check(&args[1], &Ty::I64, expected_ret, scopes); // port
+                self.check(&args[2], &Ty::Str, expected_ret, scopes); // path
+                result_of(Ty::Named("HttpResponse".to_string(), vec![]))
+            }
+            ("http_post", 4) | ("https_post", 4) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes); // host
+                self.check(&args[1], &Ty::I64, expected_ret, scopes); // port
+                self.check(&args[2], &Ty::Str, expected_ret, scopes); // path
+                self.check(&args[3], &Ty::Str, expected_ret, scopes); // body
+                result_of(Ty::Named("HttpResponse".to_string(), vec![]))
+            }
+            ("https_get", 3) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes); // host
+                self.check(&args[1], &Ty::I64, expected_ret, scopes); // port
+                self.check(&args[2], &Ty::Str, expected_ret, scopes); // path
+                result_of(Ty::Named("HttpResponse".to_string(), vec![]))
+            }
             _ => {
                 for a in args {
                     self.infer(a, expected_ret, scopes);
@@ -1967,7 +2028,10 @@ impl<'a> Checker<'a> {
     /// arms above, which may accept more than one arity, e.g. `zeros`).
     fn builtin_arity_hint(&self, name: &str) -> usize {
         match name {
-            "dot" | "cross" | "solve" => 2,
+            "dot" | "cross" | "solve" | "json_get" | "json_get_str" | "json_get_i64" | "json_get_f64"
+            | "json_get_bool" | "json_array_get" => 2,
+            "http_get" | "https_get" => 3,
+            "http_post" | "https_post" => 4,
             _ => 1,
         }
     }

@@ -235,6 +235,43 @@ pub struct Checker<'a> {
     /// `match` arm's names with their real type (`check_match_arms`,
     /// below).
     registry: TypeRegistry<'a>,
+    /// Every user function's declared return type, by name — lets
+    /// `check_match_arms` resolve a `match`ed function call's own
+    /// concrete type arguments precisely (`match some_call() { .. }`) the
+    /// same way it already does for a plain bound identifier, instead of
+    /// falling back to the conservative "assume affine" sentinel for the
+    /// single most common non-`Ident` scrutinee shape. A bare name→`Ty`
+    /// map, not real type inference — this pass still does none (module
+    /// doc); it's the same information `typeck.rs`'s own `sigs` table
+    /// already holds, just re-derived here rather than threaded through
+    /// (the two passes share no side-channel today).
+    fn_rets: HashMap<String, Ty>,
+}
+
+/// The fixed return-type *shape* of a generic-returning builtin, by name
+/// — every JSON builtin (`Ty::Json`'s doc comment) always resolves to
+/// the same `Result(_, str)` instantiation regardless of its arguments'
+/// *values* (unlike `zeros`/`ones`/`identity`, whose shape depends on a
+/// literal argument — those aren't generic-returning in the Row 11
+/// sense at all, so they don't need an entry here). Exists so
+/// `check_match_arms` can resolve `match json_parse(s) { .. }` precisely
+/// without this pass growing a general builtin type-inference table —
+/// keep this in sync with `typeck.rs::infer_builtin_call`'s own
+/// `"json_*"` arms if either changes; there is currently no single
+/// source of truth for "this builtin's declared return type" the way
+/// `ast::BUILTIN_NAMES` is one for "is this name a builtin" at all.
+fn builtin_return_ty(name: &str) -> Option<Ty> {
+    match name {
+        "json_parse" | "json_get" | "json_array_get" => Some(result_of(Ty::Json)),
+        "json_get_str" => Some(result_of(Ty::Str)),
+        "json_get_i64" | "json_array_len" => Some(result_of(Ty::I64)),
+        "json_get_f64" => Some(result_of(Ty::F64)),
+        "json_get_bool" => Some(result_of(Ty::Bool)),
+        "http_get" | "http_post" | "https_get" | "https_post" => {
+            Some(result_of(Ty::Named("HttpResponse".to_string(), vec![])))
+        }
+        _ => None,
+    }
 }
 
 /// The shared traversal both `check_ownership` and `compute_free_map`
@@ -248,6 +285,7 @@ fn run_checker(program: &Program) -> Checker<'_> {
         silent: false,
         free_map: FreeMap::default(),
         registry: TypeRegistry::build(program),
+        fn_rets: program.fns.iter().map(|f| (f.name.clone(), f.ret.clone())).collect(),
     };
     for f in &program.fns {
         c.scopes = OwnScopes::new();
@@ -400,21 +438,29 @@ impl<'a> Checker<'a> {
     /// before a binding's affinity can be judged correctly. This pass does
     /// no general type inference (it trusts `typeck.rs` to have already
     /// proved every type resolves — module doc), so it can only recover
-    /// those concrete arguments when the scrutinee is a plain bound
-    /// identifier (`match o { ... }`); anything else (a function-call
-    /// result, say) falls back to a conservative substitution that treats
-    /// every one of the enum's type parameters as affine regardless — a
-    /// real, always-affine `Ty` (`box unit`) used purely as a sentinel,
-    /// the same "assume the worse one" direction `check_if_branches`'s own
-    /// branch-merge conservatism already takes. This can only ever
-    /// over-restrict (reject some valid reuse this pass can't prove safe),
-    /// never under-restrict (accept an actual double-move).
+    /// those concrete arguments for the shapes it can resolve without one:
+    /// a plain bound identifier (`match o { .. }`), a call to a known user
+    /// function (`match get_option() { .. }` — `fn_rets`), or a call to a
+    /// generic-returning builtin with a fixed return shape (`match
+    /// json_parse(s) { .. }` — `builtin_return_ty`). Anything else (an
+    /// arbitrary nested expression) falls back to a conservative
+    /// substitution that treats every one of the enum's type parameters as
+    /// affine regardless — a real, always-affine `Ty` (`box unit`) used
+    /// purely as a sentinel, the same "assume the worse one" direction
+    /// `check_if_branches`'s own branch-merge conservatism already takes.
+    /// This can only ever over-restrict (reject some valid reuse this pass
+    /// can't prove safe), never under-restrict (accept an actual
+    /// double-move).
     fn check_match_arms(&mut self, scrutinee: &Expr, arms: &[MatchArm]) {
         let pre = self.scopes.clone();
 
         let concrete_args: Option<Vec<Ty>> = match scrutinee {
             Expr::Ident(name, _) => match pre.lookup(name) {
                 Some((Ty::Named(_, args), _)) => Some(args),
+                _ => None,
+            },
+            Expr::Call(name, _, _) => match self.fn_rets.get(name).cloned().or_else(|| builtin_return_ty(name)) {
+                Some(Ty::Named(_, args)) => Some(args),
                 _ => None,
             },
             _ => None,

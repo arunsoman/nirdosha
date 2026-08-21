@@ -193,6 +193,7 @@ fn llvm_ty(ty: &Ty) -> Result<String, CodegenError> {
         Ty::File => unsupported(
             "codegen doesn't support `file` yet — open/send/recv/stop on file are interpreter-only for now",
         ),
+        Ty::Json => unsupported("codegen doesn't support `json` yet — JSON is interpreter-only for now"),
         // A fixed-size, two-word value — pointer to the byte data plus an
         // explicit `i64` length, never NUL-terminated-only (a `str`'s
         // bytes are whatever the source literal's escapes resolved to,
