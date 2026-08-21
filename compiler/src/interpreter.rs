@@ -54,6 +54,12 @@ use crate::token::Span;
 /// collide with `serde_json::Value`'s name at every use site.
 use serde_json::Value as JsonDoc;
 
+// Row 12: relying-party identity validation (mock OIDC/JWT).
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use hmac::Mac;
+use sha2::Sha256;
+
 /// Not `Copy` — `Value::Boxed` owns a heap allocation (a real Rust `Box`),
 /// and giving the enum a free bitwise-copy would let two `Value`s alias the
 /// same allocation with neither aware of the other, exactly the hazard
@@ -163,6 +169,13 @@ pub enum Value {
     /// read reason `Value::Str`'s `Arc<str>` already documents — not
     /// affine, freely read many times.
     Json(Arc<JsonDoc>),
+    /// A handle to a real, open database connection (`db_connect(path)` —
+    /// see `Ty::Db`'s doc comment). `Mutex<Option<..>>`, same shape and
+    /// reason as `Value::Tcp`/`Value::File`: `stop` needs to `.take()` the
+    /// connection out exactly once. No custom `Drop` is needed — a
+    /// `rusqlite::Connection` closes its own database handle on drop with
+    /// no help required, the same as every other affine handle here.
+    Db(Arc<Mutex<Option<rusqlite::Connection>>>),
     /// A `struct` value (Row 11) — the declared struct's name plus its
     /// field values, positional, in declaration order (construction is
     /// positional-only — `ast::StructDecl`'s doc comment). `Arc<[Value]>`,
@@ -535,6 +548,7 @@ impl PartialEq for Value {
             (Value::Tcp(a), Value::Tcp(b)) => Arc::ptr_eq(a, b),
             (Value::TcpListener(a), Value::TcpListener(b)) => Arc::ptr_eq(a, b),
             (Value::Json(a), Value::Json(b)) => a == b,
+            (Value::Db(a), Value::Db(b)) => Arc::ptr_eq(a, b),
             (Value::Struct(an, af), Value::Struct(bn, bf)) => an == bn && af == bf,
             (Value::Enum(an, av, af), Value::Enum(bn, bv, bf)) => an == bn && av == bv && af == bf,
             _ => false,
@@ -561,6 +575,7 @@ impl Value {
             Value::TcpListener(_) => "tcp_listener",
             Value::File(_) => "file",
             Value::Json(_) => "json",
+            Value::Db(_) => "db",
             // A generic tag, not the real declared name — every real call
             // site that needs the *actual* struct/enum name already has
             // the `Ty::Named`/`Value::Struct`/`Value::Enum` name field
@@ -599,6 +614,7 @@ impl Value {
             Value::TcpListener(_) => "tcp_listener(..)".to_string(),
             Value::File(_) => "file(..)".to_string(),
             Value::Json(doc) => format!("json({doc})"),
+            Value::Db(_) => "db(..)".to_string(),
             Value::Struct(name, fields) => {
                 format!("{name}({})", fields.iter().map(Value::render).collect::<Vec<_>>().join(", "))
             }
@@ -813,6 +829,172 @@ fn json_field<'a>(doc: &'a JsonDoc, key: &str) -> Result<&'a JsonDoc, String> {
         None => Err(format!("expected a JSON object, found {}", json_kind(doc))),
         Some(obj) => obj.get(key).ok_or_else(|| format!("no field `{key}`")),
     }
+}
+
+// ---- Row 12: relying-party identity helpers --------------------------------
+
+/// Row 12 mock OIDC/JWT validation. The token format is
+/// `base64url(header).base64url(payload).base64url(signature)` with an
+/// HMAC-SHA256 signature checked against a key drawn from the supplied JWKS
+/// JSON. This is a deliberately narrow, self-contained demo of the relying-
+/// party pattern: Nirdosha validates an externally-issued token, never mints
+/// one, and returns the result as a `VerifiedIdentity` value.
+fn validate_oidc_token(token: &str, expected_issuer: &str, expected_audience: &str, jwks_json: &str) -> Result<Value, String> {
+    let mut parts = token.split('.');
+    let header_b64 = parts.next().ok_or_else(|| "malformed JWT: missing header".to_string())?;
+    let payload_b64 = parts.next().ok_or_else(|| "malformed JWT: missing payload".to_string())?;
+    let signature_b64 = parts.next().ok_or_else(|| "malformed JWT: missing signature".to_string())?;
+    if parts.next().is_some() {
+        return Err("malformed JWT: too many segments".to_string());
+    }
+
+    let header_json = String::from_utf8(
+        URL_SAFE_NO_PAD
+            .decode(header_b64)
+            .map_err(|_| "malformed JWT: header is not valid base64url".to_string())?,
+    )
+    .map_err(|_| "malformed JWT: header is not valid UTF-8".to_string())?;
+    let header: JsonDoc = serde_json::from_str(&header_json).map_err(|e| format!("malformed JWT header: {e}"))?;
+
+    let kid = header
+        .get("kid")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "malformed JWT: header has no `kid`".to_string())?
+        .to_string();
+
+    let payload_json = String::from_utf8(
+        URL_SAFE_NO_PAD
+            .decode(payload_b64)
+            .map_err(|_| "malformed JWT: payload is not valid base64url".to_string())?,
+    )
+    .map_err(|_| "malformed JWT: payload is not valid UTF-8".to_string())?;
+    let payload: JsonDoc = serde_json::from_str(&payload_json).map_err(|e| format!("malformed JWT payload: {e}"))?;
+
+    let iss = json_field(&payload, "iss")?.as_str().ok_or_else(|| "claim `iss` is not a string".to_string())?;
+    let aud = json_field(&payload, "aud")?.as_str().ok_or_else(|| "claim `aud` is not a string".to_string())?;
+    let sub = json_field(&payload, "sub")?.as_str().ok_or_else(|| "claim `sub` is not a string".to_string())?;
+    let exp = json_field(&payload, "exp")?
+        .as_i64()
+        .ok_or_else(|| "claim `exp` is not an integer".to_string())?;
+    let iat = json_field(&payload, "iat")?
+        .as_i64()
+        .ok_or_else(|| "claim `iat` is not an integer".to_string())?;
+
+    if iss != expected_issuer {
+        return Err(format!("untrusted issuer: expected `{expected_issuer}`, found `{iss}`"));
+    }
+    if aud != expected_audience {
+        return Err(format!("wrong audience: expected `{expected_audience}`, found `{aud}`"));
+    }
+
+    let jwks: JsonDoc = serde_json::from_str(jwks_json).map_err(|e| format!("malformed JWKS: {e}"))?;
+    let key = jwks_key(&jwks, &kid)?;
+    let signed_input = format!("{header_b64}.{payload_b64}").into_bytes();
+    let expected_sig = hmac_sha256_base64url(&key, &signed_input);
+    if signature_b64 != expected_sig {
+        return Err("invalid JWT signature".to_string());
+    }
+
+    // Retain every claim except the registered OIDC ones for later
+    // role/claim extraction.
+    let mut claims = serde_json::Map::new();
+    if let JsonDoc::Object(map) = &payload {
+        for (k, v) in map {
+            if !matches!(k.as_str(), "iss" | "aud" | "sub" | "exp" | "iat") {
+                claims.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    let claims_json = serde_json::to_string(&JsonDoc::Object(claims)).unwrap_or_else(|_| "{}".to_string());
+
+    Ok(verified_identity_value(sub, iss, aud, exp, iat, &claims_json))
+}
+
+fn jwks_key(jwks: &JsonDoc, kid: &str) -> Result<Vec<u8>, String> {
+    let keys = jwks.get("keys").and_then(|k| k.as_array()).ok_or_else(|| "JWKS has no `keys` array".to_string())?;
+    for k in keys {
+        let k_kid = k.get("kid").and_then(|v| v.as_str()).unwrap_or("");
+        if k_kid == kid {
+            let b64 = k.get("k").and_then(|v| v.as_str()).ok_or_else(|| format!("JWKS key `{kid}` has no `k`"))?;
+            return URL_SAFE_NO_PAD.decode(b64).map_err(|_| format!("JWKS key `{kid}` is not valid base64url"));
+        }
+    }
+    Err(format!("JWKS has no key with kid `{kid}`"))
+}
+
+fn hmac_sha256_base64url(key: &[u8], message: &[u8]) -> String {
+    let mut mac = hmac::Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take any key length");
+    mac.update(message);
+    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
+fn verified_identity_value(subject: &str, issuer: &str, audience: &str, expires_at: i64, issued_at: i64, claims_json: &str) -> Value {
+    Value::Struct(
+        Arc::from("VerifiedIdentity"),
+        Arc::from(vec![
+            Value::Str(Arc::from(subject)),
+            Value::Str(Arc::from(issuer)),
+            Value::Str(Arc::from(audience)),
+            Value::Int(expires_at),
+            Value::Int(issued_at),
+            Value::Str(Arc::from(claims_json)),
+        ]),
+    )
+}
+
+// ---- DB, layer 1: SQLite (`Ty::Db`'s doc comment) --------------------------
+
+/// `db_query`'s implementation — runs a row-returning statement (`SELECT`)
+/// and returns every row as one JSON object (column name → value), the
+/// whole result set as a JSON array. Reusing `Ty::Json` here rather than
+/// inventing a `Ty::Row`/table type is the same move JSON's own design
+/// already made for arrays/objects: no growable Nirdosha-level collection
+/// type exists (`Vector`/`Matrix` are fixed-size), so a query's row count —
+/// which is a runtime value, not a compile-time-known dimension — has
+/// nowhere else to live. The caller navigates it with the same
+/// `json_array_len`/`json_array_get`/`json_get_*` builtins any other JSON
+/// document uses.
+fn db_query(conn: &rusqlite::Connection, sql: &str) -> Value {
+    let result: rusqlite::Result<JsonDoc> = (|| {
+        let mut stmt = conn.prepare(sql)?;
+        let column_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        let rows = stmt.query_map([], |row| db_row_to_json(row, &column_names))?;
+        let rows: rusqlite::Result<Vec<JsonDoc>> = rows.collect();
+        Ok(JsonDoc::Array(rows?))
+    })();
+    match result {
+        Ok(doc) => result_ok(Value::Json(Arc::new(doc))),
+        Err(e) => result_err(e.to_string()),
+    }
+}
+
+/// One row → one JSON object, column name to value. SQLite's own dynamic
+/// typing (`rusqlite::types::Value`) maps onto JSON's own dynamic typing
+/// almost exactly — `Null`/`Integer`/`Real`/`Text` all have a direct JSON
+/// counterpart. `Blob` doesn't (this language has no `bytes` type — same
+/// gap `Ty::Tcp`/`Ty::File`'s own doc comments already name): represented
+/// as a lowercase-hex string rather than dropped or erroring, so a `Blob`
+/// column is still *readable*, just not round-trippable back into SQL from
+/// Nirdosha yet — a real, narrow, named limitation, not silently assumed
+/// away.
+fn db_row_to_json(row: &rusqlite::Row, column_names: &[String]) -> rusqlite::Result<JsonDoc> {
+    let mut map = serde_json::Map::with_capacity(column_names.len());
+    for (i, name) in column_names.iter().enumerate() {
+        let value: rusqlite::types::Value = row.get(i)?;
+        let json_value = match value {
+            rusqlite::types::Value::Null => JsonDoc::Null,
+            rusqlite::types::Value::Integer(n) => JsonDoc::from(n),
+            rusqlite::types::Value::Real(f) => {
+                serde_json::Number::from_f64(f).map(JsonDoc::Number).unwrap_or(JsonDoc::Null)
+            }
+            rusqlite::types::Value::Text(s) => JsonDoc::String(s),
+            rusqlite::types::Value::Blob(bytes) => {
+                JsonDoc::String(bytes.iter().map(|b| format!("{b:02x}")).collect())
+            }
+        };
+        map.insert(name.clone(), json_value);
+    }
+    Ok(JsonDoc::Object(map))
 }
 
 /// Builds the raw request bytes `http_request`/`https_request` both send
@@ -1680,6 +1862,101 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
             };
             Ok(https_request(host, *port, "POST", path, Some(body)))
         }
+        // Row 12: relying-party identity builtins.
+        "oidc_validate_token" => {
+            let (Value::Str(token), Value::Str(expected_issuer), Value::Str(expected_audience), Value::Str(jwks_json)) =
+                (&args[0], &args[1], &args[2], &args[3])
+            else {
+                unreachable!("typeck.rs already proved these are four strs")
+            };
+            match validate_oidc_token(token, expected_issuer, expected_audience, jwks_json) {
+                Ok(v) => Ok(result_ok(v)),
+                Err(e) => Ok(result_err(e)),
+            }
+        }
+        "check_role" => {
+            let (Value::Struct(_, fields), Value::Str(role)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved identity:VerifiedIdentity and role:str")
+            };
+            // Field index 5 is `claims_json`.
+            let claims_json = match &fields[5] {
+                Value::Str(s) => s,
+                _ => unreachable!("VerifiedIdentity.claims_json is str"),
+            };
+            let result: Result<Value, String> = (|| {
+                let claims: JsonDoc = serde_json::from_str(claims_json).map_err(|e| format!("bad claims json: {e}"))?;
+                let roles = json_field(&claims, "roles")?.as_array().ok_or_else(|| "`roles` is not an array".to_string())?;
+                if roles.iter().any(|v| v.as_str() == Some(role.as_ref())) {
+                    Ok(Value::Struct(Arc::from("RoleView"), Arc::from(vec![Value::Str(Arc::from(role.clone()))])))
+                } else {
+                    Err(format!("insufficient role: `{role}`"))
+                }
+            })();
+            match result {
+                Ok(v) => Ok(result_ok(v)),
+                Err(e) => Ok(result_err(e)),
+            }
+        }
+        "extract_claim" => {
+            let (Value::Struct(_, fields), Value::Str(claim_name)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved identity:VerifiedIdentity and name:str")
+            };
+            let claims_json = match &fields[5] {
+                Value::Str(s) => s,
+                _ => unreachable!("VerifiedIdentity.claims_json is str"),
+            };
+            let result: Result<Value, String> = (|| {
+                let claims: JsonDoc = serde_json::from_str(claims_json).map_err(|e| format!("bad claims json: {e}"))?;
+                let v = json_field(&claims, claim_name)?;
+                let s = v.as_str().ok_or_else(|| format!("claim `{claim_name}` is not a string"))?;
+                Ok(Value::Struct(Arc::from("ClaimView"), Arc::from(vec![Value::Str(Arc::from(s))])))
+            })();
+            match result {
+                Ok(v) => Ok(result_ok(v)),
+                Err(e) => Ok(result_err(e)),
+            }
+        }
+        "identity_expired" => {
+            let (Value::Struct(_, fields), Value::Int(now)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved identity:VerifiedIdentity and now:i64")
+            };
+            let expires_at = match &fields[3] {
+                Value::Int(n) => *n,
+                _ => unreachable!("VerifiedIdentity.expires_at is i64"),
+            };
+            Ok(Value::Bool(*now > expires_at))
+        }
+        // DB, layer 1 (`Ty::Db`'s doc comment).
+        "db_connect" => {
+            let Value::Str(path) = &args[0] else { unreachable!("typeck.rs already proved this is a str") };
+            match rusqlite::Connection::open(path.as_ref()) {
+                Ok(conn) => Ok(result_ok(Value::Db(Arc::new(Mutex::new(Some(conn)))))),
+                Err(e) => Ok(result_err(e.to_string())),
+            }
+        }
+        "db_query" => {
+            let (Value::Db(slot), Value::Str(sql)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are db and str")
+            };
+            let guard = slot.lock().unwrap();
+            match guard.as_ref() {
+                None => Ok(result_err("this db connection was already stopped")),
+                Some(conn) => Ok(db_query(conn, sql)),
+            }
+        }
+        "db_execute" => {
+            let (Value::Db(slot), Value::Str(sql)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are db and str")
+            };
+            let guard = slot.lock().unwrap();
+            match guard.as_ref() {
+                None => Ok(result_err("this db connection was already stopped")),
+                Some(conn) => match conn.execute(sql, []) {
+                    Ok(affected) => Ok(result_ok(Value::Int(affected as i64))),
+                    Err(e) => Ok(result_err(e.to_string())),
+                },
+            }
+        }
         _ => unreachable!("ast::BUILTIN_NAMES and eval_builtin's match must stay in sync"),
     }
 }
@@ -2046,6 +2323,7 @@ impl Interpreter {
             (Value::TcpListener(_), Ty::TcpListener) => Ok(()),
             (Value::File(_), Ty::File) => Ok(()),
             (Value::Json(_), Ty::Json) => Ok(()),
+            (Value::Db(_), Ty::Db) => Ok(()),
             (Value::Float(_), Ty::F64) => Ok(()),
             (Value::Vector(elems), Ty::Vector(elem_ty, n)) => {
                 if elems.len() != *n {
@@ -2692,6 +2970,14 @@ impl Interpreter {
                     // above — a `std::fs::File` closes its own descriptor
                     // on drop with no help required.
                     Value::File(slot) => {
+                        drop(slot.lock().unwrap().take());
+                        Ok(Value::Unit)
+                    }
+                    // Same "just drop it, double-stop is Unit not an
+                    // error" treatment as `Value::Tcp`/`Value::File` above
+                    // — a `rusqlite::Connection` closes its own database
+                    // handle on drop with no help required.
+                    Value::Db(slot) => {
                         drop(slot.lock().unwrap().take());
                         Ok(Value::Unit)
                     }

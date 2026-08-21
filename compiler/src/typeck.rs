@@ -1100,6 +1100,10 @@ impl<'a> Checker<'a> {
                     // ...and closes an `open(path, mode)` handle — same
                     // one-time consuming close, reused a third time.
                     Ty::File => Ty::Unit,
+                    // ...and closes a `db_connect(path)` handle — same
+                    // one-time consuming close, reused a fourth time
+                    // (`Ty::Db`'s doc comment).
+                    Ty::Db => Ty::Unit,
                     other => {
                         self.error(TypeErrorKind::ExpectedSandboxType { found: other }, *span);
                         Ty::Error
@@ -2009,6 +2013,44 @@ impl<'a> Checker<'a> {
                 self.check(&args[2], &Ty::Str, expected_ret, scopes); // path
                 result_of(Ty::Named("HttpResponse".to_string(), vec![]))
             }
+            // Row 12: identity as a relying party.
+            ("oidc_validate_token", 4) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes); // token
+                self.check(&args[1], &Ty::Str, expected_ret, scopes); // expected_issuer
+                self.check(&args[2], &Ty::Str, expected_ret, scopes); // expected_audience
+                self.check(&args[3], &Ty::Str, expected_ret, scopes); // jwks_json
+                result_of(Ty::Named("VerifiedIdentity".to_string(), vec![]))
+            }
+            ("check_role", 2) => {
+                self.check(&args[0], &Ty::Named("VerifiedIdentity".to_string(), vec![]), expected_ret, scopes);
+                self.check(&args[1], &Ty::Str, expected_ret, scopes);
+                result_of(Ty::Named("RoleView".to_string(), vec![]))
+            }
+            ("extract_claim", 2) => {
+                self.check(&args[0], &Ty::Named("VerifiedIdentity".to_string(), vec![]), expected_ret, scopes);
+                self.check(&args[1], &Ty::Str, expected_ret, scopes);
+                result_of(Ty::Named("ClaimView".to_string(), vec![]))
+            }
+            ("identity_expired", 2) => {
+                self.check(&args[0], &Ty::Named("VerifiedIdentity".to_string(), vec![]), expected_ret, scopes);
+                self.check(&args[1], &Ty::I64, expected_ret, scopes);
+                Ty::Bool
+            }
+            // DB, layer 1 (`Ty::Db`'s doc comment).
+            ("db_connect", 1) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes); // path
+                result_of(Ty::Db)
+            }
+            ("db_query", 2) => {
+                self.check(&args[0], &Ty::Db, expected_ret, scopes);
+                self.check(&args[1], &Ty::Str, expected_ret, scopes); // sql
+                result_of(Ty::Json)
+            }
+            ("db_execute", 2) => {
+                self.check(&args[0], &Ty::Db, expected_ret, scopes);
+                self.check(&args[1], &Ty::Str, expected_ret, scopes); // sql
+                result_of(Ty::I64)
+            }
             _ => {
                 for a in args {
                     self.infer(a, expected_ret, scopes);
@@ -2029,8 +2071,9 @@ impl<'a> Checker<'a> {
     fn builtin_arity_hint(&self, name: &str) -> usize {
         match name {
             "dot" | "cross" | "solve" | "json_get" | "json_get_str" | "json_get_i64" | "json_get_f64"
-            | "json_get_bool" | "json_array_get" => 2,
+            | "json_get_bool" | "json_array_get" | "check_role" | "extract_claim" | "db_query" | "db_execute" => 2,
             "http_get" | "https_get" => 3,
+            "oidc_validate_token" => 4,
             "http_post" | "https_post" => 4,
             _ => 1,
         }

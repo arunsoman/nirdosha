@@ -270,6 +270,15 @@ fn builtin_return_ty(name: &str) -> Option<Ty> {
         "http_get" | "http_post" | "https_get" | "https_post" => {
             Some(result_of(Ty::Named("HttpResponse".to_string(), vec![])))
         }
+        // Row 12: identity builtins all return Result(_, str) over a prelude
+        // struct so `match` exhaustiveness can be resolved without a general
+        // builtin type-inference table.
+        "oidc_validate_token" => Some(result_of(Ty::Named("VerifiedIdentity".to_string(), vec![]))),
+        "check_role" => Some(result_of(Ty::Named("RoleView".to_string(), vec![]))),
+        "extract_claim" => Some(result_of(Ty::Named("ClaimView".to_string(), vec![]))),
+        "db_connect" => Some(result_of(Ty::Db)),
+        "db_query" => Some(result_of(Ty::Json)),
+        "db_execute" => Some(result_of(Ty::I64)),
         _ => None,
     }
 }
@@ -544,9 +553,24 @@ impl<'a> Checker<'a> {
                 self.touch_expr(lhs, true);
                 self.touch_expr(rhs, true);
             }
-            Expr::Call(_, args, _) => {
-                for a in args {
-                    self.touch_expr(a, true);
+            Expr::Call(name, args, _) => {
+                for (i, a) in args.iter().enumerate() {
+                    // `db_query`/`db_execute`'s connection argument is
+                    // read, not consumed -- the same "read, don't move"
+                    // treatment `Expr::Accept`'s listener operand and
+                    // `Expr::Send`'s channel operand already get for
+                    // their own dedicated `Expr` nodes. `db`-typed
+                    // builtins are ordinary `Expr::Call`s instead
+                    // (`Ty::Json`'s doc comment: "a new builtin, not a
+                    // new grammar form" is Row 11's newer pattern), so
+                    // this is the one place that treatment needs a
+                    // per-builtin exception by name to stay usable more
+                    // than once — a real connection is meant to run many
+                    // queries, the same way a `tcp`/`file` handle is
+                    // meant to `send`/`recv` many times before its one
+                    // `stop` (`Ty::Db`'s doc comment).
+                    let consume = !(i == 0 && matches!(name.as_str(), "db_query" | "db_execute"));
+                    self.touch_expr(a, consume);
                 }
             }
             Expr::Transact { network, verify, commit, compensate, log, .. } => {

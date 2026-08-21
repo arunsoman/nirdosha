@@ -171,6 +171,26 @@ pub enum Ty {
     /// accessor returns `Ty::Named("Result", [_, Ty::Str])` — a real
     /// Nirdosha value, not a Rust-level trap.
     Json,
+    /// A handle to a real, open database connection (`db_connect(path)` —
+    /// see `Expr::Call`'s `"db_connect"` arm). Affine, for the same reason
+    /// `Ty::Tcp`/`Ty::File` are: a connection has exactly one owner, and
+    /// `stop`ping it (reusing `Expr::StopSandbox`'s keyword — see its doc
+    /// comment) is a one-time consuming close, the fourth type to join
+    /// that reuse after `sandbox`/`tcp`/`file`. `db_query`/`db_execute`
+    /// read through the handle the same way `send`/`recv` read through a
+    /// `tcp`/`file` one — the handle itself isn't consumed by an
+    /// individual query, only by `stop`. Layer 1 targets SQLite
+    /// specifically (`rusqlite`, "bundled" — statically linked, no system
+    /// `libsqlite3` dependency): embedded, no server process, so every
+    /// test that needs one can be fully self-contained, the same
+    /// discipline every other affine-handle feature's tests already
+    /// follow. A different backend (Postgres, named explicitly as a
+    /// future layer) would be a new `db_connect`-recognized connection
+    /// *string* scheme, not a new `Ty` — the Nirdosha-facing surface
+    /// (`db_connect`/`db_query`/`db_execute`/`stop`, results always
+    /// `Ty::Json`) stays the same regardless of which real driver crate
+    /// answers it underneath.
+    Db,
     /// A user-declared `struct`/`enum` name, plus its concrete type
     /// arguments (`nirdosha_row11_amendment.md` — Row 11, layer 6:
     /// generics). `Point` is `Named("Point", [])`; `Pair(i64, str)` is
@@ -218,6 +238,7 @@ impl Ty {
             "tcp_listener" => Ty::TcpListener,
             "file" => Ty::File,
             "json" => Ty::Json,
+            "db" => Ty::Db,
             _ => return None,
         })
     }
@@ -250,6 +271,7 @@ impl Ty {
             Ty::TcpListener => "tcp_listener".to_string(),
             Ty::File => "file".to_string(),
             Ty::Json => "json".to_string(),
+            Ty::Db => "db".to_string(),
             Ty::Named(name, args) if args.is_empty() => name.clone(),
             Ty::Named(name, args) => {
                 format!("{name}({})", args.iter().map(Ty::name).collect::<Vec<_>>().join(", "))
@@ -274,6 +296,7 @@ impl Ty {
                 | Ty::TcpListener
                 | Ty::File
                 | Ty::Json
+                | Ty::Db
                 | Ty::Named(_, _)
                 | Ty::F64
                 | Ty::Vector(_, _)
@@ -338,7 +361,7 @@ impl Ty {
         // computation at once, so it has to be freely copyable — see its
         // own doc comment for where the actual ownership-transfer happens
         // instead (a channel's *payload*, at `send`, not the handle).
-        matches!(self, Ty::Box(_) | Ty::Thread(_) | Ty::Sandbox | Ty::Tcp | Ty::TcpListener | Ty::File)
+        matches!(self, Ty::Box(_) | Ty::Thread(_) | Ty::Sandbox | Ty::Tcp | Ty::TcpListener | Ty::File | Ty::Db)
     }
 
     /// goal.md row 4's runtime fallback (Tier 2, §4): `interpreter.rs`
@@ -395,6 +418,7 @@ impl Ty {
             | Ty::TcpListener
             | Ty::File
             | Ty::Json
+            | Ty::Db
             | Ty::Named(_, _)
             | Ty::F64
             | Ty::Vector(_, _)
@@ -521,15 +545,46 @@ pub fn prelude_enums() -> Vec<EnumDecl> {
 /// positionally, in this exact order.
 pub fn prelude_structs() -> Vec<StructDecl> {
     let span = Span { line: 0, col: 0 };
-    vec![StructDecl {
-        name: "HttpResponse".to_string(),
-        type_params: vec![],
-        fields: vec![
-            Field { name: "status".to_string(), ty: Ty::I64 },
-            Field { name: "body".to_string(), ty: Ty::Str },
-        ],
-        span,
-    }]
+    vec![
+        StructDecl {
+            name: "HttpResponse".to_string(),
+            type_params: vec![],
+            fields: vec![
+                Field { name: "status".to_string(), ty: Ty::I64 },
+                Field { name: "body".to_string(), ty: Ty::Str },
+            ],
+            span,
+        },
+        // Row 12: first-class identity consumption. VerifiedIdentity is the
+        // common abstraction produced by protocol adapters; it is freely
+        // copyable (no affine fields). RoleView/ClaimView are runtime proofs
+        // that a role check or claim extraction was performed.
+        StructDecl {
+            name: "VerifiedIdentity".to_string(),
+            type_params: vec![],
+            fields: vec![
+                Field { name: "subject".to_string(), ty: Ty::Str },
+                Field { name: "issuer".to_string(), ty: Ty::Str },
+                Field { name: "audience".to_string(), ty: Ty::Str },
+                Field { name: "expires_at".to_string(), ty: Ty::I64 },
+                Field { name: "issued_at".to_string(), ty: Ty::I64 },
+                Field { name: "claims_json".to_string(), ty: Ty::Str },
+            ],
+            span,
+        },
+        StructDecl {
+            name: "RoleView".to_string(),
+            type_params: vec![],
+            fields: vec![Field { name: "role".to_string(), ty: Ty::Str }],
+            span,
+        },
+        StructDecl {
+            name: "ClaimView".to_string(),
+            type_params: vec![],
+            fields: vec![Field { name: "value".to_string(), ty: Ty::Str }],
+            span,
+        },
+    ]
 }
 
 /// `goal.md`'s "Effects" synthesis layer (row 4, 9) — `PROTOLANG_PORT.md`'s
@@ -1190,6 +1245,30 @@ pub const BUILTIN_NAMES: &[&str] = &[
     // hand-rolled, per PROTOLANG_PORT.md's std_io §12 stance.
     "https_get",
     "https_post",
+    // Row 12: identity as a relying party. The runtime validates tokens
+    // issued by external IdPs and returns an unforgeable-in-the-type-system
+    // VerifiedIdentity. `oidc_validate_token` performs mock OIDC/JWT
+    // signature validation against a supplied JWKS JSON string; `check_role`
+    // and `extract_claim` derive views from the verified claims.
+    "oidc_validate_token",
+    "check_role",
+    "extract_claim",
+    "identity_expired",
+    // DB, layer 1: SQLite only (`rusqlite`, "bundled" -- statically
+    // linked, no system `libsqlite3`). `Ty::Db`'s doc comment has the
+    // full design; the short version: one connection handle, `stop`-able
+    // like `tcp`/`file`/`sandbox`, and results always `Ty::Json` (no
+    // growable-collection type needed for a query's row count -- the
+    // same reasoning that already shaped JSON's own design applies here
+    // for free). `db_connect(path)` -- `":memory:"` is a real SQLite path
+    // meaning "in-memory," not special-cased here. `db_query` is for
+    // row-returning statements (`SELECT`); `db_execute` is for
+    // everything else (`INSERT`/`UPDATE`/`DELETE`/DDL), returning the
+    // affected-row count. Every fallible one returns `Result(_, str)`,
+    // same convention as JSON/HTTP.
+    "db_connect",
+    "db_query",
+    "db_execute",
 ];
 
 pub fn is_builtin(name: &str) -> bool {

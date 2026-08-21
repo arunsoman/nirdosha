@@ -73,7 +73,7 @@ below:
 | 5.3 | `all` / `race` / `background` | **Partially native** | `spawn`+`join` gets `all`'s "wait for every result" today (spawn N, join each). `race` (first successful result) and `background`-as-fire-and-forget-with-later-await have no direct equivalent, but both are thin sugar over `spawn`/`chan`/`join` a program can already write by hand; not worth new syntax until a real program needs it repeated enough to hurt (row 6's actual test), which no Nirdosha program has yet. |
 | 6 | Null safety (`Option<T>`, `?.`, `??`) | **Partially shipped** | `Option(T)` itself is real (`nirdosha_row11_amendment.md`'s prelude, layer 7) — `let x: Option(i64) = Some(5)`/`None()`, matched exhaustively. `?.`/`??` (optional-chaining/null-coalescing *syntax*) aren't built — those are sugar over a `match`, a separate, smaller follow-on with no motivating example yet, not blocked on anything. See "The next prerequisite" below for how this got unblocked. |
 | 7 | Linear types & resource management | **Already native** | This is `ownership.rs`, already stronger in one respect: it's a real static move-checker across branches and loop iterations (`LANGUAGE.md` §6, `GRAMMAR.md`'s soundness-bug note), not just "the compiler tracks linearity." `box`/`thread`/`sandbox`/`tcp`/`tcp_listener` are exactly ProtoLang §7's linear resources. Borrowing (`&`) exists; `&mut` doesn't yet (`GRAMMAR.md`), narrower than ProtoLang §7.2 but a real gap already tracked there, not new information from this exercise. |
-| 8 | Type-safe database queries | **Rejected** | Needs a schema-loading compiler stage, `Record`-typed query results, and compile-time SQL parsing — three prerequisites Nirdosha doesn't have and that aren't motivated by any of `goal.md`'s ten rows. If Nirdosha ever gets a database story, `std_io`'s §7 (below) is the right layer to revisit it from, not this. |
+| 8 | Type-safe database queries | **Rejected** (compile-time-checked queries specifically); **runtime DB connectivity shipped separately** | The *compile-time-checked* version this row actually asks for — a schema-loading compiler stage, `Record`-typed query results validated against that schema at compile time — is still rejected; none of those three prerequisites exist, and Row 11 (structs) doesn't supply the schema-loading or compile-time-SQL-parsing half. What did ship, as `std_io` §7's revisit below explains, is ordinary *runtime* DB connectivity — a real, useful, much smaller thing than this row describes, not a relabeling of it. |
 | 9 | State-dependent types (protocols) | **Already native, narrower** | ProtoLang needs a `protocol`/`state`/`transition` type-former because its types (`Connection`, `File`, `TcpSocket`) are otherwise state-blind. Nirdosha's affine handles get the load-bearing half of this for free: `tcp`/`tcp_listener`/`sandbox` are each already "closed then open then closed," and the move-checker already rejects use-after-`stop`/use-after-`join` — which *is* "cannot call `send` on a closed connection," just enforced as an affine-consumption fact instead of a state-transition fact. What Nirdosha's version can't express that ProtoLang's can: a handle with more than two states, or state-specific *methods* (different operations legal in different states) — genuinely needs the general type-former (§9's `protocol`), so multi-state handles beyond open/closed are **blocked** on the same prerequisite as `Option<T>`. |
 | 9.4 | Session types (protocol duality) | **Rejected** | No two-party protocol in Nirdosha today has more than the request/response shape `tcp` already gives untyped; formalizing duality-checking is real research-scale work (see `goal.md`'s own honest rating of Idris2/Verona) for a need that hasn't appeared yet. |
 | 10 | Configuration as code | **Blocked** on sum types (partially) | A *flat* version (top-level typed named constants, `env("X") ?? "default"`-shaped) doesn't strictly need records — `ServiceConfig`'s single-level fields could be individual `let`-like declarations. But `env()`'s honest return type is `Option<str>` (an env var may not be set), so even the flat version wants `Option` first. Revisit once `Option` lands. |
@@ -100,7 +100,7 @@ below:
 | 4 | TCP / UDP / Unix sockets | **Mostly already native** | TCP client+server (`connect`/`listen`/`accept`/`stop`, `send`/`recv` reused) already exists (`LANGUAGE.md` §7). UDP and Unix domain sockets as a *user-facing* type don't exist (Unix sockets are already used *internally* for sandboxed `chan` IPC, just not exposed) — **deferred**, real but no example program has asked for either yet. |
 | 5 | HTTP / HTTPS | **Both shipped (plain client + TLS client)** | See "Locked design 4: HTTP" below. The original blocker (a real `str`-manipulation story) turned out to be avoidable for a first cut: `http_get`/`http_post`/`https_get`/`https_post` are Rust-native builtins over the same `tcp` substrate, not a Nirdosha-source-level parser built from string primitives — so no `str` concatenation/slicing was actually needed. HTTPS uses `native-tls` (a real, considered dependency decision — bundling the platform's own TLS via OpenSSL/Schannel/SecureTransport rather than a pure-Rust reimplementation), doing the actual security-critical work (certificate-chain and hostname verification) via its own vetted defaults, exactly the "vetted library binding, not hand-rolled" stance this document already committed to. |
 | 6 | WebSockets | **Rejected**, for now | Same substrate argument as HTTP, one layer further out; blocked on HTTP being worth doing first. |
-| 7 | Database / SQL as I/O | **Rejected** | Same verdict as reference-spec §8, restated here because `std_io` re-poses it as "just I/O" — it isn't just I/O, it needs compile-time schema access, which is its own subsystem. |
+| 7 | Database / SQL as I/O | **Shipped, narrower than either verdict above anticipated** | See "Locked design 5: DB" below. `db_connect`/`db_query`/`db_execute` treat a database exactly as I/O after all — no compile-time schema access, no query validation, `sql` is an opaque `str` checked only at runtime (by the database engine itself, the same way a malformed HTTP request or unparseable JSON is only ever caught at runtime, never statically). What makes this "just I/O" honest, where the reference-spec §8 entry above says it can't be: results come back as `Ty::Json`, wrapped in `Result` (Row 11 layer 7) — no `Record`/schema type needed, the same move JSON's own design already made for the same reason. |
 | 8.1 | Standard streams (`stdin`/`stdout`/`stderr`) | **Port now**, small | `print` already covers `stdout` for every practical Nirdosha program today. A `read_line()` builtin (stdin) is a two-line addition once `file`'s `recv`-reuse pattern exists — folded into the file I/O design below rather than given its own section, since it's the same mechanism (a pre-opened, un-closeable `file`-shaped handle). |
 | 8.2 | Child process I/O (stdin/stdout/stderr streams) | **Already native, narrower** | `sandbox` already gives a real child-process handle with `stop` returning its exit code (`LANGUAGE.md` §7). Piping the child's stdout back as a `Reader` isn't built — `chan`-over-sandbox already gives typed cross-process communication for programs *written in Nirdosha itself*; piping an arbitrary external command's stdout is a different, deferred ask (no example program launches a non-Nirdosha binary today). |
 | 8.3 | Pipes | **Rejected** | `chan` already is Nirdosha's in-process pipe (typed, safer than raw bytes); an OS-level anonymous pipe has no motivating use case `chan` doesn't already cover. |
@@ -548,6 +548,91 @@ half-close signal at all, over either transport.
 5. **Compiled backend is out of scope until the interpreter version is
    proven** — `http_get`/`http_post`/`https_get`/`https_post` join the
    existing interpreter-only list, not an exception to it.
+
+---
+
+## Locked design 5: DB
+
+**Status: shipped (21 Aug 2026), layer 1 (SQLite only).**
+`db_connect`/`db_query`/`db_execute` are real, tested
+(`compiler/tests/db.rs`, `compiler/examples/db.nir`), interpreter-only.
+
+### What it brings to the table, and why "one driver per vendor, one uniform surface" instead of "one driver for everything"
+
+There's no single wire protocol or query language spanning relational,
+document, and graph databases — Postgres, MySQL, MongoDB, and Neo4j each
+speak their own protocol and their own query language, and even ODBC/
+JDBC (the closest real precedent for "one driver, many databases") only
+unify the relational subset. So the design here isn't "one driver for
+every kind of database" — that isn't achievable without inventing a
+protocol none of these vendors actually speak — it's one **uniform
+Nirdosha-facing surface** (`db_connect`/`db_query`/`db_execute`/`stop`,
+results always `Ty::Json`) over a real, vetted native driver crate per
+backend, the same "vetted library binding, not hand-rolled" stance this
+document already committed to for TLS. Layer 1 wires up exactly one
+backend, SQLite, via `rusqlite` ("bundled": SQLite compiled from source
+and statically linked, no system `libsqlite3` dependency — the same
+"fully self-contained, no external service" property this project's own
+test discipline already requires everywhere else). Adding Postgres later
+(named as layer 2, not attempted here) means wiring up `tokio-postgres`
+behind the same four function names — a small, isolated addition, never
+a rearchitecture, because the Nirdosha-facing shape doesn't change.
+
+`db_query` is for row-returning statements (`SELECT`); `db_execute` is
+for everything else (`INSERT`/`UPDATE`/`DELETE`/DDL), returning the
+affected-row count. Both return `Result(_, str)` (Row 11 layer 7) — a
+connection failure, a SQL syntax error, a constraint violation, are all
+`Err(message)`, never a trap; the database engine's own error message is
+passed straight through, not re-interpreted. `db_query`'s result reuses
+`Ty::Json` rather than inventing a `Ty::Row`/table type — the same move
+JSON's own design already made: there's no growable Nirdosha-level
+collection type to hold a variable-length row set in otherwise (`Vector`/
+`Matrix` are fixed-size), so a query's row count, a genuine runtime
+value, has nowhere else to live. A caller navigates a result set with
+the exact same `json_array_len`/`json_array_get`/`json_get_*` builtins
+any other JSON document uses — `db` and `json` compose for free, not
+through any special-casing.
+
+`Ty::Db` is affine, the same as `Ty::Tcp`/`Ty::File` — `stop` (reused a
+fourth time) is the one-time consuming close. This surfaced one real,
+general gap while building it: `db_query`/`db_execute` are ordinary
+builtin calls, not the dedicated `Expr` nodes `tcp`/`file`'s `send`/
+`recv` are (Row 11's newer "concrete builtin, not new grammar" pattern —
+`Ty::Json`'s own doc comment), so `ownership.rs`'s generic "every call
+argument is consumed" rule would otherwise have made a connection usable
+exactly once. Fixed with a small, named exception (mirroring the "read,
+don't move" treatment `Expr::Accept`'s listener operand already gets) —
+the first builtin-call-shaped case that needed one, not a general
+mechanism. A **separate, wider gap this doesn't fix**: passing the same
+connection on to more than one *other* function still moves it away from
+the caller, since there's no `&db`-aware borrowing story for `db_query`/
+`db_execute` yet — every query against one connection has to live in a
+single function today. That's a real, general limitation shared by every
+affine handle in this language (`box`/`thread`/`sandbox`/`tcp`/`file`/
+`db` alike), not something new this feature introduced, and not
+attempted here.
+
+### Rollout layers
+
+1. **Shipped.** `db_connect`/`db_query`/`db_execute`, SQLite only
+   (`rusqlite`, "bundled"), results always `Ty::Json`.
+2. **Not shipped, named explicitly.** Postgres (`tokio-postgres`) — the
+   most common real backend for services, but its own tests would need a
+   real running server (Docker or similar), a real gap in this project's
+   self-contained-test discipline that SQLite's embedded nature happens
+   to sidestep for free.
+3. **Not shipped, named explicitly.** Prepared-statement parameter
+   binding (`db_query(conn, "SELECT * FROM t WHERE id = ?", [id])`-
+   shaped) — today's `sql` is one opaque string per call, so a caller has
+   to format values into it themselves (a real SQL-injection footgun for
+   any untrusted input, worth naming honestly rather than glossing over).
+4. **Not shipped, named explicitly.** Document/graph backends (MongoDB,
+   Neo4j) — each would be its own real driver-crate integration and its
+   own connection-string scheme, not a generalization of the relational
+   layer above.
+5. **Compiled backend is out of scope until the interpreter version is
+   proven** — `db_connect`/`db_query`/`db_execute` join the existing
+   interpreter-only list, not an exception to it.
 
 ---
 

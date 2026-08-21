@@ -1,0 +1,45 @@
+// db_connect/db_query/db_execute -- layer 1: SQLite only (rusqlite,
+// "bundled" -- statically linked, no system libsqlite3). One connection
+// handle, stop-able like tcp/file/sandbox; results always read back as
+// json, composing directly with json_get_*/json_array_*.
+
+// A `db` handle is affine (like `tcp`/`file`) and, like them, has no
+// borrowing story yet -- passing it to more than one helper function
+// would move it away from the caller. Every query against one
+// connection lives in a single function for that reason, not split
+// across smaller helpers the way `first_user_name` alone might suggest
+// is possible -- a real, general limitation shared by every affine
+// handle in this language today, not specific to `db`.
+fn extract_name(row: json) -> str {
+    return match json_get_str(row, "name") {
+        Ok(name) => name,
+        Err(e) => e,
+    }
+}
+
+fn run_all(conn: db) -> str {
+    let created: i64 = match db_execute(conn, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let inserted: i64 = match db_execute(conn, "INSERT INTO users (name) VALUES ('ada')") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let name: str = match db_query(conn, "SELECT name FROM users ORDER BY id") {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => extract_name(row),
+            Err(e) => e,
+        },
+        Err(e) => e,
+    }
+    stop conn
+    return name
+}
+
+fn main() -> str {
+    return match db_connect(":memory:") {
+        Ok(conn) => run_all(conn),
+        Err(e) => e,
+    }
+}

@@ -126,7 +126,7 @@ pub struct Token {
 
 const TYPE_NAMES: &[&str] = &[
     "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "f64", "bool", "unit", "str",
-    "tcp", "tcp_listener", "file", "json",
+    "tcp", "tcp_listener", "file", "json", "db",
 ];
 
 #[derive(Debug, Clone)]

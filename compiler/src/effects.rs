@@ -196,6 +196,12 @@ fn builtin_effect(name: &str) -> EffectSet {
         // so a reader doesn't have to wonder whether they were missed).
         "json_parse" | "json_get" | "json_get_str" | "json_get_i64" | "json_get_f64" | "json_get_bool"
         | "json_array_len" | "json_array_get" => {}
+        // Same effect `file`'s `open`/`send`/`recv`/`stop` already get --
+        // SQLite (layer 1's only backend -- `Ty::Db`'s doc comment) is a
+        // local file, not a network service.
+        "db_connect" | "db_query" | "db_execute" => {
+            s.insert(Effect::Io);
+        }
         _ => {}
     }
     s
