@@ -26,6 +26,20 @@ fn parse_checked(src: &str) -> Program {
     program
 }
 
+/// Parse + typecheck only, *without* ownership checking — for codegen-
+/// rejection tests where the rejection is a `check_supported`/`emit_c_main`
+/// concern that fires before any ownership question matters (e.g. an
+/// affine-field struct, which ownership itself doesn't fully track yet —
+/// that's the Phase 4b gap). `emit_llvm_ir` runs `check_supported` first,
+/// so it rejects such a program before its own `compute_free_map` ever
+/// runs.
+fn parse_typed(src: &str) -> Program {
+    let toks = Lexer::new(src).tokenize().expect("lex should succeed");
+    let program = Parser::new(toks).parse_program().expect("parse should succeed");
+    typecheck(&program).expect("should typecheck cleanly");
+    program
+}
+
 /// Compiles `src` to a real native binary in a fresh temp path at the
 /// given optimization level, runs it, and returns its stdout and exit
 /// code. Panics (loudly, with clang's own error) if compilation itself
@@ -160,6 +174,42 @@ fn strings_example_compiles_and_matches_interpreter() {
     assert_eq!(nirdosha::run(src), Ok(nirdosha::interpreter::Value::Unit));
 }
 
+// ---- Phase 1: `main() -> str` compiles directly (used to be rejected,
+// forcing a `print`-then-return-`unit` workaround) ----------------------
+
+#[test]
+fn main_returning_str_directly_compiles_and_prints_it() {
+    let src = r#"
+        fn main() -> str {
+            return "hello from main"
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(stdout, "hello from main\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn main_returning_a_computed_str_directly_compiles_and_matches_interpreter() {
+    let src = r#"
+        fn greet(name: str) -> str {
+            if name == "world" {
+                return "hello world"
+            } else {
+                return name
+            }
+        }
+
+        fn main() -> str {
+            return greet("world")
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(stdout, "hello world\n");
+    assert_eq!(code, 0);
+    assert_eq!(nirdosha::run(src), Ok(nirdosha::interpreter::Value::Str("hello world".into())));
+}
+
 #[test]
 fn empty_string_literal_compiles_and_prints_a_blank_line() {
     let src = r#"
@@ -227,6 +277,127 @@ fn narrow_type_overflow_actually_traps_at_runtime() {
     assert_ne!(code, 0, "100 + 100 overflows i8 -- the compiled binary must not exit 0");
 }
 
+// ---- Phase 1: unsigned integers (u8/u16/u32/u64/usize) ----------------
+//
+// The one real signed-vs-unsigned instruction choice this backend needs
+// is at `widen_to_i64` (a narrower-than-i64 value loaded off the stack
+// must `zext`, not `sext`) -- every downstream op (`+`/`-`/`*`, `<`/`>`,
+// `/`) is computed at i64 width already and stays byte-identical between
+// signed/unsigned once widened correctly, since `Ty::bounds()` caps
+// every unsigned type's legal range at `[0, i64::MAX]` (never touching
+// the sign bit). These tests pick boundary values a wrong `sext` would
+// visibly get wrong (e.g. `200_u8` sign-extends to a *negative* i64 as
+// `i8`, so `200 > 5` and `200 / 5` would both come out wrong), not just
+// values that happen to work either way.
+
+#[test]
+fn u8_comparison_and_division_are_correct_at_a_value_that_would_sign_extend_negative() {
+    let src = r#"
+        fn main() {
+            let a: u8 = 200
+            let b: u8 = 5
+            print(a > b)
+            print(a / b)
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(stdout, "1\n40\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn u16_u32_u64_usize_comparison_and_division_match_interpreter() {
+    let src = r#"
+        fn main() {
+            let c: u16 = 60000
+            let d: u16 = 7
+            print(c > d)
+            print(c / d)
+
+            let e: u32 = 4000000000
+            let f: u32 = 3
+            print(e > f)
+            print(e / f)
+
+            let g: u64 = 9000000000000000000
+            let h: u64 = 2
+            print(g > h)
+            print(g / h)
+
+            let i: usize = 42
+            let j: usize = 5
+            print(i / j)
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(stdout, "1\n8571\n1\n1333333333\n1\n4500000000000000000\n8\n");
+    assert_eq!(code, 0);
+    assert!(nirdosha::run(src).is_ok());
+}
+
+#[test]
+fn u32_addition_above_i32_max_is_correct_not_sign_extended() {
+    // 4000000000 + 100000000 = 4100000000 -- within u32's range (max
+    // 4294967295) but well past i32::MAX (2147483647); a wrong `sext`
+    // widening would corrupt this into a negative i64 before the add.
+    let src = r#"
+        fn add(a: u32, b: u32) -> u32 {
+            return a + b
+        }
+
+        fn main() {
+            print(add(4000000000, 100000000))
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(stdout, "4100000000\n");
+    assert_eq!(code, 0);
+    assert_eq!(nirdosha::run(src), Ok(nirdosha::interpreter::Value::Unit));
+}
+
+#[test]
+fn u8_underflow_traps_at_runtime_same_as_signed_overflow() {
+    let src = r#"
+        fn compute(a: u8, b: u8) -> u8 {
+            return a - b
+        }
+
+        fn main() {
+            print(compute(3, 10))
+        }
+    "#;
+    let (_, code) = compile_and_run(src);
+    assert_ne!(code, 0, "3 - 10 underflows u8 -- the compiled binary must not exit 0");
+}
+
+#[test]
+fn out_of_range_unsigned_literal_is_rejected_statically() {
+    // Unaffected by this phase's codegen change (typeck.rs already
+    // range-checks every integer type generically via `Ty::in_range`) --
+    // included as a regression guard that accepting `u8`/etc. in
+    // codegen didn't loosen this static check.
+    let src = r#"
+        fn main() {
+            let a: u8 = 256
+            print(a)
+        }
+    "#;
+    let toks = nirdosha::token::Lexer::new(src).tokenize().expect("lex should succeed");
+    let program = nirdosha::parser::Parser::new(toks).parse_program().expect("parse should succeed");
+    assert!(nirdosha::typeck::typecheck(&program).is_err(), "256 does not fit in u8, should be a static type error");
+}
+
+#[test]
+fn main_returning_an_unsigned_type_directly_compiles_and_exits_with_that_code() {
+    let src = r#"
+        fn main() -> u8 {
+            return 200
+        }
+    "#;
+    let (_, code) = compile_and_run(src);
+    assert_eq!(code, 200);
+}
+
 #[test]
 fn division_by_zero_traps_at_runtime() {
     let src = r#"
@@ -238,6 +409,203 @@ fn division_by_zero_traps_at_runtime() {
     "#;
     let (_, code) = compile_and_run(src);
     assert_ne!(code, 0, "division by zero must not exit 0");
+}
+
+// ---- Phase 2: `sha256_hex`/`constant_time_str_eq` (linked native calls
+// into a from-scratch SHA-256 in `runtime_kernels.rs`, since that crate
+// has no access to the `sha2` crate `interpreter.rs` uses) -------------
+
+#[test]
+fn sha256_hex_matches_the_standard_test_vector_and_the_interpreter() {
+    // sha256("") -- the standard, independently-verifiable empty-string
+    // test vector, same one `tests/sha256_hex.rs` locks in for the
+    // interpreter.
+    let src = r#"
+        fn main() {
+            print(sha256_hex(""))
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(stdout, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n");
+    assert_eq!(code, 0);
+    assert_eq!(nirdosha::run(src), Ok(nirdosha::interpreter::Value::Unit));
+}
+
+#[test]
+fn sha256_hex_two_arg_form_matches_hashing_the_concatenation() {
+    // `sha256_hex("a", "bc")` must equal `sha256_hex("abc")` -- chaining
+    // two `update`-equivalent calls is mathematically the same as
+    // hashing the concatenation, the property that makes a hash-chained
+    // audit log (`examples/trade-finance/`) expressible at all without
+    // `str` concatenation.
+    let src = r#"
+        fn main() {
+            print(sha256_hex("a", "bc"))
+            print(sha256_hex("abc"))
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], lines[1], "sha256_hex(\"a\",\"bc\") must equal sha256_hex(\"abc\")");
+    assert_eq!(lines[0], "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn sha256_hex_multi_block_message_matches_interpreter() {
+    // A message long enough to force real padding-boundary handling
+    // (55/56/64-byte edge cases inside the from-scratch implementation)
+    // -- cross-checked directly against `hashlib.sha256` in Python
+    // during development, not just against the interpreter, but this
+    // test locks in interpreter parity specifically.
+    let src = r#"
+        fn main() {
+            print(sha256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(stdout, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1\n");
+    assert_eq!(code, 0);
+    assert!(nirdosha::run(src).is_ok());
+}
+
+#[test]
+fn constant_time_str_eq_matches_interpreter_for_equal_unequal_and_different_length() {
+    let src = r#"
+        fn main() {
+            print(constant_time_str_eq("abc", "abc"))
+            print(constant_time_str_eq("abc", "abd"))
+            print(constant_time_str_eq("abc", "ab"))
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(stdout, "1\n0\n0\n");
+    assert_eq!(code, 0);
+    assert!(nirdosha::run(src).is_ok());
+}
+
+// ---- Phase 2: `rand_seed`/`rand_f64`/`rand_gaussian` (a process-wide
+// SplitMix64/Box-Muller stream in `runtime_kernels.rs`) -----------------
+
+#[test]
+fn rand_f64_sum_of_three_draws_matches_interpreter_to_printf_precision() {
+    // A compiled binary's only way to report an `f64` is `print`'s own
+    // `%f` (6 decimal places, same disclosed cosmetic difference every
+    // other `f64` print already has), so this can't literally prove
+    // bit-for-bit equality the way the `runtime_kernels.rs` module doc's
+    // own standalone verification did -- but three independent
+    // SplitMix64-derived draws summed together coincidentally landing
+    // within 1e-6 of the interpreter's full-precision result if the
+    // underlying stream had actually diverged is vanishingly unlikely,
+    // so this is still a strong practical check, honestly described.
+    let src = r#"
+        fn main() -> f64 {
+            rand_seed(42)
+            let a: f64 = rand_f64()
+            let b: f64 = rand_f64()
+            let c: f64 = rand_f64()
+            return a + b + c
+        }
+    "#;
+    let interpreted = nirdosha::run(src).expect("should run cleanly");
+    // `main() -> f64` -- there's no exit-code round trip for a float, so
+    // the compiled side prints it instead, the same "compare real
+    // computed values, not just stdout text" approach as `nirdosha::run`
+    // above.
+    let src2 = r#"
+        fn main() {
+            rand_seed(42)
+            let a: f64 = rand_f64()
+            let b: f64 = rand_f64()
+            let c: f64 = rand_f64()
+            print(a + b + c)
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src2);
+    assert_eq!(code, 0);
+    let compiled_sum: f64 = stdout.trim().parse().expect("stdout should be a float");
+    let nirdosha::interpreter::Value::Float(interpreted_sum) = interpreted else {
+        panic!("expected Ok(Float(..)), got {interpreted:?}")
+    };
+    // `%f` only prints 6 decimal places -- match to that precision
+    // (still far tighter than the values could coincidentally agree to
+    // if the underlying SplitMix64 stream diverged even slightly).
+    assert!(
+        (compiled_sum - interpreted_sum).abs() < 1e-6,
+        "compiled {compiled_sum} vs interpreted {interpreted_sum}"
+    );
+}
+
+#[test]
+fn rand_f64_same_seed_produces_the_same_sequence() {
+    let src = r#"
+        fn main() {
+            rand_seed(1234)
+            let a: f64 = rand_f64()
+            rand_seed(1234)
+            let b: f64 = rand_f64()
+            print(a == b)
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(stdout, "1\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn rand_f64_different_seeds_produce_different_values() {
+    let src = r#"
+        fn main() {
+            rand_seed(1)
+            let a: f64 = rand_f64()
+            rand_seed(2)
+            let b: f64 = rand_f64()
+            print(a != b)
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(stdout, "1\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn rand_gaussian_matches_interpreter_to_printf_precision() {
+    let src_return = r#"
+        fn main() -> f64 {
+            rand_seed(7)
+            return rand_gaussian(100.0, 15.0)
+        }
+    "#;
+    let interpreted = nirdosha::run(src_return).expect("should run cleanly");
+    let nirdosha::interpreter::Value::Float(interpreted_val) = interpreted else {
+        panic!("expected Ok(Float(..)), got {interpreted:?}")
+    };
+    let src_print = r#"
+        fn main() {
+            rand_seed(7)
+            print(rand_gaussian(100.0, 15.0))
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src_print);
+    assert_eq!(code, 0);
+    let compiled_val: f64 = stdout.trim().parse().expect("stdout should be a float");
+    assert!((compiled_val - interpreted_val).abs() < 1e-6, "compiled {compiled_val} vs interpreted {interpreted_val}");
+}
+
+#[test]
+fn rand_f64_before_seed_aborts_at_runtime() {
+    let src = r#"
+        fn main() {
+            print(rand_f64())
+        }
+    "#;
+    let (_, code) = compile_and_run(src);
+    assert_ne!(code, 0, "rand_f64 before rand_seed must not exit 0");
+    match nirdosha::run(src) {
+        Err(msg) => assert!(msg.contains("rand_seed"), "expected an RngNotSeeded error, got: {msg}"),
+        other => panic!("expected a runtime error, got {other:?}"),
+    }
 }
 
 // ---- Tier 1 vs Tier 2 is real in the generated IR, not just documented -
@@ -578,15 +946,17 @@ fn vector_param_and_return_round_trip_through_the_new_abi() {
 fn matrices_example_is_rejected_by_codegen() {
     // As of Phase 3, indexing, elementwise ops, `*`, and `==`/`!=` are
     // all codegen-supported -- `check_supported`'s own structural
-    // pre-pass now accepts this whole program, since it has no type
-    // information to know `print(v)` is printing an aggregate (its
-    // "printable" check is purely syntactic -- not a bool *literal* --
-    // not type-aware; see `is_printable_expr`'s doc comment). The real
-    // remaining boundary is `print(v)`/`print(m)` (printing a whole
-    // Vector/Matrix directly, rather than one indexed element) still
-    // being unsupported, caught by `call()` during actual IR emission,
-    // not by the early pre-pass -- so this test now exercises the full
-    // `build` pipeline instead of `check_supported` alone.
+    // pre-pass now accepts this whole program, since `print`'s
+    // argument-checking there is purely syntactic (no type info
+    // available yet) and no longer rejects anything on its own (bool/
+    // unit arguments are real, codegen-supported cases now too -- see
+    // `Codegen::call`'s `Ty::Bool`/`Ty::Unit` arms). The real remaining
+    // boundary is `print(v)`/`print(m)` (printing a whole Vector/Matrix
+    // directly, rather than one indexed element) still being
+    // unsupported, caught by `call()` during actual IR emission (its
+    // `arg_ty.is_aggregate()` check), not by the early pre-pass -- so
+    // this test now exercises the full `build` pipeline instead of
+    // `check_supported` alone.
     let program = parse_checked(include_str!("../examples/matrices.nir"));
     assert!(
         codegen::check_supported(&program).is_ok(),
@@ -623,6 +993,60 @@ fn linalg_example_is_rejected_by_codegen() {
     let result = codegen::build(&program, &report, &out_path, codegen::OptLevel::O2);
     let _ = std::fs::remove_file(&out_path);
     assert!(result.is_err(), "print(v)/print(m) on a whole Vector/Matrix is still unsupported");
+}
+
+// ---- Phase 1: `print` on `bool`/`unit`, plus the comparison/`noop()`
+// cases the old syntactic-only rejection never actually covered ---------
+
+#[test]
+fn print_on_a_bool_literal_compiles_and_matches_interpreter() {
+    let src = r#"
+        fn main() {
+            print(true)
+            print(false)
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(stdout, "1\n0\n");
+    assert_eq!(code, 0);
+    // Compiled prints `1`/`0`; the interpreter prints `true`/`false` --
+    // a disclosed, cosmetic-only difference (`Codegen::call`'s `Ty::Bool`
+    // arm's doc comment), so this only checks the interpreter itself
+    // doesn't error, not that its stdout matches byte-for-byte.
+    assert!(nirdosha::run(src).is_ok());
+}
+
+#[test]
+fn print_on_a_bool_variable_and_a_comparison_result_compiles_and_runs() {
+    let src = r#"
+        fn main() {
+            let b: bool = true
+            print(b)
+            let x: i64 = 5
+            let y: i64 = 3
+            print(x > y)
+            print(x < y)
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(stdout, "1\n1\n0\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn print_on_a_unit_returning_call_compiles_and_prints_parens() {
+    let src = r#"
+        fn noop() {
+        }
+
+        fn main() {
+            print(noop())
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(stdout, "()\n");
+    assert_eq!(code, 0);
+    assert_eq!(nirdosha::run(src), Ok(nirdosha::interpreter::Value::Unit));
 }
 
 /// Performance smoke test (unified plan §4.3): compiled `f64` arithmetic
@@ -2117,3 +2541,617 @@ fn boxed_function_param_and_return_round_trip() {
     assert_eq!(stdout, capture_interpreted_stdout(src));
     assert_eq!(stdout, "10\n42\n");
 }
+
+// ---- Phase 4a: `struct`/`enum`/`match` codegen (Row 11, non-affine) -------
+//
+// Every test here compiles a real native binary (`clang` is required, same
+// as every other test in this file) and checks its real stdout/exit code
+// against either an explicit expected value or the interpreter's own
+// output for the identical source — the same diff-based parity discipline
+// the `box`/`str`/`Vector` tests above already use. The IR-assertion
+// style mirrors `vector_param_and_return_round_trip_*` (emit IR, grep it
+// for the structural marker the lowering is supposed to produce).
+
+#[test]
+fn non_generic_struct_round_trips_through_a_function_param_and_return() {
+    let src = r#"
+        struct Point {
+            x: f64,
+            y: f64,
+        }
+        fn shift(p: Point) -> Point {
+            return Point(p.x + 1.0, p.y + 2.0)
+        }
+        fn main() {
+            let p: Point = Point(3.0, 4.0)
+            let q: Point = shift(p)
+            print(q.x)
+            print(q.y)
+        }
+    "#;
+    // The named struct type is declared once, and `shift`'s sret return +
+    // by-pointer param are the same calling convention Vector/Matrix use.
+    let ir = emit_ir(src);
+    assert!(ir.contains("%Point = type { double, double }"), "expected a named struct decl:\n{ir}");
+    assert!(ir.contains("define void @shift(ptr %sret.ret, ptr %arg.p)"), "expected sret + by-pointer param:\n{ir}");
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    let lines: Vec<f64> = stdout.lines().map(|l| l.parse().unwrap()).collect();
+    assert_eq!(lines, [4.0, 6.0]);
+}
+
+#[test]
+fn nested_struct_field_access_compiles() {
+    let src = r#"
+        struct Inner {
+            v: i64,
+        }
+        struct Outer {
+            a: Inner,
+            b: i64,
+        }
+        fn main() {
+            let o: Outer = Outer(Inner(7), 3)
+            print(o.a.v)
+            print(o.b)
+        }
+    "#;
+    let ir = emit_ir(src);
+    // A nested named-typed field is declared *before* the outer struct
+    // (dependency order), and the outer struct's body references it.
+    assert!(ir.contains("%Inner = type { i64 }"), "expected the nested struct declared:\n{ir}");
+    assert!(ir.contains("%Outer = type { %Inner, i64 }"), "expected the outer struct to reference the inner:\n{ir}");
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "7\n3\n");
+}
+
+#[test]
+fn enum_match_with_scalar_result_compiles_and_matches_interpreter() {
+    let src = r#"
+        enum Shape {
+            Circle(f64),
+            Rectangle(f64, f64),
+        }
+        fn area(s: Shape) -> f64 {
+            return match s {
+                Circle(r) => 3.14159 * r * r,
+                Rectangle(w, h) => w * h,
+            }
+        }
+        fn main() {
+            let c: Shape = Circle(2.0)
+            let r: Shape = Rectangle(3.0, 4.0)
+            print(area(c))
+            print(area(r))
+        }
+    "#;
+    let ir = emit_ir(src);
+    // Enum lowers to `{ i64 tag, [N x i64] payload }` and dispatches via
+    // a real `switch` on the tag word.
+    assert!(ir.contains("%Shape = type { i64, ["), "expected a tagged-union enum type:\n{ir}");
+    assert!(ir.contains("switch i64"), "expected a `switch` on the variant tag:\n{ir}");
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    let lines: Vec<f64> = stdout.lines().map(|l| l.parse().unwrap()).collect();
+    assert!((lines[0] - 12.56636).abs() < 1e-6, "Circle area: {lines:?}");
+    assert!((lines[1] - 12.0).abs() < 1e-6, "Rectangle area: {lines:?}");
+}
+
+#[test]
+fn option_some_none_round_trip_through_match() {
+    let src = r#"
+        fn unwrap_or(o: Option(i64), default: i64) -> i64 {
+            return match o {
+                Some(n) => n,
+                None => default,
+            }
+        }
+        fn main() {
+            print(unwrap_or(Some(5), 0))
+            print(unwrap_or(None(), 99))
+            print(unwrap_or(Some(42), -1))
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, capture_interpreted_stdout(src));
+    assert_eq!(stdout, "5\n99\n42\n");
+}
+
+#[test]
+fn result_ok_err_round_trip_through_match() {
+    let src = r#"
+        fn classify(r: Result(i64, str)) -> str {
+            return match r {
+                Ok(v) => "ok",
+                Err(e) => e,
+            }
+        }
+        fn main() {
+            print(classify(Ok(7)))
+            print(classify(Err("nope")))
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, capture_interpreted_stdout(src));
+    assert_eq!(stdout, "ok\nnope\n");
+}
+
+#[test]
+fn literal_match_over_i64_compiles() {
+    let src = r#"
+        fn describe(n: i64) -> i64 {
+            return match n {
+                1 => 10,
+                2 => 20,
+                _ => 999,
+            }
+        }
+        fn main() {
+            print(describe(1))
+            print(describe(2))
+            print(describe(3))
+            print(describe(-5))
+        }
+    "#;
+    let ir = emit_ir(src);
+    assert!(ir.contains("switch i64"), "expected an integer `switch`:\n{ir}");
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "10\n20\n999\n999\n");
+}
+
+#[test]
+fn literal_match_over_bool_compiles() {
+    let src = r#"
+        fn flip(b: bool) -> i64 {
+            return match b {
+                true => 1,
+                _ => 0,
+            }
+        }
+        fn main() {
+            print(flip(true))
+            print(flip(false))
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n0\n");
+}
+
+#[test]
+fn literal_match_over_str_compiles() {
+    let src = r#"
+        fn greet(role: str) -> str {
+            return match role {
+                "admin" => "hi admin",
+                "user" => "hi user",
+                _ => "unknown",
+            }
+        }
+        fn main() {
+            print(greet("admin"))
+            print(greet("user"))
+            print(greet("zzz"))
+        }
+    "#;
+    // `str` has no native switch — the lowering is a sequential
+    // `nir_str_eq`-then-`br` chain, one comparison per literal arm.
+    let ir = emit_ir(src);
+    assert!(ir.contains("@nir_str_eq"), "expected `nir_str_eq` calls for the str match:\n{ir}");
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, capture_interpreted_stdout(src));
+    assert_eq!(stdout, "hi admin\nhi user\nunknown\n");
+}
+
+#[test]
+fn structs_enums_example_compiles_and_matches_the_interpreter_value() {
+    // The canonical Row 11 example — `Point`/`Shape`, fully non-affine.
+    // Its `main` returns `f64`, so the compiled binary's exit code is
+    // `fptosi` of the returned value (this backend's documented `main ->
+    // f64` convention, `emit_c_main`); the interpreter returns the full
+    // `Value::Float`. Both express the same underlying value, confirmed
+    // against each other here the same way `floats_example_*` cross-
+    // checks the `%f`-formatted stdout.
+    let src = include_str!("../examples/structs_enums.nir");
+    let (_stdout, code) = compile_and_run(src);
+    // 29.56636 truncated toward zero (fptosi) is 29.
+    assert_eq!(code, 29);
+    match nirdosha::run(src) {
+        Ok(nirdosha::interpreter::Value::Float(n)) => {
+            assert!((n - 29.56636).abs() < 1e-9, "interpreter value: {n}");
+            assert_eq!(n.trunc() as i32, code, "compiled exit code should be the trunc of the interpreter's value");
+        }
+        other => panic!("expected Ok(Float), got {other:?}"),
+    }
+}
+
+#[test]
+fn generic_struct_construction_and_field_access_compiles() {
+    let src = r#"
+        struct Wrapper(T) {
+            v: T,
+        }
+        fn main() {
+            let w: Wrapper(i64) = Wrapper(7)
+            print(w.v)
+            let s: Wrapper(str) = Wrapper("hi")
+            print(s.v)
+        }
+    "#;
+    let ir = emit_ir(src);
+    // Two distinct concrete instantiations get two distinct mangled
+    // named types, since their layouts differ.
+    assert!(ir.contains("%Wrapper$i64 = type { i64 }"), "expected the i64 instantiation:\n{ir}");
+    assert!(ir.contains("%Wrapper$str = type { {ptr, i64} }"), "expected the str instantiation (a nested ptr/i64 two-word field):\n{ir}");
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "7\nhi\n");
+}
+
+#[test]
+fn generic_option_with_match_and_nested_construction_compiles() {
+    let src = r#"
+        fn double(o: Option(i64)) -> i64 {
+            return match o {
+                Some(n) => n + n,
+                None => 0,
+            }
+        }
+        fn main() {
+            print(double(Some(21)))
+            print(double(None()))
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, capture_interpreted_stdout(src));
+    assert_eq!(stdout, "42\n0\n");
+}
+
+#[test]
+fn enum_payload_with_multiple_fields_binds_correctly() {
+    let src = r#"
+        enum NumPair {
+            Both(i64, i64),
+            Empty,
+        }
+        fn total(p: NumPair) -> i64 {
+            return match p {
+                Both(a, b) => a + b,
+                Empty => 0,
+            }
+        }
+        fn main() {
+            print(total(Both(3, 4)))
+            print(total(Empty()))
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, capture_interpreted_stdout(src));
+    assert_eq!(stdout, "7\n0\n");
+}
+
+#[test]
+fn match_as_return_value_in_a_typed_function() {
+    let src = r#"
+        enum Sign {
+            Pos,
+            Neg,
+            Zero,
+        }
+        fn label(s: Sign) -> str {
+            return match s {
+                Pos => "p",
+                Neg => "n",
+                Zero => "z",
+            }
+        }
+        fn main() {
+            print(label(Pos()))
+            print(label(Neg()))
+            print(label(Zero()))
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "p\nn\nz\n");
+}
+
+// ---- Aggregate-result `if`/`match` control flow ------------------------
+
+#[test]
+fn if_returns_a_vector_from_both_branches() {
+    let src = r#"
+        fn main() -> i64 {
+            let c: bool = true
+            let v: Vector(i64, 3) = if c { Vector(1, 2, 3) } else { Vector(4, 5, 6) }
+            return v[0]
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n");
+}
+
+#[test]
+fn if_returns_a_struct_from_both_branches() {
+    let src = r#"
+        struct Point {
+            x: f64,
+            y: f64,
+        }
+        fn main() -> f64 {
+            let c: bool = false
+            let p: Point = if c { Point(1.0, 2.0) } else { Point(3.0, 4.0) }
+            return p.x
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "3.000000\n");
+}
+
+#[test]
+fn nested_aggregate_if_compiles() {
+    let src = r#"
+        struct Point {
+            x: f64,
+            y: f64,
+        }
+        fn main() -> f64 {
+            let a: bool = true
+            let b: bool = false
+            let p: Point = if a { if b { Point(1.0, 1.0) } else { Point(2.0, 2.0) } } else { Point(3.0, 3.0) }
+            return p.y
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "2.000000\n");
+}
+
+#[test]
+fn match_returns_a_vector_from_literal_arms() {
+    let src = r#"
+        fn main() -> i64 {
+            let n: i64 = 2
+            let v: Vector(i64, 2) = match n {
+                1 => Vector(10, 11),
+                2 => Vector(20, 21),
+                _ => Vector(30, 31),
+            }
+            return v[1]
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "21\n");
+}
+
+#[test]
+fn match_returns_a_struct_from_enum_arms() {
+    let src = r#"
+        struct Point {
+            x: f64,
+            y: f64,
+        }
+        enum Shape {
+            Circle(f64),
+            Rect(f64, f64),
+        }
+        fn pick(s: Shape) -> Point {
+            return match s {
+                Circle(r) => Point(r, 0.0),
+                Rect(w, h) => Point(w, h),
+            }
+        }
+        fn main() -> f64 {
+            let p: Point = pick(Rect(5.0, 7.0))
+            return p.y
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "7.000000\n");
+}
+
+// ---- Affine-field structs/enums (`box` and `tcp`) -----------------------
+
+#[test]
+fn box_field_struct_round_trips_through_param_and_return() {
+    let src = r#"
+        struct Wrapper {
+            b: box i64,
+        }
+        fn get_value(w: Wrapper) -> i64 {
+            return *w.b
+        }
+        fn main() -> i64 {
+            let w: Wrapper = Wrapper(box 42)
+            return get_value(w)
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "42\n");
+}
+
+#[test]
+fn box_field_struct_freed_in_a_tight_loop() {
+    let src = r#"
+        struct Wrapper {
+            b: box i64,
+        }
+        fn make(n: i64) -> Wrapper {
+            return Wrapper(box n)
+        }
+        fn main() -> i64 {
+            let i: i64 = 0
+            let sum: i64 = 0
+            while i < 1000 {
+                let w: Wrapper = make(i)
+                sum = sum + *w.b
+                i = i + 1
+            }
+            return sum
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    // sum of 0..999 = 999*1000/2 = 499500
+    assert_eq!(stdout, "499500\n");
+}
+
+#[test]
+fn extracting_an_affine_field_moves_the_whole_struct() {
+    let src = r#"
+        struct Wrapper {
+            b: box i64,
+        }
+        fn main() -> i64 {
+            let w: Wrapper = Wrapper(box 7)
+            let b: box i64 = w.b
+            return *b
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "7\n");
+}
+
+#[test]
+fn enum_with_box_payload_compiles_and_frees() {
+    let src = r#"
+        enum OptBox {
+            Some(box i64),
+            None,
+        }
+        fn get_or_zero(o: OptBox) -> i64 {
+            return match o {
+                Some(v) => *v,
+                None => 0,
+            }
+        }
+        fn main() -> i64 {
+            let o: OptBox = Some(box 9)
+            return get_or_zero(o)
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "9\n");
+}
+
+#[test]
+fn match_arm_with_unused_box_payload_frees_it() {
+    let src = r#"
+        enum OptBox {
+            Some(box i64),
+            None,
+        }
+        fn main() -> i64 {
+            let o: OptBox = Some(box 123)
+            match o {
+                Some(v) => {
+                    return 1
+                }
+                None => {
+                    return 0
+                }
+            }
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n");
+}
+
+#[test]
+fn nested_box_inside_struct_field_frees_both_layers() {
+    let src = r#"
+        struct Outer {
+            inner: box box i64,
+        }
+        fn main() -> i64 {
+            let x: box i64 = box 5
+            let o: Outer = Outer(x)
+            return **o.inner
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "5\n");
+}
+
+// ---- Phase 4b boundary: an unsupported-affine-containing struct is still rejected ---
+
+#[test]
+fn a_struct_with_an_unsupported_affine_field_is_rejected_by_codegen() {
+    let src = r#"
+        struct Bad {
+            f: file,
+        }
+        fn use_bad(b: Bad) -> i64 {
+            return 0
+        }
+        fn main() -> i64 {
+            return 0
+        }
+    "#;
+    let program = parse_typed(src);
+    let report = analyze(&program);
+    let err = codegen::emit_llvm_ir(&program, &report)
+        .expect_err("an unsupported-affine-field struct must be rejected, not mis-compiled");
+    assert!(
+        err.to_string().contains("affine") || err.to_string().contains("file"),
+        "the rejection should name the affine/file reason, got: {}",
+        err
+    );
+}
+
+#[test]
+fn an_enum_with_an_unsupported_affine_payload_is_rejected_by_codegen() {
+    let src = r#"
+        enum Bad {
+            Wrapped(file),
+            Empty,
+        }
+        fn use_bad(b: Bad) -> i64 {
+            return 0
+        }
+        fn main() -> i64 {
+            return 0
+        }
+    "#;
+    let program = parse_typed(src);
+    let report = analyze(&program);
+    assert!(
+        codegen::emit_llvm_ir(&program, &report).is_err(),
+        "an enum with an unsupported affine payload must be rejected, not mis-compiled"
+    );
+}
+
+#[test]
+fn main_returning_a_struct_is_rejected_cleanly() {
+    let src = r#"
+        struct Point {
+            x: f64,
+            y: f64,
+        }
+        fn main() -> Point {
+            return Point(1.0, 2.0)
+        }
+    "#;
+    let program = parse_typed(src);
+    let report = analyze(&program);
+    let err = codegen::emit_llvm_ir(&program, &report)
+        .expect_err("`main` returning a struct should be rejected (no sensible exit code)");
+    assert!(err.to_string().contains("struct"), "got: {err}");
+}
+...

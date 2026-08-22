@@ -492,10 +492,19 @@ fn an_enum_payload_that_is_affine_makes_the_whole_enum_affine() {
     assert!(check_ownership(&program).is_err(), "moving `w` twice must be a static use-after-move error");
 }
 
-// ---- codegen: interpreter-only, rejected not mis-compiled -------------------
+// ---- codegen: Phase 4a — non-affine struct/enum/match now COMPILE ----
+// (This was the "interpreter-only, rejected not mis-compiled" guard for
+// the whole of Row 11 before Phase 4a; the affine-containing case is the
+// real remaining gap and gets its own rejection test in
+// `tests/codegen.rs` (`an_affine_field_struct_is_rejected_*`). A bare
+// non-affine struct with `f64` fields and a `.field` access is exactly the
+// 4a common case — flip the old blanket rejection to a positive
+// `check_supported` + `emit_llvm_ir` both-succeed check here; the full
+// compile-and-run parity for `structs_enums.nir` lives in
+// `tests/codegen.rs`.)
 
 #[test]
-fn struct_enum_programs_are_rejected_by_codegen_not_silently_miscompiled() {
+fn non_affine_struct_program_is_accepted_by_codegen() {
     let src = r#"
         struct Point {
             x: f64,
@@ -508,7 +517,15 @@ fn struct_enum_programs_are_rejected_by_codegen_not_silently_miscompiled() {
     "#;
     let program = parse_ok(src);
     typecheck(&program).expect("should typecheck cleanly");
-    assert!(nirdosha::codegen::check_supported(&program).is_err());
+    assert!(
+        nirdosha::codegen::check_supported(&program).is_ok(),
+        "Phase 4a: a non-affine struct program should pass check_supported"
+    );
+    let report = nirdosha::smt::analyze(&program);
+    assert!(
+        nirdosha::codegen::emit_llvm_ir(&program, &report).is_ok(),
+        "Phase 4a: a non-affine struct program should emit LLVM IR cleanly"
+    );
 }
 
 // ---- worked example ----------------------------------------------------------

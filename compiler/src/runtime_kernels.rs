@@ -246,6 +246,156 @@ fn kf_update(
     Some((x_new, p_new))
 }
 
+// ---- sha256_hex kernel ----------------------------------------------------
+//
+// A from-scratch FIPS 180-4 SHA-256 implementation, not a binding to the
+// `sha2` crate `interpreter.rs`'s own `sha256_hex`/`sha256_hex_chain`
+// use — this file is compiled as an isolated `rustc --crate-type
+// staticlib` invocation with no `--extern` flags (`build.rs`'s doc
+// comment), so it has no access to Cargo dependencies at all, only
+// `std`. Verified bit-for-bit against `interpreter.rs`'s `sha2`-backed
+// output for the empty string, ASCII text, and the exact two-part
+// chained form `sha256_hex_chain` uses (`compiler/tests/sha256_hex.rs`),
+// not just against the standard's own published test vectors.
+
+const SHA256_H0: [u32; 8] =
+    [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98,
+    0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+    0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8,
+    0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819,
+    0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+    0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+    0xc67178f2,
+];
+
+/// One 64-byte block's worth of compression, updating `state` in place —
+/// the algorithm's actual core (message-schedule expansion, 64 mixing
+/// rounds), everything else in this section is padding/framing around
+/// this.
+fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
+    let mut w = [0u32; 64];
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes([block[4 * i], block[4 * i + 1], block[4 * i + 2], block[4 * i + 3]]);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+    }
+
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+    for i in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let temp1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(SHA256_K[i]).wrapping_add(w[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = s0.wrapping_add(maj);
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(temp1);
+        d = c;
+        c = b;
+        b = a;
+        a = temp1.wrapping_add(temp2);
+    }
+
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
+    state[4] = state[4].wrapping_add(e);
+    state[5] = state[5].wrapping_add(f);
+    state[6] = state[6].wrapping_add(g);
+    state[7] = state[7].wrapping_add(h);
+}
+
+/// Hashes `a` followed by `b` as one continuous message (`b` empty is
+/// the 1-arg `sha256_hex(s)` case; `b` non-empty is the 2-arg
+/// `sha256_hex(prev_hash, payload)` chained form) — streaming both
+/// buffers through the same padding/block state the way multiple
+/// `Sha256::update` calls on one hasher already do in
+/// `interpreter.rs`, since hashing "a then b" one block at a time is
+/// mathematically identical to hashing the concatenation `a ++ b` in
+/// one pass; there's no need to actually concatenate them into a new
+/// buffer first (which `str`'s lack of a concatenation operator
+/// wouldn't let calling Nirdosha code do anyway — this streaming
+/// approach is what makes that a non-issue at the kernel level too).
+fn sha256(a: &[u8], b: &[u8]) -> [u8; 32] {
+    let mut state = SHA256_H0;
+    let total_len = (a.len() + b.len()) as u64;
+
+    let mut block = [0u8; 64];
+    let mut filled = 0usize;
+    for &byte in a.iter().chain(b.iter()) {
+        block[filled] = byte;
+        filled += 1;
+        if filled == 64 {
+            sha256_compress(&mut state, &block);
+            filled = 0;
+        }
+    }
+
+    // Padding: a single `1` bit (0x80, since messages here are always a
+    // whole number of bytes), then zero bits, then the original message
+    // length in bits as a big-endian 64-bit integer -- padded so the
+    // total is a multiple of 64 bytes, with the length always the final
+    // 8 bytes of the final block, same as every other SHA-256
+    // implementation's framing (FIPS 180-4 §5.1.1).
+    block[filled] = 0x80;
+    filled += 1;
+    if filled > 56 {
+        for b in &mut block[filled..64] {
+            *b = 0;
+        }
+        sha256_compress(&mut state, &block);
+        filled = 0;
+    }
+    for b in &mut block[filled..56] {
+        *b = 0;
+    }
+    let bit_len = total_len.wrapping_mul(8);
+    block[56..64].copy_from_slice(&bit_len.to_be_bytes());
+    sha256_compress(&mut state, &block);
+
+    let mut out = [0u8; 32];
+    for (i, word) in state.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// Lowercase hex encoding, matching `interpreter.rs`'s own
+/// `format!("{b:02x}")` per byte exactly.
+fn hex_encode(bytes: &[u8], out: &mut [u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (i, &b) in bytes.iter().enumerate() {
+        out[2 * i] = HEX[(b >> 4) as usize];
+        out[2 * i + 1] = HEX[(b & 0x0f) as usize];
+    }
+}
+
+/// The interpreter's own `constant_time_eq`, line-for-line: length
+/// mismatch is a real, immediate difference (a real, accepted timing
+/// leak of *length* — the property this function actually protects is
+/// "don't leak *which byte* differs"), otherwise XOR-accumulate every
+/// byte pair with no early exit.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 // ---- extern "C" boundary -----------------------------------------------
 //
 // Every pointer here is trusted, not validated: typeck.rs already proved
@@ -489,6 +639,129 @@ pub unsafe extern "C" fn nir_tcp_stop(fd: i64) -> i32 {
     0
 }
 
+// ---- sha256_hex / constant_time_str_eq extern boundary --------------------
+//
+// Backs the `sha256_hex(s)`/`sha256_hex(prev_hash, payload)` and
+// `constant_time_str_eq(a, b)` builtins. `codegen.rs`'s caller passes
+// `b_len: 0` for the 1-arg `sha256_hex` form -- `b_len == 0` never
+// dereferences `b_ptr` (`&[]` instead of `slice::from_raw_parts` on it),
+// so whatever codegen happens to pass as `b_ptr` in that case (a null
+// pointer constant is fine) never has to be a real, valid pointer.
+//
+// **`sha256_hex`'s output buffer is heap-allocated via `nir_alloc` and
+// never freed.** `Ty::Str` isn't affine (`Ty::is_affine`'s doc comment)
+// -- nothing in `ownership.rs`'s `FreeMap` tracks a `str` binding's last
+// use the way it does for `box`, so there's no scope-closing point for
+// codegen to hook a matching `nir_free` onto even if this function
+// wanted one. A real, disclosed, permanent leak (one 64-byte allocation
+// per `sha256_hex` call), not a silent one -- the same "state it here
+// rather than leave it implicit" discipline `box`'s own allocator used
+// before its own free-hookup phase existed, except here there is no
+// later phase that closes this one: making `str` affine to fix it would
+// be a real, unrelated language change (every existing `str` use --
+// literals, params, returns, `print` -- currently assumes freely-
+// copyable, unowned `str` values), not a small follow-up.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nir_sha256_hex(a_ptr: *const u8, a_len: i64, b_ptr: *const u8, b_len: i64, out: *mut u8) {
+    let a = unsafe { std::slice::from_raw_parts(a_ptr, a_len as usize) };
+    let b: &[u8] = if b_len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(b_ptr, b_len as usize) } };
+    let digest = sha256(a, b);
+    let out = unsafe { std::slice::from_raw_parts_mut(out, 64) };
+    hex_encode(&digest, out);
+}
+
+/// `1` if the two buffers are equal, `0` otherwise -- see
+/// `constant_time_eq`'s own doc comment for exactly what "constant-time"
+/// does and doesn't mean here.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nir_constant_time_str_eq(a_ptr: *const u8, a_len: i64, b_ptr: *const u8, b_len: i64) -> i32 {
+    let a = unsafe { std::slice::from_raw_parts(a_ptr, a_len as usize) };
+    let b = unsafe { std::slice::from_raw_parts(b_ptr, b_len as usize) };
+    constant_time_eq(a, b) as i32
+}
+
+// ---- rand_seed/rand_f64/rand_gaussian kernel -------------------------------
+//
+// `interpreter.rs`'s own `RngState`, line-for-line (SplitMix64 for the
+// underlying stream, Box-Muller for `rand_gaussian`) -- deliberately
+// re-derived here rather than shared, for the same reason every other
+// kernel in this file is: no access to `interpreter.rs` across the
+// isolated-staticlib compilation boundary (`build.rs`'s doc comment).
+// Verified bit-for-bit against the interpreter's actual output for a
+// fixed seed, not just against a re-reading of the same algorithm
+// description (`compiler/tests/codegen.rs`'s `rand_*` tests).
+//
+// **Process-wide state, not per-"instance."** The interpreter's own
+// `RngState` is deliberately *not* a global (its doc comment: "carried
+// in the interpreter environment, not a global," so independent/
+// concurrent interpreter runs never share a stream) -- but a compiled
+// Nirdosha binary has exactly one logical owner for this state per
+// process: `thread`/`spawn` aren't compiled yet (`LANGUAGE.md` §10), so
+// there's only ever one thread to own it, making a process-wide static
+// the honest equivalent of "this process's one `Interpreter` instance,"
+// not a shortcut around the interpreter's own stated reasoning.
+static RAND_SEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RAND_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn splitmix64_next(state: &std::sync::atomic::AtomicU64) -> u64 {
+    use std::sync::atomic::Ordering;
+    let mut s = state.load(Ordering::Relaxed).wrapping_add(0x9E3779B97F4A7C15);
+    state.store(s, Ordering::Relaxed);
+    s = (s ^ (s >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    s = (s ^ (s >> 27)).wrapping_mul(0x94D049BB133111EB);
+    s ^ (s >> 31)
+}
+
+fn rand_next_f64() -> f64 {
+    (splitmix64_next(&RAND_STATE) >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
+/// Seeds the process-wide stream. `codegen.rs` compiles `rand_seed(n)`
+/// for any integer type `n` (`typeck.rs`'s `t.is_integer()` check) --
+/// every one of them arrives here already widened to `i64` (this
+/// backend's own internal convention, `widen_to_i64`'s doc comment), so
+/// this only ever needs to accept one width.
+#[unsafe(no_mangle)]
+pub extern "C" fn nir_rand_seed(seed: i64) {
+    use std::sync::atomic::Ordering;
+    RAND_STATE.store(seed as u64, Ordering::Relaxed);
+    RAND_SEEDED.store(true, Ordering::Relaxed);
+}
+
+/// Aborts if called before `nir_rand_seed` -- the same "the checker
+/// can't catch this statically, so trap at runtime rather than return a
+/// silently-wrong value" treatment every other unrecoverable runtime
+/// condition in this backend gets (div-by-zero, integer overflow,
+/// `nir_alloc` failure), enforced in Rust here rather than threading an
+/// extra codegen-side branch-and-trap sequence through every call site:
+/// `interpreter.rs`'s own `ErrorKind::RngNotSeeded` is a real, catchable
+/// `RuntimeError` there because the interpreter *can* return one; a
+/// compiled binary's equivalent of "stop, this precondition was
+/// violated" is `abort()`, same as `nir_alloc`'s allocation-failure path
+/// already uses.
+#[unsafe(no_mangle)]
+pub extern "C" fn nir_rand_f64() -> f64 {
+    if !RAND_SEEDED.load(std::sync::atomic::Ordering::Relaxed) {
+        std::process::abort();
+    }
+    rand_next_f64()
+}
+
+/// Same not-yet-seeded guard as `nir_rand_f64`, then the interpreter's
+/// exact Box-Muller transform (`next_f64()` clamped away from `0.0`
+/// before `.ln()`, same sharp-edge note as `RngState::next_gaussian`'s
+/// own doc comment).
+#[unsafe(no_mangle)]
+pub extern "C" fn nir_rand_gaussian(mean: f64, stddev: f64) -> f64 {
+    if !RAND_SEEDED.load(std::sync::atomic::Ordering::Relaxed) {
+        std::process::abort();
+    }
+    let u1 = rand_next_f64().max(f64::MIN_POSITIVE);
+    let u2 = rand_next_f64();
+    let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+    mean + stddev * z0
+}
+
 // ---- box's heap allocator -------------------------------------------------
 //
 // `nir_free(ptr)` takes only a pointer, no size — `codegen.rs`'s
@@ -530,11 +803,13 @@ pub unsafe extern "C" fn nir_alloc(size: i64) -> *mut u8 {
     }
 }
 
-/// Frees a pointer previously returned by `nir_alloc`. Not called by any
-/// codegen'd program yet (`codegen.rs`'s `Expr::Box` doc comment — a
-/// later phase wires the call sites once `ownership.rs`'s move data is
-/// threaded into codegen), but implemented now, correctly, so that later
-/// phase is a pure call-site change against an already-working allocator.
+/// Frees a pointer previously returned by `nir_alloc`. Called for real
+/// by every compiled program that boxes a value: `codegen.rs`'s
+/// `emit_frees_for_names`/`emit_box_free`, driven by `ownership.rs`'s
+/// `FreeMap` (which binding's last use is where), emit this at every
+/// scope-closing point a boxed binding's last use falls in — confirmed
+/// in generated IR (`nirdosha emit-llvm`) for a simple `let`-bound box,
+/// not just assumed from this comment.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nir_free(ptr: *mut u8) {
     if ptr.is_null() {

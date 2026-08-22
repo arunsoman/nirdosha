@@ -4,3 +4,10 @@
 /bench/target
 /benchmarks/c/*_bin*
 /benchmarks/nirdosha/*_bin*
+
+# Generated bundles (kept locally only)
+/all_examples.md
+/nir_files.zip
+
+# Runtime database artifacts
+*.db

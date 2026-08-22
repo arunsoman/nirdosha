@@ -37,7 +37,7 @@ nirdosha emit-ast <file.nir>          # print the parsed AST as JSON
 | Type | Spelling | Affine? | Notes |
 |---|---|---|---|
 | Signed integers | `i8` `i16` `i32` `i64` | no | Range-checked at every `let`/return/assign boundary (runtime; some proven away statically — see §8). |
-| Unsigned integers | `u8` `u16` `u32` `u64` `usize` | no | Same range-checking. **Not compiled** (`codegen.rs` needs a signed-vs-unsigned instruction choice it doesn't make yet). |
+| Unsigned integers | `u8` `u16` `u32` `u64` `usize` | no | Same range-checking. Compiled (§10) — same widths as their signed counterparts; `codegen.rs` needs the signed-vs-unsigned instruction choice in exactly one place, not throughout (every unsigned type's range is capped at `[0, i64::MAX]`, and this backend computes all arithmetic at `i64` width regardless of source width). |
 | Float | `f64` | no | IEEE 754 double. One width — no `f32`, no literal-widening story. Saturates (`inf`/`NaN`), never traps. |
 | Boolean | `bool` | no | |
 | Unit | `unit` | no | No literal syntax — only reachable as a function's implicit return. |
@@ -113,10 +113,9 @@ to write them with). All require `f64` elements unless noted.
 
 **I/O**
 - `print(x)` — any number of args, any type, when interpreted. When
-  *compiled*, a narrower rule applies: a literal `true`/`false` can't be
-  printed directly (a `bool`-typed variable or a comparison result
-  prints fine either way) — a real, narrow codegen gap, not an
-  interpreter restriction.
+  *compiled*, every scalar shape works (integer/`f64`/`str`/`bool`/
+  `unit` — literal, variable, or computed result, all identically); the
+  one remaining gap is a whole `Vector`/`Matrix` argument (§10).
 
 **Dense linear algebra** (Phase 2)
 - `transpose(m: Matrix) -> Matrix` — any element type.
@@ -136,7 +135,7 @@ to write them with). All require `f64` elements unless noted.
 - `is_symmetric(m)` / `is_diag(m)` — square `Matrix(f64,n,n)` only. `is_square(m)` — any `Matrix`, any element type.
 
 **Deterministic simulation** (Phase 3)
-- `rand_seed(seed: <int>)` — resets the interpreter's own RNG stream (SplitMix64; see §9). Required before any draw.
+- `rand_seed(seed: <int>)` — resets the RNG stream (SplitMix64; see §9 — interpreted and compiled each keep their own, per §9/§10). Required before any draw.
 - `rand_f64() -> f64` — uniform `[0, 1)`.
 - `rand_gaussian(mean: f64, stddev: f64) -> f64` — Box-Muller.
 - `distance(a: Vector(f64,3), b: Vector(f64,3)) -> f64` — Euclidean.
@@ -302,8 +301,15 @@ SplitMix64 stream stored **per `Interpreter` instance** (not a process
 global) — same seed, same OS, same run, byte-for-byte identical draws,
 every time. A `spawn`ed function gets its own independent, unseeded RNG
 by default (an honest, documented gap — see `Interpreter::rng`'s doc
-comment). No other source of nondeterminism exists in the language
-(no ambient clock/entropy reads anywhere in the builtin set).
+comment). `nirdosha build`'s compiled version of this (§10) necessarily
+uses a process-wide store instead — there's no "interpreter instance" in
+a native binary — but `thread`/`spawn` aren't compiled yet, so a
+compiled program has exactly one thread to own it regardless, matching
+the interpreter's per-instance guarantee in practice today; that
+equivalence stops holding the moment compiled `thread`/`spawn` lands, at
+which point this needs revisiting, not left as a stale assumption. No
+other source of nondeterminism exists in the language (no ambient
+clock/entropy reads anywhere in the builtin set).
 
 ---
 
@@ -324,23 +330,62 @@ than the reverse.
 
 `nirdosha build`/`emit-llvm` now support:
 
-- `i8`/`i16`/`i32`/`i64`, `bool`, `unit`, `f64` scalars.
+- `i8`/`i16`/`i32`/`i64`, `bool`, `unit`, `f64` scalars, and their
+  unsigned counterparts `u8`/`u16`/`u32`/`u64`/`usize` — same LLVM
+  widths as the signed types. This backend computes all integer
+  arithmetic at `i64` width internally regardless of a value's declared
+  width (widening on load, narrowing back on store), and every unsigned
+  type's legal range is capped at `[0, i64::MAX]` (`Ty::bounds()`,
+  never touching the sign bit) — so the one real signed-vs-unsigned
+  instruction choice this needs is at the widen-on-load step
+  (`zext` for unsigned, `sext` for signed, `codegen.rs::widen_to_i64`);
+  every downstream `+`/`-`/`*`/comparison/`/` is byte-identical between
+  the two once correctly widened, confirmed by compiling and running
+  comparison/division/boundary-value/underflow-trap programs for all
+  five unsigned types, not just reasoned about.
 - All scalar arithmetic/comparison operators, `if`/`while`, function
-  calls (including recursion), `print` on integer/`f64`/`str` args (not
-  yet `bool`/`unit` — a real, narrow gap, not an oversight: no existing
-  example needs it).
+  calls (including recursion), `print` on integer/`f64`/`str`/`bool`/
+  `unit` args — every scalar shape. `print` on a `bool` prints `1`/`0`,
+  not `"true"`/`"false"` (the interpreter's own `render()`) — a
+  disclosed, cosmetic-only difference, not semantic. `print` on a
+  `unit`-typed argument (only reachable via a call to a `-> unit`
+  function — there's no `unit` literal syntax) prints the fixed string
+  `"()"`, matching the interpreter exactly.
 - Tier-1/2 bounds and divide-by-zero guards (elided where proven safe —
   see §8), and `audited`'s suppression of them.
 - **`box`/`&`/`*`** — real heap allocation (`nir_alloc`) *and* real,
   automatic free (`nir_free`) driven by `ownership.rs`'s `FreeMap`
   (`emit_box_free`, called at each binding's last use) — not a leak.
 - **`str`** — literals, `==`/`!=`, use as an `if` condition, `print`,
-  and ordinary (non-`main`) function parameters/returns. One real,
-  narrow gap: `main` itself can't directly `return str` yet (must
-  `print` it instead) — that's the actual caveat, not "`str` is
-  interpreter-only."
+  and function parameters/returns, `main`'s own included: `main() ->
+  str` compiles directly now (prints the returned string and exits 0 —
+  the same `%.*s`-format printf sequence `print` itself uses, since
+  there's no sensible integer exit code for a `str` value the way there
+  is for an integer/`f64` one).
 - **`tcp`/`tcp_listener`** — `connect`/`listen`/`accept`/`send`/`recv`/
   `stop` over real sockets.
+- **`sha256_hex`/`constant_time_str_eq`** — linked calls into a
+  from-scratch SHA-256 in `compiler/src/runtime_kernels.rs` (that file
+  has no access to the `sha2` crate `interpreter.rs` uses — it's
+  compiled as an isolated `rustc --crate-type staticlib` invocation with
+  no `--extern` flags, `build.rs`'s doc comment), verified bit-for-bit
+  against the standard's own test vectors, an independent Python
+  `hashlib.sha256` cross-check at every padding-boundary message length,
+  and the interpreter's `sha2`-backed output. `sha256_hex`'s output
+  buffer is heap-allocated (`nir_alloc`) and never freed — `str` isn't
+  affine, so there's no scope-closing point to hook a matching
+  `nir_free` onto (a real, small, disclosed leak, not a silent one; see
+  `runtime_kernels.rs::nir_sha256_hex`'s doc comment).
+- **`rand_seed`/`rand_f64`/`rand_gaussian`** — the same SplitMix64/
+  Box-Muller algorithm as the interpreter (§9), now with real RNG state
+  in generated code: a process-wide stream in `runtime_kernels.rs`
+  (necessarily process-wide, not per-"instance" the way the interpreter
+  keeps it — §9's determinism section explains why that's an honest
+  equivalent today, and when it stops being one). Calling `rand_f64`/
+  `rand_gaussian` before `rand_seed` aborts the process (`nir_alloc`'s
+  own allocation-failure path is the same precedent), matching the
+  interpreter's `RngNotSeeded` runtime error in spirit, just via
+  `abort()` instead of a catchable `Result`.
 - **`Vector`/`Matrix`, fully** — literals, dynamic (runtime-expression)
   indexing with a proven-or-checked bounds guard, all elementwise operators
   and every legal shape of `*`, `==`/`!=`, and every dense-linear-algebra/
@@ -365,13 +410,34 @@ than the reverse.
   `benchmarks/RESULTS.md`'s Group A "honest asterisk" for the actual numbers
   this produces (Nirdosha beats C on the fully-unrolled operations, loses to
   it on the runtime-library ones).
+- **`struct`/`enum`/`match` (Row 11), non-affine payloads** — construction
+  (an ordinary `Expr::Call`, no dedicated AST node), `expr.field` access,
+  and `match` (both enum-variant arms with a real LLVM `switch` on the
+  declaration-order variant tag, and literal-pattern `str`/`i64`/`bool`
+  arms — `str` as a sequential `nir_str_eq` chain, no native string
+  switch). A `struct`/`enum` lowers to a real named LLVM type: a struct
+  to `{ field_lltys... }` (LLVM computes the real padding), an enum to a
+  hand-rolled `{ i64 tag, [N x i64] payload }` tagged union (`N` a
+  compile-time word count, conservatively over-allocated so the same
+  buffer fits every variant). Generic instantiations get distinct mangled
+  named types (`%Result$i64$str`). **The one real caveat (Phase 4b,
+  deferred):** a `struct`/`enum` whose fields/payloads *transitively*
+  contain an affine type (`box`/`&`/`thread`/`chan`/`tcp`/`file`/`db`/`mq`)
+  is still rejected — freeing an affine field nested inside a struct, or
+  inside a *live* enum variant's payload, needs `ownership.rs`'s `FreeMap`
+  generalized beyond its current `Ty::Box`-only `still_owned_boxes` plus
+  a new `at_match_arm_end` entry for match-bound affine payloads, not
+  attempted in this phase. `check_supported` rejects such a type up front
+  with a message naming the affine/Phase-4b reason, the same
+  "reject, don't mis-compile" treatment every other still-unsupported
+  construct gets.
 
 Interpreter-only (rejected by `check_supported` with a specific reason,
 never silently mis-compiled):
 
-- `u8..usize` (needs a signed/unsigned instruction choice not yet made).
-- `struct`/`enum`/`match` (Row 11) and any `Ty::Named` reaching a
-  param/`let`/return type — the biggest remaining gap.
+- `struct`/`enum`/`match` (Row 11) with an **affine** field/payload
+  (`box`/`&`/`tcp`/`file`/`db`/`mq`, transitively) — the Phase 4b boundary
+  named above; a non-affine `struct`/`enum`/`match` compiles now.
 - `thread`/`spawn`/`join`, `chan`/`send`/`recv` (channel — distinct from
   the already-compiled `tcp`), `sandbox`/`stop`.
 - `file`/`open` (`PROTOLANG_PORT.md`'s file I/O port).
@@ -380,16 +446,13 @@ never silently mis-compiled):
   `check_role(_path)`, `extract_claim(_path)`, sessions, refresh,
   revocation) — the identity ones are additionally blocked on
   `VerifiedIdentity`/`RoleView`/`ClaimView` being structs.
-- `http_get`/`http_post`/`https_get`/`https_post`, `sha256_hex`,
-  `constant_time_str_eq`, `mock_issue_token`, `rand_seed`/`rand_f64`/
-  `rand_gaussian` (no RNG state exists in generated code yet) — every
-  builtin not in `codegen.rs`'s `PHASE4_BUILTINS`/`PHASE5_BUILTINS` lists.
+- `http_get`/`http_post`/`https_get`/`https_post`, `mock_issue_token` —
+  every builtin not in `codegen.rs`'s `PHASE4_BUILTINS`/
+  `PHASE5_BUILTINS`/`STR_CRYPTO_BUILTINS`/`RAND_BUILTINS` lists.
 - `transact`.
 - `fn(..)->..`/`acquire`/`requires(...)` — first-class and privileged
-  functions (§6a), joining this list the same way `struct`/`enum`/`match`
-  (Row 11) already did.
-- `print` on `bool`/`unit` arguments (no existing example needs it).
-- `main` returning `str` directly (must `print` it instead).
+  functions (§6a), joining the affine-field `struct`/`enum`/`match` entry
+  above on this list.
 - `screen`/`dashboard` (§11, Row 12) — consumed only by `nirdosha emit-ui`/
   `nirdosha serve`. Unlike everything else on this list, these aren't
   *rejected* by `nirdosha build`/`emit-llvm` — `codegen.rs` never
@@ -401,10 +464,11 @@ never silently mis-compiled):
 against Julia is now compiled-vs-JIT, not interpreter-vs-JIT — see
 `benchmarks/RESULTS.md` for the re-run numbers (all four Group A benchmarks
 now decisively beat Julia; the historical interpreted numbers are kept there
-too, labeled, for the record). A benchmark touching `struct`/`enum`/`match`,
-`thread`/`chan`/`sandbox`, `file`, `json`/`db`/`mq`, or any Row 12 identity
-builtin is still necessarily interpreted for now — `box`/`tcp`/`str` no
-longer carry that caveat.
+too, labeled, for the record). A benchmark touching an *affine-field*
+`struct`/`enum`/`match`, `thread`/`chan`/`sandbox`, `file`, `json`/`db`/`mq`,
+or any Row 12 identity builtin is still necessarily interpreted for now —
+a non-affine `struct`/`enum`/`match`, and `box`/`tcp`/`str`, no longer carry
+that caveat.
 
 ---
 

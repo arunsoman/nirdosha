@@ -593,14 +593,17 @@ Response (200 OK):
 }
 ```
 
-If the source uses interpreter-only features (Vector, Matrix, etc.):
+If the source uses interpreter-only features (`spawn`/`thread`/`chan`,
+an affine-containing `struct`/`enum`/`match`, `file`, `json`/`db`/`mq`,
+etc. — see `LANGUAGE.md` §10 for the current compiled-vs-interpreter
+boundary):
 ```
 {
   "binary_path": null,
   "error": "UNSUPPORTED_FEATURES",
   "unsupported_features": [
-    { "feature": "Vector", "location": { "line": 2, "col": 10 },
-      "reason": "Vector/Matrix codegen is Phase 4, not yet implemented" }
+    { "feature": "spawn", "location": { "line": 2, "col": 10 },
+      "reason": "codegen doesn't support `thread` yet — spawn/join are interpreter-only for now" }
   ]
 }
 ```
@@ -704,7 +707,7 @@ Response (200 OK):
   "builtins": [
     { "name": "print", "signature": "print(..args) -> unit",
       "category": "io", "compiled": "partial",
-      "notes": "bool literal can't be printed when compiled" },
+      "notes": "every scalar shape (int/f64/str/bool/unit) prints when compiled; a whole Vector/Matrix argument does not" },
 
     { "name": "dot", "signature": "dot(a: Vector(T, N), b: Vector(T, N)) -> T",
       "category": "linalg", "compiled": false,
@@ -720,13 +723,13 @@ Response (200 OK):
       "errors": ["SingularMatrix"] },
 
     { "name": "rand_seed", "signature": "rand_seed(seed: <int>) -> unit",
-      "category": "simulation", "compiled": false,
-      "notes": "Resets interpreter RNG. Required before any draw." },
+      "category": "simulation", "compiled": true,
+      "notes": "Resets the RNG stream (process-wide when compiled, per-Interpreter-instance when interpreted). Required before any draw." },
 
     { "name": "rand_gaussian",
       "signature": "rand_gaussian(mean: f64, stddev: f64) -> f64",
-      "category": "simulation", "compiled": false,
-      "notes": "Box-Muller. Deterministic from seed." },
+      "category": "simulation", "compiled": true,
+      "notes": "Box-Muller. Deterministic from seed. Aborts if called before rand_seed when compiled." },
 
     { "name": "kf_predict_state",
       "signature": "kf_predict_state(x: Vector, P: Matrix, F: Matrix, Q: Matrix) -> Vector",

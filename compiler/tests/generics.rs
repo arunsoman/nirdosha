@@ -258,25 +258,16 @@ fn a_generic_enum_payload_that_is_affine_makes_the_whole_value_affine() {
     assert!(check_ownership(&program).is_err(), "moving `b` twice must be a static use-after-move error");
 }
 
-// ---- codegen: the always-present prelude must not blanket-reject everything
-
+// As of Phase 4a, `struct`/`enum`/`match` over non-affine payloads are
+// *accepted* by codegen (see `codegen.rs`/`LANGUAGE.md` §10) -- this was
+// the gate the old rejection test below guarded, now flipped to a
+// positive check that a prelude-variant construction passes
+// `check_supported` (the structural pre-pass) cleanly, mirroring the way
+// every other now-compiled construct's generics test reads. Full
+// compile-and-run parity for `Option`/`Result` lives in `tests/codegen.rs`
+// (the `structs_enums_*` tests), not here.
 #[test]
-fn a_program_that_never_touches_struct_enum_still_compiles() {
-    // `Option`/`Result` are injected into every program (the prelude) --
-    // `program.enums` is never actually empty, so `check_supported` must
-    // not reject on that alone.
-    let src = r#"
-        fn main() -> i64 {
-            return 2 + 2
-        }
-    "#;
-    let program = parse_ok(src);
-    typecheck(&program).expect("should typecheck cleanly");
-    assert!(nirdosha::codegen::check_supported(&program).is_ok());
-}
-
-#[test]
-fn constructing_a_prelude_variant_is_still_rejected_by_codegen() {
+fn constructing_a_prelude_variant_is_accepted_by_codegen() {
     let src = r#"
         fn main() -> i64 {
             let o: Option(i64) = Some(5)
@@ -285,7 +276,10 @@ fn constructing_a_prelude_variant_is_still_rejected_by_codegen() {
     "#;
     let program = parse_ok(src);
     typecheck(&program).expect("should typecheck cleanly");
-    assert!(nirdosha::codegen::check_supported(&program).is_err());
+    assert!(
+        nirdosha::codegen::check_supported(&program).is_ok(),
+        "Phase 4a: a non-affine struct/enum construction should be accepted by check_supported, not rejected"
+    );
 }
 
 // ---- the Option(T)/Result(T, E) prelude itself (layer 7) ---------------

@@ -21,7 +21,7 @@ use crate::token::Span;
 /// `Ty` directly, so a diagnostic can't serialize at all — let alone
 /// round-trip — without this. Phase 2 doesn't have to add anything here;
 /// it just adds the same derive to `Expr`/`Stmt`/`Program`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Ty {
     I8,
     I16,
@@ -307,6 +307,16 @@ impl Ty {
         }
     }
 
+    /// True for the five unsigned integer types — the one place
+    /// `codegen.rs` needs a real signed-vs-unsigned instruction choice:
+    /// widening a narrower-than-`i64` value up to this backend's
+    /// internal i64 working width (`zext` here, `sext` for a signed
+    /// type — see `codegen.rs::widen_to_i64`'s doc comment for why
+    /// nothing *else* downstream needs this distinction).
+    pub fn is_unsigned(&self) -> bool {
+        matches!(self, Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::Usize)
+    }
+
     pub fn is_integer(&self) -> bool {
         !matches!(
             self,
@@ -345,16 +355,27 @@ impl Ty {
         self.is_integer() || *self == Ty::F64
     }
 
-    /// True for the two fixed-shape aggregate types (`Vector`/`Matrix`) --
-    /// every other `Ty` in this language is a single scalar value that
-    /// lives in one SSA register. `codegen.rs` uses this to decide, at
-    /// every call site that produces or consumes a value, whether to use
-    /// `Codegen::expr` (returns a bare SSA value) or `Codegen::expr_ptr`
-    /// (returns a pointer to a stack-allocated array) -- see that module's
-    /// doc comment for why a `Vector`/`Matrix` genuinely can't live in one
-    /// register the way everything else here does.
+    /// True for every fixed-shape aggregate type (`Vector`/`Matrix`, and
+    /// — as of Row 11 codegen — any resolved `struct`/`enum` instantiation,
+    /// `Ty::Named`) -- every other `Ty` in this language is a single
+    /// scalar value that lives in one SSA register. `codegen.rs` uses
+    /// this to decide, at every call site that produces or consumes a
+    /// value, whether to use `Codegen::expr` (returns a bare SSA value)
+    /// or `Codegen::expr_ptr` (returns a pointer to a stack-allocated
+    /// value) -- see that module's doc comment for why a `Vector`/
+    /// `Matrix`/struct/enum genuinely can't live in one register the way
+    /// everything else here does.
+    ///
+    /// **`Ty::Named` is included unconditionally, not just for structs
+    /// with no affine field.** Every `Ty::Named` that reaches this method
+    /// by the time codegen runs is always a resolved struct or enum
+    /// instantiation (never a bare unsubstituted type parameter — those
+    /// only exist inside a declaration before substitution), so this is
+    /// correct regardless of affinity; `codegen.rs::check_supported`
+    /// separately rejects any affine-containing `Ty::Named` before real
+    /// codegen ever consults this method for one.
     pub fn is_aggregate(&self) -> bool {
-        matches!(self, Ty::Vector(_, _) | Ty::Matrix(_, _, _))
+        matches!(self, Ty::Vector(_, _) | Ty::Matrix(_, _, _) | Ty::Named(_, _))
     }
 
     /// True for the four plain scalar types a `transact` block's

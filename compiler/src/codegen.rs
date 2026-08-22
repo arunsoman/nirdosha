@@ -18,18 +18,26 @@
 //! example: this file's own earlier doc comment claimed `box`/`&`/`*`
 //! had no codegen, when `nir_alloc`/`nir_free` (driven by
 //! `ownership.rs`'s `FreeMap`) already compiled real heap alloc/free by
-//! the time that claim was read again). As of this writing: signed
-//! integers (`i8`/`i16`/`i32`/`i64`), `bool`, `unit`, `f64`, `str`,
-//! `box`/`&`/`*`, `tcp`/`tcp_listener`, and `Vector`/`Matrix` (plus most
-//! of the dense-linalg/geometry/Kalman builtin surface) all compile.
-//! Rejected: `u8`..`usize` (deferred: LLVM's `icmp`/`div` need a
-//! signed-vs-unsigned instruction choice this pass doesn't make yet),
-//! `struct`/`enum`/`match` (Row 11, the largest remaining gap),
-//! `thread`/`chan`/`sandbox`/`file`/`json`/`db`/`mq`/`transact`/every
-//! Row 12 identity builtin, `fn(..)->..`/`acquire`/`requires(...)`, and
-//! `print` for `bool`/`unit` arguments specifically (every existing
-//! example only ever prints integer/`f64`/`str` values — this is a real,
-//! narrow, documented gap, not an oversight).
+//! the time that claim was read again). As of this writing: every
+//! scalar integer type, signed (`i8`/`i16`/`i32`/`i64`) and unsigned
+//! (`u8`/`u16`/`u32`/`u64`/`usize` — `widen_to_i64`'s doc comment on why
+//! unsigned needed only one small, contained change, not a parallel
+//! signed/unsigned codegen path), plus `bool`, `unit`, `f64`, `str`,
+//! `box`/`&`/`*`, `tcp`/`tcp_listener`, `sha256_hex`/
+//! `constant_time_str_eq` (`STR_CRYPTO_BUILTINS`), and `Vector`/`Matrix`
+//! (plus most of the dense-linalg/geometry/Kalman builtin surface) all
+//! compile — including `print` on every one of those scalar shapes
+//! (`Codegen::call`'s `Ty::Bool`/`Ty::Unit` arms handle the two that
+//! used to be rejected) — and, as of Phase 4a, `struct`/`enum`/`match`
+//! over **non-affine** payloads (construction, `expr.field` access, and
+//! `match`'s enum-variant + literal-pattern arms). Rejected: an
+//! **affine-containing** `struct`/`enum`/`match` (a `box`/`&`/`tcp`/`file`/
+//! `db`/`mq` field/payload, transitively — Phase 4b; needs
+//! `ownership.rs`'s `FreeMap` generalized beyond `Ty::Box`-only
+//! `still_owned_boxes` plus a new `at_match_arm_end` entry), `thread`/
+//! `chan`/`sandbox`/`file`/`json`/`db`/`mq`/`transact`/every Row 12
+//! identity builtin, `fn(..)->..`/`acquire`/`requires(...)`, and `print`
+//! on a whole `Vector`/`Matrix` argument.
 //!
 //! **Tier 1 vs Tier 2 finally means something.** `refine.rs` and
 //! `smt.rs` both proved things and both said, explicitly, "not wired to
@@ -59,7 +67,7 @@
 //! (`tests/basic.rs`'s short-circuit tests), and this backend has to
 //! preserve it, not just the interpreter.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use crate::ast::*;
@@ -147,6 +155,29 @@ const PHASE4_BUILTINS: &[&str] = &[
 /// rather than unrolled IR the way every `PHASE4_BUILTINS` name is.
 const PHASE5_BUILTINS: &[&str] = &["det", "inv", "solve", "rank", "kf_update_state", "kf_update_cov"];
 
+/// `sha256_hex`/`constant_time_str_eq` — also linked native calls into
+/// `runtime_kernels.rs` (a from-scratch SHA-256, since that file has no
+/// access to the `sha2` crate `interpreter.rs` uses — its own module doc
+/// explains why), but kept as their own list rather than folded into
+/// `PHASE5_BUILTINS`: that list's whole documented reason is "genuine
+/// data-dependent control flow in dense linear algebra," which doesn't
+/// describe these two at all (bit-manipulation over a runtime-length
+/// byte buffer, not a matrix). Handled directly in `Codegen::call`
+/// (like `print`), not through `call_builtin_scalar`/`call_builtin_agg`
+/// — neither fits: `sha256_hex` returns `str` (not `Ty::is_aggregate()`,
+/// so not `call_builtin_agg`'s convention; not a plain numeric scalar
+/// either, so not `call_builtin_scalar`'s).
+const STR_CRYPTO_BUILTINS: &[&str] = &["sha256_hex", "constant_time_str_eq"];
+
+/// `rand_seed`/`rand_f64`/`rand_gaussian` — a process-wide SplitMix64/
+/// Box-Muller stream in `runtime_kernels.rs` (its own module doc on why
+/// this needed real RNG *state* in generated code, the one thing that
+/// was actually missing before — the algorithm itself is a small, pure
+/// function, same class as `sha256_hex`). Its own list, not folded into
+/// `STR_CRYPTO_BUILTINS`, for the same "describes something different"
+/// reason that one isn't folded into `PHASE5_BUILTINS`.
+const RAND_BUILTINS: &[&str] = &["rand_seed", "rand_f64", "rand_gaussian"];
+
 /// WGS84 ellipsoid constants — mirrors `interpreter.rs`'s own
 /// `WGS84_A`/`WGS84_F`/`wgs84_e2()` exactly (same values, same derived
 /// `e2` formula), needed independently here since codegen computes these
@@ -159,12 +190,58 @@ const WGS84_E2: f64 = WGS84_F * (2.0 - WGS84_F);
 /// Every signed integer/bool/unit type maps to a fixed LLVM type name;
 /// `Vector`/`Matrix` map to a flat array type (`[N x double]`, or
 /// `[R*C x double]` row-major for a `Matrix` — matching
-/// `interpreter.rs`'s `Value::Matrix` storage exactly); everything else
-/// is rejected — see module doc for exactly what and why. Returns an
-/// owned `String`, not `&'static str`, because an aggregate's type
-/// string depends on its compile-time-known but not statically-fixed
-/// length.
-fn llvm_ty(ty: &Ty) -> Result<String, CodegenError> {
+/// `interpreter.rs`'s `Value::Matrix` storage exactly); a non-affine
+/// `struct`/`enum` instantiation (`Ty::Named`) maps to a real named LLVM
+/// type (`declare_named_type`'s doc — this function only ever returns
+/// its *name*, `%Point`/`%Result$i64$str`; the actual `%Name = type
+/// {...}` declaration is a separate, `&mut self`-requiring step, see
+/// `Codegen::llvm_ty`/`Codegen::declare_named_type`); everything else is
+/// rejected — see module doc for exactly what and why. Returns an owned
+/// `String`, not `&'static str`, because an aggregate's type string
+/// depends on its compile-time-known but not statically-fixed length.
+///
+/// True iff every affine value reachable inside `ty` can be torn down
+/// by the current codegen runtime. Only `box` (via `nir_free`) and
+/// `tcp`/`tcp_listener` (via `nir_tcp_stop`) are supported today; any
+/// other affine leaf (`thread`, `sandbox`, `file`, `db`, `mq`) or a
+/// struct/enum containing one keeps the whole type rejected.
+fn affine_codegen_supported(registry: &TypeRegistry, ty: &Ty) -> bool {
+    if !registry.is_affine(ty) {
+        return true;
+    }
+    match ty {
+        Ty::Box(inner) => affine_codegen_supported(registry, inner),
+        Ty::Tcp | Ty::TcpListener => true,
+        Ty::Named(name, args) => {
+            if let Some(fields) = registry.struct_fields(name) {
+                let type_params = registry.struct_type_params(name).unwrap_or(&[]);
+                let subst = zip_type_params(type_params, args);
+                fields
+                    .iter()
+                    .all(|f| affine_codegen_supported(registry, &substitute_ty(&f.ty, &subst)))
+            } else if let Some(variants) = registry.enum_variants(name) {
+                let type_params = registry.enum_type_params(name).unwrap_or(&[]);
+                let subst = zip_type_params(type_params, args);
+                variants.iter().all(|v| {
+                    v.payload
+                        .iter()
+                        .all(|t| affine_codegen_supported(registry, &substitute_ty(t, &subst)))
+                })
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Pure and stateless on purpose — no declaration emission, no mutable
+/// state — so it's cheaply callable both from `check_supported`'s
+/// pre-pass (which runs before any `Codegen` exists) and from every real
+/// codegen call site (via `Codegen::llvm_ty`, the `&mut self` wrapper
+/// that also ensures the real declaration gets emitted for a
+/// `Ty::Named`).
+fn llvm_ty(ty: &Ty, registry: &TypeRegistry) -> Result<String, CodegenError> {
     match ty {
         Ty::I8 => Ok("i8".to_string()),
         Ty::I16 => Ok("i16".to_string()),
@@ -172,11 +249,27 @@ fn llvm_ty(ty: &Ty) -> Result<String, CodegenError> {
         Ty::I64 => Ok("i64".to_string()),
         Ty::Bool => Ok("i1".to_string()),
         Ty::Unit => Ok("void".to_string()),
-        Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::Usize => unsupported(format!(
-            "codegen doesn't support unsigned types yet (`{}`) — LLVM needs a signed-vs-\
-             unsigned instruction choice (icmp/div) this pass doesn't make",
-            ty.name()
-        )),
+        // Same bit widths as their signed counterparts -- LLVM has no
+        // separate unsigned integer *type*, only separate *instructions*
+        // for the operations that actually care (`icmp`/`div`/`rem`, and
+        // widening a narrower value up to i64). See
+        // `Codegen::widen_to_i64`'s doc comment for why that's the one
+        // and only place this backend needs the signed-vs-unsigned
+        // choice: every intermediate value is computed at `i64` width
+        // (module doc), and `Ty::bounds()` already caps every unsigned
+        // type's legal range at `[0, i64::MAX]` — so once a value is
+        // correctly widened (`zext`, not `sext`), plain/signed `+`/`-`/
+        // `*`/`icmp`/`div` at `i64` width give byte-identical results to
+        // their unsigned counterparts (both interpretations agree on any
+        // bit pattern whose sign bit is clear, which a validly-widened
+        // unsigned value's always is) -- confirmed by actually compiling
+        // and running comparison/division/boundary-value programs for
+        // every one of `u8`/`u16`/`u32`/`u64`/`usize`, not just reasoned
+        // about.
+        Ty::U8 => Ok("i8".to_string()),
+        Ty::U16 => Ok("i16".to_string()),
+        Ty::U32 => Ok("i32".to_string()),
+        Ty::U64 | Ty::Usize => Ok("i64".to_string()),
         // A single heap (`Box`) or borrowed (`Ref`) pointer — one word,
         // passed by value exactly like `Ty::Str`'s `{ptr, i64}` above,
         // just narrower. `Ref` needs no allocation of its own (it's
@@ -184,7 +277,7 @@ fn llvm_ty(ty: &Ty) -> Result<String, CodegenError> {
         // `Codegen::expr`'s `Expr::Ref` arm). `Box` allocates on the heap
         // at construction (`nir_alloc`, `Expr::Box`'s own codegen) and is
         // freed for real: `ownership.rs`'s `FreeMap` records each
-        // binding's last use, and `emit_frees_for_names`/`emit_box_free`
+        // binding's last use, and `emit_frees_for_names`/`emit_affine_free`
         // emit `nir_free` for it at every scope-closing point that data
         // lists — confirmed in generated IR (`nirdosha emit-llvm`) for a
         // simple `let b: box i64 = ...` case: the `nir_free` call is
@@ -238,7 +331,7 @@ fn llvm_ty(ty: &Ty) -> Result<String, CodegenError> {
         // silently disagree with `interpreter.rs`'s own flattening.
         Ty::Vector(_, _) | Ty::Matrix(_, _, _) => {
             let (elem, len) = agg_elem_and_len(ty);
-            let elem_llty = llvm_ty(elem)?;
+            let elem_llty = llvm_ty(elem, registry)?;
             Ok(format!("[{len} x {elem_llty}]"))
         }
         // Phase B1 (str/tcp codegen plan): a `tcp`/`tcp_listener` handle
@@ -248,15 +341,121 @@ fn llvm_ty(ty: &Ty) -> Result<String, CodegenError> {
         // gives the interpreter. Both lower to the same `i64` regardless
         // of which one they are (`nir_tcp_stop` closes either uniformly).
         Ty::Tcp | Ty::TcpListener => Ok("i64".to_string()),
-        Ty::Named(name, _) => unsupported(format!(
-            "codegen doesn't support `{name}` yet — struct/enum/match (Row 11) are interpreter-only \
-             for now, see nirdosha_row11_amendment.md"
-        )),
+        // Row 11: a `struct`/`enum` instantiation lowers to a real named
+        // LLVM type — `%Point`, or `%Result$i64$str` for a generic
+        // instantiation (`mangle_ty` gives every distinct concrete
+        // instantiation its own distinct name, since their layouts
+        // genuinely differ). An affine-containing instantiation is allowed
+        // as long as every affine leaf inside it is one this backend can
+        // actually tear down today (`box` via `nir_free`, `tcp`/
+        // `tcp_listener` via `nir_tcp_stop`); if it contains an unsupported
+        // affine leaf (`thread`, `sandbox`, `file`, `db`, `mq`, etc.), the
+        // whole type is still rejected cleanly rather than mis-compiled.
+        Ty::Named(name, _) => {
+            if registry.is_affine(ty) && !affine_codegen_supported(registry, ty) {
+                return unsupported(format!(
+                    "codegen doesn't support `{name}` yet — it (transitively) contains an \
+                     affine field of a type that has no native codegen yet (`thread`/`sandbox`/\
+                     `file`/`db`/`mq`/etc.); a struct/enum whose only affine fields are `box` \
+                     or `tcp` compiles now"
+                ));
+            }
+            Ok(format!("%{}", mangle_ty(ty)))
+        }
         Ty::Fn(_, _) => unsupported(
             "codegen doesn't support `fn(..)->..` yet — first-class/privileged functions \
              (requires/acquire) are interpreter-only for now",
         ),
         Ty::Error => unreachable!("a program with a type error is never handed to codegen"),
+    }
+}
+
+/// A short, identifier-safe token for `ty`, used to name a generic
+/// struct/enum instantiation's own LLVM named type distinctly per
+/// concrete instantiation — `Result(i64, str)` and `Result(str, str)`
+/// need different LLVM types, since their layouts differ, even though
+/// they share one declaration. Only ever needs to handle the *non-affine*
+/// `Ty` subset: `llvm_ty`'s `Ty::Named` arm already rejects an
+/// affine-containing instantiation before this can run on one, and no
+/// affine type (`Box`/`Tcp`/etc.) can otherwise legally appear as a
+/// generic type argument here. Returns the name *without* a leading `%`
+/// sigil (so a nested `Ty::Named` argument mangles into the middle of
+/// the string without an illegal embedded sigil) — callers that need the
+/// real LLVM identifier prepend `%` themselves (`llvm_ty`'s `Ty::Named`
+/// arm, `declare_named_type`).
+fn mangle_ty(ty: &Ty) -> String {
+    match ty {
+        Ty::I8 => "i8".to_string(),
+        Ty::I16 => "i16".to_string(),
+        Ty::I32 => "i32".to_string(),
+        Ty::I64 => "i64".to_string(),
+        Ty::U8 => "u8".to_string(),
+        Ty::U16 => "u16".to_string(),
+        Ty::U32 => "u32".to_string(),
+        Ty::U64 => "u64".to_string(),
+        Ty::Usize => "usize".to_string(),
+        Ty::Bool => "bool".to_string(),
+        Ty::Unit => "unit".to_string(),
+        Ty::F64 => "f64".to_string(),
+        Ty::Str => "str".to_string(),
+        Ty::Vector(elem, n) => format!("vec{n}_{}", mangle_ty(elem)),
+        Ty::Matrix(elem, r, c) => format!("mat{r}x{c}_{}", mangle_ty(elem)),
+        Ty::Named(name, args) if args.is_empty() => name.clone(),
+        Ty::Named(name, args) => {
+            format!("{name}${}", args.iter().map(mangle_ty).collect::<Vec<_>>().join("$"))
+        }
+        // Every other `Ty` (`Box`/`Ref`/`Thread`/`Channel`/`Sandbox`/
+        // `Tcp`/`TcpListener`/`File`/`Json`/`Db`/`Mq`/`Fn`/`Error`) is
+        // either affine (already rejected before this can run on one) or
+        // otherwise never legally a struct/enum generic type argument —
+        // this arm is a defensive fallback, not expected to actually run
+        // for any program that reaches this point.
+        _ => ty.name().replace(['(', ')', ',', ' '], "_"),
+    }
+}
+
+/// A conservative, always-safe-to-over-allocate word count (8 bytes
+/// each) for `ty` — used only to size an enum's raw `[N x i64]` payload
+/// buffer (`declare_named_type`'s enum branch). Rounds every field up to
+/// a whole 8-byte word rather than hand-replicating LLVM's exact
+/// alignment rules, so the buffer is never undersized regardless of what
+/// LLVM's real struct layout would have chosen for a synthesized
+/// variant-payload type — a few wasted bytes in the rare case a variant
+/// packs several sub-8-byte fields, in exchange for *never* under-sizing
+/// the payload buffer, consistent with this codebase's repeatedly-stated
+/// "correctness over cleverness" bias. Every field type this language
+/// has needs at most 8-byte alignment, so this always produces a
+/// correctly-aligned offset for every field (`declare_named_type`'s own
+/// doc has the full reasoning).
+fn conservative_word_count(ty: &Ty, registry: &TypeRegistry) -> u64 {
+    match ty {
+        Ty::Str => 2,
+        Ty::Vector(_, _) | Ty::Matrix(_, _, _) => {
+            let (_, _, bytes) = agg_layout(ty);
+            bytes.div_ceil(8)
+        }
+        Ty::Named(name, args) => {
+            if let Some(fields) = registry.struct_fields(name) {
+                let subst = zip_type_params(registry.struct_type_params(name).unwrap_or(&[]), args);
+                fields.iter().map(|f| conservative_word_count(&substitute_ty(&f.ty, &subst), registry)).sum()
+            } else if let Some(variants) = registry.enum_variants(name) {
+                let subst = zip_type_params(registry.enum_type_params(name).unwrap_or(&[]), args);
+                1 + variants
+                    .iter()
+                    .map(|v| v.payload.iter().map(|t| conservative_word_count(&substitute_ty(t, &subst), registry)).sum::<u64>())
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                unreachable!("typeck.rs already proved this Ty::Named resolves to a struct or enum")
+            }
+        }
+        // Every other `Ty` this fn can legally be reached with under
+        // Phase 4a's non-affine scope (`llvm_ty`'s affine check already
+        // rejected anything containing `Box`/`Tcp`/etc.) is one scalar
+        // word or less (`Unit` needs zero, but rounding it up to one
+        // costs nothing and keeps this fn's contract simple: "at most
+        // this many words").
+        _ => 1,
     }
 }
 
@@ -296,164 +495,208 @@ fn elem_byte_size(ty: &Ty) -> u64 {
     }
 }
 
-/// The heap-allocation size (in bytes) `box e` needs for a value of type
-/// `ty` — unlike `elem_byte_size` (scalars only, for aggregate elements)
-/// or `agg_layout` (aggregates only), this covers every `Ty` `box` can
-/// legally wrap (ast.rs: "any type, recursively" — `box i64`, `box
-/// box i64`, `box Vector(f64,3)`, `box "..."`'s type, etc.), since `box`
+/// The heap-allocation size (in bytes, as an LLVM `i64` operand — see
+/// below) `box e` needs for a value of type `ty` — unlike
+/// `elem_byte_size` (scalars only, for aggregate elements) or
+/// `agg_layout` (`Vector`/`Matrix` only), this covers every `Ty` `box`
+/// can legally wrap (ast.rs: "any type, recursively" — `box i64`, `box
+/// box i64`, `box Vector(f64,3)`, `box Point{..}`, etc.), since `box`
 /// itself has no such restriction. Matches `llvm_ty`'s own type-to-size
-/// story exactly: `Vector`/`Matrix` use their flat byte layout,
-/// `Ty::Str` is the two-word `{ptr, i64}` value (16 bytes), every
-/// pointer-shaped handle (`Box`, `Ref`, and — once later phases compile
-/// them — `Thread`/`Channel`/`Sandbox`/`Tcp`/`TcpListener`) is one
-/// pointer-word (8 bytes on every platform this backend targets), and
-/// everything else is a plain scalar via `elem_byte_size`.
-fn ty_byte_size(ty: &Ty) -> u64 {
+/// story exactly: `Vector`/`Matrix` use their flat byte layout, a
+/// non-affine `Ty::Named` (Row 11) uses `agg_byte_size_operand`'s
+/// sizeof-via-GEP constant expression, `Ty::Str` is the two-word `{ptr,
+/// i64}` value (16 bytes), every pointer-shaped handle (`Box`, `Ref`,
+/// and — once later phases compile them — `Thread`/`Channel`/`Sandbox`/
+/// `Tcp`/`TcpListener`) is one pointer-word (8 bytes on every platform
+/// this backend targets), and everything else is a plain scalar via
+/// `elem_byte_size`.
+///
+/// Returns a `String` operand, not a plain `u64`, for the same reason
+/// `agg_byte_size_operand` does: a `Ty::Named`'s real size isn't a
+/// number this side can compute without risking disagreement with
+/// LLVM's own struct-layout/alignment rules, so it's expressed as an
+/// LLVM constant expression instead and left for LLVM itself to
+/// evaluate. Every other arm still produces a plain integer literal
+/// (unchanged from before), which is exactly as valid an `i64` operand
+/// as the constant expression is.
+fn ty_byte_size(ty: &Ty, registry: &TypeRegistry) -> String {
     match ty {
-        Ty::Vector(_, _) | Ty::Matrix(_, _, _) => agg_layout(ty).2,
-        Ty::Str => 16,
-        Ty::Box(_) | Ty::Ref(_) | Ty::Thread(_) | Ty::Channel(_) | Ty::Sandbox | Ty::Tcp | Ty::TcpListener | Ty::File => 8,
-        Ty::Unit => 0,
-        _ => elem_byte_size(ty),
+        Ty::Vector(_, _) | Ty::Matrix(_, _, _) | Ty::Named(_, _) => agg_byte_size_operand(ty, registry),
+        Ty::Str => "16".to_string(),
+        Ty::Box(_) | Ty::Ref(_) | Ty::Thread(_) | Ty::Channel(_) | Ty::Sandbox | Ty::Tcp | Ty::TcpListener | Ty::File => {
+            "8".to_string()
+        }
+        Ty::Unit => "0".to_string(),
+        _ => elem_byte_size(ty).to_string(),
     }
 }
 
-/// `(element Ty, flat element count, total byte size)` for an aggregate
-/// type — everything `llvm.memcpy`-based aggregate codegen (function
-/// prologue copy-in, `let`/assignment copies, literal row copies) needs
-/// in one call.
+/// `(element Ty, flat element count, total byte size)` for a `Vector`/
+/// `Matrix` type — everything `llvm.memcpy`-based aggregate codegen
+/// (function prologue copy-in, `let`/assignment copies, literal row
+/// copies) needs in one call. `Ty::Named` (Row 11) deliberately doesn't
+/// go through this — see `agg_byte_size_operand`.
 fn agg_layout(ty: &Ty) -> (&Ty, usize, u64) {
     let (elem, len) = agg_elem_and_len(ty);
     let bytes = len as u64 * elem_byte_size(elem);
     (elem, len, bytes)
 }
 
+/// The byte-size *operand text* for `ty` (`Ty::is_aggregate()` only) —
+/// used everywhere an aggregate's whole-value byte count is needed as an
+/// `llvm.memcpy`/`nir_alloc` operand. `Vector`/`Matrix` keep using
+/// `agg_layout`'s plain integer literal exactly as before this function
+/// existed. `Ty::Named` has no such literal available on the Rust side
+/// without hand-replicating LLVM's own struct-layout/alignment rules (a
+/// real under-sizing risk if that math ever drifted from LLVM's actual
+/// choice) — instead this emits the standard LLVM "sizeof via
+/// GEP-of-null-plus-one" constant expression, which LLVM itself computes
+/// correctly from the real declared type: `ptrtoint (ptr getelementptr
+/// (%Name, ptr null, i32 1) to i64)`. Constant-foldable, so it costs
+/// nothing extra after `-O2` — the same "trust `clang -O2` to fold
+/// constant-shaped IR" precedent already used to justify a plain
+/// `llvm.memcpy` over hand-unrolled loads/stores (module doc).
+fn agg_byte_size_operand(ty: &Ty, registry: &TypeRegistry) -> String {
+    match ty {
+        Ty::Vector(_, _) | Ty::Matrix(_, _, _) => {
+            let (_, _, bytes) = agg_layout(ty);
+            bytes.to_string()
+        }
+        Ty::Named(_, _) => {
+            let llty = llvm_ty(ty, registry).expect("check_supported already validated this type");
+            format!("ptrtoint (ptr getelementptr ({llty}, ptr null, i32 1) to i64)")
+        }
+        _ => unreachable!("only called on Ty::is_aggregate() types"),
+    }
+}
+
 /// Structural pre-check: walks the whole program and rejects, with a
 /// specific reason, anything `llvm_ty` or the `print`-argument rule
 /// would reject — run once, up front, so codegen itself can assume every
 /// type/expression it encounters is in the supported subset.
+///
+/// Row 11 (`struct`/`enum`/`match`) is handled the same way every other
+/// type-level restriction here is: `llvm_ty`, threaded a `TypeRegistry`
+/// built fresh for this pre-pass (this runs before any real `Codegen`
+/// exists, so it can't reuse one), rejects any *affine-containing*
+/// `Ty::Named` reaching a param/`let`/return type — `program.enums` is
+/// never actually empty (`Option`/`Result` are injected into every
+/// program at parse time, `ast::prelude_enums`'s doc comment), but a
+/// non-affine struct/enum is now genuinely supported, so there's nothing
+/// left here that needs a bespoke ctor-name check the way there used to
+/// be (a struct/variant construction is syntactically just `Expr::Call`,
+/// walked exactly like any other call below).
 pub fn check_supported(program: &Program) -> Result<(), CodegenError> {
-    // Row 11 (struct/enum/match) is interpreter-only, full stop — but
-    // `program.enums` is never actually empty any more (`Option`/
-    // `Result` are injected into *every* program at parse time —
-    // `ast::prelude_enums`'s doc comment), so a blanket "any struct/enum
-    // declared at all" check would reject every program unconditionally,
-    // not just ones that actually use Row 11. This instead rejects a
-    // program only if it actually *uses* a struct/enum: `llvm_ty`
-    // already rejects any `Ty::Named` reaching a param/let/return type,
-    // and `check_expr`'s own `Expr::FieldAccess`/`Expr::Match` arms
-    // already reject those forms directly — `ctor_names` (struct names
-    // and every enum's variant names, prelude included) is the one
-    // remaining gap: a struct/variant constructor call is syntactically
-    // just `Expr::Call`, indistinguishable from an ordinary function
-    // call without a declaration table to check the callee's name
-    // against, which `check_expr` doesn't otherwise have access to.
-    let mut ctor_names: std::collections::HashSet<&str> = program.structs.iter().map(|s| s.name.as_str()).collect();
-    for e in &program.enums {
-        ctor_names.extend(e.variants.iter().map(|v| v.name.as_str()));
-    }
+    let registry = TypeRegistry::build(program);
     for f in &program.fns {
         for p in &f.params {
-            llvm_ty(&p.ty)?;
+            llvm_ty(&p.ty, &registry)?;
         }
-        llvm_ty(&f.ret)?;
-        check_stmts(&f.body.stmts, &ctor_names)?;
+        llvm_ty(&f.ret, &registry)?;
+        check_stmts(&f.body.stmts, &registry)?;
     }
     Ok(())
 }
 
-fn check_stmts(stmts: &[Stmt], ctor_names: &std::collections::HashSet<&str>) -> Result<(), CodegenError> {
+fn check_stmts(stmts: &[Stmt], registry: &TypeRegistry) -> Result<(), CodegenError> {
     for s in stmts {
-        check_stmt(s, ctor_names)?;
+        check_stmt(s, registry)?;
     }
     Ok(())
 }
 
-fn check_stmt(s: &Stmt, ctor_names: &std::collections::HashSet<&str>) -> Result<(), CodegenError> {
+fn check_stmt(s: &Stmt, registry: &TypeRegistry) -> Result<(), CodegenError> {
     match s {
         Stmt::Let { ty, value, .. } => {
-            llvm_ty(ty)?;
-            check_expr(value, ctor_names)
+            llvm_ty(ty, registry)?;
+            check_expr(value, registry)
         }
-        Stmt::Return { value: Some(e), .. } => check_expr(e, ctor_names),
+        Stmt::Return { value: Some(e), .. } => check_expr(e, registry),
         Stmt::Return { value: None, .. } => Ok(()),
         Stmt::While { cond, body, .. } => {
-            check_expr(cond, ctor_names)?;
-            check_stmts(&body.stmts, ctor_names)
+            check_expr(cond, registry)?;
+            check_stmts(&body.stmts, registry)
         }
-        Stmt::Expr(e) => check_expr(e, ctor_names),
+        Stmt::Expr(e) => check_expr(e, registry),
         // `audited` only suppresses guard *emission* (`Codegen::audited`,
         // checked inside `guard_in_range`/the division trap) -- every
         // statement inside still has to be otherwise codegen-supported,
         // so this walks in exactly like `While`'s body.
-        Stmt::Audited { body, .. } => check_stmts(body, ctor_names),
+        Stmt::Audited { body, .. } => check_stmts(body, registry),
     }
 }
 
-fn check_expr(e: &Expr, ctor_names: &std::collections::HashSet<&str>) -> Result<(), CodegenError> {
+fn check_expr(e: &Expr, registry: &TypeRegistry) -> Result<(), CodegenError> {
     match e {
         Expr::Int(_, _) | Expr::Bool(_, _) | Expr::Ident(_, _) | Expr::Float(_, _) | Expr::Str(_, _) => Ok(()),
-        Expr::Unary(_, inner, _) => check_expr(inner, ctor_names),
+        Expr::Unary(_, inner, _) => check_expr(inner, registry),
         Expr::Binary(_, l, r, _) => {
-            check_expr(l, ctor_names)?;
-            check_expr(r, ctor_names)
+            check_expr(l, registry)?;
+            check_expr(r, registry)
         }
         Expr::Call(name, args, _) => {
-            if ctor_names.contains(name.as_str()) {
-                return unsupported(format!(
-                    "codegen doesn't support `{name}` yet — struct/enum construction (Row 11) is \
-                     interpreter-only for now, see nirdosha_row11_amendment.md"
-                ));
-            }
+            // A struct/variant constructor call is syntactically just
+            // `Expr::Call` (no dedicated AST node) — nothing special to
+            // check here beyond its arguments, same as any other call;
+            // `Codegen::construct`/`expr_ptr`'s real handling is where
+            // the actual construction codegen lives.
             if name == "print" {
-                for a in args {
-                    if !is_printable_expr(a) {
-                        return unsupported(
-                            "codegen only supports `print` on integer/f64-typed arguments so far \
-                             — no existing example needs bool/unit printing, so it wasn't built",
-                        );
-                    }
-                }
+                // No syntactic rejection needed here any more: `print`
+                // now handles every scalar shape (`Codegen::call`'s
+                // `Ty::Bool`/`Ty::Unit` arms) — the one real remaining
+                // rejection, a `Vector`/`Matrix` argument, needs real
+                // type info this purely-syntactic pre-pass doesn't have,
+                // so it's caught later in `Codegen::call` itself (the
+                // existing `arg_ty.is_aggregate()` check there), same as
+                // before. Each argument still gets walked for its own
+                // recursive validity by the shared loop below.
             } else if is_builtin(name)
                 && !PHASE4_BUILTINS.contains(&name.as_str())
                 && !PHASE5_BUILTINS.contains(&name.as_str())
+                && !STR_CRYPTO_BUILTINS.contains(&name.as_str())
+                && !RAND_BUILTINS.contains(&name.as_str())
             {
-                // Every dense linear algebra builtin not in
-                // `PHASE4_BUILTINS` (unrolled IR) or `PHASE5_BUILTINS`
-                // (linked runtime call, for genuine data-dependent
-                // control flow) is rejected here with a specific reason
-                // rather than falling through to `check_expr`'s
-                // per-argument walk, which would report a less specific
-                // one. `rand_seed`/`rand_f64`/`rand_gaussian` stay
-                // rejected (no RNG state exists in generated code).
+                // Every builtin not in `PHASE4_BUILTINS` (unrolled IR),
+                // `PHASE5_BUILTINS`/`STR_CRYPTO_BUILTINS` (linked runtime
+                // call), or `RAND_BUILTINS` (linked call into a
+                // process-wide RNG stream) is rejected here with a
+                // specific reason rather than falling through to
+                // `check_expr`'s per-argument walk, which would report a
+                // less specific one.
                 return unsupported(format!(
                     "codegen doesn't support `{name}` yet — this builtin is interpreter-only \
                      for now (numeric codegen lands in a later phase)"
                 ));
             }
             for a in args {
-                check_expr(a, ctor_names)?;
+                check_expr(a, registry)?;
             }
             Ok(())
         }
         Expr::If { cond, then_block, else_block, .. } => {
-            check_expr(cond, ctor_names)?;
-            check_stmts(&then_block.stmts, ctor_names)?;
+            check_expr(cond, registry)?;
+            check_stmts(&then_block.stmts, registry)?;
             match else_block.as_deref() {
-                Some(ElseBranch::Block(b)) => check_stmts(&b.stmts, ctor_names),
-                Some(ElseBranch::If(e2)) => check_expr(e2, ctor_names),
+                Some(ElseBranch::Block(b)) => check_stmts(&b.stmts, registry),
+                Some(ElseBranch::If(e2)) => check_expr(e2, registry),
                 None => Ok(()),
             }
         }
-        Expr::Assign(_, rhs, _) => check_expr(rhs, ctor_names),
-        // Row 11's other two unsupported forms, rejected directly —
-        // neither can type-check without a real struct/enum somewhere
-        // (`typeck.rs`), but unlike a bare constructor call, both are
-        // their own dedicated `Expr` variants, easy to reject by shape
-        // alone with no `ctor_names` lookup needed.
-        Expr::FieldAccess(..) | Expr::Match { .. } => unsupported(
-            "codegen doesn't support struct/enum/match yet (Row 11) — interpreter-only for now",
-        ),
+        Expr::Assign(_, rhs, _) => check_expr(rhs, registry),
+        // Row 11: both now recurse structurally, same "walk, don't
+        // reject" treatment every other now-supported construct gets —
+        // real type-directed validation (the affine check) happens where
+        // `Codegen`'s own methods can see a base/scrutinee's actual
+        // resolved type (`Codegen::field_access`/`Codegen::match_expr`),
+        // not in this purely-syntactic pre-pass.
+        Expr::FieldAccess(base, _, _) => check_expr(base, registry),
+        Expr::Match { scrutinee, arms, .. } => {
+            check_expr(scrutinee, registry)?;
+            for arm in arms {
+                check_expr(&arm.body, registry)?;
+            }
+            Ok(())
+        }
         // `box`/`*`/`&` land as of this phase — see `llvm_ty`'s
         // `Ty::Box`/`Ty::Ref` arm and `Codegen::expr`'s real `Expr::Box`/
         // `Expr::Deref`/`Expr::Ref` arms for the actual codegen. This
@@ -461,7 +704,7 @@ fn check_expr(e: &Expr, ctor_names: &std::collections::HashSet<&str>) -> Result<
         // job, at real IR-gen time), so it just recurses into whatever's
         // inside — same "walk, don't reject" treatment every other
         // already-supported unary-ish construct gets.
-        Expr::Box(inner, _) | Expr::Deref(inner, _) | Expr::Ref(inner, _) => check_expr(inner, ctor_names),
+        Expr::Box(inner, _) | Expr::Deref(inner, _) | Expr::Ref(inner, _) => check_expr(inner, registry),
         Expr::Spawn(_, _, _) | Expr::Join(_, _) => {
             unsupported("codegen doesn't support `spawn`/`join` yet — interpreter-only for now")
         }
@@ -482,10 +725,10 @@ fn check_expr(e: &Expr, ctor_names: &std::collections::HashSet<&str>) -> Result<
         // actually see its type via `local_ty_of`.
         Expr::Chan(_) => unsupported("codegen doesn't support `chan` yet — interpreter-only for now"),
         Expr::Send(chan, value, _) => {
-            check_expr(chan, ctor_names)?;
-            check_expr(value, ctor_names)
+            check_expr(chan, registry)?;
+            check_expr(value, registry)
         }
-        Expr::Recv(chan, _) => check_expr(chan, ctor_names),
+        Expr::Recv(chan, _) => check_expr(chan, registry),
         // Same reasoning as `send`/`recv` above: `stop` is one AST node
         // (`Expr::StopSandbox`) shared by `sandbox`/`tcp`/`tcp_listener`,
         // dispatched on the operand's type — `sandbox` itself stays
@@ -495,7 +738,7 @@ fn check_expr(e: &Expr, ctor_names: &std::collections::HashSet<&str>) -> Result<
         Expr::SpawnSandbox(_, _, _) => {
             unsupported("codegen doesn't support `sandbox` yet — interpreter-only for now")
         }
-        Expr::StopSandbox(inner, _) => check_expr(inner, ctor_names),
+        Expr::StopSandbox(inner, _) => check_expr(inner, registry),
         // `open`/file I/O is interpreter-only for now, same treatment
         // `Expr::Chan`/`Expr::SpawnSandbox` above get — no type info at
         // this structural pre-pass, so straight rejection rather than
@@ -504,11 +747,11 @@ fn check_expr(e: &Expr, ctor_names: &std::collections::HashSet<&str>) -> Result<
             unsupported("codegen doesn't support `open`/file I/O yet — interpreter-only for now")
         }
         Expr::Connect(host, port, _) => {
-            check_expr(host, ctor_names)?;
-            check_expr(port, ctor_names)
+            check_expr(host, registry)?;
+            check_expr(port, registry)
         }
-        Expr::Listen(port, _) => check_expr(port, ctor_names),
-        Expr::Accept(listener, _) => check_expr(listener, ctor_names),
+        Expr::Listen(port, _) => check_expr(port, registry),
+        Expr::Accept(listener, _) => check_expr(listener, registry),
         // Vector/Matrix indexing lands as of this phase — the base and
         // every index expression are walked the same way `ArrayLit`'s
         // elements are, so a still-unsupported construct nested inside
@@ -516,9 +759,9 @@ fn check_expr(e: &Expr, ctor_names: &std::collections::HashSet<&str>) -> Result<
         // rejection reason instead of being silently accepted because
         // `Expr::Index` itself is now fine.
         Expr::Index(base, indices, _) => {
-            check_expr(base, ctor_names)?;
+            check_expr(base, registry)?;
             for idx in indices {
-                check_expr(idx, ctor_names)?;
+                check_expr(idx, registry)?;
             }
             Ok(())
         }
@@ -530,7 +773,7 @@ fn check_expr(e: &Expr, ctor_names: &std::collections::HashSet<&str>) -> Result<
         // `ArrayLit` shape itself is now fine.
         Expr::ArrayLit(elements, _) => {
             for e in elements {
-                check_expr(e, ctor_names)?;
+                check_expr(e, registry)?;
             }
             Ok(())
         }
@@ -546,17 +789,6 @@ fn check_expr(e: &Expr, ctor_names: &std::collections::HashSet<&str>) -> Result<
             unsupported("codegen doesn't support `transact` yet — interpreter-only for now")
         }
     }
-}
-
-/// A conservative, codegen-local "is this definitely not a `bool`"
-/// check — not a real type inference pass (typeck.rs already is one;
-/// re-deriving its full precision here isn't worth it for one narrow
-/// question). Good enough to catch the common cases (`print(true)`,
-/// `print(some_bool_var)`) without needing a declared-type table
-/// threaded all the way into `check_expr`. Named for what it actually
-/// accepts as of Phase 4 (integers *and* `f64`), not just integers.
-fn is_printable_expr(e: &Expr) -> bool {
-    !matches!(e, Expr::Bool(_, _))
 }
 
 /// One binding's declared type plus the LLVM register holding a
@@ -665,10 +897,37 @@ struct Codegen<'a> {
     /// one written (redundantly) inside an already-audited block doesn't
     /// prematurely turn guards back on when *it* exits.
     audited: bool,
+    /// The program's struct/enum declaration table — built once at the
+    /// start of `emit_llvm_ir` and consulted by every Row 11 codegen path
+    /// (`llvm_ty`'s struct/enum arms, `construct`, `match_expr`, field
+    /// access) to resolve a `Ty::Named`'s fields/payloads/variants and to
+    /// re-check affinity (the free `llvm_ty`/`check_supported` pre-pass
+    /// builds its own throwaway copy, since it runs before this `Codegen`
+    /// exists). Borrows from `program` for the same lifetime `smt_report`
+    /// does — see `emit_llvm_ir`'s `'a` unification.
+    registry: TypeRegistry<'a>,
+    /// Every distinct concrete `struct`/`enum` instantiation already
+    /// emitted as a real LLVM named-type declaration (`%Point = type
+    /// {...}`), keyed by mangled name — so `declare_named_type` declares
+    /// each one exactly once even when many call sites construct the
+    /// same instantiation. Built up over the whole `emit_llvm_ir` run,
+    /// then the collected declarations are prepended to the module top
+    /// (before any `define` that references one) at the very end.
+    declared_named_types: HashSet<String>,
+    /// The `%Name = type { ... }` text itself, accumulated in dependency
+    /// order (`declare_named_type` recurses into a struct's named-typed
+    /// fields first so a `%Outer = type { %Point }` always follows its
+    /// `%Point = type { ... }`), then spliced into `self.out` at position
+    /// 0 once `emit_llvm_ir` finishes. Module-scoped, never reset — same
+    /// structural shape as `string_globals` (appended once at the end),
+    /// just prepended instead because a named type must textually precede
+    /// any `define` that mentions it.
+    named_type_decls: String,
 }
 
-pub fn emit_llvm_ir(program: &Program, smt_report: &SmtReport) -> Result<String, CodegenError> {
+pub fn emit_llvm_ir<'a>(program: &'a Program, smt_report: &'a SmtReport) -> Result<String, CodegenError> {
     check_supported(program)?;
+    let registry = TypeRegistry::build(program);
     let sigs = program
         .fns
         .iter()
@@ -694,6 +953,9 @@ pub fn emit_llvm_ir(program: &Program, smt_report: &SmtReport) -> Result<String,
             current_fn_sret: None,
             terminated: false,
             audited: false,
+            registry,
+            declared_named_types: HashSet::new(),
+            named_type_decls: String::new(),
         };
 
     writeln!(cg.out, "declare i32 @printf(ptr, ...)").unwrap();
@@ -740,6 +1002,14 @@ pub fn emit_llvm_ir(program: &Program, smt_report: &SmtReport) -> Result<String,
     // a byte compare, same "reuse proven Rust code via a linked call"
     // choice as the Phase 5 builtins above, not hand-emitted IR.
     writeln!(cg.out, "declare i32 @nir_str_eq(ptr, i64, ptr, i64)").unwrap();
+    // `sha256_hex`/`constant_time_str_eq` — `STR_CRYPTO_BUILTINS`'
+    // doc comment.
+    writeln!(cg.out, "declare void @nir_sha256_hex(ptr, i64, ptr, i64, ptr)").unwrap();
+    writeln!(cg.out, "declare i32 @nir_constant_time_str_eq(ptr, i64, ptr, i64)").unwrap();
+    // `rand_seed`/`rand_f64`/`rand_gaussian` — `RAND_BUILTINS`' doc comment.
+    writeln!(cg.out, "declare void @nir_rand_seed(i64)").unwrap();
+    writeln!(cg.out, "declare double @nir_rand_f64()").unwrap();
+    writeln!(cg.out, "declare double @nir_rand_gaussian(double, double)").unwrap();
     // Phase B1's `tcp`/`tcp_listener` kernels — real socket syscalls,
     // wrapped in Rust inside the linked staticlib rather than hand-
     // emitted raw syscall IR, same "reuse proven Rust code via a linked
@@ -775,6 +1045,11 @@ pub fn emit_llvm_ir(program: &Program, smt_report: &SmtReport) -> Result<String,
     // guaranteed NUL-terminated by this design (see `Ty::Str`'s note in
     // `llvm_ty`), only the format string itself is.
     writeln!(cg.out, "@.str_fmt = private unnamed_addr constant [6 x i8] c\"%.*s\\0A\\00\"").unwrap();
+    // "()\n\0" — 4 bytes. No format specifier at all: `unit` carries no
+    // runtime data to interpolate, so this is printed as a fixed literal
+    // — matching `interpreter.rs`'s `render()`, which prints `"()"` for
+    // `Value::Unit`, so interpreted/compiled output agree.
+    writeln!(cg.out, "@.unit_fmt = private unnamed_addr constant [4 x i8] c\"()\\0A\\00\"").unwrap();
     writeln!(cg.out).unwrap();
 
     for f in &program.fns {
@@ -786,7 +1061,46 @@ pub fn emit_llvm_ir(program: &Program, smt_report: &SmtReport) -> Result<String,
     // global constant, collected during function codegen since it can't
     // be written mid-function-body, appended here once at the end.
     cg.out.push_str(&cg.string_globals);
+    // See `named_type_decls`'s own doc — every `%Name = type {...}`
+    // declaration, collected during function codegen (a named type is
+    // only discovered when a concrete instantiation is actually used)
+    // and prepended here at the *top* of the module, so each one
+    // textually precedes the `define` blocks that reference it (LLVM
+    // textual IR requires a named struct type to be declared before any
+    // use in a function body). `declare_named_type` already emitted
+    // them in dependency order (a struct's named-typed fields before the
+    // struct itself), so prepending the whole buffer preserves that
+    // order in the final text.
+    cg.out.insert_str(0, &cg.named_type_decls);
     Ok(cg.out)
+}
+
+/// `typeck::bind_type_params`'s exact substitution logic, duplicated here
+/// (that function is private to `typeck.rs`) so `Codegen::ctor_ty`/
+/// `infer_type_args` can resolve a generic constructor's type parameters
+/// from its arguments' own types the same way `typeck.rs`'s own
+/// `resolve_type_args` fall-back path does — no inference theory of
+/// codegen's own, just the same structural bind `typeck.rs` already
+/// proved correct for every generic program.
+fn bind_type_params_owned(decl_ty: &Ty, concrete_ty: &Ty, type_params: &[String], subst: &mut HashMap<String, Ty>) {
+    match (decl_ty, concrete_ty) {
+        (Ty::Named(name, args), _) if args.is_empty() && type_params.iter().any(|p| p == name) => {
+            subst.entry(name.clone()).or_insert_with(|| concrete_ty.clone());
+        }
+        (Ty::Box(a), Ty::Box(b))
+        | (Ty::Ref(a), Ty::Ref(b))
+        | (Ty::Thread(a), Ty::Thread(b))
+        | (Ty::Channel(a), Ty::Channel(b)) => bind_type_params_owned(a, b, type_params, subst),
+        (Ty::Vector(a, _), Ty::Vector(b, _)) | (Ty::Matrix(a, _, _), Ty::Matrix(b, _, _)) => {
+            bind_type_params_owned(a, b, type_params, subst)
+        }
+        (Ty::Named(dn, dargs), Ty::Named(cn, cargs)) if dn == cn && dargs.len() == cargs.len() => {
+            for (da, ca) in dargs.iter().zip(cargs.iter()) {
+                bind_type_params_owned(da, ca, type_params, subst);
+            }
+        }
+        _ => {}
+    }
 }
 
 impl Codegen<'_> {
@@ -814,6 +1128,359 @@ impl Codegen<'_> {
         writeln!(self.entry_allocas, "  {dest} = alloca {ty}").unwrap();
     }
 
+    /// The `&mut self` wrapper every real-codegen call site uses
+    /// instead of the free `llvm_ty` function: resolves `ty` to its
+    /// LLVM type string exactly as the free function does, *and* — for
+    /// a `Ty::Named` — ensures the real `%Name = type {...}`
+    /// declaration has been emitted into `named_type_decls` (memoized
+    /// by mangled name) before handing back the name a `define`/GEP/
+    /// `alloca` is about to reference. The free function can't do this
+    /// half (it has no `&mut self`); the `check_supported` pre-pass
+    /// doesn't need this half (it never emits a `define`, only
+    /// validates — so it calls the free function directly with its own
+    /// throwaway registry). Pure delegation otherwise — no type-
+    /// resolution logic of its own.
+    fn llvm_ty(&mut self, ty: &Ty) -> Result<String, CodegenError> {
+        if let Ty::Named(_, _) = ty {
+            self.declare_named_type(ty)?;
+        }
+        llvm_ty(ty, &self.registry)
+    }
+
+    /// Emit the real `%Name = type { ... }` declaration for one concrete
+    /// `struct`/`enum` instantiation, exactly once per distinct mangled
+    /// name (memoized via `declared_named_types`). Called from `llvm_ty`
+    /// above — so any codegen path that resolves a `Ty::Named` to its
+    /// LLVM name automatically declares it too, no separate "declare
+    /// every struct" pass needed.
+    ///
+    /// **Struct layout**: `{ f0_llty, f1_llty, ... }` in field order, each
+    /// field's LLVM type resolved via the free `llvm_ty` against the
+    /// instantiation's own type-argument substitution. A named-typed
+    /// field (a nested struct/enum) is declared *first*, recursively, so
+    /// the outer `%Outer = type { %Point }` textually follows `%Point` —
+    /// LLVM requires a named struct type to be declared before any use,
+    /// including as another struct's field type. LLVM's own struct
+    /// layout then computes the real per-field alignment/padding; this
+    /// codebase never reads field offsets by hand for a struct (always
+    /// via `getelementptr %Name, ..., i32 0, i32 <idx>`), so the exact
+    /// padding is LLVM's concern, not ours.
+    ///
+    /// **Enum layout**: `{ i64 tag, [N x i64] payload }` — a hand-rolled
+    /// tagged union (LLVM has no native enum/sum-type equivalent).
+    /// `tag` is the variant's declaration-order index
+    /// (`registry.enum_variants` order, matching `typeck.rs`'s own
+    /// exhaustiveness-checking order). `N` is
+    /// `1 + max_over_variants(sum_of(conservative_word_count(payload_field)))`,
+    /// a real compile-time integer, so the same buffer fits every
+    /// variant's payload without a per-variant type. Payload fields are
+    /// stored into this raw `[N x i64]` buffer at 8-byte-aligned word
+    /// offsets by `construct`/`match_expr` — see those for the GEP
+    /// arithmetic; the buffer's element type is always `i64` regardless
+    /// of a field's real type, so a `getelementptr i64, ptr %payload,
+    /// i64 <word_off>` gives an always-8-byte-aligned address for any
+    /// field store/load (every type this language has needs at most
+    /// 8-byte alignment).
+    fn declare_named_type(&mut self, ty: &Ty) -> Result<(), CodegenError> {
+        let Ty::Named(decl_name, args) = ty else {
+            return Ok(());
+        };
+        let mangled = mangle_ty(ty);
+        if !self.declared_named_types.insert(mangled.clone()) {
+            return Ok(()); // already declared — memoized
+        }
+        let decl_name = decl_name.as_str();
+        if let Some(fields) = self.registry.struct_fields(decl_name) {
+            let type_params = self.registry.struct_type_params(decl_name).unwrap_or(&[]);
+            let subst = zip_type_params(type_params, args);
+            let mut parts: Vec<String> = Vec::with_capacity(fields.len());
+            for f in fields {
+                let field_ty = substitute_ty(&f.ty, &subst);
+                // A named-typed field is a dependency of this struct's
+                // own declaration — declare it first so its `%Name =
+                // type {...}` textually precedes this one. Recurses
+                // through `llvm_ty`'s `Ty::Named` branch (which calls
+                // this method), so arbitrarily-deep nesting is ordered
+                // correctly in one pass.
+                if matches!(field_ty, Ty::Named(_, _)) {
+                    self.declare_named_type(&field_ty)?;
+                }
+                parts.push(llvm_ty(&field_ty, &self.registry)?);
+            }
+            writeln!(self.named_type_decls, "%{mangled} = type {{ {} }}", parts.join(", ")).unwrap();
+            Ok(())
+        } else if let Some(variants) = self.registry.enum_variants(decl_name) {
+            let type_params = self.registry.enum_type_params(decl_name).unwrap_or(&[]);
+            let subst = zip_type_params(type_params, args);
+            let max_payload_words: u64 = variants
+                .iter()
+                .map(|v| {
+                    v.payload
+                        .iter()
+                        .map(|t| conservative_word_count(&substitute_ty(t, &subst), &self.registry))
+                        .sum::<u64>()
+                })
+                .max()
+                .unwrap_or(0);
+            let n = max_payload_words;
+            writeln!(self.named_type_decls, "%{mangled} = type {{ i64, [{n} x i64] }}").unwrap();
+            Ok(())
+        } else {
+            unreachable!("typeck.rs already proved every Ty::Named resolves to a struct or enum")
+        }
+    }
+
+    /// Resolve the concrete `Ty::Named(name, type_args)` a constructor call
+    /// `name(args)` produces, *without* an expected-type context — the
+    /// structural-inference fallback `expr_ptr`'s own `Expr::Call` ctor
+    /// branch and `local_ty_of`'s `Expr::Call` ctor arm need (the four
+    /// real construction sites — `Stmt::Let`/`Stmt::Return`/`call_args`/
+    /// nested-`construct` — already have a concrete `expected` in hand and
+    /// never call this; they call `construct` directly). Mirrors
+    /// `typeck.rs::resolve_type_args`'s fall-back path: for a generic
+    /// declaration, infer each type parameter from the corresponding
+    /// argument's own type via `bind_type_params`, then collect. Returns
+    /// `None` only for the genuinely-ambiguous case a zero-payload variant
+    /// (`None`) reached with no enclosing type context at all — exactly
+    /// the case the struct/enum codegen plan names as the one disclosed
+    /// `CodegenError` to fail rather than guess on.
+    fn ctor_ty(&self, name: &str, args: &[Expr], scopes: &Scopes) -> Option<Ty> {
+        if let Some(decl) = self.registry.struct_decl(name) {
+            let type_params = decl.type_params.clone();
+            let decl_tys: Vec<Ty> = decl.fields.iter().map(|f| f.ty.clone()).collect();
+            let type_args = self.infer_type_args(&type_params, &decl_tys, args, scopes)?;
+            Some(Ty::Named(name.to_string(), type_args))
+        } else if let Some((enum_name, variant)) = self.registry.find_variant(name) {
+            let type_params = self.registry.enum_type_params(enum_name)?.to_vec();
+            let decl_tys = variant.payload.clone();
+            let type_args = self.infer_type_args(&type_params, &decl_tys, args, scopes)?;
+            Some(Ty::Named(enum_name.to_string(), type_args))
+        } else {
+            None
+        }
+    }
+
+    /// The shared inference core of `ctor_ty` — `typeck.rs::
+    /// resolve_type_args` minus its expected-type shortcut and its
+    /// diagnostic path (codegen only ever sees an already-well-typed
+    /// program, so a genuinely-ambiguous constructor is a real, disclosed
+    /// `CodegenError` this returns `None` for, not a recoverable type
+    /// error to report). Returns the fully-resolved `type_args` if every
+    /// parameter was bound, `None` otherwise.
+    fn infer_type_args(&self, type_params: &[String], decl_tys: &[Ty], args: &[Expr], scopes: &Scopes) -> Option<Vec<Ty>> {
+        if type_params.is_empty() {
+            return Some(Vec::new());
+        }
+        let mut subst: HashMap<String, Ty> = HashMap::new();
+        for (decl_ty, arg) in decl_tys.iter().zip(args.iter()) {
+            let arg_ty = self.local_ty_of(arg, scopes);
+            if arg_ty != Ty::Error {
+                bind_type_params_owned(decl_ty, &arg_ty, type_params, &mut subst);
+            }
+        }
+        type_params.iter().map(|p| subst.get(p).cloned()).collect()
+    }
+
+    /// `(field_index, substituted_field_type)` for `field` of the struct
+    /// type `base_ty` — the one piece of information both `expr()`'s and
+    /// `expr_ptr()`'s `Expr::FieldAccess` arms need, factored out so they
+    /// share one resolution path. `base_ty` is always a concrete struct
+    /// instantiation by the time this runs (`typeck.rs` already proved the
+    /// base is a struct and the field exists); the `None` return is a
+    /// defense-in-depth fallback, not an expected path.
+    fn field_index_and_ty(&self, base_ty: &Ty, field: &str) -> Option<(usize, Ty)> {
+        if let Ty::Named(name, type_args) = base_ty
+            && let Some(fields) = self.registry.struct_fields(name)
+        {
+            let type_params = self.registry.struct_type_params(name).unwrap_or(&[]);
+            let subst = zip_type_params(type_params, type_args);
+            for (i, f) in fields.iter().enumerate() {
+                if f.name == field {
+                    return Some((i, substitute_ty(&f.ty, &subst)));
+                }
+            }
+        }
+        None
+    }
+
+    /// `expr_ptr`'s `Expr::Call` ctor branch, and the shared backend the
+    /// three expected-type-bearing construction sites (`Stmt::Let`/
+    /// `Stmt::Return`/`call_args`, via `expr_ptr_expected`) route
+    /// through. Allocates a fresh destination sized to `expected`'s real
+    /// LLVM type, fills its fields (struct) or its tag + payload words
+    /// (enum variant) from `args`, and returns the destination pointer —
+    /// the `expr_ptr`-shaped result every aggregate value produces.
+    ///
+    /// `expected` is always a *concrete* `Ty::Named(decl_name, type_args)`
+    /// at every call site: `Stmt::Let`/`Stmt::Return`/`call_args` hand
+    /// over their own already-resolved declared/return/parameter type, and
+    /// a nested constructor argument recurses with its field's own
+    /// substituted type. So this is pure lookup + substitution, never
+    /// inference — the inference the plan's design-decision 4 names is
+    /// entirely `ctor_ty`'s job (the `expr_ptr`-reached fallback), not
+    /// this method's.
+    #[allow(clippy::too_many_arguments)]
+    fn construct(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        expected: &Ty,
+        span: Span,
+        scopes: &mut Scopes,
+    ) -> Result<String, CodegenError> {
+        let dest_llty = self.llvm_ty(expected)?;
+        let dest = self.fresh_reg("ctor.addr");
+        self.emit_alloca(&dest, &dest_llty);
+
+        if self.registry.is_struct(name) {
+            self.construct_struct(name, args, expected, &dest, span, scopes)?;
+        } else if let Some((enum_name, variant)) = self.registry.find_variant(name) {
+            self.construct_variant(enum_name, variant, args, expected, &dest, span, scopes)?;
+        } else {
+            unreachable!("typeck.rs already proved `{name}` is a struct or variant constructor")
+        }
+        Ok(dest)
+    }
+
+    /// The struct half of `construct` — stores each argument into its
+    /// field slot via `getelementptr %Name, ptr dest, i32 0, i32 i`,
+    /// recursing through `construct` for a nested constructor argument
+    /// (so `Outer(Inner(1))` constructs the `Inner` into its own temp,
+    /// then memcpys it into `Outer`'s field — a small extra copy, kept
+    /// for simplicity over a "construct directly into the field slot"
+    /// optimization that would need a different `construct` shape).
+    fn construct_struct(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        expected: &Ty,
+        dest: &str,
+        span: Span,
+        scopes: &mut Scopes,
+    ) -> Result<(), CodegenError> {
+        let decl_name = if let Ty::Named(n, _) = expected { n.as_str() } else { name };
+        let fields = self.registry.struct_fields(decl_name).expect("just proved this is a struct");
+        let type_params = self.registry.struct_type_params(decl_name).unwrap_or(&[]);
+        let type_args = if let Ty::Named(_, a) = expected { a.clone() } else { Vec::new() };
+        let subst = zip_type_params(type_params, &type_args);
+        let base_llty = self.llvm_ty(expected)?;
+        for (i, (arg, f)) in args.iter().zip(fields.iter()).enumerate() {
+            let field_ty = substitute_ty(&f.ty, &subst);
+            let field_ptr = self.fresh_reg("field.addr");
+            writeln!(self.out, "  {field_ptr} = getelementptr inbounds {base_llty}, ptr {dest}, i32 0, i32 {i}").unwrap();
+            self.store_value_into(arg, &field_ty, &field_ptr, span, scopes)?;
+        }
+        Ok(())
+    }
+
+    /// The enum-variant half of `construct` — stores the variant's
+    /// declaration-order index at the tag word (GEP field 0), then stores
+    /// each payload argument at its 8-byte-aligned word offset inside the
+    /// `[N x i64]` payload buffer (GEP field 1, then a word-granularity
+    /// `getelementptr i64` into it). Word offsets are the cumulative
+    /// `conservative_word_count` of the preceding payload fields in this
+    /// variant — exactly the over-allocating, never-under-sizing scheme
+    /// `declare_named_type`'s enum-layout doc explains.
+    #[allow(clippy::too_many_arguments)]
+    fn construct_variant(
+        &mut self,
+        enum_name: &str,
+        variant: &Variant,
+        args: &[Expr],
+        expected: &Ty,
+        dest: &str,
+        span: Span,
+        scopes: &mut Scopes,
+    ) -> Result<(), CodegenError> {
+        let variants = self.registry.enum_variants(enum_name).expect("just proved this is an enum");
+        let vidx = variants.iter().position(|v| v.name == variant.name).expect("typeck.rs proved this variant exists");
+        let type_params = self.registry.enum_type_params(enum_name).unwrap_or(&[]);
+        let type_args = if let Ty::Named(_, a) = expected { a.clone() } else { Vec::new() };
+        let subst = zip_type_params(type_params, &type_args);
+        let base_llty = self.llvm_ty(expected)?;
+
+        // Tag word at GEP field 0.
+        let tag_ptr = self.fresh_reg("tag.addr");
+        writeln!(self.out, "  {tag_ptr} = getelementptr inbounds {base_llty}, ptr {dest}, i32 0, i32 0").unwrap();
+        writeln!(self.out, "  store i64 {vidx}, ptr {tag_ptr}").unwrap();
+
+        // Payload buffer at GEP field 1 — `[N x i64]`, element-addressable
+        // by a plain `getelementptr i64, ptr %payload, i64 <word_off>`.
+        let payload = self.fresh_reg("payload.addr");
+        writeln!(self.out, "  {payload} = getelementptr inbounds {base_llty}, ptr {dest}, i32 0, i32 1").unwrap();
+
+        let mut word_off: u64 = 0;
+        for (arg, decl_ty) in args.iter().zip(variant.payload.iter()) {
+            let field_ty = substitute_ty(decl_ty, &subst);
+            let field_ptr = self.fresh_reg("payfield.addr");
+            writeln!(self.out, "  {field_ptr} = getelementptr inbounds i64, ptr {payload}, i64 {word_off}").unwrap();
+            self.store_value_into(arg, &field_ty, &field_ptr, span, scopes)?;
+            word_off += conservative_word_count(&field_ty, &self.registry);
+        }
+        Ok(())
+    }
+
+    /// Store `arg`'s value (a scalar) or whole value (an aggregate) into
+    /// the slot at `field_ptr`, with the slot's own declared `field_ty`
+    /// driving the scalar-vs-aggregate choice exactly the way `call_args`
+    /// does for a call argument. A nested constructor argument recurses
+    /// through `construct` (with `field_ty` as its expected type) instead
+    /// of going through `expr_ptr`'s no-expected fallback — so a nested
+    /// `Outer(Inner(1))` never hits `ctor_ty`'s ambiguous-case `None`.
+    fn store_value_into(
+        &mut self,
+        arg: &Expr,
+        field_ty: &Ty,
+        field_ptr: &str,
+        span: Span,
+        scopes: &mut Scopes,
+    ) -> Result<(), CodegenError> {
+        if field_ty.is_aggregate() {
+            if let Expr::Call(name, cargs, _) = arg
+                && (self.registry.is_struct(name) || self.registry.find_variant(name).is_some())
+            {
+                let src = self.construct(name, cargs, field_ty, span, scopes)?;
+                let bytes = agg_byte_size_operand(field_ty, &self.registry);
+                writeln!(self.out, "  call void @llvm.memcpy.p0.p0.i64(ptr {field_ptr}, ptr {src}, i64 {bytes}, i1 false)").unwrap();
+                return Ok(());
+            }
+            let src = self.expr_ptr(arg, scopes)?;
+            let bytes = agg_byte_size_operand(field_ty, &self.registry);
+            writeln!(self.out, "  call void @llvm.memcpy.p0.p0.i64(ptr {field_ptr}, ptr {src}, i64 {bytes}, i1 false)").unwrap();
+        } else {
+            let v = self.expr(arg, scopes)?;
+            let v = if field_ty.is_integer() { self.narrow_from_i64(&v, field_ty)? } else { v };
+            let field_llty = self.llvm_ty(field_ty)?;
+            writeln!(self.out, "  store {field_llty} {v}, ptr {field_ptr}").unwrap();
+        }
+        Ok(())
+    }
+
+    /// The expected-type-bearing entry point the three aggregate-value
+    /// call sites that already have a concrete type in hand (`Stmt::Let`'s
+    /// own declared type, `Stmt::Return`'s `current_fn_ret`, `call_args`'
+    /// per-argument `sig_params[i]`) route through instead of `expr_ptr` —
+    /// so a constructor reached in one of those positions is built with
+    /// its real expected type (never `ctor_ty`'s inference fallback), and
+    /// every other aggregate expression is forwarded to `expr_ptr`
+    /// unchanged. A constructor's `expected` is always a concrete
+    /// `Ty::Named` here (a `let`/return/parameter type is fully resolved
+    /// by `typeck.rs` before codegen runs), so `construct`'s "no
+    /// inference" contract holds at every entry.
+    fn expr_ptr_expected(
+        &mut self,
+        e: &Expr,
+        expected: &Ty,
+        scopes: &mut Scopes,
+    ) -> Result<String, CodegenError> {
+        if let Expr::Call(name, args, span) = e
+            && (self.registry.is_struct(name) || self.registry.find_variant(name).is_some())
+        {
+            return self.construct(name, args, expected, *span, scopes);
+        }
+        self.expr_ptr(e, scopes)
+    }
+
     fn function(&mut self, f: &FnDecl) -> Result<(), CodegenError> {
         self.current_fn_ret = f.ret.clone();
         self.current_fn_name = f.name.clone();
@@ -825,7 +1492,7 @@ impl Codegen<'_> {
         // `Stmt::Return` memcpys its computed result into it and `ret
         // void`s, instead of `ret <ty> <val>`.
         let is_agg_ret = f.ret.is_aggregate();
-        let ret_llty: String = if is_agg_ret { "void".to_string() } else { llvm_ty(&f.ret)? };
+        let ret_llty: String = if is_agg_ret { "void".to_string() } else { self.llvm_ty(&f.ret)? };
         let name = if f.name == "main" { "nir_main" } else { f.name.as_str() };
 
         let mut params: Vec<String> = Vec::new();
@@ -844,7 +1511,7 @@ impl Codegen<'_> {
                 // either).
                 params.push(format!("ptr %arg.{}", p.name));
             } else {
-                params.push(format!("{} %arg.{}", llvm_ty(&p.ty)?, p.name));
+                params.push(format!("{} %arg.{}", self.llvm_ty(&p.ty)?, p.name));
             }
         }
         writeln!(self.out, "define {ret_llty} @{name}({}) {{", params.join(", ")).unwrap();
@@ -862,10 +1529,10 @@ impl Codegen<'_> {
         let mut scopes = Scopes::new();
         for p in &f.params {
             if p.ty.is_aggregate() {
-                let agg_llty = llvm_ty(&p.ty)?;
+                let agg_llty = self.llvm_ty(&p.ty)?;
                 let local_ptr = format!("%{}.addr", p.name);
                 self.emit_alloca(&local_ptr, &agg_llty);
-                let (_, _, bytes) = agg_layout(&p.ty);
+                let bytes = agg_byte_size_operand(&p.ty, &self.registry);
                 writeln!(
                     self.out,
                     "  call void @llvm.memcpy.p0.p0.i64(ptr {local_ptr}, ptr %arg.{}, i64 {bytes}, i1 false)",
@@ -874,7 +1541,7 @@ impl Codegen<'_> {
                 .unwrap();
                 scopes.define(&p.name, p.ty.clone(), local_ptr);
             } else {
-                let ty = llvm_ty(&p.ty)?;
+                let ty = self.llvm_ty(&p.ty)?;
                 let ptr = format!("%{}.addr", p.name);
                 self.emit_alloca(&ptr, &ty);
                 writeln!(self.out, "  store {ty} %arg.{}, ptr {ptr}", p.name).unwrap();
@@ -933,12 +1600,17 @@ impl Codegen<'_> {
                     // storage, or a later `w = ...` reassignment would
                     // silently mutate `v` too (see `Codegen::expr_ptr`'s
                     // `Expr::Ident` arm, which deliberately returns the
-                    // existing pointer with no copy of its own).
-                    let src = self.expr_ptr(value, scopes)?;
-                    let agg_llty = llvm_ty(ty)?;
+                    // existing pointer with no copy of its own). A
+                    // constructor expression here is built with `ty` as its
+                    // expected type (`expr_ptr_expected`), so a generic
+                    // zero-payload variant like `None` resolves from this
+                    // `let`'s own annotation rather than the no-context
+                    // `ctor_ty` fallback.
+                    let src = self.expr_ptr_expected(value, ty, scopes)?;
+                    let agg_llty = self.llvm_ty(ty)?;
                     let dest = self.fresh_reg(&format!("{name}.addr"));
                     self.emit_alloca(&dest, &agg_llty);
-                    let (_, _, bytes) = agg_layout(ty);
+                    let bytes = agg_byte_size_operand(ty, &self.registry);
                     writeln!(self.out, "  call void @llvm.memcpy.p0.p0.i64(ptr {dest}, ptr {src}, i64 {bytes}, i1 false)").unwrap();
                     scopes.define(name, ty.clone(), dest);
                     return Ok(());
@@ -946,7 +1618,7 @@ impl Codegen<'_> {
                 let val = self.expr(value, scopes)?; // i64 (or i1 for bool)
                 let val = self.guard_in_range(&val, ty, *span)?; // checked at i64 width, before narrowing
                 let val = if ty.is_integer() { self.narrow_from_i64(&val, ty)? } else { val };
-                let llty = llvm_ty(ty)?;
+                let llty = self.llvm_ty(ty)?;
                 let ptr = self.fresh_reg(&format!("{name}.addr"));
                 self.emit_alloca(&ptr, &llty);
                 writeln!(self.out, "  store {llty} {val}, ptr {ptr}").unwrap();
@@ -966,12 +1638,12 @@ impl Codegen<'_> {
                     Some(e) => {
                         let ret_ty = self.current_fn_ret.clone();
                         if ret_ty.is_aggregate() {
-                            let src = self.expr_ptr(e, scopes)?;
+                            let src = self.expr_ptr_expected(e, &ret_ty, scopes)?;
                             let sret = self
                                 .current_fn_sret
                                 .clone()
                                 .expect("an aggregate-returning function always sets current_fn_sret");
-                            let (_, _, bytes) = agg_layout(&ret_ty);
+                            let bytes = agg_byte_size_operand(&ret_ty, &self.registry);
                             writeln!(self.out, "  call void @llvm.memcpy.p0.p0.i64(ptr {sret}, ptr {src}, i64 {bytes}, i1 false)").unwrap();
                             self.emit_frees_for_names(&free_names, scopes);
                             writeln!(self.out, "  ret void").unwrap();
@@ -987,7 +1659,8 @@ impl Codegen<'_> {
                             let val = self.guard_in_range(&val, &ret_ty, *span)?;
                             let val = if ret_ty.is_integer() { self.narrow_from_i64(&val, &ret_ty)? } else { val };
                             self.emit_frees_for_names(&free_names, scopes);
-                            writeln!(self.out, "  ret {} {val}", llvm_ty(&ret_ty)?).unwrap();
+                            let ret_llty = self.llvm_ty(&ret_ty)?;
+                            writeln!(self.out, "  ret {} {val}", ret_llty).unwrap();
                         }
                     }
                     None => {
@@ -1072,7 +1745,40 @@ impl Codegen<'_> {
             {
                 self.builtin_result_ty(name, args, scopes)
             }
+            // Not in `self.sigs` (that table is user-defined functions
+            // only) -- without this arm, the fallback below would
+            // wrongly report `Ty::I64` for these two builtins.
+            Expr::Call(name, _, _) if name == "sha256_hex" => Ty::Str,
+            Expr::Call(name, _, _) if name == "constant_time_str_eq" => Ty::Bool,
+            Expr::Call(name, _, _) if name == "rand_f64" || name == "rand_gaussian" => Ty::F64,
+            Expr::Call(name, _, _) if name == "rand_seed" => Ty::Unit,
+            // Row 11: a struct/variant constructor call produces a
+            // `Ty::Named` value (the struct's own type, or the owning
+            // enum's), not the `Ty::I64` the `self.sigs.get` fallback
+            // below would wrongly hand back for a name that isn't a user
+            // fn. `ctor_ty`'s `None` (a zero-payload generic variant
+            // reached with no expected type, e.g. a bare `None`
+            // expression statement) falls back to a placeholder `Named`
+            // so `is_aggregate()` routing still picks the right
+            // `expr_ptr`/`expr` fork — the real construction path
+            // (`expr_ptr_expected`) always has the true expected type and
+            // never reaches this `None` branch for a real program.
+            Expr::Call(name, args, _) if self.registry.is_struct(name) || self.registry.find_variant(name).is_some() => {
+                self.ctor_ty(name, args, scopes).unwrap_or_else(|| Ty::Named(name.to_string(), Vec::new()))
+            }
             Expr::Call(name, _, _) => self.sigs.get(name).map(|s| s.ret.clone()).unwrap_or(Ty::I64),
+            // Row 11: `base.field`'s type is `base`'s struct type's
+            // substituted field type — factored through
+            // `field_index_and_ty` so `expr()`/`expr_ptr()`'s own
+            // `Expr::FieldAccess` arms share one resolution path with
+            // this `local_ty_of` arm. The `Ty::I64` fallback is
+            // defense-in-depth (typeck already proved the base is a struct
+            // and the field exists), not an expected path.
+            Expr::FieldAccess(base, field, _) => {
+                self.field_index_and_ty(&self.local_ty_of(base, scopes), field)
+                    .map(|(_, ty)| ty)
+                    .unwrap_or(Ty::I64)
+            }
             Expr::ArrayLit(elements, _) => self.array_lit_ty(elements, scopes),
             Expr::Index(base, _, _) => match self.local_ty_of(base, scopes) {
                 Ty::Vector(elem, _) | Ty::Matrix(elem, _, _) => *elem,
@@ -1103,6 +1809,13 @@ impl Codegen<'_> {
                 Ty::Box(t) | Ty::Ref(t) => *t,
                 _ => Ty::I64,
             },
+            // Aggregate-result `if`/`match`: typeck already proved every
+            // branch/arm body has the same type, so the first one is
+            // representative. This is only needed so that nested
+            // aggregate control flow (e.g. an `if` inside an `if` branch)
+            // can resolve its own result type.
+            Expr::If { then_block, .. } => self.block_trailing_ty(then_block, scopes),
+            Expr::Match { arms, .. } => self.local_ty_of(&arms[0].body, scopes),
             _ => Ty::I64,
         }
     }
@@ -1219,17 +1932,28 @@ impl Codegen<'_> {
     /// Every integer-typed value this backend hands around internally is
     /// `i64` — see the module doc's "why arithmetic is always computed
     /// at i64 width" note; this is the *load* side of that: a value just
-    /// read out of a narrower-than-`i64` stack slot gets sign-extended
-    /// immediately, before it can participate in anything else. A no-op
-    /// for `bool` (stays `i1` throughout — it never enters the i64
-    /// scheme) or a value that's already `i64`.
+    /// read out of a narrower-than-`i64` stack slot gets widened
+    /// immediately, before it can participate in anything else. `zext`
+    /// for an unsigned type (`Ty::is_unsigned`), `sext` for a signed
+    /// one — the *only* place this backend needs that distinction at
+    /// all (see `llvm_ty`'s `Ty::U8`/etc. arm for why nothing
+    /// downstream does). A no-op for `bool` (stays `i1` throughout — it
+    /// never enters the i64 scheme) or a value whose LLVM width is
+    /// already 64 bits (`Ty::I64`, and also `Ty::U64`/`Ty::Usize`, which
+    /// map to the same `i64` width — checked by comparing the actual
+    /// LLVM type string, not the `Ty` variant, since `Ty::U64 !=
+    /// Ty::I64` even though they compile to the identical width).
     fn widen_to_i64(&mut self, val: &str, ty: &Ty) -> String {
-        if !ty.is_integer() || *ty == Ty::I64 {
+        if !ty.is_integer() {
             return val.to_string();
         }
-        let llty = llvm_ty(ty).expect("check_supported already validated this type");
+        let llty = self.llvm_ty(ty).expect("check_supported already validated this type");
+        if llty == "i64" {
+            return val.to_string();
+        }
         let r = self.fresh_reg("widen");
-        writeln!(self.out, "  {r} = sext {llty} {val} to i64").unwrap();
+        let op = if ty.is_unsigned() { "zext" } else { "sext" };
+        writeln!(self.out, "  {r} = {op} {llty} {val} to i64").unwrap();
         r
     }
 
@@ -1241,7 +1965,7 @@ impl Codegen<'_> {
     /// not after — see the module doc's "found by testing" note on why
     /// computing directly at the narrow width was wrong).
     fn narrow_from_i64(&mut self, val: &str, ty: &Ty) -> Result<String, CodegenError> {
-        let llty = llvm_ty(ty)?;
+        let llty = self.llvm_ty(ty)?;
         if llty == "i64" {
             return Ok(val.to_string());
         }
@@ -1295,32 +2019,114 @@ impl Codegen<'_> {
         Ok(val.to_string())
     }
 
-    /// Frees one still-owned `box`-typed binding, recursing into nested
-    /// `box box T` layers first — `nir_free` only reclaims the one heap
-    /// block `ptr_reg` itself points to; a `box box i64`'s outer
-    /// allocation holds nothing but *another* heap pointer as its
-    /// content, and that inner allocation would leak forever if nothing
-    /// ever loads it back out and frees it too. Order doesn't matter for
-    /// memory safety (the inner pointer is read out before anything is
-    /// freed), only for tidiness — innermost first, matching how nested
-    /// teardown reads everywhere else in this file.
-    fn emit_box_free(&mut self, ptr_reg: &str, ty: &Ty) {
-        let Ty::Box(inner) = ty else { return };
-        if let Ty::Box(_) = inner.as_ref() {
-            let inner_ptr = self.fresh_reg("nested_box_inner");
-            writeln!(self.out, "  {inner_ptr} = load ptr, ptr {ptr_reg}").unwrap();
-            self.emit_box_free(&inner_ptr, inner);
+    /// Tear down one affine-typed value whose storage lives at `value_ptr`.
+    /// Recurses into `box` contents, `struct` affine fields, and the live
+    /// variant's affine payload fields of `enum`s. `value_ptr` is always a
+    /// pointer to where the value is stored (a stack slot, a field address,
+    /// or the heap address for the contents of a box), not the scalar value
+    /// itself.
+    fn emit_affine_free(&mut self, value_ptr: &str, ty: &Ty) {
+        match ty {
+            Ty::Box(inner) => {
+                let heap_ptr = self.fresh_reg("box.heap_ptr");
+                writeln!(self.out, "  {heap_ptr} = load ptr, ptr {value_ptr}").unwrap();
+                if self.registry.is_affine(inner) {
+                    self.emit_affine_free(&heap_ptr, inner);
+                }
+                writeln!(self.out, "  call void @nir_free(ptr {heap_ptr})").unwrap();
+            }
+            Ty::Tcp | Ty::TcpListener => {
+                let fd = self.fresh_reg("tcp.fd");
+                writeln!(self.out, "  {fd} = load i64, ptr {value_ptr}").unwrap();
+                writeln!(self.out, "  call i32 @nir_tcp_stop(i64 {fd})").unwrap();
+            }
+            Ty::Named(name, args) => {
+                if let Some(fields) = self.registry.struct_fields(name) {
+                    let type_params = self.registry.struct_type_params(name).unwrap_or(&[]);
+                    let subst = zip_type_params(type_params, args);
+                    let struct_llty = self.llvm_ty(ty).expect("check_supported already accepted this type");
+                    for (i, f) in fields.iter().enumerate() {
+                        let field_ty = substitute_ty(&f.ty, &subst);
+                        if self.registry.is_affine(&field_ty) {
+                            let field_ptr = self.fresh_reg("struct_field.addr");
+                            writeln!(
+                                self.out,
+                                "  {field_ptr} = getelementptr inbounds {struct_llty}, ptr {value_ptr}, i32 0, i32 {i}"
+                            )
+                            .unwrap();
+                            self.emit_affine_free(&field_ptr, &field_ty);
+                        }
+                    }
+                } else if let Some(variants) = self.registry.enum_variants(name) {
+                    let type_params = self.registry.enum_type_params(name).unwrap_or(&[]);
+                    let subst = zip_type_params(type_params, args);
+                    let enum_llty = self.llvm_ty(ty).expect("check_supported already accepted this type");
+                    let tag_ptr = self.fresh_reg("enum_tag.addr");
+                    writeln!(
+                        self.out,
+                        "  {tag_ptr} = getelementptr inbounds {enum_llty}, ptr {value_ptr}, i32 0, i32 0"
+                    )
+                    .unwrap();
+                    let tag = self.fresh_reg("enum_tag");
+                    writeln!(self.out, "  {tag} = load i64, ptr {tag_ptr}").unwrap();
+                    let payload = self.fresh_reg("enum_payload.addr");
+                    writeln!(
+                        self.out,
+                        "  {payload} = getelementptr inbounds {enum_llty}, ptr {value_ptr}, i32 0, i32 1"
+                    )
+                    .unwrap();
+
+                    let mut case_labels: Vec<String> = Vec::new();
+                    for _ in variants.iter() {
+                        case_labels.push(self.fresh_label("enum_free_arm"));
+                    }
+                    let default_label = self.fresh_label("enum_free_default");
+                    let merge_label = self.fresh_label("enum_free_merge");
+
+                    writeln!(self.out, "  switch i64 {tag}, label %{default_label} [").unwrap();
+                    for (vidx, label) in case_labels.iter().enumerate() {
+                        writeln!(self.out, "    i64 {vidx}, label %{label}").unwrap();
+                    }
+                    writeln!(self.out, "  ]").unwrap();
+
+                    writeln!(self.out, "{default_label}:").unwrap();
+                    writeln!(self.out, "  unreachable").unwrap();
+
+                    for (variant, label) in variants.iter().zip(case_labels.iter()) {
+                        writeln!(self.out, "{label}:").unwrap();
+                        let mut word_off: u64 = 0;
+                        for decl_ty in variant.payload.iter() {
+                            let field_ty = substitute_ty(decl_ty, &subst);
+                            if self.registry.is_affine(&field_ty) {
+                                let field_ptr = self.fresh_reg("enum_payload_field.addr");
+                                writeln!(
+                                    self.out,
+                                    "  {field_ptr} = getelementptr inbounds i64, ptr {payload}, i64 {word_off}"
+                                )
+                                .unwrap();
+                                self.emit_affine_free(&field_ptr, &field_ty);
+                            }
+                            word_off += conservative_word_count(&field_ty, &self.registry);
+                        }
+                        writeln!(self.out, "  br label %{merge_label}").unwrap();
+                    }
+
+                    writeln!(self.out, "{merge_label}:").unwrap();
+                }
+            }
+            _ => {}
         }
-        writeln!(self.out, "  call void @nir_free(ptr {ptr_reg})").unwrap();
     }
 
-    /// Emits `nir_free` (recursively, via `emit_box_free`) for every
-    /// named binding in a `FreeMap` entry, looking each one up in the
-    /// scope it's still live in. Callers are every scope-closing point
-    /// `FreeMap`'s doc comment lists — always guarded by `!self.terminated`
-    /// except `Stmt::Return`'s own call, which fires unconditionally since
-    /// it's what's *about* to set `terminated`, not something already past
-    /// it.
+    /// Emits teardown for every named binding in a `FreeMap` entry,
+    /// looking each one up in the scope it's still live in. The binding's
+    /// stack slot pointer is passed straight to `emit_affine_free`, which
+    /// decides whether the slot contains a heap pointer (`box`), an fd
+    /// (`tcp`), or a struct/enum value with affine fields. Callers are
+    /// every scope-closing point `FreeMap`'s doc comment lists — always
+    /// guarded by `!self.terminated` except `Stmt::Return`'s own call,
+    /// which fires unconditionally since it's what's *about* to set
+    /// `terminated`, not something already past it.
     fn emit_frees_for_names(&mut self, names: &[String], scopes: &Scopes) {
         for name in names {
             let Some((ty, stack_ptr)) = scopes.get(name) else {
@@ -1333,16 +2139,7 @@ impl Codegen<'_> {
                 // itself doesn't own.
                 continue;
             };
-            // `scopes.get` hands back the binding's own stack slot (the
-            // same `ptr_reg` every other scalar-shaped value uses) — it
-            // holds the box's heap pointer *value*, it isn't that value
-            // itself. Load the actual heap address out before freeing it;
-            // freeing the stack slot's own address would be a bug (and,
-            // separately, the stack slot doesn't need freeing at all —
-            // it's `entry_allocas`-hoisted and dies for free at return).
-            let heap_ptr = self.fresh_reg(&format!("{name}.heap_ptr"));
-            writeln!(self.out, "  {heap_ptr} = load ptr, ptr {stack_ptr}").unwrap();
-            self.emit_box_free(&heap_ptr, &ty);
+            self.emit_affine_free(&stack_ptr, &ty);
         }
     }
 
@@ -1462,7 +2259,7 @@ impl Codegen<'_> {
                          through a function call"
                     ));
                 }
-                let llty = llvm_ty(&ty)?;
+                let llty = self.llvm_ty(&ty)?;
                 let reg = self.fresh_reg(&format!("{name}.val"));
                 writeln!(self.out, "  {reg} = load {llty}, ptr {ptr}").unwrap();
                 Ok(self.widen_to_i64(&reg, &ty))
@@ -1509,7 +2306,7 @@ impl Codegen<'_> {
                 let val = self.expr(rhs, scopes)?; // i64 (or i1 for bool)
                 let val = self.guard_in_range(&val, &ty, *span)?; // checked at i64 width
                 let store_val = if ty.is_integer() { self.narrow_from_i64(&val, &ty)? } else { val.clone() };
-                let llty = llvm_ty(&ty)?;
+                let llty = self.llvm_ty(&ty)?;
                 writeln!(self.out, "  store {llty} {store_val}, ptr {ptr}").unwrap();
                 // `val` (still i64/i1), not `store_val` (narrow) — every
                 // other `expr()` result is i64 for an integer type, and
@@ -1524,11 +2321,47 @@ impl Codegen<'_> {
             | Expr::Chan(_)
             | Expr::SpawnSandbox(_, _, _)
             | Expr::Open(_, _, _)
-            | Expr::Transact { .. }
-            | Expr::FieldAccess(..)
-            | Expr::Match { .. } => {
+            | Expr::Transact { .. } => {
                 unreachable!("check_supported already rejected this program")
             }
+            // Row 11: `base.field` where the field is a plain scalar —
+            // GEP to the field's index within `base`'s real named struct
+            // type, then `load` the field's own LLVM type, exactly the
+            // shape every other scalar `expr()` arm has. An
+            // aggregate-typed field (a nested struct/Vector/Matrix) never
+            // reaches `expr()` — `local_ty_of` reports it as
+            // `is_aggregate()`, so `Stmt::Let`/`Stmt::Expr`/`call_args`
+            // all route it to `expr_ptr()`'s own `Expr::FieldAccess` arm
+            // instead; the guard below keeps this arm a clean
+            // `CodegenError` rather than a wrong-shaped `load` if some
+            // future construct defies that routing.
+            Expr::FieldAccess(base, field, span) => {
+                let base_ty = self.local_ty_of(base, scopes);
+                let (idx, field_ty) = self
+                    .field_index_and_ty(&base_ty, field)
+                    .expect("typeck.rs already proved this base is a struct with this field");
+                if field_ty.is_aggregate() {
+                    return unsupported(format!(
+                        "codegen doesn't support an aggregate-typed field access `.{field}` at {span:?} in this scalar expression position yet — bind it via `let` instead (same pre-existing gap `if`/`match` themselves have for an aggregate result)"
+                    ));
+                }
+                let base_ptr = self.expr_ptr(base, scopes)?;
+                let base_llty = self.llvm_ty(&base_ty)?;
+                let gep = self.fresh_reg("fieldptr");
+                writeln!(self.out, "  {gep} = getelementptr inbounds {base_llty}, ptr {base_ptr}, i32 0, i32 {idx}").unwrap();
+                let field_llty = self.llvm_ty(&field_ty)?;
+                let loaded = self.fresh_reg("fieldval");
+                writeln!(self.out, "  {loaded} = load {field_llty}, ptr {gep}").unwrap();
+                Ok(self.widen_to_i64(&loaded, &field_ty))
+            }
+            // Row 11: `match scrutinee { ... }` with a scalar result —
+            // the overwhelmingly common real case (`structs_enums.nir`'s
+            // own `area()`). An aggregate-result `match` is deliberately
+            // out of scope here, the same pre-existing gap `expr_ptr`'s
+            // own `_ => unsupported(...)` already covers for `if` — it
+            // fails cleanly via `expr_ptr_expected`'s `expr_ptr` fallback
+            // rather than being silently absent.
+            Expr::Match { scrutinee, arms, span } => self.match_expr(scrutinee, arms, *span, scopes),
             // `box e` — heap-allocate `e`'s type's own byte size
             // (`ty_byte_size`, covers every `Ty` a `box` can wrap, not
             // just aggregates), copy `e`'s value in, return the heap
@@ -1542,7 +2375,7 @@ impl Codegen<'_> {
             // the matching `nir_free` is emitted later, at whichever
             // scope-closing point actually owns this box's last use
             // (`ownership.rs`'s `FreeMap`, consumed by
-            // `emit_frees_for_names`/`emit_box_free`) — a real, working
+            // `emit_frees_for_names`/`emit_affine_free`) — a real, working
             // free, not a placeholder (confirmed in generated IR for a
             // simple `let`-bound box). Keeping allocation and free as two
             // separate emission sites mirrors how the rest of this file
@@ -1550,7 +2383,7 @@ impl Codegen<'_> {
             // scope ends."
             Expr::Box(inner, _) => {
                 let inner_ty = self.local_ty_of(inner, scopes);
-                let size = ty_byte_size(&inner_ty);
+                let size = ty_byte_size(&inner_ty, &self.registry);
                 let heap_ptr = self.fresh_reg("box_heap");
                 writeln!(self.out, "  {heap_ptr} = call ptr @nir_alloc(i64 {size})").unwrap();
                 if inner_ty.is_aggregate() {
@@ -1558,7 +2391,7 @@ impl Codegen<'_> {
                     writeln!(self.out, "  call void @llvm.memcpy.p0.p0.i64(ptr {heap_ptr}, ptr {src}, i64 {size}, i1 false)").unwrap();
                 } else {
                     let v = self.expr(inner, scopes)?;
-                    let llty = llvm_ty(&inner_ty)?;
+                    let llty = self.llvm_ty(&inner_ty)?;
                     let v = if inner_ty.is_integer() { self.narrow_from_i64(&v, &inner_ty)? } else { v };
                     writeln!(self.out, "  store {llty} {v}, ptr {heap_ptr}").unwrap();
                 }
@@ -1600,7 +2433,7 @@ impl Codegen<'_> {
                          not a language-level limitation"
                     ));
                 }
-                let llty = llvm_ty(&result_ty)?;
+                let llty = self.llvm_ty(&result_ty)?;
                 let reg = self.fresh_reg("deref_val");
                 writeln!(self.out, "  {reg} = load {llty}, ptr {ptr}").unwrap();
                 Ok(self.widen_to_i64(&reg, &result_ty))
@@ -1726,7 +2559,7 @@ impl Codegen<'_> {
                     }
                     _ => unreachable!("typeck.rs already proved this is indexable (Vector/Matrix only)"),
                 };
-                let elem_llty = llvm_ty(&elem)?;
+                let elem_llty = self.llvm_ty(&elem)?;
                 let gep = self.fresh_reg("idx_gep");
                 writeln!(self.out, "  {gep} = getelementptr {elem_llty}, ptr {base_ptr}, i64 {offset}").unwrap();
                 let loaded = self.fresh_reg("idx_val");
@@ -1747,39 +2580,56 @@ impl Codegen<'_> {
     }
 
     fn call(&mut self, name: &str, args: &[Expr], scopes: &mut Scopes) -> Result<String, CodegenError> {
+        // Row 11: a struct/variant constructor is always aggregate-valued
+        // (`is_aggregate()` now covers `Ty::Named`), so a scalar `expr()`
+        // result is the wrong shape for it — every well-typed caller
+        // already routed it to `expr_ptr`/`expr_ptr_expected` via
+        // `local_ty_of`'s `is_aggregate()` fork. This guard keeps the
+        // scalar path a clean `CodegenError` (not the `sigs.get(name)
+        // .expect(...)` panic a ctor name would otherwise hit below) if
+        // some future construct defies that routing — the same
+        // defense-in-depth shape `Expr::Ident`/`Expr::Assign`'s own
+        // aggregate guards already use.
+        if self.registry.is_struct(name) || self.registry.find_variant(name).is_some() {
+            return unsupported(format!(
+                "codegen doesn't support constructing `{name}` in this scalar expression position yet — a struct/enum value is aggregate; bind it via `let`, or pass/return it through a function call"
+            ));
+        }
         // `check_supported` (`check_expr`'s `Expr::Call` arm, above)
-        // already rejected every builtin except `print` before this ever
-        // runs -- `== "print"` here, not `is_builtin`, states that
-        // invariant explicitly rather than leaning on it silently.
+        // already rejected every builtin except `print`,
+        // `STR_CRYPTO_BUILTINS`, `RAND_BUILTINS`, and `PHASE4_BUILTINS`/
+        // `PHASE5_BUILTINS`' names before this ever runs -- explicit
+        // `== "print"`/`== "sha256_hex"`/etc. checks here, not
+        // `is_builtin`, state that invariant directly rather than
+        // leaning on it silently.
         if name == "print" {
             for a in args {
                 // `local_ty_of` picks the right `printf` format
-                // string/vararg type: genuinely `double` for `f64`,
-                // `i64` for a plain integer expression (every integer-
-                // typed `expr()` result is, by construction — module
-                // doc) -- but a *comparison* (`x > y`) is neither: its
-                // `expr()` result is `i1`, not `i64`, even though
-                // `is_printable_expr` (a syntactic "not a bool literal"
-                // check, not real type inference) lets it through. A
-                // real, pre-existing gap this phase's own `is_float`
-                // dispatch is the natural place to close alongside it --
-                // `zext` the `i1` up to `i64` and print it as 0/1
-                // (`interpreter.rs`'s `render()` prints "true"/"false"
-                // for a real `bool` value; this is an honest, narrow
-                // cosmetic difference for the one case -- a comparison
-                // *result* printed directly -- no existing example
-                // exercises either way).
+                // string/vararg type: `double` for `f64`, the `{ptr,
+                // i64}` two-word convention for `str`, `i1`-widened for
+                // `bool` (a bare bool variable, a bool literal, and a
+                // comparison result `x > y` all resolve to `Ty::Bool`
+                // here identically -- `local_ty_of`'s `Expr::Binary` arm
+                // already maps every comparison/`&&`/`||` operator to
+                // `Ty::Bool`, so there's exactly one bool-shaped case to
+                // handle, not several), a fixed `"()"` string for `unit`
+                // (there's no `unit` *literal* syntax -- the only way to
+                // produce a unit-typed argument is a call to a `-> unit`
+                // function; its side effect still has to run, so `expr()`
+                // below is still called unconditionally, its nominal
+                // result just isn't a meaningful value to print), and
+                // plain `i64` for everything else.
                 let arg_ty = self.local_ty_of(a, scopes);
                 if arg_ty.is_aggregate() {
                     // Printing a whole Vector/Matrix isn't built yet —
-                    // `is_printable_expr` (a purely syntactic "not a
-                    // bool literal" check) doesn't know the arg's type,
-                    // so this has to be caught here instead, with a
-                    // specific reason rather than falling through to a
-                    // scalar `expr()` call that would fail confusingly.
+                    // this purely-syntactic pre-pass (`check_expr`) has
+                    // no type info to catch it earlier, so it's caught
+                    // here instead, with a specific reason rather than
+                    // falling through to a scalar `expr()` call that
+                    // would fail confusingly.
                     return unsupported(
                         "codegen doesn't support `print` on a Vector/Matrix argument yet — \
-                         only integer/f64-typed arguments are supported so far",
+                         only integer/f64/str/bool/unit-typed arguments are supported so far",
                     );
                 }
                 let v = self.expr(a, scopes)?;
@@ -1798,14 +2648,111 @@ impl Codegen<'_> {
                     writeln!(self.out, "  {len_i32} = trunc i64 {len_reg} to i32").unwrap();
                     writeln!(self.out, "  call i32 (ptr, ...) @printf(ptr @.str_fmt, i32 {len_i32}, ptr {ptr_reg})").unwrap();
                 } else if arg_ty == Ty::Bool {
+                    // Prints `1`/`0`, not `interpreter.rs`'s `render()`
+                    // `"true"`/`"false"` — a real, honest cosmetic
+                    // difference between the two execution paths (same
+                    // class as `@.float_fmt`'s `%f`-vs-Rust-formatting
+                    // note above), not a semantic one: both agree on
+                    // which of the two boolean values it is.
                     let widened = self.fresh_reg("bool_as_i64");
                     writeln!(self.out, "  {widened} = zext i1 {v} to i64").unwrap();
                     writeln!(self.out, "  call i32 (ptr, ...) @printf(ptr @.int_fmt, i64 {widened})").unwrap();
+                } else if arg_ty == Ty::Unit {
+                    // `v` (the call's nominal "result") carries no real
+                    // data for a `void`-returning callee — deliberately
+                    // ignored. `interpreter.rs`'s `render()` prints
+                    // `"()"` for `Value::Unit`; match that exactly so
+                    // interpreted/compiled output agree.
+                    let _ = v;
+                    writeln!(self.out, "  call i32 (ptr, ...) @printf(ptr @.unit_fmt)").unwrap();
                 } else {
                     writeln!(self.out, "  call i32 (ptr, ...) @printf(ptr @.int_fmt, i64 {v})").unwrap();
                 }
             }
             return Ok("0".to_string()); // print's own "value" is unit; never read
+        }
+        // `sha256_hex`/`constant_time_str_eq` — linked calls into
+        // `runtime_kernels.rs`'s from-scratch SHA-256 (`STR_CRYPTO_BUILTINS`'
+        // doc comment on why these two don't go through
+        // `call_builtin_scalar`/`call_builtin_agg` like `PHASE4`/
+        // `PHASE5_BUILTINS` do).
+        if name == "sha256_hex" {
+            let a = self.expr(&args[0], scopes)?;
+            let a_ptr = self.fresh_reg("sha256_a_ptr");
+            writeln!(self.out, "  {a_ptr} = extractvalue {{ptr, i64}} {a}, 0").unwrap();
+            let a_len = self.fresh_reg("sha256_a_len");
+            writeln!(self.out, "  {a_len} = extractvalue {{ptr, i64}} {a}, 1").unwrap();
+            // The 1-arg form passes a null `b_ptr`/`0` `b_len` -- the
+            // kernel never dereferences `b_ptr` when `b_len` is 0 (its
+            // own doc comment), so an absent second argument needs no
+            // real buffer, just these two placeholder values.
+            let (b_ptr, b_len) = if args.len() == 2 {
+                let b = self.expr(&args[1], scopes)?;
+                let b_ptr = self.fresh_reg("sha256_b_ptr");
+                writeln!(self.out, "  {b_ptr} = extractvalue {{ptr, i64}} {b}, 0").unwrap();
+                let b_len = self.fresh_reg("sha256_b_len");
+                writeln!(self.out, "  {b_len} = extractvalue {{ptr, i64}} {b}, 1").unwrap();
+                (b_ptr, b_len)
+            } else {
+                ("null".to_string(), "0".to_string())
+            };
+            // 64 bytes, always -- a hex-encoded SHA-256 digest is a
+            // fixed size, never data-dependent. Heap-allocated and never
+            // freed (`nir_sha256_hex`'s own doc comment on why: `Ty::Str`
+            // isn't affine, so there's no scope-closing point to hook a
+            // matching `nir_free` onto).
+            let out_ptr = self.fresh_reg("sha256_out");
+            writeln!(self.out, "  {out_ptr} = call ptr @nir_alloc(i64 64)").unwrap();
+            writeln!(
+                self.out,
+                "  call void @nir_sha256_hex(ptr {a_ptr}, i64 {a_len}, ptr {b_ptr}, i64 {b_len}, ptr {out_ptr})"
+            )
+            .unwrap();
+            let partial = self.fresh_reg("sha256_str_partial");
+            writeln!(self.out, "  {partial} = insertvalue {{ptr, i64}} undef, ptr {out_ptr}, 0").unwrap();
+            let result = self.fresh_reg("sha256_str");
+            writeln!(self.out, "  {result} = insertvalue {{ptr, i64}} {partial}, i64 64, 1").unwrap();
+            return Ok(result);
+        }
+        if name == "constant_time_str_eq" {
+            let a = self.expr(&args[0], scopes)?;
+            let b = self.expr(&args[1], scopes)?;
+            let a_ptr = self.fresh_reg("cteq_a_ptr");
+            writeln!(self.out, "  {a_ptr} = extractvalue {{ptr, i64}} {a}, 0").unwrap();
+            let a_len = self.fresh_reg("cteq_a_len");
+            writeln!(self.out, "  {a_len} = extractvalue {{ptr, i64}} {a}, 1").unwrap();
+            let b_ptr = self.fresh_reg("cteq_b_ptr");
+            writeln!(self.out, "  {b_ptr} = extractvalue {{ptr, i64}} {b}, 0").unwrap();
+            let b_len = self.fresh_reg("cteq_b_len");
+            writeln!(self.out, "  {b_len} = extractvalue {{ptr, i64}} {b}, 1").unwrap();
+            let raw = self.fresh_reg("cteq_raw");
+            writeln!(
+                self.out,
+                "  {raw} = call i32 @nir_constant_time_str_eq(ptr {a_ptr}, i64 {a_len}, ptr {b_ptr}, i64 {b_len})"
+            )
+            .unwrap();
+            return self.icmp("ne", "i32", &raw, "0");
+        }
+        if name == "rand_seed" {
+            // Every integer-typed `expr()` result is already `i64`
+            // (module doc) regardless of `rand_seed`'s argument's own
+            // declared width (`typeck.rs` accepts any integer type) --
+            // no extra widening needed here.
+            let seed = self.expr(&args[0], scopes)?;
+            writeln!(self.out, "  call void @nir_rand_seed(i64 {seed})").unwrap();
+            return Ok("0".to_string()); // rand_seed's own "value" is unit; never read
+        }
+        if name == "rand_f64" {
+            let r = self.fresh_reg("rand_f64");
+            writeln!(self.out, "  {r} = call double @nir_rand_f64()").unwrap();
+            return Ok(r);
+        }
+        if name == "rand_gaussian" {
+            let mean = self.expr(&args[0], scopes)?;
+            let stddev = self.expr(&args[1], scopes)?;
+            let r = self.fresh_reg("rand_gaussian");
+            writeln!(self.out, "  {r} = call double @nir_rand_gaussian(double {mean}, double {stddev})").unwrap();
+            return Ok(r);
         }
         if PHASE4_BUILTINS.contains(&name) || name == "det" || name == "rank" {
             return self.call_builtin_scalar(name, args, scopes);
@@ -1831,7 +2778,7 @@ impl Codegen<'_> {
 
         let arg_vals = self.call_args(args, &sig_params, scopes)?;
 
-        let ret_llty = llvm_ty(&sig_ret)?;
+        let ret_llty = self.llvm_ty(&sig_ret)?;
         if ret_llty == "void" {
             writeln!(self.out, "  call void @{name}({})", arg_vals.join(", ")).unwrap();
             Ok("0".to_string()) // unit result; never read by a well-typed caller
@@ -1867,12 +2814,16 @@ impl Codegen<'_> {
                 // the callee's own prologue does the copy-in (`function`'s
                 // doc comment), so the caller can hand over whichever
                 // pointer `expr_ptr` already has (a variable's own
-                // storage, or a fresh literal's).
-                let ptr = self.expr_ptr(a, scopes)?;
+                // storage, or a fresh literal's). A constructor argument
+                // is built with `want` (this parameter's declared type)
+                // as its expected type via `expr_ptr_expected`, so an
+                // `Option(i64)` parameter receives a `None`/`Some(5)`
+                // argument constructed against exactly that instantiation.
+                let ptr = self.expr_ptr_expected(a, want, scopes)?;
                 arg_vals.push(format!("ptr {ptr}"));
                 continue;
             }
-            let llty = llvm_ty(want)?;
+            let llty = self.llvm_ty(want)?;
             let v = if let Some(n) = literal_value(a) {
                 // A literal (or negated literal) that typeck already
                 // proved fits `want`'s range — emit it directly at
@@ -1922,7 +2873,7 @@ impl Codegen<'_> {
                 let a_ty = self.local_ty_of(&args[0], scopes);
                 let (elem, len) = agg_elem_and_len(&a_ty);
                 let (elem, len) = (elem.clone(), len);
-                let elem_llty = llvm_ty(&elem)?;
+                let elem_llty = self.llvm_ty(&elem)?;
                 let is_float = elem == Ty::F64;
                 let a_ptr = self.expr_ptr(&args[0], scopes)?;
                 let b_ptr = self.expr_ptr(&args[1], scopes)?;
@@ -1941,7 +2892,7 @@ impl Codegen<'_> {
                 let a_ty = self.local_ty_of(&args[0], scopes);
                 let (elem, len) = agg_elem_and_len(&a_ty);
                 let (elem, len) = (elem.clone(), len);
-                let elem_llty = llvm_ty(&elem)?;
+                let elem_llty = self.llvm_ty(&elem)?;
                 let is_float = elem == Ty::F64;
                 let a_ptr = self.expr_ptr(&args[0], scopes)?;
                 let mut acc = self.agg_load_elem(&a_ptr, &elem_llty, &elem, 0);
@@ -2000,7 +2951,7 @@ impl Codegen<'_> {
                 let Ty::Matrix(elem, n, _) = self.local_ty_of(&args[0], scopes) else {
                     unreachable!("typeck.rs already proved this is a square Matrix")
                 };
-                let elem_llty = llvm_ty(&elem)?;
+                let elem_llty = self.llvm_ty(&elem)?;
                 let is_float = *elem == Ty::F64;
                 let a_ptr = self.expr_ptr(&args[0], scopes)?;
                 let mut acc = self.agg_load_elem(&a_ptr, &elem_llty, &elem, 0);
@@ -2164,7 +3115,7 @@ impl Codegen<'_> {
     /// `local_ty_of` uses), so every arm below just fills it in.
     fn call_builtin_agg(&mut self, name: &str, args: &[Expr], scopes: &mut Scopes) -> Result<String, CodegenError> {
         let result_ty = self.builtin_result_ty(name, args, scopes);
-        let agg_llty = llvm_ty(&result_ty)?;
+        let agg_llty = self.llvm_ty(&result_ty)?;
         let dest = self.fresh_reg("builtin_result.addr");
         self.emit_alloca(&dest, &agg_llty);
 
@@ -2173,7 +3124,7 @@ impl Codegen<'_> {
                 let Ty::Matrix(elem, rows, cols) = self.local_ty_of(&args[0], scopes) else {
                     unreachable!("typeck.rs already proved this is a Matrix")
                 };
-                let elem_llty = llvm_ty(&elem)?;
+                let elem_llty = self.llvm_ty(&elem)?;
                 let m_ptr = self.expr_ptr(&args[0], scopes)?;
                 // Matches interpreter.rs: `for j in 0..cols { for i in
                 // 0..rows { out.push(elems[i*cols+j]) } }` -- output is
@@ -2190,7 +3141,7 @@ impl Codegen<'_> {
                 let a_ty = self.local_ty_of(&args[0], scopes);
                 let (elem, _) = agg_elem_and_len(&a_ty);
                 let elem = elem.clone();
-                let elem_llty = llvm_ty(&elem)?;
+                let elem_llty = self.llvm_ty(&elem)?;
                 let is_float = elem == Ty::F64;
                 let a_ptr = self.expr_ptr(&args[0], scopes)?;
                 let b_ptr = self.expr_ptr(&args[1], scopes)?;
@@ -2607,11 +3558,54 @@ impl Codegen<'_> {
                 Ok(ptr)
             }
             Expr::ArrayLit(elements, _) => self.array_lit(elements, scopes),
-            Expr::Call(name, args, _) => self.call_ptr(name, args, scopes),
+            // Row 11: a constructor call reached *without* an expected
+            // type in hand (a bare constructor expression statement, or
+            // any other `expr_ptr`-reached position `expr_ptr_expected`
+            // didn't intercept). Resolve the expected type by
+            // structural inference from the arguments' own types
+            // (`ctor_ty`, the same fall-back `typeck.rs::resolve_type_args`
+            // uses when no context is available); the one genuinely-
+            // ambiguous case — a zero-payload variant like `None` with no
+            // enclosing type context — is the disclosed `CodegenError`
+            // the struct/enum codegen plan names, not a guess.
+            Expr::Call(name, args, span) => {
+                if self.registry.is_struct(name) || self.registry.find_variant(name).is_some() {
+                    let expected = self.ctor_ty(name, args, scopes).ok_or_else(|| CodegenError {
+                        message: format!(
+                            "codegen can't infer the concrete type of `{name}(...)` here without an enclosing type context — give it one (a `let` annotation, a `return` in a typed function, or a typed call argument); this is the one genuinely-ambiguous construction case (a zero-payload variant reached with no expected type)"
+                        ),
+                    })?;
+                    self.construct(name, args, &expected, *span, scopes)
+                } else {
+                    self.call_ptr(name, args, scopes)
+                }
+            }
+            // Row 11: `base.field` where the field is itself an aggregate
+            // (a nested struct, a `Vector`/`Matrix` field) — GEP to the
+            // field's index within `base`'s real named struct type and
+            // return that pointer directly, no load, no copy (the same
+            // "expose the storage, don't clone it" shape `expr_ptr`'s
+            // `Expr::Ident` and `Expr::Deref` arms already use). A
+            // scalar field reached here is returned as a pointer to the
+            // scalar slot — valid for any `expr_ptr` consumer that just
+            // forwards the pointer onward, and never the path a scalar
+            // `let`/argument takes (those route through `expr()`'s own
+            // `Expr::FieldAccess` arm via `local_ty_of`'s scalar result).
+            Expr::FieldAccess(base, field, _) => {
+                let base_ty = self.local_ty_of(base, scopes);
+                let (idx, _field_ty) = self
+                    .field_index_and_ty(&base_ty, field)
+                    .expect("typeck.rs already proved this base is a struct with this field");
+                let base_ptr = self.expr_ptr(base, scopes)?;
+                let base_llty = self.llvm_ty(&base_ty)?;
+                let gep = self.fresh_reg("fieldptr");
+                writeln!(self.out, "  {gep} = getelementptr inbounds {base_llty}, ptr {base_ptr}, i32 0, i32 {idx}").unwrap();
+                Ok(gep)
+            }
             Expr::Assign(name, rhs, _) => {
                 let src = self.expr_ptr(rhs, scopes)?;
                 let (ty, dst) = scopes.get(name).expect("typeck.rs already proved this resolves");
-                let (_, _, bytes) = agg_layout(&ty);
+                let bytes = agg_byte_size_operand(&ty, &self.registry);
                 writeln!(self.out, "  call void @llvm.memcpy.p0.p0.i64(ptr {dst}, ptr {src}, i64 {bytes}, i1 false)").unwrap();
                 Ok(dst)
             }
@@ -2633,10 +3627,18 @@ impl Codegen<'_> {
             // `expr()`'s own `Expr::Deref` arm for the non-aggregate
             // case — same value, different result shape only).
             Expr::Deref(inner, _) => self.expr(inner, scopes),
+            // Aggregate-result `if`/`match` — `expr_ptr` is reached only
+            // when the caller already knows this expression has an aggregate
+            // type, so `if_expr`/`match_expr` will allocate a slot and
+            // return its pointer.
+            Expr::If { cond, then_block, else_block, span } => {
+                self.if_expr(cond, then_block, else_block.as_deref(), *span, scopes)
+            }
+            Expr::Match { scrutinee, arms, span } => self.match_expr(scrutinee, arms, *span, scopes),
             _ => unsupported(
-                "codegen doesn't support this Vector/Matrix expression form yet — only \
+                "codegen doesn't support this aggregate expression form yet — only \
                  identifiers, literals, assignment, binary operators, dereferencing a boxed/\
-                 borrowed aggregate, and function calls/returns are supported so far \
+                 borrowed aggregate, function calls/returns, `if`, and `match` are supported so far \
                  (indexing reads a scalar element via `expr()`, and builtins land in a later \
                  phase)",
             ),
@@ -2651,13 +3653,13 @@ impl Codegen<'_> {
     /// `interpreter.rs`'s `Value::Matrix` exactly).
     fn array_lit(&mut self, elements: &[Expr], scopes: &mut Scopes) -> Result<String, CodegenError> {
         let ty = self.array_lit_ty(elements, scopes);
-        let agg_llty = llvm_ty(&ty)?;
+        let agg_llty = self.llvm_ty(&ty)?;
         let dest = self.fresh_reg("arraylit.addr");
         self.emit_alloca(&dest, &agg_llty);
 
         match &ty {
             Ty::Vector(elem, _) => {
-                let elem_llty = llvm_ty(elem)?;
+                let elem_llty = self.llvm_ty(elem)?;
                 for (i, e) in elements.iter().enumerate() {
                     let v = self.expr(e, scopes)?;
                     let v = if elem.is_integer() { self.narrow_from_i64(&v, elem)? } else { v };
@@ -2696,7 +3698,7 @@ impl Codegen<'_> {
         let sig_ret = self.sigs.get(name).expect("typeck.rs already resolved this call").ret.clone();
         let arg_vals = self.call_args(args, &sig_params, scopes)?;
 
-        let agg_llty = llvm_ty(&sig_ret)?;
+        let agg_llty = self.llvm_ty(&sig_ret)?;
         let dest = self.fresh_reg("call_result.addr");
         self.emit_alloca(&dest, &agg_llty);
         let mut all_args = vec![format!("ptr {dest}")];
@@ -3042,7 +4044,7 @@ impl Codegen<'_> {
         let l_ptr = self.expr_ptr(lhs, scopes)?;
         let r_ptr = self.expr_ptr(rhs, scopes)?;
         let (elem, len) = agg_elem_and_len(ty);
-        let elem_llty = llvm_ty(elem)?;
+        let elem_llty = self.llvm_ty(elem)?;
         let is_float = *elem == Ty::F64;
 
         let mut acc: Option<String> = None;
@@ -3117,7 +4119,7 @@ impl Codegen<'_> {
     /// saturates, never traps, matching `scalar_binop`'s `Float` arm.
     fn agg_elementwise(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, span: Span, scopes: &mut Scopes) -> Result<String, CodegenError> {
         let ty = self.local_ty_of(lhs, scopes);
-        let agg_llty = llvm_ty(&ty)?;
+        let agg_llty = self.llvm_ty(&ty)?;
         let dest = self.fresh_reg("agg_elemwise.addr");
         self.emit_alloca(&dest, &agg_llty);
 
@@ -3125,7 +4127,7 @@ impl Codegen<'_> {
         let r_ptr = self.expr_ptr(rhs, scopes)?;
         let (elem, len) = agg_elem_and_len(&ty);
         let elem = elem.clone();
-        let elem_llty = llvm_ty(&elem)?;
+        let elem_llty = self.llvm_ty(&elem)?;
         let is_float = elem == Ty::F64;
 
         for i in 0..len {
@@ -3173,7 +4175,7 @@ impl Codegen<'_> {
         let lt = self.local_ty_of(lhs, scopes);
         let rt = self.local_ty_of(rhs, scopes);
         let result_ty = self.mul_result_ty(lhs, rhs, scopes);
-        let agg_llty = llvm_ty(&result_ty)?;
+        let agg_llty = self.llvm_ty(&result_ty)?;
         let dest = self.fresh_reg("agg_mul.addr");
         self.emit_alloca(&dest, &agg_llty);
 
@@ -3195,7 +4197,7 @@ impl Codegen<'_> {
             (Ty::Matrix(m_elem, rows, cols), Ty::Vector(..)) => {
                 let m_ptr = self.expr_ptr(lhs, scopes)?;
                 let v_ptr = self.expr_ptr(rhs, scopes)?;
-                let elem_llty = llvm_ty(m_elem)?;
+                let elem_llty = self.llvm_ty(m_elem)?;
                 let is_float = **m_elem == Ty::F64;
                 let cols = *cols;
                 for i in 0..*rows {
@@ -3217,7 +4219,7 @@ impl Codegen<'_> {
             (Ty::Matrix(l_elem, r1, c1), Ty::Matrix(_, _r2, c2)) => {
                 let a_ptr = self.expr_ptr(lhs, scopes)?;
                 let b_ptr = self.expr_ptr(rhs, scopes)?;
-                let elem_llty = llvm_ty(l_elem)?;
+                let elem_llty = self.llvm_ty(l_elem)?;
                 let is_float = **l_elem == Ty::F64;
                 let (ac, bc) = (*c1, *c2);
                 for i in 0..*r1 {
@@ -3245,7 +4247,7 @@ impl Codegen<'_> {
     fn agg_scale(&mut self, scalar: &str, m_ptr: &str, mat_ty: &Ty, dest: &str) -> Result<(), CodegenError> {
         let (elem, len) = agg_elem_and_len(mat_ty);
         let elem = elem.clone();
-        let elem_llty = llvm_ty(&elem)?;
+        let elem_llty = self.llvm_ty(&elem)?;
         let is_float = elem == Ty::F64;
         for i in 0..len {
             let m = self.agg_load_elem(m_ptr, &elem_llty, &elem, i);
@@ -3323,19 +4325,24 @@ impl Codegen<'_> {
         let slot = if result_ty == Ty::Unit {
             None
         } else {
-            let llty = llvm_ty(&result_ty)?;
+            let llty = self.llvm_ty(&result_ty)?;
             let ptr = self.fresh_reg("if_result.addr");
             self.emit_alloca(&ptr, &llty);
             Some((ptr, llty))
         };
+        let is_aggregate = result_ty.is_aggregate();
 
         writeln!(self.out, "  br i1 {c}, label %{then_label}, label %{else_label}").unwrap();
 
         writeln!(self.out, "{then_label}:").unwrap();
         self.terminated = false;
         scopes.push();
-        let then_val = self.block_value(then_block, scopes)?;
-        // Each branch is its own scope with its own independent box
+        if let Some((ptr, _)) = &slot {
+            self.block_value_to_slot(then_block, &ptr, &result_ty, scopes)?;
+        } else {
+            self.block_side_effects(then_block, scopes)?;
+        }
+        // Each branch is its own scope with its own independent affine
         // ownership — only the branch that actually runs at runtime frees
         // what it itself still owns there; the other branch's own
         // (different) still-owned set, if any, is a separate `FreeMap`
@@ -3346,38 +4353,61 @@ impl Codegen<'_> {
             self.emit_frees_for_names(&names, scopes);
         }
         scopes.pop();
+        let then_terminated = self.terminated;
         if !self.terminated {
-            if let Some((ptr, llty)) = &slot {
-                writeln!(self.out, "  store {llty} {then_val}, ptr {ptr}").unwrap();
-            }
             writeln!(self.out, "  br label %{merge_label}").unwrap();
         }
-        let then_terminated = self.terminated;
 
         writeln!(self.out, "{else_label}:").unwrap();
         self.terminated = false;
-        let else_val = match else_block {
+        match else_block {
             Some(ElseBranch::Block(b)) => {
                 scopes.push();
-                let v = self.block_value(b, scopes)?;
+                if let Some((ptr, _)) = &slot {
+                    self.block_value_to_slot(b, &ptr, &result_ty, scopes)?;
+                } else {
+                    self.block_side_effects(b, scopes)?;
+                }
                 if !self.terminated
                     && let Some(names) = self.free_map.at_if_branch_end.get(&(span, false)).cloned()
                 {
                     self.emit_frees_for_names(&names, scopes);
                 }
                 scopes.pop();
-                v
             }
-            Some(ElseBranch::If(e2)) => self.expr(e2, scopes)?,
-            None => "0".to_string(),
+            Some(ElseBranch::If(e2)) => {
+                // An `else if` produces a single value; route through the
+                // same `if_expr` so nested scalar/aggregate handling is
+                // uniform. The slot is shared with the outer `if`.
+                if let Some((ptr, _)) = &slot {
+                    if result_ty.is_aggregate() {
+                        let src = self.expr_ptr(e2, scopes)?;
+                        if !self.terminated {
+                            let bytes = agg_byte_size_operand(&result_ty, &self.registry);
+                            writeln!(
+                                self.out,
+                                "  call void @llvm.memcpy.p0.p0.i64(ptr {ptr}, ptr {src}, i64 {bytes}, i1 false)"
+                            )
+                            .unwrap();
+                        }
+                    } else {
+                        let v = self.expr(e2, scopes)?;
+                        if !self.terminated {
+                            let llty = self.llvm_ty(&result_ty)?;
+                            writeln!(self.out, "  store {llty} {v}, ptr {ptr}").unwrap();
+                        }
+                    }
+                } else {
+                    // unit-valued else-if: evaluate for side effects only.
+                    self.expr(e2, scopes)?;
+                }
+            }
+            None => {}
         };
+        let else_terminated = self.terminated;
         if !self.terminated {
-            if let Some((ptr, llty)) = &slot {
-                writeln!(self.out, "  store {llty} {else_val}, ptr {ptr}").unwrap();
-            }
             writeln!(self.out, "  br label %{merge_label}").unwrap();
         }
-        let else_terminated = self.terminated;
 
         // The merge block is only reachable if at least one branch falls
         // through to it — if both branches unconditionally `return`,
@@ -3394,29 +4424,471 @@ impl Codegen<'_> {
         }
         match slot {
             Some((ptr, llty)) => {
-                let out = self.fresh_reg("if_val");
-                writeln!(self.out, "  {out} = load {llty}, ptr {ptr}").unwrap();
-                Ok(out)
+                if is_aggregate {
+                    // The caller asked for a pointer (we're on the
+                    // `expr_ptr` path); the slot itself is the value.
+                    Ok(ptr)
+                } else {
+                    let out = self.fresh_reg("if_val");
+                    writeln!(self.out, "  {out} = load {llty}, ptr {ptr}").unwrap();
+                    Ok(out)
+                }
             }
             None => Ok("0".to_string()), // unit; never meaningfully read
         }
     }
 
-    fn block_value(&mut self, block: &Block, scopes: &mut Scopes) -> Result<String, CodegenError> {
-        match block.stmts.split_last() {
+    /// `match scrutinee { ... }` — Row 11's destructuring expression,
+    /// shaped exactly like `if_expr`'s slot-allocate/branch/merge
+    /// structure, generalized from 2 branches to N. Two scrutinee shapes,
+    /// exactly matching `typeck.rs`'s own `check_match`/
+    /// `check_literal_match` split and `interpreter.rs`'s own `Expr::Match`
+    /// eval:
+    ///
+    /// **Enum-variant arms** — the scrutinee is a `Ty::Named` enum value
+    /// (`is_aggregate()` now), fetched via `expr_ptr`; the variant tag is
+    /// loaded from GEP field 0 and dispatched with a real LLVM `switch`
+    /// over the declaration-order variant indices (`enum_variants` order,
+    /// the same order `declare_named_type`/`construct_variant` use).
+    /// `%default` is a single `unreachable` block — `typeck.rs`'s
+    /// exhaustiveness check already guarantees every variant is covered,
+    /// the same "typeck already proved this" trust the interpreter's own
+    /// `.expect(...)` at this exact point already relies on. Each arm
+    /// binds its payload fields into fresh stack slots (mirroring the
+    /// function-prologue param-binding pattern), evaluates its body into
+    /// the shared result slot, and `br`s to the merge block.
+    ///
+    /// **Literal-pattern arms** — a `str`/`i64`/`bool` scrutinee (never
+    /// an enum). `i64`/`bool` use a real LLVM `switch` (native integer
+    /// dispatch, `bool` widened to `i64` for a uniform switch type);
+    /// `str` has no native switch, so codegen emits a sequential
+    /// `nir_str_eq`-then-`br` chain per arm (first match wins, falling
+    /// through to the next), ending at the mandatory trailing `_` arm's
+    /// block unconditionally — `typeck.rs::check_literal_match` already
+    /// guarantees exactly one trailing wildcard and no duplicate literal
+    /// arms.
+    ///
+    /// An aggregate-*result* `match` (an arm body producing a struct/
+    /// enum/`Vector`/`Matrix`) is deliberately out of scope, the same
+    /// pre-existing gap `expr_ptr`'s own `_ => unsupported(...)` already
+    /// covers for `if`: it fails cleanly via `expr_ptr_expected`'s
+    /// `expr_ptr` fallback rather than being silently absent. The
+    /// overwhelmingly common real case — a scalar result (`area()`'s
+    /// `f64`, an `Option`-unwrap's `i64`, a `str`-dispatch's `str`) — goes
+    /// through `if_expr`'s already-proven slot/merge mechanism unchanged.
+    fn match_expr(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+        span: Span,
+        scopes: &mut Scopes,
+    ) -> Result<String, CodegenError> {
+        let scrutinee_ty = self.local_ty_of(scrutinee, scopes);
+        // All arm bodies share one result type (typeck already proved
+        // they agree); `local_ty_of` of the first arm's body is the
+        // match's own result type, the same way `if_expr` uses
+        // `block_trailing_ty` of the `then` block.
+        let result_ty = self.local_ty_of(&arms[0].body, scopes);
+        let merge_label = self.fresh_label("match_merge");
+        let slot = if result_ty == Ty::Unit {
+            None
+        } else {
+            let llty = self.llvm_ty(&result_ty)?;
+            let ptr = self.fresh_reg("match_result.addr");
+            self.emit_alloca(&ptr, &llty);
+            Some((ptr, llty))
+        };
+        let is_aggregate = result_ty.is_aggregate();
+
+        match &scrutinee_ty {
+            Ty::Named(enum_name, type_args) if self.registry.is_enum(enum_name) => {
+                self.match_enum(scrutinee, enum_name, type_args, arms, &result_ty, slot.as_ref(), &merge_label, span, scopes)?
+            }
+            Ty::Str | Ty::I64 | Ty::Bool => {
+                self.match_literal(scrutinee, &scrutinee_ty, arms, &result_ty, slot.as_ref(), &merge_label, span, scopes)?
+            }
+            _ => unreachable!("typeck.rs already restricted a match scrutinee to an enum or str/i64/bool"),
+        }
+
+        writeln!(self.out, "{merge_label}:").unwrap();
+        // The merge block is only reachable if at least one arm falls
+        // through to it; if every arm unconditionally `return`s, the
+        // match itself is a definite-return and `terminated` reflects
+        // that so a caller doesn't read a never-produced value.
+        if self.terminated {
+            writeln!(self.out, "  unreachable").unwrap();
+            return Ok("0".to_string());
+        }
+        match slot {
+            Some((ptr, llty)) => {
+                if is_aggregate {
+                    Ok(ptr)
+                } else {
+                    let out = self.fresh_reg("match_val");
+                    writeln!(self.out, "  {out} = load {llty}, ptr {ptr}").unwrap();
+                    Ok(out)
+                }
+            }
             None => Ok("0".to_string()),
+        }
+    }
+
+    /// The enum-variant-arms half of `match_expr` — loads the tag word
+    /// and `switch`es on it, one case per arm in declaration order. See
+    /// `match_expr`'s doc for the overall shape.
+    #[allow(clippy::too_many_arguments)]
+    fn match_enum(
+        &mut self,
+        scrutinee: &Expr,
+        enum_name: &str,
+        type_args: &[Ty],
+        arms: &[MatchArm],
+        result_ty: &Ty,
+        slot: Option<&(String, String)>,
+        merge_label: &str,
+        span: Span,
+        scopes: &mut Scopes,
+    ) -> Result<(), CodegenError> {
+        let scrutinee_ptr = self.expr_ptr(scrutinee, scopes)?;
+        let enum_ty = Ty::Named(enum_name.to_string(), type_args.to_vec());
+        let enum_llty = self.llvm_ty(&enum_ty)?;
+        let tag_ptr = self.fresh_reg("tag.addr");
+        writeln!(self.out, "  {tag_ptr} = getelementptr inbounds {enum_llty}, ptr {scrutinee_ptr}, i32 0, i32 0").unwrap();
+        let tag = self.fresh_reg("tag");
+        writeln!(self.out, "  {tag} = load i64, ptr {tag_ptr}").unwrap();
+        let payload = self.fresh_reg("payload.addr");
+        writeln!(self.out, "  {payload} = getelementptr inbounds {enum_llty}, ptr {scrutinee_ptr}, i32 0, i32 1").unwrap();
+
+        let variants = self.registry.enum_variants(enum_name).expect("typeck.rs proved this is an enum");
+        let type_params = self.registry.enum_type_params(enum_name).unwrap_or(&[]);
+        let subst = zip_type_params(type_params, type_args);
+
+        let default_label = self.fresh_label("match_default");
+        // Build the `switch` cases: one per arm, keyed by the variant's
+        // declaration-order index. `typeck.rs`'s exhaustiveness check
+        // guarantees every variant is covered exactly once, so `default`
+        // is genuinely unreachable.
+        let mut cases: Vec<String> = Vec::new();
+        let mut arm_labels: Vec<String> = Vec::new();
+        for arm in arms {
+            let vidx = variants.iter().position(|v| v.name == arm.variant).expect("typeck.rs proved every match arm names a declared variant");
+            let label = self.fresh_label("match_arm");
+            cases.push(format!("i64 {vidx}, label %{label}"));
+            arm_labels.push(label);
+        }
+        writeln!(self.out, "  switch i64 {tag}, label %{default_label} [").unwrap();
+        for c in &cases {
+            writeln!(self.out, "    {c}").unwrap();
+        }
+        writeln!(self.out, "  ]").unwrap();
+        // The unreachable default — exhaustiveness is typeck's
+        // guarantee, the same trust the interpreter's `.expect` relies on.
+        writeln!(self.out, "{default_label}:").unwrap();
+        writeln!(self.out, "  unreachable").unwrap();
+
+        let mut any_fell_through = false;
+        for (arm_idx, (arm, arm_label)) in arms.iter().zip(arm_labels.iter()).enumerate() {
+            writeln!(self.out, "{arm_label}:").unwrap();
+            self.terminated = false;
+            scopes.push();
+            let variant = variants.iter().find(|v| v.name == arm.variant).expect("just proved this variant exists");
+            let mut word_off: u64 = 0;
+            for (name, decl_ty) in arm.bindings.iter().zip(variant.payload.iter()) {
+                let field_ty = substitute_ty(decl_ty, &subst);
+                let field_ptr = self.fresh_reg("armfield.addr");
+                writeln!(self.out, "  {field_ptr} = getelementptr inbounds i64, ptr {payload}, i64 {word_off}").unwrap();
+                // Every binding gets its own stack slot — the same
+                // "even a scalar gets an alloca" convention `function`'s
+                // param-binding uses — so a later reassignment inside the
+                // arm body has real storage to store into.
+                let slot_llty = self.llvm_ty(&field_ty)?;
+                let slot_ptr = self.fresh_reg(&format!("{name}.addr"));
+                self.emit_alloca(&slot_ptr, &slot_llty);
+                if field_ty.is_aggregate() {
+                    let bytes = agg_byte_size_operand(&field_ty, &self.registry);
+                    writeln!(self.out, "  call void @llvm.memcpy.p0.p0.i64(ptr {slot_ptr}, ptr {field_ptr}, i64 {bytes}, i1 false)").unwrap();
+                } else {
+                    let loaded = self.fresh_reg(&format!("{name}.val"));
+                    writeln!(self.out, "  {loaded} = load {slot_llty}, ptr {field_ptr}").unwrap();
+                    let loaded = self.widen_to_i64(&loaded, &field_ty);
+                    let stored = if field_ty.is_integer() { self.narrow_from_i64(&loaded, &field_ty)? } else { loaded };
+                    writeln!(self.out, "  store {slot_llty} {stored}, ptr {slot_ptr}").unwrap();
+                }
+                scopes.define(name, field_ty.clone(), slot_ptr);
+                word_off += conservative_word_count(&field_ty, &self.registry);
+            }
+            let fell_through = if result_ty.is_aggregate() {
+                let src = self.expr_ptr(&arm.body, scopes)?;
+                if let Some((ptr, _)) = slot {
+                    let bytes = agg_byte_size_operand(result_ty, &self.registry);
+                    writeln!(
+                        self.out,
+                        "  call void @llvm.memcpy.p0.p0.i64(ptr {ptr}, ptr {src}, i64 {bytes}, i1 false)"
+                    )
+                    .unwrap();
+                }
+                !self.terminated
+            } else {
+                let body_val = self.expr(&arm.body, scopes)?;
+                if !self.terminated {
+                    if let Some((ptr, llty)) = slot {
+                        let stored = if result_ty.is_integer() { self.narrow_from_i64(&body_val, result_ty)? } else { body_val.clone() };
+                        writeln!(self.out, "  store {llty} {stored}, ptr {ptr}").unwrap();
+                    }
+                }
+                !self.terminated
+            };
+            // Affine payload bindings declared inside this arm are freed
+            // here, before we leave the arm's scope; the match-arm-end
+            // FreeMap field is populated in Part 2.
+            if !self.terminated {
+                if let Some(names) = self.free_map.at_match_arm_end.get(&(span, arm_idx)).cloned() {
+                    self.emit_frees_for_names(&names, scopes);
+                }
+            }
+            scopes.pop();
+            if fell_through {
+                writeln!(self.out, "  br label %{merge_label}").unwrap();
+                any_fell_through = true;
+            }
+        }
+        self.terminated = !any_fell_through;
+        Ok(())
+    }
+
+    /// The literal-pattern-arms half of `match_expr` — a `str`/`i64`/
+    /// `bool` scrutinee matched against literal-value arms plus a
+    /// mandatory trailing `_`. `i64`/`bool` use a real LLVM `switch`;
+    /// `str` uses a sequential `nir_str_eq`-then-`br` chain (no native
+    /// string switch). See `match_expr`'s doc for the overall shape.
+    #[allow(clippy::too_many_arguments)]
+    fn match_literal(
+        &mut self,
+        scrutinee: &Expr,
+        scrutinee_ty: &Ty,
+        arms: &[MatchArm],
+        result_ty: &Ty,
+        slot: Option<&(String, String)>,
+        merge_label: &str,
+        span: Span,
+        scopes: &mut Scopes,
+    ) -> Result<(), CodegenError> {
+        // `typeck.rs::check_literal_match` guarantees the last arm is the
+        // `_` wildcard and no earlier arm duplicates a literal.
+        let (literal_arms, wildcard) = arms.split_at(arms.len() - 1);
+        let wildcard = &wildcard[0];
+
+        // Emit one arm's body into the shared result slot, then `br` to
+        // the merge block (unless the body itself terminated). Shared by
+        // every arm across both the int/bool `switch` and the `str` chain.
+        // `scopes` is left untouched here (no payload bindings exist for
+        // a literal arm — `check_literal_match` keeps `bindings` empty);
+        // the caller wraps its own `scopes.push()`/`pop()` where needed.
+        let emit_arm_body = |cg: &mut Codegen<'_>,
+                             arm_idx: usize,
+                             body: &Expr,
+                             scopes: &mut Scopes|
+         -> Result<bool, CodegenError> {
+            if result_ty.is_aggregate() {
+                let src = cg.expr_ptr(body, scopes)?;
+                if !cg.terminated {
+                    if let Some((ptr, _)) = slot {
+                        let bytes = agg_byte_size_operand(result_ty, &cg.registry);
+                        writeln!(
+                            cg.out,
+                            "  call void @llvm.memcpy.p0.p0.i64(ptr {ptr}, ptr {src}, i64 {bytes}, i1 false)"
+                        )
+                        .unwrap();
+                    }
+                }
+            } else {
+                let body_val = cg.expr(body, scopes)?;
+                if !cg.terminated {
+                    if let Some((ptr, llty)) = slot {
+                        let stored = if result_ty.is_integer() { cg.narrow_from_i64(&body_val, result_ty)? } else { body_val.clone() };
+                        writeln!(cg.out, "  store {llty} {stored}, ptr {ptr}").unwrap();
+                    }
+                }
+            }
+            if !cg.terminated {
+                if let Some(names) = cg.free_map.at_match_arm_end.get(&(span, arm_idx)).cloned() {
+                    cg.emit_frees_for_names(&names, scopes);
+                }
+                writeln!(cg.out, "  br label %{merge_label}").unwrap();
+            }
+            Ok(!cg.terminated)
+        };
+
+        let mut any_fell_through = false;
+
+        match scrutinee_ty {
+            Ty::I64 | Ty::Bool => {
+                let raw = self.expr(scrutinee, scopes)?;
+                let tag = if *scrutinee_ty == Ty::Bool {
+                    let t = self.fresh_reg("match_bool");
+                    writeln!(self.out, "  {t} = zext i1 {raw} to i64").unwrap();
+                    t
+                } else {
+                    raw
+                };
+                let arm_labels: Vec<String> = literal_arms.iter().map(|_| self.fresh_label("match_arm")).collect();
+                let default_label = self.fresh_label("match_default");
+                let mut cases: Vec<String> = Vec::new();
+                for (a, label) in literal_arms.iter().zip(arm_labels.iter()) {
+                    let lit = match a.pattern.as_ref().expect("literal arm always has a pattern") {
+                        LiteralPattern::Int(n) => format!("i64 {n}"),
+                        LiteralPattern::Bool(b) => format!("i64 {}", if *b { 1 } else { 0 }),
+                        LiteralPattern::Wildcard | LiteralPattern::Str(_) => {
+                            unreachable!("check_literal_match keeps int/bool arms int/bool-typed")
+                        }
+                    };
+                    cases.push(format!("{lit}, label %{label}"));
+                }
+                writeln!(self.out, "  switch i64 {tag}, label %{default_label} [").unwrap();
+                for c in &cases {
+                    writeln!(self.out, "    {c}").unwrap();
+                }
+                writeln!(self.out, "  ]").unwrap();
+                // The default is the wildcard arm — every non-listed
+                // value falls through to it, exactly the `_` semantics.
+                for (arm_idx, (a, label)) in literal_arms.iter().zip(arm_labels.iter()).enumerate() {
+                    writeln!(self.out, "{label}:").unwrap();
+                    self.terminated = false;
+                    let fell = emit_arm_body(self, arm_idx, &a.body, scopes)?;
+                    any_fell_through |= fell;
+                }
+                writeln!(self.out, "{default_label}:").unwrap();
+                self.terminated = false;
+                let wildcard_idx = literal_arms.len();
+                let fell = emit_arm_body(self, wildcard_idx, &wildcard.body, scopes)?;
+                any_fell_through |= fell;
+            }
+            Ty::Str => {
+                // No native string switch — a sequential `nir_str_eq`-
+                // then-`br` chain, first match wins, falling through to
+                // the next comparison; after the last literal arm, the
+                // fall-through goes straight to the wildcard arm.
+                let s = self.expr(scrutinee, scopes)?;
+                let s_ptr = self.fresh_reg("match_str_ptr");
+                writeln!(self.out, "  {s_ptr} = extractvalue {{ptr, i64}} {s}, 0").unwrap();
+                let s_len = self.fresh_reg("match_str_len");
+                writeln!(self.out, "  {s_len} = extractvalue {{ptr, i64}} {s}, 1").unwrap();
+
+                let arm_labels: Vec<String> = literal_arms.iter().map(|_| self.fresh_label("match_arm")).collect();
+                let wildcard_label = self.fresh_label("match_arm");
+                // `cmp_label[0]` is the first comparison's block; the
+                // initial `br` targets it. Each comparison falls through
+                // to the next comparison's block (or the wildcard's, after
+                // the last literal arm).
+                let cmp_labels: Vec<String> = literal_arms.iter().map(|_| self.fresh_label("match_str_cmp")).collect();
+                let fallthrough_targets: Vec<String> = cmp_labels
+                    .iter()
+                    .skip(1)
+                    .cloned()
+                    .chain(std::iter::once(wildcard_label.clone()))
+                    .collect();
+
+                writeln!(self.out, "  br label %{cmp0}", cmp0 = cmp_labels[0]).unwrap();
+                for (i, (a, arm_label)) in literal_arms.iter().zip(arm_labels.iter()).enumerate() {
+                    let LiteralPattern::Str(lit) = a.pattern.as_ref().expect("str arm") else { unreachable!() };
+                    let cmp_label = &cmp_labels[i];
+                    let next_label = &fallthrough_targets[i];
+                    writeln!(self.out, "{cmp_label}:").unwrap();
+                    self.terminated = false;
+                    // The literal's backing global — same emission shape
+                    // `Expr::Str` uses, but the literal lives in `a.pattern`,
+                    // not an `Expr::Str`, so emit it inline here.
+                    let global = self.fresh_global("str");
+                    let bytes = lit.as_bytes();
+                    let escaped = llvm_escape_bytes(bytes);
+                    writeln!(self.string_globals, "{global} = private unnamed_addr constant [{} x i8] c\"{escaped}\\00\"", bytes.len() + 1).unwrap();
+                    let lit_ptr = self.fresh_reg("match_lit_ptr");
+                    writeln!(self.out, "  {lit_ptr} = getelementptr [{} x i8], ptr {global}, i64 0, i64 0", bytes.len() + 1).unwrap();
+                    let lit_len = bytes.len() as i64;
+                    let raw = self.fresh_reg("match_streq");
+                    writeln!(self.out, "  {raw} = call i32 @nir_str_eq(ptr {s_ptr}, i64 {s_len}, ptr {lit_ptr}, i64 {lit_len})").unwrap();
+                    let is_eq = self.icmp("ne", "i32", &raw, "0")?;
+                    writeln!(self.out, "  br i1 {is_eq}, label %{arm_label}, label %{next_label}").unwrap();
+                    // The arm body block.
+                    writeln!(self.out, "{arm_label}:").unwrap();
+                    self.terminated = false;
+                    let fell = emit_arm_body(self, i, &a.body, scopes)?;
+                    any_fell_through |= fell;
+                }
+                // Wildcard arm — the unconditional catch-all.
+                writeln!(self.out, "{wildcard_label}:").unwrap();
+                self.terminated = false;
+                let wildcard_idx = literal_arms.len();
+                let fell = emit_arm_body(self, wildcard_idx, &wildcard.body, scopes)?;
+                any_fell_through |= fell;
+            }
+            _ => unreachable!("caller already restricted scrutinee_ty to str/i64/bool"),
+        }
+        self.terminated = !any_fell_through;
+        Ok(())
+    }
+
+    /// Run `block` for side effects only and return whether it falls
+    /// through (so the caller knows whether to emit a branch to the merge
+    /// label). Used by unit-valued `if`/`match` arms.
+    fn block_side_effects(&mut self, block: &Block, scopes: &mut Scopes) -> Result<(), CodegenError> {
+        match block.stmts.split_last() {
+            None => {}
+            Some((last, rest)) => {
+                self.stmts(rest, scopes)?;
+                if !self.terminated {
+                    match last {
+                        Stmt::Expr(e) => {
+                            self.expr(e, scopes)?;
+                        }
+                        other => {
+                            self.stmt(other, scopes)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluate `block` and store its trailing value into `slot_ptr`.
+    /// Used by `if_expr`/`match_expr` for both scalar and aggregate result
+    /// slots.
+    fn block_value_to_slot(
+        &mut self,
+        block: &Block,
+        slot_ptr: &str,
+        result_ty: &Ty,
+        scopes: &mut Scopes,
+    ) -> Result<(), CodegenError> {
+        match block.stmts.split_last() {
+            None => Ok(()),
             Some((last, rest)) => {
                 self.stmts(rest, scopes)?;
                 if self.terminated {
-                    return Ok("0".to_string()); // unreachable; value never used
+                    return Ok(());
                 }
                 match last {
-                    Stmt::Expr(e) => self.expr(e, scopes),
+                    Stmt::Expr(e) => {
+                        if result_ty.is_aggregate() {
+                            let src = self.expr_ptr(e, scopes)?;
+                            let bytes = agg_byte_size_operand(result_ty, &self.registry);
+                            writeln!(
+                                self.out,
+                                "  call void @llvm.memcpy.p0.p0.i64(ptr {slot_ptr}, ptr {src}, i64 {bytes}, i1 false)"
+                            )
+                            .unwrap();
+                        } else {
+                            let v = self.expr(e, scopes)?;
+                            let llty = self.llvm_ty(result_ty)?;
+                            writeln!(self.out, "  store {llty} {v}, ptr {slot_ptr}").unwrap();
+                        }
+                    }
                     other => {
                         self.stmt(other, scopes)?;
-                        Ok("0".to_string())
                     }
                 }
+                Ok(())
             }
         }
     }
@@ -3440,8 +4912,8 @@ impl Codegen<'_> {
             // (sret convention) — a genuine invalid-IR mismatch this
             // guard exists specifically to prevent.
             return unsupported(
-                "codegen doesn't support `main` returning a Vector/Matrix directly yet — print \
-                 its elements instead of returning the aggregate itself",
+                "codegen doesn't support `main` returning a Vector/Matrix/struct/enum directly yet — print \
+                 its elements/fields instead of returning the aggregate itself",
             );
         }
         writeln!(self.out, "define i32 @main() {{").unwrap();
@@ -3453,18 +4925,27 @@ impl Codegen<'_> {
             // Same "no sensible exit code" reasoning as the aggregate
             // case above — `str` is a `{ptr, i64}` struct value, not
             // something `sext`/`trunc`/`fptosi` (the only conversions
-            // this fallback knows) can turn into an `i32`. Found by
-            // actually compiling a `main() -> str` program and watching
-            // the fallback's `sext` arm emit `sext {ptr, i64} ... to
-            // i32` — invalid IR clang rejects, exactly the failure mode
-            // this guard exists to turn into a clean `CodegenError`
-            // instead (same discipline as the aggregate-return guard).
-            return unsupported(
-                "codegen doesn't support `main` returning `str` directly yet — print it instead \
-                 of returning it",
-            );
+            // the generic fallback below knows) can turn into an `i32`.
+            // Resolved the same way `Ty::Unit` above is: there's no exit
+            // code to compute either way, so print the value (exactly
+            // `Codegen::call`'s own `Ty::Str` print-arm sequence — same
+            // `%.*s` format, same explicit length rather than a NUL scan,
+            // `Ty::Str`'s own note in `llvm_ty` on why) and exit 0. This
+            // is precisely the workaround the old rejection message told
+            // callers to do by hand (`print(...)` then return `unit`);
+            // automating it here removes the need for that workaround.
+            let r = self.fresh_reg("main_str_result");
+            writeln!(self.out, "  {r} = call {{ptr, i64}} @nir_main()").unwrap();
+            let ptr_reg = self.fresh_reg("main_str_ptr");
+            writeln!(self.out, "  {ptr_reg} = extractvalue {{ptr, i64}} {r}, 0").unwrap();
+            let len_reg = self.fresh_reg("main_str_len");
+            writeln!(self.out, "  {len_reg} = extractvalue {{ptr, i64}} {r}, 1").unwrap();
+            let len_i32 = self.fresh_reg("main_str_len_i32");
+            writeln!(self.out, "  {len_i32} = trunc i64 {len_reg} to i32").unwrap();
+            writeln!(self.out, "  call i32 (ptr, ...) @printf(ptr @.str_fmt, i32 {len_i32}, ptr {ptr_reg})").unwrap();
+            writeln!(self.out, "  ret i32 0").unwrap();
         } else {
-            let llty = llvm_ty(&main_fn.ret)?;
+            let llty = self.llvm_ty(&main_fn.ret)?;
             let r = self.fresh_reg("main_result");
             writeln!(self.out, "  {r} = call {llty} @nir_main()").unwrap();
             let r32 = match llty.as_str() {
@@ -3487,9 +4968,17 @@ impl Codegen<'_> {
                     writeln!(self.out, "  {t} = fptosi double {r} to i32").unwrap();
                     t
                 }
+                // `i8`/`i16`-width results (`i8`/`i16`, and their
+                // unsigned counterparts `u8`/`u16`, which map to the
+                // exact same LLVM widths — `llty` alone can't tell them
+                // apart, hence checking `main_fn.ret.is_unsigned()`
+                // directly) need widening up to `i32`; `zext` for
+                // unsigned, `sext` for signed, same distinction
+                // `widen_to_i64` makes and for the same reason.
                 _ => {
                     let t = self.fresh_reg("exit_code");
-                    writeln!(self.out, "  {t} = sext {llty} {r} to i32").unwrap();
+                    let op = if main_fn.ret.is_unsigned() { "zext" } else { "sext" };
+                    writeln!(self.out, "  {t} = {op} {llty} {r} to i32").unwrap();
                     t
                 }
             };

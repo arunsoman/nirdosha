@@ -156,15 +156,15 @@ fn merge_moved(a: Vec<HashMap<String, (Ty, bool)>>, b: Vec<HashMap<String, (Ty, 
 }
 
 /// Where a real (non-cloning, LLVM-compiled) backend needs to insert
-/// `nir_free` for a `box`-typed binding — computed as a side effect of
-/// the exact same move-tracking traversal `Checker` already runs for
+/// runtime teardown for an affine-typed binding — computed as a side effect
+/// of the exact same move-tracking traversal `Checker` already runs for
 /// error-checking (see `compute_free_map`), not a second, independently
 /// re-derived liveness analysis. Every entry answers "at this exact
-/// program point, which box-typed bindings are still owned (never moved
+/// program point, which affine-typed bindings are still owned (never moved
 /// away) and therefore need freeing here" — codegen looks each one up by
 /// the matching AST node's own span (or, for a whole function, its name)
-/// and emits a `call void @nir_free(...)` per name, using its own
-/// `Scopes` to find that name's current pointer register.
+/// and emits the right runtime call per name, using its own `Scopes` to
+/// find that name's current pointer register.
 #[derive(Debug, Clone, Default)]
 pub struct FreeMap {
     /// Keyed by a `Stmt::Return`'s own span. A `return` unwinds every
@@ -193,6 +193,12 @@ pub struct FreeMap {
     /// `at_while_end`/`at_if_branch_end`, for an `audited { ... }` block's
     /// own scope.
     pub at_audited_end: HashMap<Span, Vec<String>>,
+    /// Keyed by a `match` expression's own span plus the arm index —
+    /// bindings declared directly in that arm's payload-pattern scope and
+    /// still owned at the arm's end. Each arm is its own scope with its
+    /// own moved-state; only the arm that actually runs at runtime frees
+    /// what it itself still owns there.
+    pub at_match_arm_end: HashMap<(Span, usize), Vec<String>>,
     /// Keyed by function name (unique per `Program.fns`, per `typeck.rs`)
     /// — bindings (including unused parameters) still owned when a
     /// function's body finishes without having hit an explicit `return`
@@ -205,17 +211,21 @@ pub struct FreeMap {
     pub at_fn_end: HashMap<String, Vec<String>>,
 }
 
-/// The box-typed, not-yet-moved bindings in exactly one scope frame — the
+/// The affine, not-yet-moved bindings in exactly one scope frame — the
 /// "free these when *this* scope closes" answer, used for every
 /// `FreeMap` field except `at_return` (which needs every open frame at
 /// once, since a `return` unwinds them all simultaneously — see
-/// `all_still_owned_boxes`).
-fn still_owned_boxes(scope: &HashMap<String, (Ty, bool)>) -> Vec<String> {
-    scope.iter().filter(|(_, (ty, moved))| matches!(ty, Ty::Box(_)) && !moved).map(|(name, _)| name.clone()).collect()
+/// `all_still_owned_affine`).
+fn still_owned_affine(scope: &HashMap<String, (Ty, bool)>, registry: &TypeRegistry<'_>) -> Vec<String> {
+    scope
+        .iter()
+        .filter(|(_, (ty, moved))| registry.is_affine(ty) && !moved)
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
-fn all_still_owned_boxes(scopes: &OwnScopes) -> Vec<String> {
-    scopes.0.iter().flat_map(still_owned_boxes).collect()
+fn all_still_owned_affine(scopes: &OwnScopes, registry: &TypeRegistry<'_>) -> Vec<String> {
+    scopes.0.iter().flat_map(|s| still_owned_affine(s, registry)).collect()
 }
 
 pub struct Checker<'a> {
@@ -312,7 +322,7 @@ fn run_checker(program: &Program) -> Checker<'_> {
         // body finishes (params plus any top-level `let`s — every nested
         // block scope has already been popped by this point) is exactly
         // what an implicit fall-off-the-end return needs freed.
-        let freed = still_owned_boxes(c.scopes.0.last().unwrap());
+        let freed = still_owned_affine(c.scopes.0.last().unwrap(), &c.registry);
         c.free_map.at_fn_end.insert(f.name.clone(), freed);
     }
     c
@@ -357,7 +367,7 @@ impl<'a> Checker<'a> {
     fn check_block(&mut self, block: &Block) -> Vec<String> {
         self.scopes.push();
         self.check_stmts(&block.stmts);
-        let freed = still_owned_boxes(self.scopes.0.last().unwrap());
+        let freed = still_owned_affine(self.scopes.0.last().unwrap(), &self.registry);
         self.scopes.pop();
         freed
     }
@@ -376,7 +386,7 @@ impl<'a> Checker<'a> {
                 // unlike `check_block`'s single-frame snapshot, this needs
                 // everything still owned across the whole scope stack.
                 if !self.silent {
-                    self.free_map.at_return.insert(*span, all_still_owned_boxes(&self.scopes));
+                    self.free_map.at_return.insert(*span, all_still_owned_affine(&self.scopes, &self.registry));
                 }
             }
             Stmt::While { cond, body, span } => {
@@ -387,7 +397,7 @@ impl<'a> Checker<'a> {
             Stmt::Audited { body, span, .. } => {
                 self.scopes.push();
                 self.check_stmts(body);
-                let freed = still_owned_boxes(self.scopes.0.last().unwrap());
+                let freed = still_owned_affine(self.scopes.0.last().unwrap(), &self.registry);
                 self.scopes.pop();
                 if !self.silent {
                     self.free_map.at_audited_end.insert(*span, freed);
@@ -466,7 +476,7 @@ impl<'a> Checker<'a> {
     /// This can only ever over-restrict (reject some valid reuse this pass
     /// can't prove safe), never under-restrict (accept an actual
     /// double-move).
-    fn check_match_arms(&mut self, scrutinee: &Expr, arms: &[MatchArm]) {
+    fn check_match_arms(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: Span) {
         let pre = self.scopes.clone();
 
         let concrete_args: Option<Vec<Ty>> = match scrutinee {
@@ -484,7 +494,7 @@ impl<'a> Checker<'a> {
 
         let mut merged: Option<Vec<HashMap<String, (Ty, bool)>>> = None;
 
-        for arm in arms {
+        for (arm_idx, arm) in arms.iter().enumerate() {
             self.scopes = pre.clone();
             self.scopes.push();
             if let Some((owner, v)) = self.registry.find_variant(&arm.variant) {
@@ -499,6 +509,10 @@ impl<'a> Checker<'a> {
                 }
             }
             self.touch_expr(&arm.body, true);
+            if !self.silent {
+                let freed = still_owned_affine(self.scopes.0.last().unwrap(), &self.registry);
+                self.free_map.at_match_arm_end.insert((span, arm_idx), freed);
+            }
             self.scopes.pop();
 
             let after = self.scopes.0.clone();
@@ -805,13 +819,13 @@ impl<'a> Checker<'a> {
                     self.touch_expr(base, false);
                 }
             }
-            Expr::Match { scrutinee, arms, .. } => {
+            Expr::Match { scrutinee, arms, span } => {
                 // The scrutinee is consumed as a whole -- matching
                 // destructures it into fresh payload bindings, the same
                 // "moves as a whole" rule struct/enum affinity already
                 // gets (§3.5).
                 self.touch_expr(scrutinee, true);
-                self.check_match_arms(scrutinee, arms);
+                self.check_match_arms(scrutinee, arms, *span);
             }
         }
     }
