@@ -313,6 +313,10 @@ impl Checker<'_> {
                 }
                 Int::fresh_const("call_result")
             }
+            Expr::Acquire(_, proof, _) => {
+                self.expr(proof, scopes);
+                Int::fresh_const("acquire_result")
+            }
             Expr::If { cond, then_block, else_block, .. } => {
                 let cond_term = self.bool_expr(cond, scopes);
 
@@ -607,7 +611,8 @@ fn assigned_names(stmts: &[Stmt]) -> HashSet<String> {
             | Expr::Ref(inner, _)
             | Expr::Join(inner, _)
             | Expr::Recv(inner, _)
-            | Expr::StopSandbox(inner, _) => walk_expr(inner, names),
+            | Expr::StopSandbox(inner, _)
+            | Expr::Acquire(_, inner, _) => walk_expr(inner, names),
             Expr::Binary(_, l, r, _) => {
                 walk_expr(l, names);
                 walk_expr(r, names);

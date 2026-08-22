@@ -48,6 +48,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::ast::*;
+use crate::effects::{self, EffectSet};
+use crate::observability;
 use crate::token::Span;
 
 /// Renamed on import — this file's own `Value` enum would otherwise
@@ -58,7 +60,7 @@ use serde_json::Value as JsonDoc;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hmac::Mac;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 /// Not `Copy` — `Value::Boxed` owns a heap allocation (a real Rust `Box`),
 /// and giving the enum a free bitwise-copy would let two `Value`s alias the
@@ -72,6 +74,30 @@ use sha2::Sha256;
 /// backend would need to free deterministically with no garbage collector
 /// at all. Don't read "the interpreter runs `box` correctly" as "row 1 is
 /// done" — it's the checker that's doing the row-1 work, not this file.
+/// Thin wrapper solely so `Value::Mq` can derive `Debug` — `redis::
+/// Connection` itself doesn't implement it. `Deref`/`DerefMut` make it
+/// otherwise transparent at call sites.
+pub struct MqConn(pub redis::Connection);
+
+impl std::fmt::Debug for MqConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MqConn(..)")
+    }
+}
+
+impl std::ops::Deref for MqConn {
+    type Target = redis::Connection;
+    fn deref(&self) -> &redis::Connection {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for MqConn {
+    fn deref_mut(&mut self) -> &mut redis::Connection {
+        &mut self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
@@ -176,6 +202,14 @@ pub enum Value {
     /// `rusqlite::Connection` closes its own database handle on drop with
     /// no help required, the same as every other affine handle here.
     Db(Arc<Mutex<Option<rusqlite::Connection>>>),
+    /// A handle to a real, open message-queue connection (`mq_connect(host,
+    /// port)` — see `Ty::Mq`'s doc comment). Same `Mutex<Option<..>>` shape
+    /// and reason as `Value::Db`. Backed by Redis (`redis` crate); no
+    /// custom `Drop` needed — a `redis::Connection` closes its own socket
+    /// on drop. Wrapped in `MqConn` because `redis::Connection` itself
+    /// doesn't implement `Debug` (unlike `rusqlite::Connection`, which
+    /// does, so `Value::Db` needs no such wrapper).
+    Mq(Arc<Mutex<Option<MqConn>>>),
     /// A `struct` value (Row 11) — the declared struct's name plus its
     /// field values, positional, in declaration order (construction is
     /// positional-only — `ast::StructDecl`'s doc comment). `Arc<[Value]>`,
@@ -193,6 +227,14 @@ pub enum Value {
     /// (same shape as `Value::Struct`, plus the variant tag `match`
     /// dispatches on).
     Enum(Arc<str>, Arc<str>, Arc<[Value]>),
+    /// A first-class function value (`Ty::Fn`) — just the target
+    /// top-level function's name, `Arc<str>` for the same cheap-clone-on-
+    /// read reason `Value::Str` already documents (there's no closure
+    /// environment to carry — this language has none). Produced by
+    /// naming a plain top-level fn directly, or by a successful
+    /// `Expr::Acquire`; never by any other path (`typeck.rs` proves a
+    /// `requires`-gated function's name can't reach here any other way).
+    Fn(Arc<str>),
 }
 
 /// A spawned computation's raw join handle. Its own alias, not just inline
@@ -556,6 +598,21 @@ impl PartialEq for Value {
     }
 }
 
+/// Whether a literal-pattern `match` arm's pattern
+/// (`typeck.rs::check_literal_match` already proved `value` is a
+/// `str`/`i64`/`bool` and every non-wildcard pattern agrees with it in
+/// type) matches `value` -- `Value`'s own `PartialEq` above does the
+/// real comparison, `Wildcard` always matches.
+fn literal_pattern_matches(pattern: &Option<LiteralPattern>, value: &Value) -> bool {
+    match pattern {
+        Some(LiteralPattern::Wildcard) => true,
+        Some(LiteralPattern::Str(s)) => matches!(value, Value::Str(v) if v.as_ref() == s.as_str()),
+        Some(LiteralPattern::Int(n)) => matches!(value, Value::Int(v) if v == n),
+        Some(LiteralPattern::Bool(b)) => matches!(value, Value::Bool(v) if v == b),
+        None => false,
+    }
+}
+
 impl Value {
     fn ty_name(&self) -> &'static str {
         match self {
@@ -576,6 +633,7 @@ impl Value {
             Value::File(_) => "file",
             Value::Json(_) => "json",
             Value::Db(_) => "db",
+            Value::Mq(_) => "mq",
             // A generic tag, not the real declared name — every real call
             // site that needs the *actual* struct/enum name already has
             // the `Ty::Named`/`Value::Struct`/`Value::Enum` name field
@@ -583,6 +641,7 @@ impl Value {
             // generic method; this exists only so `ty_name` stays total.
             Value::Struct(..) => "struct",
             Value::Enum(..) => "enum",
+            Value::Fn(_) => "fn",
         }
     }
 
@@ -615,12 +674,14 @@ impl Value {
             Value::File(_) => "file(..)".to_string(),
             Value::Json(doc) => format!("json({doc})"),
             Value::Db(_) => "db(..)".to_string(),
+            Value::Mq(_) => "mq(..)".to_string(),
             Value::Struct(name, fields) => {
                 format!("{name}({})", fields.iter().map(Value::render).collect::<Vec<_>>().join(", "))
             }
             Value::Enum(_, variant, payload) => {
                 format!("{variant}({})", payload.iter().map(Value::render).collect::<Vec<_>>().join(", "))
             }
+            Value::Fn(name) => format!("fn({name})"),
         }
     }
 }
@@ -638,6 +699,11 @@ pub enum ErrorKind {
     OutOfRange { ty: String, value: i64 },
     DivByZero,
     MissingReturn { fn_name: String },
+    /// `call()`'s `MAX_CALL_DEPTH` guard tripped — see that constant's
+    /// doc comment. A normal, catchable error instead of the uncatchable
+    /// Rust-stack-overflow abort deep `.nir` recursion would otherwise
+    /// cause.
+    CallStackOverflow { fn_name: String },
     /// The spawned thread panicked instead of returning normally — Rust's
     /// own panic payload isn't `Display`-friendly in general, so this
     /// carries a best-effort message rather than the raw payload.
@@ -735,6 +801,11 @@ impl std::fmt::Display for RuntimeError {
             ErrorKind::RngNotSeeded => {
                 write!(f, "{line}:{col}: rand_f64/rand_gaussian called before rand_seed")
             }
+            ErrorKind::CallStackOverflow { fn_name } => write!(
+                f,
+                "{line}:{col}: call stack depth exceeded while calling `{fn_name}` — \
+                 likely unbounded recursion"
+            ),
         }
     }
 }
@@ -839,7 +910,7 @@ fn json_field<'a>(doc: &'a JsonDoc, key: &str) -> Result<&'a JsonDoc, String> {
 /// JSON. This is a deliberately narrow, self-contained demo of the relying-
 /// party pattern: Nirdosha validates an externally-issued token, never mints
 /// one, and returns the result as a `VerifiedIdentity` value.
-fn validate_oidc_token(token: &str, expected_issuer: &str, expected_audience: &str, jwks_json: &str) -> Result<Value, String> {
+pub(crate) fn validate_oidc_token(token: &str, expected_issuer: &str, expected_audience: &str, jwks_json: &str) -> Result<Value, String> {
     let mut parts = token.split('.');
     let header_b64 = parts.next().ok_or_else(|| "malformed JWT: missing header".to_string())?;
     let payload_b64 = parts.next().ok_or_else(|| "malformed JWT: missing payload".to_string())?;
@@ -886,12 +957,24 @@ fn validate_oidc_token(token: &str, expected_issuer: &str, expected_audience: &s
     if aud != expected_audience {
         return Err(format!("wrong audience: expected `{expected_audience}`, found `{aud}`"));
     }
+    // Deliberately no `exp`/`now` check here: this function (and the
+    // `.nir`-facing `oidc_validate_token` builtin wrapping it) must stay
+    // a pure function of its inputs, no wall-clock read, for the same
+    // determinism reason `mock_issue_token`'s own doc comment states
+    // (LANGUAGE.md §9) — `identity_expired(identity, now)` exists
+    // specifically so an explicit, caller-supplied `now` decides
+    // expiry, not a hidden clock inside validation itself. A red-team
+    // finding is right that nothing calls that automatically against a
+    // *real* clock for `nirdosha serve`'s bearer-token HTTP path — see
+    // `serve.rs::dispatch`, which is where that belongs (real Rust
+    // infrastructure at the actual network boundary, not part of the
+    // `.nir` determinism contract), not here.
 
     let jwks: JsonDoc = serde_json::from_str(jwks_json).map_err(|e| format!("malformed JWKS: {e}"))?;
     let key = jwks_key(&jwks, &kid)?;
     let signed_input = format!("{header_b64}.{payload_b64}").into_bytes();
     let expected_sig = hmac_sha256_base64url(&key, &signed_input);
-    if signature_b64 != expected_sig {
+    if !constant_time_eq(signature_b64, &expected_sig) {
         return Err("invalid JWT signature".to_string());
     }
 
@@ -928,6 +1011,176 @@ fn hmac_sha256_base64url(key: &[u8], message: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
 }
 
+/// A red-team finding, fixed: the JWT signature check used to be a
+/// plain `!=` on the two base64url strings — a short-circuiting
+/// comparison that returns on the first differing byte, a timing side
+/// channel on the sole signature gate protecting every authenticated
+/// endpoint. This walks every byte of both sides regardless of where
+/// they first differ (accumulating mismatches with `|`, not branching
+/// on them), so the time taken doesn't depend on *where* a forged
+/// signature first diverges from the real one. Different lengths are
+/// rejected up front (real signatures are always the same fixed
+/// length), which does leak a length comparison, not a content one —
+/// no `Ord`/short-circuit over the actual signature bytes either way.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// The deliberate inverse of `validate_oidc_token` — mints a token
+/// instead of verifying one, reusing the exact same `jwks_key`/
+/// `hmac_sha256_base64url` helpers, so a token minted here round-trips
+/// through the real, unmodified `validate_oidc_token` unchanged. Row 12's
+/// one narrow, explicitly-named exception to "the runtime never mints
+/// tokens; it only consumes externally-issued ones" (this file's own
+/// `validate_oidc_token` doc comment) — for local dev/testing only,
+/// never a stand-in for a real IdP; the `mock_` prefix on the Nirdosha-
+/// facing builtin name is meant to keep that honest. `issued_at` is a
+/// required argument, not a hidden wall-clock read, so this stays
+/// deterministic — `effects.rs` classifies `mock_issue_token` as pure
+/// via its default arm, same as the `json_*` builtins.
+fn mock_issue_token(
+    subject: &str,
+    issuer: &str,
+    audience: &str,
+    issued_at: i64,
+    ttl_secs: i64,
+    claims_json: &str,
+    jwks_json: &str,
+) -> Result<String, String> {
+    let jwks: JsonDoc = serde_json::from_str(jwks_json).map_err(|e| format!("malformed JWKS: {e}"))?;
+    let keys = jwks.get("keys").and_then(|k| k.as_array()).ok_or_else(|| "JWKS has no `keys` array".to_string())?;
+    let kid = keys
+        .first()
+        .and_then(|k| k.get("kid"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "JWKS has no keys, or its first key has no `kid`".to_string())?;
+
+    let claims: JsonDoc = serde_json::from_str(claims_json).map_err(|e| format!("malformed claims_json: {e}"))?;
+    let claims_obj = claims.as_object().ok_or_else(|| "claims_json must be a JSON object".to_string())?;
+
+    let header = serde_json::json!({"alg": "HS256", "kid": kid});
+    let mut payload_map = serde_json::Map::new();
+    payload_map.insert("iss".to_string(), JsonDoc::String(issuer.to_string()));
+    payload_map.insert("aud".to_string(), JsonDoc::String(audience.to_string()));
+    payload_map.insert("sub".to_string(), JsonDoc::String(subject.to_string()));
+    payload_map.insert("iat".to_string(), JsonDoc::from(issued_at));
+    payload_map.insert("exp".to_string(), JsonDoc::from(issued_at + ttl_secs));
+    for (k, v) in claims_obj {
+        payload_map.insert(k.clone(), v.clone());
+    }
+    let payload = JsonDoc::Object(payload_map);
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).map_err(|e| e.to_string())?);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).map_err(|e| e.to_string())?);
+    let key = jwks_key(&jwks, kid)?;
+    let signature_b64 = hmac_sha256_base64url(&key, format!("{header_b64}.{payload_b64}").as_bytes());
+    Ok(format!("{header_b64}.{payload_b64}.{signature_b64}"))
+}
+
+/// Reads `identity`'s (a `VerifiedIdentity` struct value) embedded
+/// `claims_json` field (index 5) as a parsed JSON document. Shared root
+/// of `identity_has_role`/`identity_claim` below.
+fn identity_claims(identity: &Value) -> Result<JsonDoc, String> {
+    let Value::Struct(_, fields) = identity else {
+        unreachable!("typeck.rs already proved this is a VerifiedIdentity")
+    };
+    let Value::Str(claims_json) = &fields[5] else {
+        unreachable!("VerifiedIdentity.claims_json is str")
+    };
+    serde_json::from_str(claims_json).map_err(|e| format!("bad claims json: {e}"))
+}
+
+/// Whether `identity` carries `role` in its embedded `claims_json`'s
+/// `"roles"` array. Extracted out of the `check_role` builtin so
+/// `serve.rs`'s runtime `requires(role: ...)` enforcement can reuse the
+/// exact same check — `Interpreter::call_named` itself doesn't enforce
+/// `FnDecl.requires` at all (only `Expr::Acquire` does), so `serve.rs`
+/// has to do it itself, and duplicating this logic there instead of
+/// sharing it would be one drift risk too many for an authz check.
+pub(crate) fn identity_has_role(identity: &Value, role: &str) -> Result<bool, String> {
+    let claims = identity_claims(identity)?;
+    let roles = json_field(&claims, "roles")?.as_array().ok_or_else(|| "`roles` is not an array".to_string())?;
+    Ok(roles.iter().any(|v| v.as_str() == Some(role)))
+}
+
+/// The string value of claim `key` in `identity`'s embedded
+/// `claims_json`. Extracted out of the `extract_claim` builtin for the
+/// same reuse-by-`serve.rs` reason as `identity_has_role` above.
+pub(crate) fn identity_claim(identity: &Value, key: &str) -> Result<String, String> {
+    let claims = identity_claims(identity)?;
+    let v = json_field(&claims, key)?;
+    v.as_str().map(|s| s.to_string()).ok_or_else(|| format!("claim `{key}` is not a string"))
+}
+
+/// `json_field`'s multi-level sibling: walks `path` (dot-separated, e.g.
+/// `"realm_access.roles"`) through nested JSON objects, one flat
+/// `json_field` step per segment. Backs `check_role_path`/
+/// `extract_claim_path` only -- `check_role`/`extract_claim` (and every
+/// general-purpose `json_get*` builtin) stay on plain `json_field`
+/// unchanged, since a claim name can itself contain a literal dot
+/// (Auth0-style namespaced claims, `"https://myapp.example.com/roles"`)
+/// -- that's a flat single key, not a nested path, and splitting it on
+/// `.` would silently misread it as one. Callers choose the right tool
+/// for their IdP's claim shape; this helper only ever walks *actual*
+/// nesting.
+fn json_field_path<'a>(doc: &'a JsonDoc, path: &str) -> Result<&'a JsonDoc, String> {
+    let mut cur = doc;
+    for segment in path.split('.') {
+        cur = json_field(cur, segment)?;
+    }
+    Ok(cur)
+}
+
+/// `identity_has_role`'s dotted-path sibling, for IdPs that nest the
+/// roles array under a path instead of a flat top-level `"roles"` field
+/// (Keycloak's `realm_access.roles`, for one real example). Backs
+/// `check_role_path`; `check_role`/`identity_has_role` are untouched.
+pub(crate) fn identity_has_role_at(identity: &Value, path: &str, role: &str) -> Result<bool, String> {
+    let claims = identity_claims(identity)?;
+    let roles = json_field_path(&claims, path)?.as_array().ok_or_else(|| format!("`{path}` is not an array"))?;
+    Ok(roles.iter().any(|v| v.as_str() == Some(role)))
+}
+
+/// `identity_claim`'s dotted-path sibling, for a claim nested under an
+/// object instead of a flat top-level field. Backs `extract_claim_path`;
+/// `extract_claim`/`identity_claim` are untouched.
+pub(crate) fn identity_claim_at(identity: &Value, path: &str) -> Result<String, String> {
+    let claims = identity_claims(identity)?;
+    let v = json_field_path(&claims, path)?;
+    v.as_str().map(|s| s.to_string()).ok_or_else(|| format!("claim `{path}` is not a string"))
+}
+
+/// `identity`'s `expires_at` field — extracted for the same reuse-by-
+/// `serve.rs` reason as `identity_has_role`/`identity_claim` above:
+/// `serve.rs::dispatch` is real Rust infrastructure at the actual
+/// network boundary (not part of the `.nir` determinism contract the
+/// rest of this file's identity builtins deliberately keep — see
+/// `validate_oidc_token`'s own doc comment on why *it* never reads a
+/// real clock), so it's the correct place to reject an actually-expired
+/// bearer token against a real `SystemTime::now()` read automatically,
+/// rather than leaving that to `identity_expired`, an opt-in builtin a
+/// `.nir` program has to call itself with its own supplied `now`.
+pub(crate) fn identity_expires_at(identity: &Value) -> Result<i64, String> {
+    let Value::Struct(name, fields) = identity else {
+        return Err("not a VerifiedIdentity".to_string());
+    };
+    if name.as_ref() != "VerifiedIdentity" {
+        return Err("not a VerifiedIdentity".to_string());
+    }
+    match fields.get(3) {
+        Some(Value::Int(n)) => Ok(*n),
+        _ => Err("VerifiedIdentity.expires_at is not an i64".to_string()),
+    }
+}
+
 fn verified_identity_value(subject: &str, issuer: &str, audience: &str, expires_at: i64, issued_at: i64, claims_json: &str) -> Value {
     Value::Struct(
         Arc::from("VerifiedIdentity"),
@@ -942,6 +1195,111 @@ fn verified_identity_value(subject: &str, issuer: &str, audience: &str, expires_
     )
 }
 
+// ---- Row 12 continued: session, refresh, revocation, API-key helpers ------
+
+/// A per-process random secret, generated once, for `session_id`'s
+/// unpredictable component (see that function's doc comment for why it
+/// needs one at all). `/dev/urandom` is real OS entropy, no new crate
+/// dependency needed (this codebase already avoids pulling in `rand`'s
+/// trait ecosystem even for the *deterministic* `.nir`-facing PRNG — see
+/// `RngState`'s own doc comment); the fallback only matters on a
+/// platform without it, and is still strictly better than a fixed
+/// constant.
+fn session_secret_hex() -> &'static str {
+    static SECRET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SECRET.get_or_init(|| {
+        let mut buf = [0u8; 32];
+        let got_os_random = std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
+            .is_ok();
+        if !got_os_random {
+            let pid = std::process::id() as u64;
+            let addr = &buf as *const _ as u64; // ASLR-randomized
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            let mixed = sha256_hex_chain(&[&pid.to_string(), &addr.to_string(), &nanos.to_string()]);
+            let mixed_bytes = mixed.as_bytes();
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = mixed_bytes[i % mixed_bytes.len()];
+            }
+        }
+        buf.iter().map(|b| format!("{b:02x}")).collect()
+    })
+}
+
+/// A red-team finding, fixed: `session_id` used to be
+/// `format!("{issuer}_{subject}_{now}")` with `now` a *fixed* constant
+/// (`create_application_session`'s call site) — the same (issuer,
+/// subject) pair always produced the identical session cookie, no
+/// randomness or server secret involved at all. Anyone who knew a
+/// victim's subject/issuer (rarely secret) could compute their exact
+/// session cookie — full hijack, no forgery needed. The
+/// `{issuer}_{subject}_` prefix stays (existing behavior/tests key off
+/// it for readability/log-grepping), but the suffix is now
+/// `sha256_hex_chain(secret, subject, issuer, real-time nanoseconds,
+/// a per-process counter)` — unpredictable without the process-local
+/// secret, and unique even for two sessions created in the same
+/// nanosecond. Real time/counter here (unlike `now: i64`, which stays
+/// exactly as before for `expires_at`'s bookkeeping) is fine specifically
+/// because this value's only job is to be an opaque, unguessable
+/// credential — nothing about the `.nir` determinism contract depends
+/// on a session *id* being reproducible the way a program's own return
+/// value must be.
+fn application_session_value(subject: &str, issuer: &str, now: i64) -> Value {
+    static SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let counter = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let real_now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let unpredictable =
+        sha256_hex_chain(&[session_secret_hex(), subject, issuer, &real_now_nanos.to_string(), &counter.to_string()]);
+    let session_id = format!("{}_{}_{}", issuer.replace("https://", ""), subject, unpredictable);
+    let eight_hours = 8 * 60 * 60;
+    Value::Struct(
+        Arc::from("ApplicationSession"),
+        Arc::from(vec![
+            Value::Str(Arc::from(session_id)),
+            Value::Str(Arc::from(subject)),
+            Value::Str(Arc::from(issuer)),
+            Value::Int(now),
+            Value::Int(now + eight_hours),
+            Value::Int(now),
+        ]),
+    )
+}
+
+fn refresh_token_value(expires_at: i64) -> Value {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let handle = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i64;
+    Value::Struct(
+        Arc::from("RefreshTokenHandle"),
+        Arc::from(vec![Value::Boxed(Box::new(Value::Int(handle))), Value::Int(expires_at)]),
+    )
+}
+
+fn sha256_hex(s: &str) -> String {
+    sha256_hex_chain(&[s])
+}
+
+/// The 2-arg form of the `sha256_hex` builtin — hashes each part in
+/// sequence (`Sha256::update` called once per part) rather than
+/// concatenating first, since Nirdosha `str` has no concatenation
+/// operator at all (LANGUAGE.md §2). This is what makes a real
+/// hash-chained audit log (`hash = sha256_hex(prev_hash, payload)`)
+/// expressible from Nirdosha source — the "combine two strings" step
+/// happens here, in Rust, not via string concatenation in the language.
+fn sha256_hex_chain(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for p in parts {
+        hasher.update(p.as_bytes());
+    }
+    let result = hasher.finalize();
+    result.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 // ---- DB, layer 1: SQLite (`Ty::Db`'s doc comment) --------------------------
 
 /// `db_query`'s implementation — runs a row-returning statement (`SELECT`)
@@ -954,11 +1312,11 @@ fn verified_identity_value(subject: &str, issuer: &str, audience: &str, expires_
 /// nowhere else to live. The caller navigates it with the same
 /// `json_array_len`/`json_array_get`/`json_get_*` builtins any other JSON
 /// document uses.
-fn db_query(conn: &rusqlite::Connection, sql: &str) -> Value {
+fn db_query(conn: &rusqlite::Connection, sql: &str, params: &[rusqlite::types::Value]) -> Value {
     let result: rusqlite::Result<JsonDoc> = (|| {
         let mut stmt = conn.prepare(sql)?;
         let column_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
-        let rows = stmt.query_map([], |row| db_row_to_json(row, &column_names))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| db_row_to_json(row, &column_names))?;
         let rows: rusqlite::Result<Vec<JsonDoc>> = rows.collect();
         Ok(JsonDoc::Array(rows?))
     })();
@@ -966,6 +1324,26 @@ fn db_query(conn: &rusqlite::Connection, sql: &str) -> Value {
         Ok(doc) => result_ok(Value::Json(Arc::new(doc))),
         Err(e) => result_err(e.to_string()),
     }
+}
+
+/// Converts `db_query`/`db_execute`'s trailing bind-value arguments
+/// (`typeck.rs`'s arity-ranged `(2..=10)` signature) into rusqlite's own
+/// bind-value type. Scalars only — `Int`/`Float`/`Str`/`Bool` map
+/// directly (`Bool` as SQLite's usual 0/1 integer convention);
+/// anything else (struct, handle, ...) is a clear runtime error rather
+/// than a silent misbind. See `typeck.rs`'s doc comment on why these
+/// args aren't type-constrained ahead of time — this is the actual
+/// (runtime) gate.
+fn sql_bind_params(args: &[Value]) -> Result<Vec<rusqlite::types::Value>, String> {
+    args.iter()
+        .map(|v| match v {
+            Value::Int(n) => Ok(rusqlite::types::Value::Integer(*n)),
+            Value::Float(f) => Ok(rusqlite::types::Value::Real(*f)),
+            Value::Str(s) => Ok(rusqlite::types::Value::Text(s.to_string())),
+            Value::Bool(b) => Ok(rusqlite::types::Value::Integer(if *b { 1 } else { 0 })),
+            other => Err(format!("db bind value must be str/i64/f64/bool, got {}", other.ty_name())),
+        })
+        .collect()
 }
 
 /// One row → one JSON object, column name to value. SQLite's own dynamic
@@ -1875,44 +2253,43 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
             }
         }
         "check_role" => {
-            let (Value::Struct(_, fields), Value::Str(role)) = (&args[0], &args[1]) else {
+            let (identity, Value::Str(role)) = (&args[0], &args[1]) else {
                 unreachable!("typeck.rs already proved identity:VerifiedIdentity and role:str")
             };
-            // Field index 5 is `claims_json`.
-            let claims_json = match &fields[5] {
-                Value::Str(s) => s,
-                _ => unreachable!("VerifiedIdentity.claims_json is str"),
-            };
-            let result: Result<Value, String> = (|| {
-                let claims: JsonDoc = serde_json::from_str(claims_json).map_err(|e| format!("bad claims json: {e}"))?;
-                let roles = json_field(&claims, "roles")?.as_array().ok_or_else(|| "`roles` is not an array".to_string())?;
-                if roles.iter().any(|v| v.as_str() == Some(role.as_ref())) {
-                    Ok(Value::Struct(Arc::from("RoleView"), Arc::from(vec![Value::Str(Arc::from(role.clone()))])))
-                } else {
-                    Err(format!("insufficient role: `{role}`"))
-                }
-            })();
-            match result {
-                Ok(v) => Ok(result_ok(v)),
+            match identity_has_role(identity, role) {
+                Ok(true) => Ok(result_ok(Value::Struct(Arc::from("RoleView"), Arc::from(vec![Value::Str(Arc::from(role.clone()))])))),
+                Ok(false) => Ok(result_err(format!("insufficient role: `{role}`"))),
                 Err(e) => Ok(result_err(e)),
             }
         }
         "extract_claim" => {
-            let (Value::Struct(_, fields), Value::Str(claim_name)) = (&args[0], &args[1]) else {
+            let (identity, Value::Str(claim_name)) = (&args[0], &args[1]) else {
                 unreachable!("typeck.rs already proved identity:VerifiedIdentity and name:str")
             };
-            let claims_json = match &fields[5] {
-                Value::Str(s) => s,
-                _ => unreachable!("VerifiedIdentity.claims_json is str"),
+            match identity_claim(identity, claim_name) {
+                Ok(s) => Ok(result_ok(Value::Struct(Arc::from("ClaimView"), Arc::from(vec![Value::Str(Arc::from(s))])))),
+                Err(e) => Ok(result_err(e)),
+            }
+        }
+        // `check_role`/`extract_claim`'s dotted-path siblings (see
+        // `identity_has_role_at`/`identity_claim_at`'s doc comments) --
+        // additive, not a revision of the two builtins above.
+        "check_role_path" => {
+            let (identity, Value::Str(path), Value::Str(role)) = (&args[0], &args[1], &args[2]) else {
+                unreachable!("typeck.rs already proved identity:VerifiedIdentity, path:str, and role:str")
             };
-            let result: Result<Value, String> = (|| {
-                let claims: JsonDoc = serde_json::from_str(claims_json).map_err(|e| format!("bad claims json: {e}"))?;
-                let v = json_field(&claims, claim_name)?;
-                let s = v.as_str().ok_or_else(|| format!("claim `{claim_name}` is not a string"))?;
-                Ok(Value::Struct(Arc::from("ClaimView"), Arc::from(vec![Value::Str(Arc::from(s))])))
-            })();
-            match result {
-                Ok(v) => Ok(result_ok(v)),
+            match identity_has_role_at(identity, path, role) {
+                Ok(true) => Ok(result_ok(Value::Struct(Arc::from("RoleView"), Arc::from(vec![Value::Str(Arc::from(role.clone()))])))),
+                Ok(false) => Ok(result_err(format!("insufficient role: `{role}`"))),
+                Err(e) => Ok(result_err(e)),
+            }
+        }
+        "extract_claim_path" => {
+            let (identity, Value::Str(path)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved identity:VerifiedIdentity and path:str")
+            };
+            match identity_claim_at(identity, path) {
+                Ok(s) => Ok(result_ok(Value::Struct(Arc::from("ClaimView"), Arc::from(vec![Value::Str(Arc::from(s))])))),
                 Err(e) => Ok(result_err(e)),
             }
         }
@@ -1925,6 +2302,116 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
                 _ => unreachable!("VerifiedIdentity.expires_at is i64"),
             };
             Ok(Value::Bool(*now > expires_at))
+        }
+        // Row 12 continued: session, refresh, revocation, API-key.
+        "create_application_session" => {
+            let Value::Struct(_, fields) = &args[0] else {
+                unreachable!("typeck.rs already proved identity:VerifiedIdentity")
+            };
+            let subject = match &fields[0] {
+                Value::Str(s) => s.as_ref(),
+                _ => unreachable!("VerifiedIdentity.subject is str"),
+            };
+            let issuer = match &fields[1] {
+                Value::Str(s) => s.as_ref(),
+                _ => unreachable!("VerifiedIdentity.issuer is str"),
+            };
+            let now = 1700000000_i64; // deterministic mock timestamp
+            Ok(application_session_value(subject, issuer, now))
+        }
+        "session_cookie" => {
+            let Value::Struct(_, fields) = &args[0] else {
+                unreachable!("typeck.rs already proved session:ApplicationSession")
+            };
+            let session_id = match &fields[0] {
+                Value::Str(s) => s.as_ref(),
+                _ => unreachable!("ApplicationSession.session_id is str"),
+            };
+            let cookie = format!(
+                "session={}; HttpOnly; Secure; SameSite=Strict; Max-Age={}",
+                session_id,
+                8 * 60 * 60
+            );
+            Ok(Value::Str(Arc::from(cookie)))
+        }
+        "new_refresh_token" => {
+            let Value::Int(expires_at) = &args[0] else { unreachable!("typeck.rs already proved expires_at:i64") };
+            Ok(refresh_token_value(*expires_at))
+        }
+        "exchange_refresh_token" => {
+            let (Value::Struct(_, id_fields), Value::Struct(_, rt_fields), Value::Int(now)) =
+                (&args[0], &args[1], &args[2])
+            else {
+                unreachable!("typeck.rs already proved identity, refresh handle, now")
+            };
+            let rt_expires = match &rt_fields[1] {
+                Value::Int(n) => *n,
+                _ => unreachable!("RefreshTokenHandle.expires_at is i64"),
+            };
+            if *now > rt_expires {
+                return Ok(result_err("refresh token expired".to_string()));
+            }
+            let subject = match &id_fields[0] {
+                Value::Str(s) => s.as_ref(),
+                _ => unreachable!("VerifiedIdentity.subject is str"),
+            };
+            let issuer = match &id_fields[1] {
+                Value::Str(s) => s.as_ref(),
+                _ => unreachable!("VerifiedIdentity.issuer is str"),
+            };
+            let audience = match &id_fields[2] {
+                Value::Str(s) => s.as_ref(),
+                _ => unreachable!("VerifiedIdentity.audience is str"),
+            };
+            let claims_json = match &id_fields[5] {
+                Value::Str(s) => s.as_ref(),
+                _ => unreachable!("VerifiedIdentity.claims_json is str"),
+            };
+            let new_exp = rt_expires;
+            let new_iat = *now;
+            let new_identity = verified_identity_value(subject, issuer, audience, new_exp, new_iat, claims_json);
+            Ok(result_ok(new_identity))
+        }
+        "check_revocation" => {
+            let Value::Struct(_, fields) = &args[0] else {
+                unreachable!("typeck.rs already proved identity:VerifiedIdentity")
+            };
+            let claims_json = match &fields[5] {
+                Value::Str(s) => s,
+                _ => unreachable!("VerifiedIdentity.claims_json is str"),
+            };
+            let revoked: bool = serde_json::from_str(claims_json)
+                .ok()
+                .and_then(|doc: JsonDoc| doc.get("revoked").and_then(|v| v.as_bool()))
+                .unwrap_or(false);
+            Ok(Value::Bool(revoked))
+        }
+        "validate_api_key" => {
+            let (Value::Str(api_key), Value::Str(expected_hash)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved two strs")
+            };
+            if sha256_hex(api_key).as_str() != expected_hash.as_ref() {
+                return Ok(result_err("invalid API key".to_string()));
+            }
+            let claims_json = r#"{"service_account":"api-client","roles":["physician"],"department":"radiology"}"#;
+            let identity = verified_identity_value("api-client", "api-key-issuer", "api-key-audience", 2000000000, 1700000000, claims_json);
+            Ok(result_ok(identity))
+        }
+        "sha256_hex" => {
+            let Value::Str(a) = &args[0] else { unreachable!("typeck.rs already proved this is a str") };
+            let digest = if args.len() == 2 {
+                let Value::Str(b) = &args[1] else { unreachable!("typeck.rs already proved this is a str") };
+                sha256_hex_chain(&[a, b])
+            } else {
+                sha256_hex(a)
+            };
+            Ok(Value::Str(Arc::from(digest)))
+        }
+        "constant_time_str_eq" => {
+            let (Value::Str(a), Value::Str(b)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved two strs")
+            };
+            Ok(Value::Bool(constant_time_eq(a, b)))
         }
         // DB, layer 1 (`Ty::Db`'s doc comment).
         "db_connect" => {
@@ -1941,7 +2428,10 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
             let guard = slot.lock().unwrap();
             match guard.as_ref() {
                 None => Ok(result_err("this db connection was already stopped")),
-                Some(conn) => Ok(db_query(conn, sql)),
+                Some(conn) => match sql_bind_params(&args[2..]) {
+                    Ok(params) => Ok(db_query(conn, sql, &params)),
+                    Err(e) => Ok(result_err(e)),
+                },
             }
         }
         "db_execute" => {
@@ -1951,10 +2441,82 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
             let guard = slot.lock().unwrap();
             match guard.as_ref() {
                 None => Ok(result_err("this db connection was already stopped")),
-                Some(conn) => match conn.execute(sql, []) {
-                    Ok(affected) => Ok(result_ok(Value::Int(affected as i64))),
+                Some(conn) => match sql_bind_params(&args[2..]) {
+                    Ok(params) => match conn.execute(sql, rusqlite::params_from_iter(&params)) {
+                        Ok(affected) => Ok(result_ok(Value::Int(affected as i64))),
+                        Err(e) => Ok(result_err(e.to_string())),
+                    },
+                    Err(e) => Ok(result_err(e)),
+                },
+            }
+        }
+        // MQ, layer 1 (`Ty::Mq`'s doc comment) -- Redis-backed.
+        "mq_connect" => {
+            let (Value::Str(host), Value::Int(port)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are str and i64")
+            };
+            let opened: Result<redis::Connection, redis::RedisError> =
+                redis::Client::open(format!("redis://{host}:{port}/")).and_then(|c| c.get_connection());
+            match opened {
+                Ok(conn) => Ok(result_ok(Value::Mq(Arc::new(Mutex::new(Some(MqConn(conn))))))),
+                Err(e) => Ok(result_err(e.to_string())),
+            }
+        }
+        "mq_publish" => {
+            let (Value::Mq(slot), Value::Str(queue), Value::Str(message)) = (&args[0], &args[1], &args[2]) else {
+                unreachable!("typeck.rs already proved these are mq, str and str")
+            };
+            let mut guard = slot.lock().unwrap();
+            match guard.as_mut() {
+                None => Ok(result_err("this mq connection was already stopped".to_string())),
+                Some(conn) => match redis::cmd("LPUSH").arg(queue.as_ref()).arg(message.as_ref()).query::<i64>(&mut conn.0) {
+                    Ok(_) => Ok(result_ok(Value::Unit)),
                     Err(e) => Ok(result_err(e.to_string())),
                 },
+            }
+        }
+        "mq_consume" => {
+            let (Value::Mq(slot), Value::Str(queue), Value::Int(timeout_secs)) = (&args[0], &args[1], &args[2]) else {
+                unreachable!("typeck.rs already proved these are mq, str and i64")
+            };
+            let mut guard = slot.lock().unwrap();
+            match guard.as_mut() {
+                None => Ok(result_err("this mq connection was already stopped".to_string())),
+                Some(conn) => {
+                    // BLPOP: blocks up to `timeout_secs` for the first
+                    // element pushed to `queue`, `None` on timeout --
+                    // matches `Result(str, str)`'s "timeout is an error,
+                    // not a hang" contract from `typeck.rs`'s signature.
+                    let popped = redis::cmd("BLPOP")
+                        .arg(queue.as_ref())
+                        .arg(*timeout_secs)
+                        .query::<Option<(String, String)>>(&mut conn.0);
+                    match popped {
+                        Ok(Some((_key, message))) => Ok(result_ok(Value::Str(Arc::from(message)))),
+                        Ok(None) => Ok(result_err(format!("mq_consume: no message on `{queue}` within {timeout_secs}s"))),
+                        Err(e) => Ok(result_err(e.to_string())),
+                    }
+                }
+            }
+        }
+        // Row 12's mock-only inverse of `oidc_validate_token` -- see
+        // `mock_issue_token`'s own doc comment.
+        "mock_issue_token" => {
+            let (
+                Value::Str(subject),
+                Value::Str(issuer),
+                Value::Str(audience),
+                Value::Int(issued_at),
+                Value::Int(ttl_secs),
+                Value::Str(claims_json),
+                Value::Str(jwks_json),
+            ) = (&args[0], &args[1], &args[2], &args[3], &args[4], &args[5], &args[6])
+            else {
+                unreachable!("typeck.rs already proved these seven arg types")
+            };
+            match mock_issue_token(subject, issuer, audience, *issued_at, *ttl_secs, claims_json, jwks_json) {
+                Ok(token) => Ok(result_ok(Value::Str(Arc::from(token)))),
+                Err(e) => Ok(result_err(e)),
             }
         }
         _ => unreachable!("ast::BUILTIN_NAMES and eval_builtin's match must stay in sync"),
@@ -1966,6 +2528,30 @@ fn mismatch(expected: impl Into<String>, found: impl Into<String>, span: Span) -
         kind: ErrorKind::TypeMismatch { expected: expected.into(), found: found.into() },
         span,
     })
+}
+
+/// `Interpreter::call`'s hook point's `outcome_of` — `call()` returns a
+/// plain `Result<Value, RuntimeError>`, not `SResult`/`Signal`.
+fn outcome_of_runtime_result(result: &Result<Value, RuntimeError>) -> observability::Outcome {
+    match result {
+        Ok(_) => observability::Outcome::Ok,
+        Err(e) => observability::Outcome::Err(observability::error_kind_name(&e.kind)),
+    }
+}
+
+/// `Interpreter::traced`'s `outcome_of` for every effectful `eval_expr`
+/// arm, which all return `SResult<Value>` (`Result<Value, Signal>`).
+fn outcome_of_signal_result(result: &SResult<Value>) -> observability::Outcome {
+    match result {
+        Ok(_) => observability::Outcome::Ok,
+        Err(Signal::Err(e)) => observability::Outcome::Err(observability::error_kind_name(&e.kind)),
+        // `Signal::Return` only ever originates from a `Stmt::Return`
+        // unwinding through `exec_block`/`call()` — none of the leaf
+        // `eval_expr` hook points wrapped with `traced` ever produce it,
+        // but this stays total (no `unreachable!()`) rather than
+        // assuming that stays true forever.
+        Err(Signal::Return(_)) => observability::Outcome::Ok,
+    }
 }
 
 /// Everything that can interrupt normal left-to-right evaluation.
@@ -2054,6 +2640,28 @@ pub struct Interpreter {
     /// used by `tests/sandbox.rs` to point sandboxed children at the
     /// real, separately-built `nirdosha` binary instead.
     sandbox_exe: Option<std::path::PathBuf>,
+    /// Observability layer 1 (`observability.rs`'s module doc):
+    /// `None` by default — the exact "one field, one branch, no cost
+    /// when disabled" mechanism the design plan requires. Every hook
+    /// point in this file is `let Some(tracer) = &self.tracer else {
+    /// return <original, untraced path>; };` (see `Interpreter::traced`
+    /// and `Interpreter::call`) — when `None`, that's the *entire* cost
+    /// paid. Threaded into spawned threads' own fresh `Interpreter` the
+    /// same cheap-`Arc::clone` way `sandbox_exe` already is (see
+    /// `Expr::Spawn`'s closure below). `with_tracer` is the builder,
+    /// mirroring `with_sandbox_exe` exactly.
+    tracer: Option<Arc<observability::Tracer>>,
+    /// `call()`'s hotspot-attribution tag: each function's inferred
+    /// `ast::Effect` set (`effects::infer_effects`), computed lazily —
+    /// only the first time a `tracer`-enabled `call()` actually needs
+    /// it, via `effect_of_fn` — so a plain `tracer: None` run never pays
+    /// this whole-call-graph fixed-point cost at all. Recomputed per
+    /// `Interpreter` instance rather than threaded in from `typeck.rs`'s
+    /// own internal call to `infer_effects` (that result isn't returned
+    /// out) — the same "each pass redoes its own minimal shadow walk"
+    /// idiom `effects.rs`'s own module doc already establishes for
+    /// `refine.rs`/`smt.rs`.
+    fn_effects: std::cell::OnceCell<HashMap<String, EffectSet>>,
     /// `rand_seed`/`rand_f64`/`rand_gaussian`'s state — "carried in the
     /// interpreter environment, not a global" (unified plan §4.3.1):
     /// this is per-`Interpreter`-*instance* state, not a Rust `static`,
@@ -2074,6 +2682,78 @@ pub struct Interpreter {
     /// silent implicit seed that would quietly undercut "deterministic
     /// by default."
     rng: std::cell::RefCell<Option<RngState>>,
+    /// User-function call depth (every recursive/mutually-recursive
+    /// `.nir` call goes through `call()`, this file's single choke
+    /// point) — with no limit, a `.nir` program recursing deeply enough
+    /// (its own logic, no forbidden syntax, no malice required) overflows
+    /// the *Rust* call stack, which is an uncatchable process abort
+    /// (SIGABRT/SIGSEGV via the stack guard page), not a `RuntimeError` —
+    /// unlike an ordinary panic, `catch_unwind` at any call site (e.g.
+    /// `serve.rs`'s per-request dispatch) cannot stop this from taking
+    /// the whole process down. Checked and incremented/decremented
+    /// around `run()` in `call()` below, turning what would otherwise be
+    /// that abort into a normal, catchable `ErrorKind::CallStackOverflow`
+    /// once too deep -- the fix for a live red-team finding (deep
+    /// self-recursion abort the whole `nirdosha serve` process for every
+    /// concurrent caller, not just the one that triggered it).
+    call_depth: std::cell::Cell<usize>,
+}
+
+/// Past this many nested `call()`s, fail cleanly instead of overflowing
+/// the real Rust stack. Sized against `run_on_big_stack`'s explicit
+/// stack, not the OS default -- on the *default* thread stack, a debug
+/// build's unoptimized frames are large enough that a trivial single-
+/// recursive-call function aborted for real around depth 100-120,
+/// making a fixed depth counter alone unsafe unless set uncomfortably
+/// low. See `run_on_big_stack`'s doc comment for the actual measured
+/// numbers on the bigger stack this is paired with. High enough that no
+/// legitimate hand-written `.nir` recursive function should ever hit it
+/// (the same tradeoff `sys.setrecursionlimit`/JVM `-Xss` make in other
+/// stack-based interpreters) -- this can't be a fully airtight guarantee
+/// (a single call level with an extreme enough expression tree could
+/// still cost more stack than this margin covers) but converts the
+/// overwhelming majority of unbounded-recursion cases from an
+/// uncatchable process abort into a normal, catchable error.
+const MAX_CALL_DEPTH: usize = 2000;
+
+/// Runs `f` on a dedicated thread with a large explicit stack, joins,
+/// and returns its result -- every real entry point into user-`.nir`
+/// execution (`run_main_on_big_stack`, `call_named_on_big_stack`) goes
+/// through this rather than running on the calling thread directly.
+///
+/// This exists *alongside* `MAX_CALL_DEPTH`, not instead of it: a bigger
+/// stack alone doesn't make unbounded recursion safe (it only raises the
+/// threshold), and a stack-overflow guard-page hit is a hard process
+/// abort in Rust regardless of which thread triggers it -- spawning a
+/// thread does **not** contain the crash to just that thread the way
+/// `catch_unwind` contains an ordinary panic. What the bigger stack
+/// actually buys is headroom for `MAX_CALL_DEPTH` to be set at a number
+/// generous enough for legitimate hand-written recursion without itself
+/// being unsafe on the platform's default 8MB stack (measured: a debug
+/// build overflowed for real around depth 100-120 on the default stack,
+/// which would force an uncomfortably low depth counter on its own).
+/// 256MB scales that debug-build threshold up by roughly the same
+/// factor (measured: clean past depth 2000 on this stack where it
+/// previously aborted before 120), which is what `MAX_CALL_DEPTH` above
+/// is sized against.
+///
+/// Panics propagate through `.join()`'s `Err` and are re-raised on the
+/// calling thread (matching every pre-existing caller's behavior before
+/// this wrapper existed) -- containing *those* is `serve.rs`'s own
+/// `catch_unwind` boundary around request dispatch, a separate concern
+/// from this function's actual job.
+pub fn run_on_big_stack<F, T>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    const STACK_SIZE: usize = 256 * 1024 * 1024;
+    std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(f)
+        .expect("failed to spawn interpreter worker thread")
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
 }
 
 /// A from-scratch, dependency-free, byte-for-byte-reproducible PRNG —
@@ -2126,7 +2806,16 @@ impl RngState {
 impl Interpreter {
     pub fn new(program: Arc<Program>, source: Arc<str>) -> Self {
         let fn_index = program.fns.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect();
-        Interpreter { program, fn_index, source, sandbox_exe: None, rng: std::cell::RefCell::new(None) }
+        Interpreter {
+            program,
+            fn_index,
+            source,
+            sandbox_exe: None,
+            tracer: None,
+            fn_effects: std::cell::OnceCell::new(),
+            rng: std::cell::RefCell::new(None),
+            call_depth: std::cell::Cell::new(0),
+        }
     }
 
     pub fn with_sandbox_exe(mut self, path: std::path::PathBuf) -> Self {
@@ -2134,9 +2823,27 @@ impl Interpreter {
         self
     }
 
+    /// Observability layer 1's builder — same shape as `with_sandbox_exe`
+    /// (see `tracer`'s own doc comment). `main.rs`'s `--otel-console` (via
+    /// `lib.rs::run_with_tracer`/`run_diagnostic_with_tracer`) is the one
+    /// caller that uses this today.
+    pub fn with_tracer(mut self, tracer: Arc<observability::Tracer>) -> Self {
+        self.tracer = Some(tracer);
+        self
+    }
+
     pub fn run_main(&self) -> Result<Value, RuntimeError> {
         let span = Span { line: 0, col: 0 };
         self.call("main", &[], span)
+    }
+
+    /// Same as `run_main`, but run on a thread with a much larger stack
+    /// (see `run_on_big_stack`'s doc comment) — the entry point every
+    /// caller of `run_main` outside this file's own tests should
+    /// actually use, for the same reason `call_named`'s own big-stack
+    /// twin (`call_named_on_big_stack`) exists.
+    pub fn run_main_on_big_stack(self) -> Result<Value, RuntimeError> {
+        run_on_big_stack(move || self.run_main())
     }
 
     /// A public entry point for calling an arbitrary named function
@@ -2149,6 +2856,18 @@ impl Interpreter {
     /// position for "the CLI asked for this."
     pub fn call_named(&self, name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
         self.call(name, args, Span { line: 0, col: 0 })
+    }
+
+    /// Same as `call_named`, but run on a thread with a much larger
+    /// stack (see `run_on_big_stack`'s doc comment) — the entry point
+    /// `main.rs`'s `--sandbox-worker` mode and `serve.rs`'s per-request
+    /// dispatch actually use; both construct a fresh `Interpreter` right
+    /// before this call and never touch it again afterward, so consuming
+    /// `self` costs nothing at either call site.
+    pub fn call_named_on_big_stack(self, name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+        let name = name.to_string();
+        let args = args.to_vec();
+        run_on_big_stack(move || self.call_named(&name, &args))
     }
 
     fn find_fn(&self, name: &str) -> Option<&FnDecl> {
@@ -2260,44 +2979,121 @@ impl Interpreter {
     }
 
     fn call(&self, name: &str, arg_vals: &[Value], span: Span) -> Result<Value, RuntimeError> {
-        let f = self.find_fn(name).ok_or_else(|| RuntimeError {
-            kind: ErrorKind::UnknownFn(name.to_string()),
-            span,
-        })?;
-        if f.params.len() != arg_vals.len() {
-            return err(
-                ErrorKind::ArityMismatch {
-                    fn_name: name.to_string(),
-                    want: f.params.len(),
-                    got: arg_vals.len(),
-                },
+        // `MAX_CALL_DEPTH` guard (see its own doc comment and
+        // `call_depth`'s): checked and incremented before `run` even
+        // starts, so a call past the limit never adds another real Rust
+        // stack frame at all. `_depth_guard`'s `Drop` decrements on every
+        // exit path below (both the early `tracer.is_none()` return and
+        // the traced path), the same way a lock guard would.
+        let depth = self.call_depth.get() + 1;
+        if depth > MAX_CALL_DEPTH {
+            return err(ErrorKind::CallStackOverflow { fn_name: name.to_string() }, span);
+        }
+        self.call_depth.set(depth);
+        struct DepthGuard<'a>(&'a std::cell::Cell<usize>);
+        impl Drop for DepthGuard<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() - 1);
+            }
+        }
+        let _depth_guard = DepthGuard(&self.call_depth);
+
+        let run = || -> Result<Value, RuntimeError> {
+            let f = self.find_fn(name).ok_or_else(|| RuntimeError {
+                kind: ErrorKind::UnknownFn(name.to_string()),
                 span,
-            );
-        }
+            })?;
+            if f.params.len() != arg_vals.len() {
+                return err(
+                    ErrorKind::ArityMismatch {
+                        fn_name: name.to_string(),
+                        want: f.params.len(),
+                        got: arg_vals.len(),
+                    },
+                    span,
+                );
+            }
 
-        let mut env = Env::new();
-        for (p, v) in f.params.iter().zip(arg_vals) {
-            self.check_ty(v, &p.ty, span)?;
-            env.define(&p.name, v.clone(), p.ty.clone());
-        }
+            let mut env = Env::new();
+            for (p, v) in f.params.iter().zip(arg_vals) {
+                self.check_ty(v, &p.ty, span)?;
+                env.define(&p.name, v.clone(), p.ty.clone());
+            }
 
-        match self.exec_block(&f.body, &mut env) {
-            Ok(_) => {
-                // Block ran to completion without `return` — its value
-                // (the last expression-statement, or Unit) is only a valid
-                // function result if the declared return type is Unit.
-                if f.ret == Ty::Unit {
-                    Ok(Value::Unit)
-                } else {
-                    err(ErrorKind::MissingReturn { fn_name: name.to_string() }, f.span)
+            match self.exec_block(&f.body, &mut env) {
+                Ok(_) => {
+                    // Block ran to completion without `return` — its value
+                    // (the last expression-statement, or Unit) is only a valid
+                    // function result if the declared return type is Unit.
+                    if f.ret == Ty::Unit {
+                        Ok(Value::Unit)
+                    } else {
+                        err(ErrorKind::MissingReturn { fn_name: name.to_string() }, f.span)
+                    }
                 }
+                Err(Signal::Return(v)) => {
+                    self.check_ty(&v, &f.ret, span)?;
+                    Ok(v)
+                }
+                Err(Signal::Err(e)) => Err(e),
             }
-            Err(Signal::Return(v)) => {
-                self.check_ty(&v, &f.ret, span)?;
-                Ok(v)
-            }
-            Err(Signal::Err(e)) => Err(e),
-        }
+        };
+
+        // Observability layer 1's hotspot-attribution hook — see
+        // `tracer`'s doc comment: the `None` branch below is exactly
+        // `run()`, no `Instant::now()`, no `effect_of_fn` lookup, no
+        // allocation. Every user-function call goes through here
+        // (unconditionally, when a tracer *is* attached), so a slow pure
+        // helper nested inside a traced function still shows up.
+        let Some(tracer) = &self.tracer else { return run() };
+        let effect = self.effect_of_fn(name);
+        let start = std::time::Instant::now();
+        let result = run();
+        tracer.record_span(effect, span, "call", Some(Arc::from(name)), start, outcome_of_runtime_result(&result));
+        result
+    }
+
+    /// `call()`'s effect tag: the target function's own inferred
+    /// `ast::Effect` set (`effects::infer_effects`), reduced to a single
+    /// representative tag (a `BTreeSet`'s smallest element — its `Ord`
+    /// derive gives a fixed, deterministic pick when a function has more
+    /// than one effect, not that any one tag is more "real" than
+    /// another) to fit `SpanRecord::effect`'s single-`Option<Effect>`
+    /// shape. `None` for a pure function — `call()` still traces it (see
+    /// `SpanRecord`'s doc comment), just with no effect tag.
+    ///
+    /// Computed lazily via `fn_effects`'s `OnceCell` — see that field's
+    /// own doc comment for why this only ever runs when tracing is
+    /// actually on.
+    fn effect_of_fn(&self, name: &str) -> Option<Effect> {
+        let table = self.fn_effects.get_or_init(|| {
+            let registry = TypeRegistry::build(&self.program);
+            effects::infer_effects(&self.program, &registry).into_iter().map(|(k, fx)| (k, fx.inferred)).collect()
+        });
+        table.get(name).and_then(|set| set.iter().next().copied())
+    }
+
+    /// The one hook-point shape every effectful `eval_expr` arm and the
+    /// `eval_builtin` dispatch site (this file's other two hook points
+    /// alongside `call()`, see `observability.rs`'s module doc) reuses:
+    /// run `f`, and only if a `tracer` is attached, time it and record a
+    /// span tagged `effect`/`name`/`fn_name` at `site`. The `None`
+    /// branch is exactly `f()` — the entire cost paid when tracing is
+    /// off.
+    fn traced<T>(
+        &self,
+        effect: Option<Effect>,
+        site: Span,
+        name: &'static str,
+        fn_name: Option<Arc<str>>,
+        f: impl FnOnce() -> T,
+        outcome_of: fn(&T) -> observability::Outcome,
+    ) -> T {
+        let Some(tracer) = &self.tracer else { return f() };
+        let start = std::time::Instant::now();
+        let result = f();
+        tracer.record_span(effect, site, name, fn_name, start, outcome_of(&result));
+        result
     }
 
     fn check_ty(&self, v: &Value, ty: &Ty, span: Span) -> Result<(), RuntimeError> {
@@ -2324,6 +3120,14 @@ impl Interpreter {
             (Value::File(_), Ty::File) => Ok(()),
             (Value::Json(_), Ty::Json) => Ok(()),
             (Value::Db(_), Ty::Db) => Ok(()),
+            (Value::Mq(_), Ty::Mq) => Ok(()),
+            // No inner signature to recurse into — `typeck.rs` already
+            // proved a `Value::Fn` reaching here carries a target whose
+            // real signature matches `Ty::Fn`'s params/ret (`infer_call`'s
+            // call-through-value arm, `infer_acquire`), same "nothing
+            // left to check at runtime" reasoning `Value::Thread`/
+            // `Value::Channel` above already give.
+            (Value::Fn(_), Ty::Fn(_, _)) => Ok(()),
             (Value::Float(_), Ty::F64) => Ok(()),
             (Value::Vector(elems), Ty::Vector(elem_ty, n)) => {
                 if elems.len() != *n {
@@ -2494,9 +3298,16 @@ impl Interpreter {
                 }
             }
             Expr::Bool(b, _) => Ok(Value::Bool(*b)),
-            Expr::Ident(name, span) => env.get(name).ok_or_else(|| {
-                Signal::Err(RuntimeError { kind: ErrorKind::UnknownVar(name.clone()), span: *span })
-            }),
+            Expr::Ident(name, span) => match env.get(name) {
+                Some(v) => Ok(v),
+                // Not a local binding — `typeck.rs` already proved this is
+                // only reachable for a plain (non-`requires`) top-level
+                // fn name (`infer`'s `Expr::Ident` fallback), so this is
+                // always safe: a first-class function value is just its
+                // target name.
+                None if self.find_fn(name).is_some() => Ok(Value::Fn(Arc::from(name.as_str()))),
+                None => Err(Signal::Err(RuntimeError { kind: ErrorKind::UnknownVar(name.clone()), span: *span })),
+            },
             Expr::Unary(op, inner, span) => {
                 let v = self.eval_expr(inner, env)?;
                 match (op, v) {
@@ -2509,10 +3320,45 @@ impl Interpreter {
             }
             Expr::Binary(op, lhs, rhs, span) => self.eval_binary(*op, lhs, rhs, env, *span),
             Expr::Call(name, arg_exprs, span) => {
+                // First-class function call-through-value: `name` names a
+                // local binding holding a `Value::Fn` (either a plain
+                // top-level fn named directly, or an `acquire`d privileged
+                // one) rather than a global fn/builtin/constructor.
+                // Dispatched to the *target* the value actually carries,
+                // via the same `call` every ordinary `Expr::Call` below
+                // ends up at — checked ahead of everything else, matching
+                // `typeck.rs::infer_call`'s identical precedence.
+                if let Some(Value::Fn(target)) = env.get(name) {
+                    let mut vals = Vec::with_capacity(arg_exprs.len());
+                    for a in arg_exprs {
+                        vals.push(self.eval_expr(a, env)?);
+                    }
+                    return self.call(target.as_ref(), &vals, *span).map_err(Signal::Err);
+                }
                 if is_builtin(name) {
                     let mut vals = Vec::with_capacity(arg_exprs.len());
                     for a in arg_exprs {
                         vals.push(self.eval_expr(a, env)?);
+                    }
+                    // Observability layer 1's third and last hook point —
+                    // one wrapping call at this single dispatch site (not
+                    // per-builtin-arm), gated behind `self.tracer.is_some()`
+                    // *before* even looking `name` up in
+                    // `observability::traced_builtin`'s table, so a plain
+                    // `tracer: None` run doesn't pay that lookup either.
+                    if self.tracer.is_some() {
+                        if let Some((effect, static_name)) = observability::traced_builtin(name) {
+                            return self
+                                .traced(
+                                    Some(effect),
+                                    *span,
+                                    static_name,
+                                    None,
+                                    || eval_builtin(name, &vals, *span, &self.rng),
+                                    outcome_of_runtime_result,
+                                )
+                                .map_err(Signal::Err);
+                        }
                     }
                     return eval_builtin(name, &vals, *span, &self.rng).map_err(Signal::Err);
                 }
@@ -2544,6 +3390,37 @@ impl Interpreter {
                     vals.push(self.eval_expr(a, env)?);
                 }
                 self.call(name, &vals, *span).map_err(Signal::Err)
+            }
+            // `acquire name(proof)` — checks `proof` (a `RoleView`/
+            // `ClaimView`) against `name`'s declared `requires(...)`,
+            // yielding `Ok(Value::Fn(name))` on a match, `Err(reason)`
+            // otherwise. Runtime string comparison, same spirit
+            // `check_role`/`extract_claim` already use for their own
+            // proof checks — `typeck.rs::infer_acquire` already proved
+            // `name` is a real, gated fn and `proof`'s type matches what
+            // the requirement demands, so every `unreachable!` below is
+            // a real static guarantee, not a hope.
+            Expr::Acquire(name, proof_expr, _span) => {
+                let proof = self.eval_expr(proof_expr, env)?;
+                let f = self.find_fn(name).unwrap_or_else(|| {
+                    unreachable!("typeck.rs::infer_acquire already proved `{name}` is a real fn")
+                });
+                let requirement =
+                    f.requires.as_ref().unwrap_or_else(|| unreachable!("typeck.rs already proved `{name}` is gated"));
+                let proof_field = match &proof {
+                    Value::Struct(_, fields) => &fields[0],
+                    _ => unreachable!("typeck.rs already proved proof is a RoleView/ClaimView"),
+                };
+                let want = match requirement {
+                    Requirement::Role(role) => role,
+                    Requirement::Claim(_, value) => value,
+                };
+                let matched = matches!(proof_field, Value::Str(s) if s.as_ref() == want.as_str());
+                if matched {
+                    Ok(result_ok(Value::Fn(Arc::from(name.as_str()))))
+                } else {
+                    Ok(result_err(format!("insufficient privilege: `{name}` {}", requirement.describe())))
+                }
             }
             Expr::If { cond, then_block, else_block, span } => {
                 let c = self.eval_expr(cond, env)?;
@@ -2647,124 +3524,173 @@ impl Interpreter {
                 env.pop();
                 Ok(Value::Bool(committed))
             }
-            Expr::Spawn(name, arg_exprs, span) => {
-                let mut vals = Vec::with_capacity(arg_exprs.len());
-                for a in arg_exprs {
-                    vals.push(self.eval_expr(a, env)?);
-                }
-                // Everything moved into the closure is owned, not
-                // borrowed from `self`/`env` — `std::thread::spawn`
-                // requires `'static`, and this is also the concrete,
-                // checkable form of the race-freedom claim: the spawned
-                // thread gets its *own* independent copy of the program
-                // (a cheap `Arc` clone) and its *own* values (already
-                // proven, by `ownership.rs`, to have been moved out of
-                // the spawning side — see this file's module doc).
-                let program = Arc::clone(&self.program);
-                let source = Arc::clone(&self.source);
-                let sandbox_exe = self.sandbox_exe.clone();
-                let name = name.clone();
-                let call_span = *span;
-                let handle = std::thread::spawn(move || {
-                    let mut interp = Interpreter::new(program, source);
-                    if let Some(exe) = sandbox_exe {
-                        interp = interp.with_sandbox_exe(exe);
+            Expr::Spawn(name, arg_exprs, span) => self.traced(
+                Some(Effect::Concurrent),
+                *span,
+                "spawn",
+                None,
+                || {
+                    let mut vals = Vec::with_capacity(arg_exprs.len());
+                    for a in arg_exprs {
+                        vals.push(self.eval_expr(a, env)?);
                     }
-                    interp.call(&name, &vals, call_span)
-                });
-                Ok(Value::Thread(Arc::new(Mutex::new(Some(handle)))))
-            }
-            Expr::Join(inner, span) => {
-                let v = self.eval_expr(inner, env)?;
-                match v {
-                    Value::Thread(slot) => {
-                        // `.take()` is what makes a handle single-use at
-                        // runtime, backing up `ownership.rs`'s static
-                        // single-join proof the same "checker is the real
-                        // gate, this is the backstop" way `check_ty`
-                        // backs up `typeck.rs` elsewhere in this file.
-                        let handle = slot.lock().unwrap().take();
-                        match handle {
-                            None => Err(Signal::Err(RuntimeError { kind: ErrorKind::AlreadyJoined, span: *span })),
-                            Some(h) => match h.join() {
-                                Ok(Ok(result)) => Ok(result),
-                                Ok(Err(runtime_err)) => Err(Signal::Err(runtime_err)),
-                                Err(panic_payload) => {
-                                    let message = panic_payload
-                                        .downcast_ref::<&str>()
-                                        .map(|s| s.to_string())
-                                        .or_else(|| panic_payload.downcast_ref::<String>().cloned())
-                                        .unwrap_or_else(|| "(no message)".to_string());
-                                    Err(Signal::Err(RuntimeError {
-                                        kind: ErrorKind::ThreadPanicked { message },
-                                        span: *span,
-                                    }))
-                                }
-                            },
+                    // Everything moved into the closure is owned, not
+                    // borrowed from `self`/`env` — `std::thread::spawn`
+                    // requires `'static`, and this is also the concrete,
+                    // checkable form of the race-freedom claim: the spawned
+                    // thread gets its *own* independent copy of the program
+                    // (a cheap `Arc` clone) and its *own* values (already
+                    // proven, by `ownership.rs`, to have been moved out of
+                    // the spawning side — see this file's module doc).
+                    let program = Arc::clone(&self.program);
+                    let source = Arc::clone(&self.source);
+                    let sandbox_exe = self.sandbox_exe.clone();
+                    // Observability layer 1: a spawned thread's own fresh
+                    // `Interpreter` inherits the same `tracer` via a cheap
+                    // `Arc::clone`, the exact way `sandbox_exe` already
+                    // threads through (see `tracer`'s doc comment) — every
+                    // thread's spans land in the same exporter/file.
+                    let tracer = self.tracer.clone();
+                    let name = name.clone();
+                    let call_span = *span;
+                    let handle = std::thread::spawn(move || {
+                        let mut interp = Interpreter::new(program, source);
+                        if let Some(exe) = sandbox_exe {
+                            interp = interp.with_sandbox_exe(exe);
                         }
+                        if let Some(t) = tracer {
+                            interp = interp.with_tracer(t);
+                        }
+                        interp.call(&name, &vals, call_span)
+                    });
+                    Ok(Value::Thread(Arc::new(Mutex::new(Some(handle)))))
+                },
+                outcome_of_signal_result,
+            ),
+            Expr::Join(inner, span) => self.traced(
+                Some(Effect::Concurrent),
+                *span,
+                "join",
+                None,
+                || {
+                    let v = self.eval_expr(inner, env)?;
+                    match v {
+                        Value::Thread(slot) => {
+                            // `.take()` is what makes a handle single-use at
+                            // runtime, backing up `ownership.rs`'s static
+                            // single-join proof the same "checker is the real
+                            // gate, this is the backstop" way `check_ty`
+                            // backs up `typeck.rs` elsewhere in this file.
+                            let handle = slot.lock().unwrap().take();
+                            match handle {
+                                None => Err(Signal::Err(RuntimeError { kind: ErrorKind::AlreadyJoined, span: *span })),
+                                Some(h) => match h.join() {
+                                    Ok(Ok(result)) => Ok(result),
+                                    Ok(Err(runtime_err)) => Err(Signal::Err(runtime_err)),
+                                    Err(panic_payload) => {
+                                        let message = panic_payload
+                                            .downcast_ref::<&str>()
+                                            .map(|s| s.to_string())
+                                            .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                                            .unwrap_or_else(|| "(no message)".to_string());
+                                        Err(Signal::Err(RuntimeError {
+                                            kind: ErrorKind::ThreadPanicked { message },
+                                            span: *span,
+                                        }))
+                                    }
+                                },
+                            }
+                        }
+                        v => Err(mismatch("thread", v.ty_name(), *span)),
                     }
-                    v => Err(mismatch("thread", v.ty_name(), *span)),
-                }
-            }
+                },
+                outcome_of_signal_result,
+            ),
+            // Bare `chan()` construction is untraced on purpose — it's
+            // `effects.rs`'s own classification too (`walk_expr`'s
+            // `Expr::Chan(_) => {}` arm): allocating the handle is pure,
+            // never blocks, never errors; only `send`/`recv`/`stop` on the
+            // handle it produces are effectful, and those are traced below.
             Expr::Chan(_) => Ok(Value::Channel(Arc::new(ChannelInner::new()))),
             Expr::Str(s, _) => Ok(Value::Str(Arc::from(s.as_str()))),
             Expr::Send(chan_expr, value_expr, span) => {
                 let c = self.eval_expr(chan_expr, env)?;
                 let v = self.eval_expr(value_expr, env)?;
                 match c {
-                    Value::Channel(inner) => match inner.send(v) {
-                        Ok(()) => Ok(Value::Unit),
-                        // Only reachable for a socket-backed channel (the
-                        // in-process transport's `send` can never fail) —
-                        // the peer (a sandboxed process) is gone or the
-                        // pipe broke.
-                        Err(e) => Err(Signal::Err(RuntimeError {
-                            kind: ErrorKind::ChannelIoError { message: e.to_string() },
-                            span: *span,
-                        })),
-                    },
-                    Value::Tcp(slot) => {
-                        let Value::Str(text) = v else {
-                            unreachable!("typeck.rs already restricted tcp send payloads to str")
-                        };
-                        let mut guard = slot.lock().unwrap();
-                        match guard.as_mut() {
-                            None => Err(Signal::Err(RuntimeError {
-                                kind: ErrorKind::ChannelIoError {
-                                    message: "this tcp connection was already stopped".to_string(),
-                                },
+                    Value::Channel(inner) => self.traced(
+                        Some(Effect::Concurrent),
+                        *span,
+                        "chan.send",
+                        None,
+                        || match inner.send(v) {
+                            Ok(()) => Ok(Value::Unit),
+                            // Only reachable for a socket-backed channel (the
+                            // in-process transport's `send` can never fail) —
+                            // the peer (a sandboxed process) is gone or the
+                            // pipe broke.
+                            Err(e) => Err(Signal::Err(RuntimeError {
+                                kind: ErrorKind::ChannelIoError { message: e.to_string() },
                                 span: *span,
                             })),
-                            Some(stream) => match write_tcp(stream, &text) {
-                                Ok(()) => Ok(Value::Unit),
-                                Err(e) => Err(Signal::Err(RuntimeError {
-                                    kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                        },
+                        outcome_of_signal_result,
+                    ),
+                    Value::Tcp(slot) => self.traced(
+                        Some(Effect::Network),
+                        *span,
+                        "tcp.send",
+                        None,
+                        || {
+                            let Value::Str(text) = v else {
+                                unreachable!("typeck.rs already restricted tcp send payloads to str")
+                            };
+                            let mut guard = slot.lock().unwrap();
+                            match guard.as_mut() {
+                                None => Err(Signal::Err(RuntimeError {
+                                    kind: ErrorKind::ChannelIoError {
+                                        message: "this tcp connection was already stopped".to_string(),
+                                    },
                                     span: *span,
                                 })),
-                            },
-                        }
-                    }
-                    Value::File(slot) => {
-                        let Value::Str(text) = v else {
-                            unreachable!("typeck.rs already restricted file send payloads to str")
-                        };
-                        let mut guard = slot.lock().unwrap();
-                        match guard.as_mut() {
-                            None => Err(Signal::Err(RuntimeError {
-                                kind: ErrorKind::ChannelIoError {
-                                    message: "this file was already stopped".to_string(),
+                                Some(stream) => match write_tcp(stream, &text) {
+                                    Ok(()) => Ok(Value::Unit),
+                                    Err(e) => Err(Signal::Err(RuntimeError {
+                                        kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                                        span: *span,
+                                    })),
                                 },
-                                span: *span,
-                            })),
-                            Some(file) => match write_file(file, &text) {
-                                Ok(()) => Ok(Value::Unit),
-                                Err(e) => Err(Signal::Err(RuntimeError {
-                                    kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                            }
+                        },
+                        outcome_of_signal_result,
+                    ),
+                    Value::File(slot) => self.traced(
+                        Some(Effect::Io),
+                        *span,
+                        "file.send",
+                        None,
+                        || {
+                            let Value::Str(text) = v else {
+                                unreachable!("typeck.rs already restricted file send payloads to str")
+                            };
+                            let mut guard = slot.lock().unwrap();
+                            match guard.as_mut() {
+                                None => Err(Signal::Err(RuntimeError {
+                                    kind: ErrorKind::ChannelIoError {
+                                        message: "this file was already stopped".to_string(),
+                                    },
                                     span: *span,
                                 })),
-                            },
-                        }
-                    }
+                                Some(file) => match write_file(file, &text) {
+                                    Ok(()) => Ok(Value::Unit),
+                                    Err(e) => Err(Signal::Err(RuntimeError {
+                                        kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                                        span: *span,
+                                    })),
+                                },
+                            }
+                        },
+                        outcome_of_signal_result,
+                    ),
                     other => Err(mismatch("chan", other.ty_name(), *span)),
                 }
             }
@@ -2775,178 +3701,241 @@ impl Interpreter {
                     // see `ChannelInner::recv` and `Ty::Channel`'s doc
                     // comment for why this is a genuine wait primitive,
                     // not just a race-freedom mechanism.
-                    Value::Channel(inner) => match inner.recv() {
-                        Ok(v) => Ok(v),
-                        Err(e) => Err(Signal::Err(RuntimeError {
-                            kind: ErrorKind::ChannelIoError { message: e.to_string() },
-                            span: *span,
-                        })),
-                    },
-                    Value::Tcp(slot) => {
-                        let mut guard = slot.lock().unwrap();
-                        match guard.as_mut() {
-                            None => Err(Signal::Err(RuntimeError {
-                                kind: ErrorKind::ChannelIoError {
-                                    message: "this tcp connection was already stopped".to_string(),
-                                },
+                    Value::Channel(inner) => self.traced(
+                        Some(Effect::Concurrent),
+                        *span,
+                        "chan.recv",
+                        None,
+                        || match inner.recv() {
+                            Ok(v) => Ok(v),
+                            Err(e) => Err(Signal::Err(RuntimeError {
+                                kind: ErrorKind::ChannelIoError { message: e.to_string() },
                                 span: *span,
                             })),
-                            Some(stream) => match read_tcp(stream) {
-                                Ok(s) => Ok(Value::Str(Arc::from(s.as_str()))),
-                                Err(e) => Err(Signal::Err(RuntimeError {
-                                    kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                        },
+                        outcome_of_signal_result,
+                    ),
+                    Value::Tcp(slot) => self.traced(
+                        Some(Effect::Network),
+                        *span,
+                        "tcp.recv",
+                        None,
+                        || {
+                            let mut guard = slot.lock().unwrap();
+                            match guard.as_mut() {
+                                None => Err(Signal::Err(RuntimeError {
+                                    kind: ErrorKind::ChannelIoError {
+                                        message: "this tcp connection was already stopped".to_string(),
+                                    },
                                     span: *span,
                                 })),
-                            },
-                        }
-                    }
-                    Value::File(slot) => {
-                        let mut guard = slot.lock().unwrap();
-                        match guard.as_mut() {
-                            None => Err(Signal::Err(RuntimeError {
-                                kind: ErrorKind::ChannelIoError {
-                                    message: "this file was already stopped".to_string(),
+                                Some(stream) => match read_tcp(stream) {
+                                    Ok(s) => Ok(Value::Str(Arc::from(s.as_str()))),
+                                    Err(e) => Err(Signal::Err(RuntimeError {
+                                        kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                                        span: *span,
+                                    })),
                                 },
-                                span: *span,
-                            })),
-                            Some(file) => match read_file(file) {
-                                Ok(s) => Ok(Value::Str(Arc::from(s.as_str()))),
-                                Err(e) => Err(Signal::Err(RuntimeError {
-                                    kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                            }
+                        },
+                        outcome_of_signal_result,
+                    ),
+                    Value::File(slot) => self.traced(
+                        Some(Effect::Io),
+                        *span,
+                        "file.recv",
+                        None,
+                        || {
+                            let mut guard = slot.lock().unwrap();
+                            match guard.as_mut() {
+                                None => Err(Signal::Err(RuntimeError {
+                                    kind: ErrorKind::ChannelIoError {
+                                        message: "this file was already stopped".to_string(),
+                                    },
                                     span: *span,
                                 })),
-                            },
-                        }
-                    }
+                                Some(file) => match read_file(file) {
+                                    Ok(s) => Ok(Value::Str(Arc::from(s.as_str()))),
+                                    Err(e) => Err(Signal::Err(RuntimeError {
+                                        kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                                        span: *span,
+                                    })),
+                                },
+                            }
+                        },
+                        outcome_of_signal_result,
+                    ),
                     other => Err(mismatch("chan", other.ty_name(), *span)),
                 }
             }
-            Expr::Connect(host_expr, port_expr, span) => {
-                let host = match self.eval_expr(host_expr, env)? {
-                    Value::Str(s) => s,
-                    v => return Err(mismatch("str", v.ty_name(), *span)),
-                };
-                let port = match self.eval_expr(port_expr, env)? {
-                    Value::Int(n) => match u16::try_from(n) {
-                        Ok(p) => p,
-                        Err(_) => {
-                            return Err(Signal::Err(RuntimeError {
-                                kind: ErrorKind::ChannelIoError {
-                                    message: format!("port {n} is not a valid 0-65535 TCP port"),
-                                },
-                                span: *span,
-                            }));
-                        }
-                    },
-                    v => return Err(mismatch("i64", v.ty_name(), *span)),
-                };
-                match std::net::TcpStream::connect((host.as_ref(), port)) {
-                    Ok(stream) => Ok(Value::Tcp(Arc::new(Mutex::new(Some(stream))))),
-                    Err(e) => Err(Signal::Err(RuntimeError {
-                        kind: ErrorKind::ChannelIoError { message: e.to_string() },
-                        span: *span,
-                    })),
-                }
-            }
-            Expr::Listen(port_expr, span) => {
-                let port = match self.eval_expr(port_expr, env)? {
-                    Value::Int(n) => match u16::try_from(n) {
-                        Ok(p) => p,
-                        Err(_) => {
-                            return Err(Signal::Err(RuntimeError {
-                                kind: ErrorKind::ChannelIoError {
-                                    message: format!("port {n} is not a valid 0-65535 TCP port"),
-                                },
-                                span: *span,
-                            }));
-                        }
-                    },
-                    v => return Err(mismatch("i64", v.ty_name(), *span)),
-                };
-                // Binds all interfaces (`0.0.0.0`), not just loopback --
-                // "simulation nodes can talk to each other" (unified plan
-                // §4.3.3) means across real machines/network namespaces,
-                // not just within one process.
-                match std::net::TcpListener::bind(("0.0.0.0", port)) {
-                    Ok(listener) => Ok(Value::TcpListener(Arc::new(Mutex::new(Some(listener))))),
-                    Err(e) => Err(Signal::Err(RuntimeError {
-                        kind: ErrorKind::ChannelIoError { message: e.to_string() },
-                        span: *span,
-                    })),
-                }
-            }
-            Expr::Accept(listener_expr, span) => {
-                let lv = self.eval_expr(listener_expr, env)?;
-                let Value::TcpListener(slot) = lv else {
-                    unreachable!("typeck.rs already proved this is a TcpListener")
-                };
-                let guard = slot.lock().unwrap();
-                match guard.as_ref() {
-                    None => Err(Signal::Err(RuntimeError {
-                        kind: ErrorKind::ChannelIoError {
-                            message: "this tcp_listener was already stopped".to_string(),
+            Expr::Connect(host_expr, port_expr, span) => self.traced(
+                Some(Effect::Network),
+                *span,
+                "connect",
+                None,
+                || {
+                    let host = match self.eval_expr(host_expr, env)? {
+                        Value::Str(s) => s,
+                        v => return Err(mismatch("str", v.ty_name(), *span)),
+                    };
+                    let port = match self.eval_expr(port_expr, env)? {
+                        Value::Int(n) => match u16::try_from(n) {
+                            Ok(p) => p,
+                            Err(_) => {
+                                return Err(Signal::Err(RuntimeError {
+                                    kind: ErrorKind::ChannelIoError {
+                                        message: format!("port {n} is not a valid 0-65535 TCP port"),
+                                    },
+                                    span: *span,
+                                }));
+                            }
                         },
-                        span: *span,
-                    })),
-                    Some(listener) => match listener.accept() {
-                        Ok((stream, _addr)) => Ok(Value::Tcp(Arc::new(Mutex::new(Some(stream))))),
+                        v => return Err(mismatch("i64", v.ty_name(), *span)),
+                    };
+                    match std::net::TcpStream::connect((host.as_ref(), port)) {
+                        Ok(stream) => Ok(Value::Tcp(Arc::new(Mutex::new(Some(stream))))),
                         Err(e) => Err(Signal::Err(RuntimeError {
                             kind: ErrorKind::ChannelIoError { message: e.to_string() },
                             span: *span,
                         })),
-                    },
-                }
-            }
-            Expr::Open(path_expr, mode_expr, span) => {
-                let path = match self.eval_expr(path_expr, env)? {
-                    Value::Str(s) => s,
-                    v => return Err(mismatch("str", v.ty_name(), *span)),
-                };
-                let mode = match self.eval_expr(mode_expr, env)? {
-                    Value::Str(s) => s,
-                    v => return Err(mismatch("str", v.ty_name(), *span)),
-                };
-                let opened = match mode.as_ref() {
-                    "r" => std::fs::File::open(path.as_ref()),
-                    "w" => std::fs::File::create(path.as_ref()),
-                    "a" => std::fs::OpenOptions::new().append(true).create(true).open(path.as_ref()),
-                    other => {
-                        return Err(Signal::Err(RuntimeError {
+                    }
+                },
+                outcome_of_signal_result,
+            ),
+            Expr::Listen(port_expr, span) => self.traced(
+                Some(Effect::Network),
+                *span,
+                "listen",
+                None,
+                || {
+                    let port = match self.eval_expr(port_expr, env)? {
+                        Value::Int(n) => match u16::try_from(n) {
+                            Ok(p) => p,
+                            Err(_) => {
+                                return Err(Signal::Err(RuntimeError {
+                                    kind: ErrorKind::ChannelIoError {
+                                        message: format!("port {n} is not a valid 0-65535 TCP port"),
+                                    },
+                                    span: *span,
+                                }));
+                            }
+                        },
+                        v => return Err(mismatch("i64", v.ty_name(), *span)),
+                    };
+                    // Binds all interfaces (`0.0.0.0`), not just loopback --
+                    // "simulation nodes can talk to each other" (unified plan
+                    // §4.3.3) means across real machines/network namespaces,
+                    // not just within one process.
+                    match std::net::TcpListener::bind(("0.0.0.0", port)) {
+                        Ok(listener) => Ok(Value::TcpListener(Arc::new(Mutex::new(Some(listener))))),
+                        Err(e) => Err(Signal::Err(RuntimeError {
+                            kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                            span: *span,
+                        })),
+                    }
+                },
+                outcome_of_signal_result,
+            ),
+            Expr::Accept(listener_expr, span) => self.traced(
+                Some(Effect::Network),
+                *span,
+                "accept",
+                None,
+                || {
+                    let lv = self.eval_expr(listener_expr, env)?;
+                    let Value::TcpListener(slot) = lv else {
+                        unreachable!("typeck.rs already proved this is a TcpListener")
+                    };
+                    let guard = slot.lock().unwrap();
+                    match guard.as_ref() {
+                        None => Err(Signal::Err(RuntimeError {
                             kind: ErrorKind::ChannelIoError {
-                                message: format!("invalid file mode {other:?} — expected \"r\", \"w\", or \"a\""),
+                                message: "this tcp_listener was already stopped".to_string(),
                             },
                             span: *span,
-                        }));
+                        })),
+                        Some(listener) => match listener.accept() {
+                            Ok((stream, _addr)) => Ok(Value::Tcp(Arc::new(Mutex::new(Some(stream))))),
+                            Err(e) => Err(Signal::Err(RuntimeError {
+                                kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                                span: *span,
+                            })),
+                        },
                     }
-                };
-                match opened {
-                    Ok(file) => Ok(Value::File(Arc::new(Mutex::new(Some(file))))),
-                    Err(e) => Err(Signal::Err(RuntimeError {
-                        kind: ErrorKind::ChannelIoError { message: e.to_string() },
-                        span: *span,
-                    })),
-                }
-            }
-            Expr::SpawnSandbox(name, arg_exprs, span) => {
-                let mut vals = Vec::with_capacity(arg_exprs.len());
-                for a in arg_exprs {
-                    vals.push(self.eval_expr(a, env)?);
-                }
-                self.spawn_sandbox(name, &vals, *span)
-            }
+                },
+                outcome_of_signal_result,
+            ),
+            Expr::Open(path_expr, mode_expr, span) => self.traced(
+                Some(Effect::Io),
+                *span,
+                "open",
+                None,
+                || {
+                    let path = match self.eval_expr(path_expr, env)? {
+                        Value::Str(s) => s,
+                        v => return Err(mismatch("str", v.ty_name(), *span)),
+                    };
+                    let mode = match self.eval_expr(mode_expr, env)? {
+                        Value::Str(s) => s,
+                        v => return Err(mismatch("str", v.ty_name(), *span)),
+                    };
+                    let opened = match mode.as_ref() {
+                        "r" => std::fs::File::open(path.as_ref()),
+                        "w" => std::fs::File::create(path.as_ref()),
+                        "a" => std::fs::OpenOptions::new().append(true).create(true).open(path.as_ref()),
+                        other => {
+                            return Err(Signal::Err(RuntimeError {
+                                kind: ErrorKind::ChannelIoError {
+                                    message: format!("invalid file mode {other:?} — expected \"r\", \"w\", or \"a\""),
+                                },
+                                span: *span,
+                            }));
+                        }
+                    };
+                    match opened {
+                        Ok(file) => Ok(Value::File(Arc::new(Mutex::new(Some(file))))),
+                        Err(e) => Err(Signal::Err(RuntimeError {
+                            kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                            span: *span,
+                        })),
+                    }
+                },
+                outcome_of_signal_result,
+            ),
+            Expr::SpawnSandbox(name, arg_exprs, span) => self.traced(
+                Some(Effect::Concurrent),
+                *span,
+                "spawn_sandbox",
+                None,
+                || {
+                    let mut vals = Vec::with_capacity(arg_exprs.len());
+                    for a in arg_exprs {
+                        vals.push(self.eval_expr(a, env)?);
+                    }
+                    self.spawn_sandbox(name, &vals, *span)
+                },
+                outcome_of_signal_result,
+            ),
             Expr::StopSandbox(inner, span) => {
                 let v = self.eval_expr(inner, env)?;
                 match v {
-                    Value::Sandbox(slot) => {
-                        let taken = slot.lock().unwrap().take();
-                        match taken {
-                            None => Err(Signal::Err(RuntimeError {
-                                kind: ErrorKind::AlreadySandboxStopped,
-                                span: *span,
-                            })),
-                            Some(mut child) => Ok(Value::Int(child.stop())),
-                        }
-                    }
+                    Value::Sandbox(slot) => self.traced(
+                        Some(Effect::Concurrent),
+                        *span,
+                        "sandbox.stop",
+                        None,
+                        || {
+                            let taken = slot.lock().unwrap().take();
+                            match taken {
+                                None => Err(Signal::Err(RuntimeError {
+                                    kind: ErrorKind::AlreadySandboxStopped,
+                                    span: *span,
+                                })),
+                                Some(mut child) => Ok(Value::Int(child.stop())),
+                            }
+                        },
+                        outcome_of_signal_result,
+                    ),
                     // Closing a `tcp` connection is just dropping the
                     // `TcpStream` -- no kill-on-drop machinery needed the
                     // way `SandboxChild` needs (see `Value::Tcp`'s doc
@@ -2955,32 +3944,82 @@ impl Interpreter {
                     // error -- closing an already-closed connection isn't
                     // the same hazard a double-kill/double-join is, so
                     // there's nothing to guard against here.
-                    Value::Tcp(slot) => {
-                        drop(slot.lock().unwrap().take());
-                        Ok(Value::Unit)
-                    }
+                    Value::Tcp(slot) => self.traced(
+                        Some(Effect::Network),
+                        *span,
+                        "tcp.stop",
+                        None,
+                        || {
+                            drop(slot.lock().unwrap().take());
+                            Ok(Value::Unit)
+                        },
+                        outcome_of_signal_result,
+                    ),
                     // Same "just drop it, double-stop is Unit not an
                     // error" treatment as `Value::Tcp` above.
-                    Value::TcpListener(slot) => {
-                        drop(slot.lock().unwrap().take());
-                        Ok(Value::Unit)
-                    }
+                    Value::TcpListener(slot) => self.traced(
+                        Some(Effect::Network),
+                        *span,
+                        "tcp.stop",
+                        None,
+                        || {
+                            drop(slot.lock().unwrap().take());
+                            Ok(Value::Unit)
+                        },
+                        outcome_of_signal_result,
+                    ),
                     // Same "just drop it, double-stop is Unit not an
                     // error" treatment as `Value::Tcp`/`Value::TcpListener`
                     // above — a `std::fs::File` closes its own descriptor
                     // on drop with no help required.
-                    Value::File(slot) => {
-                        drop(slot.lock().unwrap().take());
-                        Ok(Value::Unit)
-                    }
+                    Value::File(slot) => self.traced(
+                        Some(Effect::Io),
+                        *span,
+                        "file.stop",
+                        None,
+                        || {
+                            drop(slot.lock().unwrap().take());
+                            Ok(Value::Unit)
+                        },
+                        outcome_of_signal_result,
+                    ),
                     // Same "just drop it, double-stop is Unit not an
                     // error" treatment as `Value::Tcp`/`Value::File` above
                     // — a `rusqlite::Connection` closes its own database
-                    // handle on drop with no help required.
-                    Value::Db(slot) => {
-                        drop(slot.lock().unwrap().take());
-                        Ok(Value::Unit)
-                    }
+                    // handle on drop with no help required. Not part of
+                    // `effects.rs`'s own `local_ty`/`StopSandbox` mapping
+                    // (a pre-existing, documented gap there — `Ty::Db`
+                    // isn't one of its matched cases), but `Effect::Io`
+                    // is the honest tag here regardless: a db handle's own
+                    // `open`/`send`/`recv` are already `Io`.
+                    Value::Db(slot) => self.traced(
+                        Some(Effect::Io),
+                        *span,
+                        "db.stop",
+                        None,
+                        || {
+                            drop(slot.lock().unwrap().take());
+                            Ok(Value::Unit)
+                        },
+                        outcome_of_signal_result,
+                    ),
+                    // Same treatment as `Value::Db` immediately above,
+                    // one handle type later — a `redis::Connection`
+                    // closes its own socket on drop, and this is
+                    // `Effect::Network` (not `Io`) for the same reason
+                    // `mq_connect`/`mq_publish`/`mq_consume` already are
+                    // (`Ty::Mq`'s doc comment).
+                    Value::Mq(slot) => self.traced(
+                        Some(Effect::Network),
+                        *span,
+                        "mq.stop",
+                        None,
+                        || {
+                            drop(slot.lock().unwrap().take());
+                            Ok(Value::Unit)
+                        },
+                        outcome_of_signal_result,
+                    ),
                     other => Err(mismatch("sandbox", other.ty_name(), *span)),
                 }
             }
@@ -3043,6 +4082,24 @@ impl Interpreter {
             }
             Expr::Match { scrutinee, arms, span } => {
                 let sv = self.eval_expr(scrutinee, env)?;
+                // Literal-pattern match (`typeck.rs::check_literal_match`)
+                // -- a `str`/`i64`/`bool` scrutinee is never an `Enum`
+                // value, so it gets its own, much simpler evaluation:
+                // first arm whose pattern matches wins (`_` matches
+                // anything), same "first match wins" semantics the
+                // mandatory-trailing-wildcard typecheck already commits
+                // to. No payload bindings exist for this form.
+                if matches!(sv, Value::Str(_) | Value::Int(_) | Value::Bool(_)) {
+                    let arm = arms
+                        .iter()
+                        .find(|a| literal_pattern_matches(&a.pattern, &sv))
+                        .expect("typeck.rs already proved this literal match has a matching arm (trailing `_` required)");
+                    env.push();
+                    let result = self.eval_expr(&arm.body, env);
+                    env.pop();
+                    let _ = span;
+                    return result;
+                }
                 let Value::Enum(_, variant, payload) = &sv else {
                     unreachable!("typeck.rs already proved this is an enum, got {}", sv.ty_name())
                 };

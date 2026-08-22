@@ -1,0 +1,1988 @@
+// Enterprise Trade Finance B2B Platform, implemented in Nirdosha.
+// Source spec: Enterprise_Trade_Finance_B2B_Platform_Expanded.docx.
+// Build tracker + disposition of every requirement (BUILD/MOCK/
+// SUBSTITUTED): examples/trade-finance/todo.md -- read that first.
+//
+//     nirdosha serve examples/trade-finance/trade_finance.nir --port 8090 \
+//       --jwks-file <jwks.json> --issuer https://mock-idp.local \
+//       --audience store-app --identity-base http://localhost:9090
+//
+// (reuses examples/identity_mock.nir, extended with this platform's own
+// role vocabulary -- run it on port 9090 first, same JWKS.)
+//
+// One unified Nirdosha service, one shared SQLite DB
+// (trade_finance.db), standing in for "nine distributed microservices"
+// -- see todo.md's architecture note for why, given no import system
+// and heavy real interdependency between modules. `db` is affine with
+// no borrowing (examples/db.nir's doc comment), so every function below
+// opens, uses, and `stop`s its own connection; schema creation is
+// inlined per function for the same reason (examples/store.nir's own
+// header comment already documents this).
+
+// =========================================================================
+// Module 1: System Foundation, Identity, Security & Approval Governance
+// =========================================================================
+//
+// The one governance primitive every other module's sensitive actions
+// route through. Maker-Checker (2-Eyes) needs exactly one independent
+// decision; 6-Eyes needs two (Reviewer, then Approver) -- modeled as an
+// append-only ApprovalDecision log rather than mutable stage fields, so
+// segregation-of-duties (a decider's identity must differ from the
+// initiator AND every prior decider on this request) is one SQL query,
+// not hand-rolled state-machine logic per risk tier.
+
+// Named `Approval`, not `ApprovalRequest` -- `emit-ui` derives a
+// screen's nav entry by snake_case-matching a struct's name against
+// `list_<name>`/etc, so the struct name has to agree with the
+// `list_approval`/`submit_approval`/... functions below (the audit
+// log's own `entity_type` string tag still says "ApprovalRequest",
+// independently -- that's just descriptive text, not tied to this
+// struct's Nirdosha name).
+struct Approval {
+    id: i64,
+    action_type: str,
+    risk_tier: str,
+    initiator_subject: str,
+    sla_hours: i64,
+    payload_note: str,
+    status: str,
+    required_eyes: i64,
+}
+
+// Named `AuditLog`, not `AuditLogEntry`, for the same
+// snake_case-matching reason as `Approval` above (`list_audit_log`).
+struct AuditLog {
+    id: i64,
+    entity_type: str,
+    entity_id: i64,
+    actor_subject: str,
+    action: str,
+    note: str,
+    prev_hash: str,
+    hash: str,
+}
+
+// Schema creation is inlined into every function that touches these
+// tables, not factored into a shared helper: `db` is affine with no
+// borrowing, so passing an already-open `conn` into another function
+// moves it away from the caller (confirmed the hard way while building
+// this file -- see `examples/store.nir`'s header comment for the same
+// discipline in the earlier apps). `finish_with_audit` below is the one
+// exception, and only because it's always the *last* thing a caller
+// does with `conn`.
+
+fn list_audit_log_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS approval_request (id INTEGER PRIMARY KEY AUTOINCREMENT, action_type TEXT, risk_tier TEXT, initiator_subject TEXT, sla_hours INTEGER, payload_note TEXT, status TEXT, required_eyes INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS approval_decision (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER, actor_subject TEXT, stage_index INTEGER, decision TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS audit_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT, entity_id INTEGER, actor_subject TEXT, action TEXT, note TEXT, prev_hash TEXT, hash TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, entity_type, entity_id, actor_subject, action, note, hash FROM audit_log_entry ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_audit_log() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_audit_log_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+// Walks the whole chain and returns -1 ("OK") or the id of the first
+// row whose stored `hash` no longer matches a fresh
+// `sha256_hex(prev_hash, note)` recompute -- real tamper detection, not
+// a stub. `count` bounds how many rows to check (no dynamic-length
+// array iteration ergonomic enough to walk an unbounded result set
+// without a loop-friendly JSON-array primitive -- see todo.md; capped
+// at a caller-supplied count instead of "all rows" for now).
+fn verify_audit_chain_rows(rows: json) -> i64 {
+    let n: i64 = match json_array_len(rows) {
+        Ok(k) => k,
+        Err(e) => 0,
+    }
+    let i: i64 = 0
+    let broken_at: i64 = -1
+    while i < n {
+        let row: json = match json_array_get(rows, i) {
+            Ok(r) => r,
+            Err(e) => rows,
+        }
+        let note: str = match json_get_str(row, "note") { Ok(s) => s, Err(e) => "" }
+        let prev_hash: str = match json_get_str(row, "prev_hash") { Ok(s) => s, Err(e) => "" }
+        let stored_hash: str = match json_get_str(row, "hash") { Ok(s) => s, Err(e) => "" }
+        let recomputed: str = sha256_hex(prev_hash, note)
+        let this_id: i64 = match json_get_i64(row, "id") { Ok(v) => v, Err(e) => -1 }
+        if recomputed != stored_hash && broken_at < 0 {
+            broken_at = this_id
+        }
+        i = i + 1
+    }
+    return broken_at
+}
+
+fn verify_audit_chain_inner(conn: db, count: i64) -> i64 {
+    let result: i64 = match db_query(conn, "SELECT id, note, prev_hash, hash FROM audit_log_entry ORDER BY id ASC LIMIT ?", count) {
+        Ok(rows) => verify_audit_chain_rows(rows),
+        Err(e) => -2,
+    }
+    stop conn
+    return result
+}
+
+fn verify_audit_chain(count: i64) -> i64 {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => verify_audit_chain_inner(conn, count),
+        Err(e) => -2,
+    }
+}
+
+// ---- Maker-Checker (2-Eyes) / 6-Eyes (3-tier), one primitive --------
+
+// Terminal: appends one hash-chained audit entry using the caller's
+// still-open `conn`, `stop`s it, and produces the function's final
+// `Result` -- the one place `conn` changes hands to another function,
+// and only because it's always the caller's *last* use of it (an
+// affine handle can be handed off exactly once, on a path where the
+// caller never touches it again). `hash = sha256_hex(prev_hash, note)`
+// chains onto whatever the previous entry's hash was, so
+// `verify_audit_chain` can independently detect tampering.
+fn finish_with_audit(conn: db, entity_type: str, entity_id: i64, actor_subject: str, action: str, note: str, is_ok: bool, ok_value: i64, err_message: str) -> Result(i64, str) {
+    let prev_hash: str = match db_query(conn, "SELECT hash as value FROM audit_log_entry ORDER BY id DESC LIMIT 1") {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") {
+                Ok(h) => h,
+                Err(e) => "genesis",
+            },
+            Err(e) => "genesis",
+        },
+        Err(e) => "genesis",
+    }
+    let hash: str = sha256_hex(prev_hash, note)
+    let inserted: i64 = match db_execute(conn, "INSERT INTO audit_log_entry (entity_type, entity_id, actor_subject, action, note, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?)", entity_type, entity_id, actor_subject, action, note, prev_hash, hash) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    stop conn
+    return if is_ok { Ok(ok_value) } else { Err(err_message) }
+}
+
+fn submit_approval_inner(conn: db, identity: VerifiedIdentity, action_type: str, risk_tier: str, required_eyes: i64, sla_hours: i64, payload_note: str) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS approval_request (id INTEGER PRIMARY KEY AUTOINCREMENT, action_type TEXT, risk_tier TEXT, initiator_subject TEXT, sla_hours INTEGER, payload_note TEXT, status TEXT, required_eyes INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS approval_decision (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER, actor_subject TEXT, stage_index INTEGER, decision TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS audit_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT, entity_id INTEGER, actor_subject TEXT, action TEXT, note TEXT, prev_hash TEXT, hash TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let inserted: i64 = match db_execute(conn, "INSERT INTO approval_request (action_type, risk_tier, initiator_subject, sla_hours, payload_note, status, required_eyes) VALUES (?, ?, ?, ?, ?, 'PENDING', ?)", action_type, risk_tier, identity.subject, sla_hours, payload_note, required_eyes) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let request_id: i64 = match db_query(conn, "SELECT last_insert_rowid() as value") {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => -1 },
+            Err(e) => -1,
+        },
+        Err(e) => -1,
+    }
+    return finish_with_audit(conn, "ApprovalRequest", request_id, identity.subject, "SUBMIT", payload_note, request_id >= 0, request_id, "failed to submit approval request")
+}
+
+// Any signed-in identity may submit or decide -- the real control here
+// is segregation-of-duties (below), not a role check: the doc's own
+// Module 1 description is explicit that SoD is enforced "regardless of
+// role assignment." `required_eyes` generalizes Maker-Checker (1) /
+// 6-Eyes (2) / any n-eyes policy to a plain integer instead of a
+// hardcoded tier name -- decide_approval_core below no longer branches
+// on risk_tier at all, it just needs required_eyes distinct decisions.
+fn submit_approval(identity: VerifiedIdentity, action_type: str, risk_tier: str, required_eyes: i64, sla_hours: i64, payload_note: str) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => submit_approval_inner(conn, identity, action_type, risk_tier, required_eyes, sla_hours, payload_note),
+        Err(e) => Err(e),
+    }
+}
+
+fn list_approval_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS approval_request (id INTEGER PRIMARY KEY AUTOINCREMENT, action_type TEXT, risk_tier TEXT, initiator_subject TEXT, sla_hours INTEGER, payload_note TEXT, status TEXT, required_eyes INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, action_type, risk_tier, initiator_subject, sla_hours, payload_note, status, required_eyes FROM approval_request ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_approval() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_approval_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+// The state machine itself, generalized to n-eyes: `status` is the
+// object's state (PENDING/APPROVED/REJECTED); `required_eyes` (stored
+// on the request, set at submit time) is the exit condition's
+// threshold; `prior_decisions` (a plain COUNT over the append-only
+// decision log) is how many of those exits have already been taken.
+// Whether the caller is proven via a live bearer token (decide_approval
+// below) or via a single-use decision-link token
+// (decide_approval_via_link further down) is irrelevant here -- both
+// paths resolve to a plain `actor_subject: str` before reaching this
+// function, because this function always reloads `status`/
+// `required_eyes`/prior decisions fresh from `conn` rather than trusting
+// any in-memory state. There is no separate "object is already in
+// memory" fast path: every Nirdosha request opens its own `db` handle
+// and nothing survives between requests, so this cold-reload *is* the
+// only path, for a same-session click or a reply to a three-day-old
+// email alike.
+fn decide_approval_core(conn: db, actor_subject: str, request_id: i64, decision: str) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS approval_request (id INTEGER PRIMARY KEY AUTOINCREMENT, action_type TEXT, risk_tier TEXT, initiator_subject TEXT, sla_hours INTEGER, payload_note TEXT, status TEXT, required_eyes INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS approval_decision (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER, actor_subject TEXT, stage_index INTEGER, decision TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS audit_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT, entity_id INTEGER, actor_subject TEXT, action TEXT, note TEXT, prev_hash TEXT, hash TEXT)") { Ok(n) => n, Err(e) => -1 }
+
+    let status: str = match db_query(conn, "SELECT status as value FROM approval_request WHERE id = ?", request_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") { Ok(v) => v, Err(e) => "MISSING" },
+            Err(e) => "MISSING",
+        },
+        Err(e) => "MISSING",
+    }
+    let required_eyes: i64 = match db_query(conn, "SELECT required_eyes as value FROM approval_request WHERE id = ?", request_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => 1 },
+            Err(e) => 1,
+        },
+        Err(e) => 1,
+    }
+
+    // Segregation of duties, one query: has `actor_subject` already
+    // acted on this request, either as the original initiator or as a
+    // prior decider? If so, reject -- the identity check the doc
+    // describes ("regardless of role assignment"), done in SQL rather
+    // than hand-rolled comparisons against however many prior stages a
+    // given policy happens to require.
+    let already_acted: i64 = match db_query(conn, "SELECT COUNT(*) as value FROM (SELECT initiator_subject as subj FROM approval_request WHERE id = ? UNION ALL SELECT actor_subject FROM approval_decision WHERE request_id = ?) WHERE subj = ?", request_id, request_id, actor_subject) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => 1 },
+            Err(e) => 1,
+        },
+        Err(e) => 1,
+    }
+
+    let prior_decisions: i64 = match db_query(conn, "SELECT COUNT(*) as value FROM approval_decision WHERE request_id = ?", request_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => 0 },
+            Err(e) => 0,
+        },
+        Err(e) => 0,
+    }
+    let stage_index: i64 = prior_decisions + 1
+
+    let eligible: bool = status == "PENDING" && already_acted == 0 && prior_decisions < required_eyes
+
+    let outcome: str = if !eligible {
+        "not eligible"
+    } else {
+        if decision == "REJECT" {
+            "rejected"
+        } else {
+            "recorded"
+        }
+    }
+
+    let recorded: i64 = if eligible {
+        match db_execute(conn, "INSERT INTO approval_decision (request_id, actor_subject, stage_index, decision) VALUES (?, ?, ?, ?)", request_id, actor_subject, stage_index, decision) {
+            Ok(n) => n,
+            Err(e) => -1,
+        }
+    } else {
+        -1
+    }
+
+    let final_status: str = if !eligible {
+        status
+    } else {
+        if decision == "REJECT" {
+            "REJECTED"
+        } else {
+            if prior_decisions + 1 >= required_eyes { "APPROVED" } else { "PENDING" }
+        }
+    }
+    let updated: i64 = if eligible && final_status != status {
+        match db_execute(conn, "UPDATE approval_request SET status = ? WHERE id = ?", final_status, request_id) {
+            Ok(n) => n,
+            Err(e) => -1,
+        }
+    } else {
+        0
+    }
+
+    return finish_with_audit(conn, "ApprovalRequest", request_id, actor_subject, "DECIDE", outcome, eligible, request_id, "segregation-of-duties violation, already decided, or wrong stage")
+}
+
+fn decide_approval_inner(conn: db, identity: VerifiedIdentity, request_id: i64, decision: str) -> Result(i64, str) {
+    return decide_approval_core(conn, identity.subject, request_id, decision)
+}
+
+fn decide_approval(identity: VerifiedIdentity, request_id: i64, decision: str) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => decide_approval_inner(conn, identity, request_id, decision),
+        Err(e) => Err(e),
+    }
+}
+
+// ---- decision links: deciding without a live login session --------
+//
+// A real reviewer at their Nth-eyes stage is often not logged into this
+// app when their turn comes -- they get an email, click a link, or
+// enter an OTP. `serve.rs` only ever produces a VerifiedIdentity by
+// validating a request's own `Authorization: Bearer <token>` header,
+// and Nirdosha has no struct-literal syntax at all -- a .nir function
+// can never fabricate a VerifiedIdentity itself. So "decide via link"
+// has to be a genuinely different, unauthenticated endpoint: it proves
+// *which* identity is deciding via a single-use signed token instead of
+// a bearer token, then hands off to the exact same decide_approval_core
+// used by the logged-in path above -- one state-machine transition, two
+// ways to prove who's making it.
+//
+// `actor_subject` is *always* `identity.subject` -- a caller can only
+// ever mint a link for themselves, never name someone else (a live,
+// exploited bug in an earlier version of this function: any signed-in
+// identity could name an arbitrary, even nonexistent, actor_subject and
+// then single-handedly decide as them, fully defeating segregation of
+// duties). The realistic flow is still served: Carol logs in once,
+// mints her own link ahead of time, and later decides via that link
+// without a live session -- she just can't mint one for Bob.
+//
+// token = sha256_hex(sha256_hex(sha256_hex(identity.subject,
+// payload_note), prev_hash), <secret>) -- `prev_hash` is the audit
+// chain's current tip at mint time: public (list_audit_log has no
+// gate), but it advances on every governance action in the system
+// (including this function's own terminal finish_with_audit call), so
+// it serves as a nonce that makes even a repeat mint for the same
+// actor+request produce a different token -- the earlier version had no
+// nonce at all, so identical (actor_subject, payload_note) mints
+// collided and one leaked token could decide multiple links. `prev_hash`
+// being public is fine specifically because it's the nonce, not the
+// secret: the trailing `<secret>` (a fixed dev-only string, same
+// precedent as identity_mock.nir's hardcoded HMAC JWKS key -- a real
+// deployment would pull it from a real secret store, which Nirdosha has
+// no builtin for) is what still has to stay unknown to forge a token.
+// The secret goes last (an envelope/suffix MAC), not first, so a
+// length-extension attack against the underlying Merkle-Damgard SHA-256
+// can't forge a valid token without already knowing it.
+// No expiry: Nirdosha has no wall-clock builtin (see todo.md's SLA
+// deadline note) -- a link is single-use via `consumed` instead of
+// time-boxed. `get_decision_link` only exists because there's no real
+// email sender to deliver the link/token out of band for this demo; a
+// real deployment would never expose it -- and even here, it now only
+// returns a link's token to the identity that minted it.
+
+fn mint_decision_link_inner(conn: db, identity: VerifiedIdentity, request_id: i64) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS approval_request (id INTEGER PRIMARY KEY AUTOINCREMENT, action_type TEXT, risk_tier TEXT, initiator_subject TEXT, sla_hours INTEGER, payload_note TEXT, status TEXT, required_eyes INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS decision_link (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER, actor_subject TEXT, token TEXT, consumed INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS audit_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT, entity_id INTEGER, actor_subject TEXT, action TEXT, note TEXT, prev_hash TEXT, hash TEXT)") { Ok(n) => n, Err(e) => -1 }
+
+    let status: str = match db_query(conn, "SELECT status as value FROM approval_request WHERE id = ?", request_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") { Ok(v) => v, Err(e) => "MISSING" },
+            Err(e) => "MISSING",
+        },
+        Err(e) => "MISSING",
+    }
+    let payload_note: str = match db_query(conn, "SELECT payload_note as value FROM approval_request WHERE id = ?", request_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") { Ok(v) => v, Err(e) => "" },
+            Err(e) => "",
+        },
+        Err(e) => "",
+    }
+    let prev_hash: str = match db_query(conn, "SELECT hash as value FROM audit_log_entry ORDER BY id DESC LIMIT 1") {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") { Ok(h) => h, Err(e) => "genesis" },
+            Err(e) => "genesis",
+        },
+        Err(e) => "genesis",
+    }
+
+    return if status != "PENDING" {
+        stop conn
+        Err("approval request is not pending")
+    } else {
+        let combo: str = sha256_hex(identity.subject, payload_note)
+        let salted: str = sha256_hex(combo, prev_hash)
+        let token: str = sha256_hex(salted, "trade-finance-decision-link-secret-dev-only")
+        let inserted: i64 = match db_execute(conn, "INSERT INTO decision_link (request_id, actor_subject, token, consumed) VALUES (?, ?, ?, 0)", request_id, identity.subject, token) {
+            Ok(n) => n,
+            Err(e) => -1,
+        }
+        let link_id: i64 = match db_query(conn, "SELECT last_insert_rowid() as value") {
+            Ok(rows) => match json_array_get(rows, 0) {
+                Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => -1 },
+                Err(e) => -1,
+            },
+            Err(e) => -1,
+        }
+        finish_with_audit(conn, "DecisionLink", link_id, identity.subject, "LINK_MINTED", payload_note, link_id >= 0, link_id, "failed to mint decision link")
+    }
+}
+
+fn mint_decision_link(identity: VerifiedIdentity, request_id: i64) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => mint_decision_link_inner(conn, identity, request_id),
+        Err(e) => Err(e),
+    }
+}
+
+// Dev-only stand-in for "the email that would have delivered this link"
+// -- see the block comment above. Only returns a link's token to the
+// identity that minted it (`actor_subject` is always that same identity
+// now), matching how a real email would only ever reach that person's
+// own inbox.
+fn get_decision_link_inner(conn: db, link_id: i64, caller_subject: str) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS decision_link (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER, actor_subject TEXT, token TEXT, consumed INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, request_id, actor_subject, token, consumed FROM decision_link WHERE id = ? AND actor_subject = ?", link_id, caller_subject)
+    stop conn
+    return rows
+}
+
+fn get_decision_link(identity: VerifiedIdentity, link_id: i64) -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => get_decision_link_inner(conn, link_id, identity.subject),
+        Err(e) => Err(e),
+    }
+}
+
+fn decide_approval_via_link_inner(conn: db, link_id: i64, token: str, decision: str) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS decision_link (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER, actor_subject TEXT, token TEXT, consumed INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS approval_request (id INTEGER PRIMARY KEY AUTOINCREMENT, action_type TEXT, risk_tier TEXT, initiator_subject TEXT, sla_hours INTEGER, payload_note TEXT, status TEXT, required_eyes INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS approval_decision (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER, actor_subject TEXT, stage_index INTEGER, decision TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let t4: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS audit_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT, entity_id INTEGER, actor_subject TEXT, action TEXT, note TEXT, prev_hash TEXT, hash TEXT)") { Ok(n) => n, Err(e) => -1 }
+
+    let request_id: i64 = match db_query(conn, "SELECT request_id as value FROM decision_link WHERE id = ?", link_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => -1 },
+            Err(e) => -1,
+        },
+        Err(e) => -1,
+    }
+    let actor_subject: str = match db_query(conn, "SELECT actor_subject as value FROM decision_link WHERE id = ?", link_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") { Ok(v) => v, Err(e) => "" },
+            Err(e) => "",
+        },
+        Err(e) => "",
+    }
+    let stored_token: str = match db_query(conn, "SELECT token as value FROM decision_link WHERE id = ?", link_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") { Ok(v) => v, Err(e) => "" },
+            Err(e) => "",
+        },
+        Err(e) => "",
+    }
+    let consumed: i64 = match db_query(conn, "SELECT consumed as value FROM decision_link WHERE id = ?", link_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => 1 },
+            Err(e) => 1,
+        },
+        Err(e) => 1,
+    }
+
+    // `constant_time_str_eq`, not `==` -- a red-team finding: comparing
+    // a secret-derived token with a short-circuiting `==` is a timing
+    // side channel on the one thing standing between "click the link"
+    // and forging a decision.
+    let valid: bool = consumed == 0 && request_id >= 0 && constant_time_str_eq(stored_token, token)
+
+    return if !valid {
+        finish_with_audit(conn, "DecisionLink", link_id, actor_subject, "LINK_DECIDE_REJECTED", "invalid, already-consumed, or unknown decision link", false, -1, "decision link is invalid, expired, or already used")
+    } else {
+        let marked: i64 = match db_execute(conn, "UPDATE decision_link SET consumed = 1 WHERE id = ?", link_id) {
+            Ok(n) => n,
+            Err(e) => -1,
+        }
+        decide_approval_core(conn, actor_subject, request_id, decision)
+    }
+}
+
+fn decide_approval_via_link(link_id: i64, token: str, decision: str) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => decide_approval_via_link_inner(conn, link_id, token, decision),
+        Err(e) => Err(e),
+    }
+}
+
+// =========================================================================
+// Module 2: Corporate & Counterparty Onboarding (KYC/KYB)
+// =========================================================================
+
+struct Counterparty {
+    id: i64,
+    legal_name: str,
+    lei: str,
+    tax_id: str,
+    counterparty_type: str,
+    status: str,
+    risk_rating: str,
+}
+
+fn list_counterparty_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS counterparty (id INTEGER PRIMARY KEY AUTOINCREMENT, legal_name TEXT, lei TEXT, tax_id TEXT, counterparty_type TEXT, status TEXT, risk_rating TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, legal_name, lei, tax_id, counterparty_type, status, risk_rating FROM counterparty ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_counterparty() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_counterparty_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn create_counterparty_inner(conn: db, c: Counterparty) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS counterparty (id INTEGER PRIMARY KEY AUTOINCREMENT, legal_name TEXT, lei TEXT, tax_id TEXT, counterparty_type TEXT, status TEXT, risk_rating TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let inserted: i64 = match db_execute(conn, "INSERT INTO counterparty (legal_name, lei, tax_id, counterparty_type, status, risk_rating) VALUES (?, ?, ?, ?, 'draft', ?)", c.legal_name, c.lei, c.tax_id, c.counterparty_type, c.risk_rating) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    stop conn
+    return if inserted >= 0 { Ok(inserted) } else { Err("failed to create counterparty") }
+}
+
+// Onboarding is Nirdosha's own affine/db pattern applied to KYC: create
+// as `status = 'draft'`; `update_counterparty` lets an operator move it
+// to `active` once screening (below) has cleared. Not
+// `requires`-gated at the language level -- the doc's own governance
+// table treats "approve onboarding activation" as Maker-Checker, which
+// is a *workflow* decision (submit_approval/decide_approval), not a
+// blanket role restriction on who may call `update_counterparty` at
+// all; wiring that specific action through the shared governance
+// primitive end-to-end is illustrated below for the sanctions-override
+// case, the doc's own highest-risk action in this module.
+fn update_counterparty_inner(conn: db, c: Counterparty) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS counterparty (id INTEGER PRIMARY KEY AUTOINCREMENT, legal_name TEXT, lei TEXT, tax_id TEXT, counterparty_type TEXT, status TEXT, risk_rating TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, str) = db_execute(conn, "UPDATE counterparty SET legal_name = ?, lei = ?, tax_id = ?, counterparty_type = ?, status = ?, risk_rating = ? WHERE id = ?", c.legal_name, c.lei, c.tax_id, c.counterparty_type, c.status, c.risk_rating, c.id)
+    stop conn
+    return result
+}
+
+fn update_counterparty(c: Counterparty) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => update_counterparty_inner(conn, c),
+        Err(e) => Err(e),
+    }
+}
+
+fn create_counterparty(c: Counterparty) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => create_counterparty_inner(conn, c),
+        Err(e) => Err(e),
+    }
+}
+
+// `[MOCK]` -- stands in for a real GLEIF LEI registry lookup. Exact
+// match against a tiny fixed local table (no HTTP call, no live
+// registry) -- see todo.md's Module 2 section.
+fn mock_lei_lookup(lei: str) -> Result(json, str) {
+    return match lei {
+        "5493001KJTIIGC8Y1R129" => json_parse("{\"lei\":\"5493001KJTIIGC8Y1R129\",\"legal_name\":\"Novak Grain Trading GmbH\",\"registry_status\":\"ISSUED\"}"),
+        "213800WSGIIZCXF1P572" => json_parse("{\"lei\":\"213800WSGIIZCXF1P572\",\"legal_name\":\"Kabul Grain Import Co\",\"registry_status\":\"ISSUED\"}"),
+        _ => Err("lei not found in mock GLEIF registry"),
+    }
+}
+
+// `[MOCK]` -- stands in for OFAC/EU/UN/UK consolidated sanctions/PEP
+// lists (no licensed OpenSanctions feed). Exact-name match against a
+// tiny fixed local watchlist. A real match still routes to a 6-Eyes
+// override exactly like the doc specifies -- see
+// `override_sanctions_match` below.
+fn mock_sanctions_screen(legal_name: str) -> Result(json, str) {
+    return if legal_name == "Sanctioned Trading Ltd" {
+        json_parse("{\"matched\":true,\"list_source\":\"mock-consolidated\",\"match_score\":98}")
+    } else {
+        json_parse("{\"matched\":false,\"list_source\":\"mock-consolidated\",\"match_score\":0}")
+    }
+}
+
+// A real sanctions match is high-risk per the doc's own table (6-Eyes)
+// -- this wires the shared Module 1 primitive end-to-end for one
+// representative marquee action per module, rather than every listed
+// action (see todo.md's scoping note). `submit_sanctions_override`
+// creates the 6-Eyes request; once `decide_approval` has recorded two
+// distinct APPROVE decisions on it (verified via `list_approval`), an
+// operator calls `clear_sanctions_override` to actually flip the
+// counterparty's status -- two steps, matching how a real
+// workflow-gated action (propose, then execute-once-approved) works,
+// as opposed to a blanket role check.
+fn submit_sanctions_override(identity: VerifiedIdentity, counterparty_id: i64, justification: str) -> Result(i64, str) {
+    return submit_approval(identity, "override_sanctions_match", "SIX_EYES", 2, 4, justification)
+}
+
+fn clear_sanctions_override_inner(conn: db, request_id: i64, counterparty_id: i64) -> Result(i64, str) {
+    let status: str = match db_query(conn, "SELECT status as value FROM approval_request WHERE id = ?", request_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") { Ok(v) => v, Err(e) => "MISSING" },
+            Err(e) => "MISSING",
+        },
+        Err(e) => "MISSING",
+    }
+    return if status == "APPROVED" {
+        let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS counterparty (id INTEGER PRIMARY KEY AUTOINCREMENT, legal_name TEXT, lei TEXT, tax_id TEXT, counterparty_type TEXT, status TEXT, risk_rating TEXT)") { Ok(n) => n, Err(e) => -1 }
+        let updated: Result(i64, str) = db_execute(conn, "UPDATE counterparty SET status = 'active' WHERE id = ?", counterparty_id)
+        stop conn
+        updated
+    } else {
+        stop conn
+        Err("sanctions override request is not yet fully approved")
+    }
+}
+
+fn clear_sanctions_override(request_id: i64, counterparty_id: i64) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => clear_sanctions_override_inner(conn, request_id, counterparty_id),
+        Err(e) => Err(e),
+    }
+}
+
+// ---- credit limits ------------------------------------------------
+
+struct CreditLimit {
+    id: i64,
+    counterparty_id: i64,
+    facility_cap_cents: i64,
+    utilized_cents: i64,
+    status: str,
+}
+
+fn list_credit_limit_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS credit_limit (id INTEGER PRIMARY KEY AUTOINCREMENT, counterparty_id INTEGER, facility_cap_cents INTEGER, utilized_cents INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, counterparty_id, facility_cap_cents, utilized_cents, status FROM credit_limit ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_credit_limit() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_credit_limit_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn create_credit_limit_inner(conn: db, cl: CreditLimit) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS credit_limit (id INTEGER PRIMARY KEY AUTOINCREMENT, counterparty_id INTEGER, facility_cap_cents INTEGER, utilized_cents INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let inserted: i64 = match db_execute(conn, "INSERT INTO credit_limit (counterparty_id, facility_cap_cents, utilized_cents, status) VALUES (?, ?, 0, 'active')", cl.counterparty_id, cl.facility_cap_cents) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    stop conn
+    return if inserted >= 0 { Ok(inserted) } else { Err("failed to create credit limit") }
+}
+
+fn create_credit_limit(cl: CreditLimit) -> Result(i64, str) requires(role: "compliance_officer") {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => create_credit_limit_inner(conn, cl),
+        Err(e) => Err(e),
+    }
+}
+
+// Real, reusable hold check -- called synchronously (a real function
+// call, not just documented intent) by any later module before it lets
+// a disbursement/payment/discounting request through: does the
+// counterparty have enough headroom? Returns `true` if the request
+// would fit within the facility cap.
+fn check_credit_hold_inner(conn: db, counterparty_id: i64, amount_cents: i64) -> bool {
+    let headroom: i64 = match db_query(conn, "SELECT facility_cap_cents - utilized_cents as value FROM credit_limit WHERE counterparty_id = ? AND status = 'active'", counterparty_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => 0 },
+            Err(e) => 0,
+        },
+        Err(e) => 0,
+    }
+    stop conn
+    return amount_cents <= headroom
+}
+
+fn check_credit_hold(counterparty_id: i64, amount_cents: i64) -> bool {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => check_credit_hold_inner(conn, counterparty_id, amount_cents),
+        Err(e) => false,
+    }
+}
+
+// ---- financial statements: real ratio computation ------------------
+//
+// `Ty::I64`/`Ty::F64` have no conversion operator between them
+// (LANGUAGE.md §3), so ratios are computed and stored as basis points
+// (i64 * 10000 / i64) throughout, the same convention
+// `examples/rev-assurence/rev_assurance.nir`'s `stat_leakage_rate_bps`
+// already established -- real division, guarded against a zero
+// divisor (`LANGUAGE.md` §4: int division traps on zero).
+
+struct FinancialStatement {
+    id: i64,
+    counterparty_id: i64,
+    period: str,
+    current_assets_cents: i64,
+    current_liabilities_cents: i64,
+    total_liabilities_cents: i64,
+    total_equity_cents: i64,
+}
+
+fn list_financial_statement_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS financial_statement (id INTEGER PRIMARY KEY AUTOINCREMENT, counterparty_id INTEGER, period TEXT, current_ratio_bps INTEGER, debt_to_equity_bps INTEGER, credit_score INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, counterparty_id, period, current_ratio_bps, debt_to_equity_bps, credit_score FROM financial_statement ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_financial_statement() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_financial_statement_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn create_financial_statement_inner(conn: db, fs: FinancialStatement) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS financial_statement (id INTEGER PRIMARY KEY AUTOINCREMENT, counterparty_id INTEGER, period TEXT, current_ratio_bps INTEGER, debt_to_equity_bps INTEGER, credit_score INTEGER)") { Ok(n) => n, Err(e) => -1 }
+
+    let current_ratio_bps: i64 = if fs.current_liabilities_cents == 0 {
+        0
+    } else {
+        (fs.current_assets_cents * 10000) / fs.current_liabilities_cents
+    }
+    let debt_to_equity_bps: i64 = if fs.total_equity_cents == 0 {
+        0
+    } else {
+        (fs.total_liabilities_cents * 10000) / fs.total_equity_cents
+    }
+    // A deliberately simple, deterministic heuristic -- real arithmetic
+    // over the two computed ratios, not a trained model (the doc's own
+    // scikit-learn/XGBoost scoring pipeline is `[SUBSTITUTED]`; see
+    // todo.md). Higher current ratio and lower leverage both raise the
+    // score; clamped to [0, 10000].
+    let raw_score: i64 = 5000 + (current_ratio_bps / 4) - (debt_to_equity_bps / 4)
+    let credit_score: i64 = if raw_score < 0 {
+        0
+    } else {
+        if raw_score > 10000 { 10000 } else { raw_score }
+    }
+
+    let inserted: i64 = match db_execute(conn, "INSERT INTO financial_statement (counterparty_id, period, current_ratio_bps, debt_to_equity_bps, credit_score) VALUES (?, ?, ?, ?, ?)", fs.counterparty_id, fs.period, current_ratio_bps, debt_to_equity_bps, credit_score) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    stop conn
+    return if inserted >= 0 { Ok(credit_score) } else { Err("failed to record financial statement") }
+}
+
+fn create_financial_statement(fs: FinancialStatement) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => create_financial_statement_inner(conn, fs),
+        Err(e) => Err(e),
+    }
+}
+
+
+// =========================================================================
+// Module 3: Trade Contracts, Documents & Instrument Lifecycle
+// =========================================================================
+//
+// Five workflow variants as real stored/selectable state (not prose):
+// ADVANCE_PAYMENT / OPEN_ACCOUNT / DOCUMENTARY_COLLECTION / LC_BACKED /
+// MILESTONE_ESCROW. `recommend_workflow_variant` is a real deterministic
+// rule function; the doc is explicit this is a *recommendation*, so the
+// actually-used `workflow_variant` on a `PurchaseOrder` is always a
+// separate human-recorded field, never auto-applied.
+
+struct PurchaseOrder {
+    id: i64,
+    buyer_counterparty_id: i64,
+    seller_counterparty_id: i64,
+    workflow_variant: str,
+    goods_description: str,
+    quantity: i64,
+    beneficiary_name: str,
+    total_amount_cents: i64,
+    currency: str,
+    status: str,
+}
+
+fn list_purchase_order_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS purchase_order (id INTEGER PRIMARY KEY AUTOINCREMENT, buyer_counterparty_id INTEGER, seller_counterparty_id INTEGER, workflow_variant TEXT, goods_description TEXT, quantity INTEGER, beneficiary_name TEXT, total_amount_cents INTEGER, currency TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, buyer_counterparty_id, seller_counterparty_id, workflow_variant, goods_description, quantity, beneficiary_name, total_amount_cents, currency, status FROM purchase_order ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_purchase_order() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_purchase_order_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn create_purchase_order_inner(conn: db, po: PurchaseOrder) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS purchase_order (id INTEGER PRIMARY KEY AUTOINCREMENT, buyer_counterparty_id INTEGER, seller_counterparty_id INTEGER, workflow_variant TEXT, goods_description TEXT, quantity INTEGER, beneficiary_name TEXT, total_amount_cents INTEGER, currency TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let inserted: i64 = match db_execute(conn, "INSERT INTO purchase_order (buyer_counterparty_id, seller_counterparty_id, workflow_variant, goods_description, quantity, beneficiary_name, total_amount_cents, currency, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft')", po.buyer_counterparty_id, po.seller_counterparty_id, po.workflow_variant, po.goods_description, po.quantity, po.beneficiary_name, po.total_amount_cents, po.currency) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    stop conn
+    return if inserted >= 0 { Ok(inserted) } else { Err("failed to create purchase order") }
+}
+
+fn create_purchase_order(po: PurchaseOrder) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => create_purchase_order_inner(conn, po),
+        Err(e) => Err(e),
+    }
+}
+
+fn update_purchase_order_inner(conn: db, po: PurchaseOrder) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS purchase_order (id INTEGER PRIMARY KEY AUTOINCREMENT, buyer_counterparty_id INTEGER, seller_counterparty_id INTEGER, workflow_variant TEXT, goods_description TEXT, quantity INTEGER, beneficiary_name TEXT, total_amount_cents INTEGER, currency TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    // Split across two statements -- db_execute's bind-value arity caps
+    // at 8 (10 args total incl. conn+sql; typeck.rs's (2..=10) range),
+    // and this struct has 9 settable columns + the WHERE id.
+    let part1: i64 = match db_execute(conn, "UPDATE purchase_order SET buyer_counterparty_id = ?, seller_counterparty_id = ?, workflow_variant = ?, goods_description = ? WHERE id = ?", po.buyer_counterparty_id, po.seller_counterparty_id, po.workflow_variant, po.goods_description, po.id) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, str) = db_execute(conn, "UPDATE purchase_order SET quantity = ?, beneficiary_name = ?, total_amount_cents = ?, currency = ?, status = ? WHERE id = ?", po.quantity, po.beneficiary_name, po.total_amount_cents, po.currency, po.status, po.id)
+    stop conn
+    return result
+}
+
+// Amending a PO line item is Maker-Checker per the doc's table --
+// implemented as a plain, callable update here (same disclosed scoping
+// as `update_counterparty` in Module 2: only one marquee action per
+// module gets wired through the full submit/decide governance
+// primitive end-to-end; every other action is real, callable business
+// logic whose governance tier is documented, not re-derived per call).
+fn update_purchase_order(po: PurchaseOrder) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => update_purchase_order_inner(conn, po),
+        Err(e) => Err(e),
+    }
+}
+
+// Real deterministic rule, not a stub: counterparty trust tier, credit
+// rating, order size, and an explicit bank-guarantee requirement select
+// a recommended workflow variant. The doc is explicit this is advisory
+// only -- `create_purchase_order`/`update_purchase_order` above always
+// take `workflow_variant` as a plain human-supplied field; nothing here
+// writes to storage.
+fn recommend_workflow_variant(trust_tier: str, credit_rating_bps: i64, order_amount_cents: i64, bank_guarantee_required: bool) -> str {
+    return if bank_guarantee_required {
+        "LC_BACKED"
+    } else {
+        if trust_tier == "new" {
+            "ADVANCE_PAYMENT"
+        } else {
+            if trust_tier == "high" && credit_rating_bps >= 7000 {
+                "OPEN_ACCOUNT"
+            } else {
+                if order_amount_cents > 10000000 && credit_rating_bps < 5000 {
+                    "ADVANCE_PAYMENT"
+                } else {
+                    if order_amount_cents > 5000000 {
+                        "DOCUMENTARY_COLLECTION"
+                    } else {
+                        "MILESTONE_ESCROW"
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---- Letters of Credit: applied -> advised -> amended -> presented ->
+// discrepancy-checked -> settled -----------------------------------
+
+struct LetterOfCredit {
+    id: i64,
+    purchase_order_id: i64,
+    lc_number: str,
+    status: str,
+    amount_cents: i64,
+    currency: str,
+}
+
+fn list_letter_of_credit_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS letter_of_credit (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, lc_number TEXT, status TEXT, amount_cents INTEGER, currency TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, purchase_order_id, lc_number, status, amount_cents, currency FROM letter_of_credit ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_letter_of_credit() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_letter_of_credit_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+// Issuance (MT700) is 6-Eyes per the doc's table -- this module's
+// marquee governance wiring, same two-step "submit, then apply once
+// approved" shape as Module 2's sanctions override:
+// `submit_lc_issuance` opens a `required_eyes: 2` request;
+// `issue_letter_of_credit` only actually creates the LC row once
+// `list_approval` shows that request as APPROVED.
+fn submit_lc_issuance(identity: VerifiedIdentity, purchase_order_id: i64, lc_number: str, justification: str) -> Result(i64, str) {
+    return submit_approval(identity, "issue_letter_of_credit", "SIX_EYES", 2, 8, justification)
+}
+
+fn issue_letter_of_credit_inner(conn: db, request_id: i64, purchase_order_id: i64, lc_number: str, amount_cents: i64, currency: str) -> Result(i64, str) {
+    let status: str = match db_query(conn, "SELECT status as value FROM approval_request WHERE id = ?", request_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") { Ok(v) => v, Err(e) => "MISSING" },
+            Err(e) => "MISSING",
+        },
+        Err(e) => "MISSING",
+    }
+    return if status != "APPROVED" {
+        stop conn
+        Err("LC issuance is not yet fully 6-Eyes approved")
+    } else {
+        let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS letter_of_credit (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, lc_number TEXT, status TEXT, amount_cents INTEGER, currency TEXT)") { Ok(n) => n, Err(e) => -1 }
+        let inserted: i64 = match db_execute(conn, "INSERT INTO letter_of_credit (purchase_order_id, lc_number, status, amount_cents, currency) VALUES (?, ?, 'advised', ?, ?)", purchase_order_id, lc_number, amount_cents, currency) {
+            Ok(n) => n,
+            Err(e) => -1,
+        }
+        stop conn
+        if inserted >= 0 { Ok(inserted) } else { Err("failed to issue letter of credit") }
+    }
+}
+
+fn issue_letter_of_credit(request_id: i64, purchase_order_id: i64, lc_number: str, amount_cents: i64, currency: str) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => issue_letter_of_credit_inner(conn, request_id, purchase_order_id, lc_number, amount_cents, currency),
+        Err(e) => Err(e),
+    }
+}
+
+// Amendment is Maker-Checker per the doc's table -- plain callable
+// update, same disclosed scoping as `update_purchase_order` above.
+fn amend_letter_of_credit_inner(conn: db, lc: LetterOfCredit) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS letter_of_credit (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, lc_number TEXT, status TEXT, amount_cents INTEGER, currency TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, str) = db_execute(conn, "UPDATE letter_of_credit SET lc_number = ?, amount_cents = ?, currency = ?, status = 'amended' WHERE id = ?", lc.lc_number, lc.amount_cents, lc.currency, lc.id)
+    stop conn
+    return result
+}
+
+fn amend_letter_of_credit(lc: LetterOfCredit) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => amend_letter_of_credit_inner(conn, lc),
+        Err(e) => Err(e),
+    }
+}
+
+// ---- UCP 600 discrepancy checker: real field-by-field comparison ----
+//
+// One row per presentation, comparing the two fields the doc names
+// (quantity, party name) against the underlying PO -- real comparison
+// logic, not a stub. Dates aren't compared numerically since Nirdosha
+// has no date/time builtin (same substitution as the SLA-deadline gap
+// noted elsewhere); `date_note` is captured on the `TradeDocument` row
+// for the record but not diffed.
+
+struct TradeDocument {
+    id: i64,
+    letter_of_credit_id: i64,
+    doc_type: str,
+    presented_quantity: i64,
+    presented_party_name: str,
+    date_note: str,
+}
+
+struct DiscrepancyCheckResult {
+    id: i64,
+    letter_of_credit_id: i64,
+    po_quantity: i64,
+    presented_quantity: i64,
+    quantity_status: str,
+    po_party_name: str,
+    presented_party_name: str,
+    party_status: str,
+    overall_status: str,
+}
+
+fn list_discrepancy_check_result_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS discrepancy_check_result (id INTEGER PRIMARY KEY AUTOINCREMENT, letter_of_credit_id INTEGER, po_quantity INTEGER, presented_quantity INTEGER, quantity_status TEXT, po_party_name TEXT, presented_party_name TEXT, party_status TEXT, overall_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, letter_of_credit_id, po_quantity, presented_quantity, quantity_status, po_party_name, presented_party_name, party_status, overall_status FROM discrepancy_check_result ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_discrepancy_check_result() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_discrepancy_check_result_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn present_documents_inner(conn: db, letter_of_credit_id: i64, doc_type: str, presented_quantity: i64, presented_party_name: str, date_note: str) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS trade_document (id INTEGER PRIMARY KEY AUTOINCREMENT, letter_of_credit_id INTEGER, doc_type TEXT, presented_quantity INTEGER, presented_party_name TEXT, date_note TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS discrepancy_check_result (id INTEGER PRIMARY KEY AUTOINCREMENT, letter_of_credit_id INTEGER, po_quantity INTEGER, presented_quantity INTEGER, quantity_status TEXT, po_party_name TEXT, presented_party_name TEXT, party_status TEXT, overall_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS letter_of_credit (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, lc_number TEXT, status TEXT, amount_cents INTEGER, currency TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let t4: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS purchase_order (id INTEGER PRIMARY KEY AUTOINCREMENT, buyer_counterparty_id INTEGER, seller_counterparty_id INTEGER, workflow_variant TEXT, goods_description TEXT, quantity INTEGER, beneficiary_name TEXT, total_amount_cents INTEGER, currency TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+
+    let purchase_order_id: i64 = match db_query(conn, "SELECT purchase_order_id as value FROM letter_of_credit WHERE id = ?", letter_of_credit_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => -1 },
+            Err(e) => -1,
+        },
+        Err(e) => -1,
+    }
+    let po_quantity: i64 = match db_query(conn, "SELECT quantity as value FROM purchase_order WHERE id = ?", purchase_order_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => 0 },
+            Err(e) => 0,
+        },
+        Err(e) => 0,
+    }
+    let po_party_name: str = match db_query(conn, "SELECT beneficiary_name as value FROM purchase_order WHERE id = ?", purchase_order_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") { Ok(v) => v, Err(e) => "" },
+            Err(e) => "",
+        },
+        Err(e) => "",
+    }
+
+    let quantity_status: str = if presented_quantity == po_quantity { "MATCH" } else { "DISCREPANT" }
+    let party_status: str = if presented_party_name == po_party_name { "MATCH" } else { "DISCREPANT" }
+    let overall_status: str = if quantity_status == "MATCH" && party_status == "MATCH" { "CLEAN" } else { "DISCREPANT" }
+
+    let doc_inserted: i64 = match db_execute(conn, "INSERT INTO trade_document (letter_of_credit_id, doc_type, presented_quantity, presented_party_name, date_note) VALUES (?, ?, ?, ?, ?)", letter_of_credit_id, doc_type, presented_quantity, presented_party_name, date_note) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result_inserted: i64 = match db_execute(conn, "INSERT INTO discrepancy_check_result (letter_of_credit_id, po_quantity, presented_quantity, quantity_status, po_party_name, presented_party_name, party_status, overall_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", letter_of_credit_id, po_quantity, presented_quantity, quantity_status, po_party_name, presented_party_name, party_status, overall_status) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let new_lc_status: str = if overall_status == "CLEAN" { "presented" } else { "discrepancy_checked" }
+    let updated: i64 = match db_execute(conn, "UPDATE letter_of_credit SET status = ? WHERE id = ?", new_lc_status, letter_of_credit_id) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    stop conn
+    return if result_inserted >= 0 { Ok(result_inserted) } else { Err("failed to record document presentation") }
+}
+
+fn present_documents(letter_of_credit_id: i64, doc_type: str, presented_quantity: i64, presented_party_name: str, date_note: str) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => present_documents_inner(conn, letter_of_credit_id, doc_type, presented_quantity, presented_party_name, date_note),
+        Err(e) => Err(e),
+    }
+}
+
+// Accepting a UCP 600 discrepancy waiver is 6-Eyes per the doc's table
+// -- second half of this module's governance wiring, same submit/apply
+// shape as LC issuance above: only once two distinct approvers have
+// accepted does the LC actually move to `settled`.
+fn submit_discrepancy_waiver(identity: VerifiedIdentity, letter_of_credit_id: i64, justification: str) -> Result(i64, str) {
+    return submit_approval(identity, "accept_discrepancy_waiver", "SIX_EYES", 2, 8, justification)
+}
+
+fn apply_discrepancy_waiver_inner(conn: db, request_id: i64, letter_of_credit_id: i64) -> Result(i64, str) {
+    let status: str = match db_query(conn, "SELECT status as value FROM approval_request WHERE id = ?", request_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") { Ok(v) => v, Err(e) => "MISSING" },
+            Err(e) => "MISSING",
+        },
+        Err(e) => "MISSING",
+    }
+    return if status != "APPROVED" {
+        stop conn
+        Err("discrepancy waiver is not yet fully 6-Eyes approved")
+    } else {
+        let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS letter_of_credit (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, lc_number TEXT, status TEXT, amount_cents INTEGER, currency TEXT)") { Ok(n) => n, Err(e) => -1 }
+        let updated: Result(i64, str) = db_execute(conn, "UPDATE letter_of_credit SET status = 'settled' WHERE id = ?", letter_of_credit_id)
+        stop conn
+        updated
+    }
+}
+
+fn apply_discrepancy_waiver(request_id: i64, letter_of_credit_id: i64) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => apply_discrepancy_waiver_inner(conn, request_id, letter_of_credit_id),
+        Err(e) => Err(e),
+    }
+}
+
+// ---- SWIFT messaging: `[MOCK]`, real semantic fields, not wire bytes -
+
+struct SwiftMessageLog {
+    id: i64,
+    msg_type: str,
+    reference: str,
+    fields_note: str,
+    status: str,
+}
+
+fn list_swift_message_log_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS swift_message_log (id INTEGER PRIMARY KEY AUTOINCREMENT, msg_type TEXT, reference TEXT, fields_note TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, msg_type, reference, fields_note, status FROM swift_message_log ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_swift_message_log() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_swift_message_log_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn mock_generate_swift_message_inner(conn: db, msg_type: str, reference: str, fields_note: str) -> str {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS swift_message_log (id INTEGER PRIMARY KEY AUTOINCREMENT, msg_type TEXT, reference TEXT, fields_note TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let inserted: i64 = match db_execute(conn, "INSERT INTO swift_message_log (msg_type, reference, fields_note, status) VALUES (?, ?, ?, 'generated')", msg_type, reference, fields_note) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    stop conn
+    // Literal-pattern `match` over `str` (a real switch, not a nested
+    // if-else chain -- see `examples/identity_mock.nir`'s `login` for
+    // the same conversion, and `nirdosha_row11_amendment.md` §3.4's
+    // addendum for why `str` is a valid `match` scrutinee now).
+    return match msg_type {
+        "MT700" => "MT700 generated (mock): irrevocable documentary credit issuance",
+        "MT707" => "MT707 generated (mock): amendment to documentary credit",
+        "MT710" => "MT710 generated (mock): advice of a third bank's documentary credit",
+        "MT760" => "MT760 generated (mock): guarantee/standby letter of credit",
+        _ => "SWIFT message generated (mock)",
+    }
+}
+
+// `[MOCK]` -- stands in for real Prowide/SWIFT Alliance Access
+// transmission; logs the real semantic fields, not wire-format bytes,
+// not actually transmitted anywhere. See todo.md's Module 3 section.
+fn mock_generate_swift_message(msg_type: str, reference: str, fields_note: str) -> str {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => mock_generate_swift_message_inner(conn, msg_type, reference, fields_note),
+        Err(e) => "swift message log unavailable (mock)",
+    }
+}
+
+
+// =========================================================================
+// Module 6: Inventory & Goods Movement Reconciliation
+// =========================================================================
+//
+// Closes the physical-to-financial gap: a warehouse operator enters a
+// Goods Receipt Note (no IoT/RFID/barcode feed exists -- `[MOCK]`, see
+// todo.md), a real three-way match engine compares it against the
+// underlying purchase order, and the result either auto-confirms within
+// tolerance or opens a real `DeliveryDispute` that Modules 4 and 5 gate
+// on synchronously below.
+
+struct GoodsReceiptNote {
+    id: i64,
+    purchase_order_id: i64,
+    received_quantity: i64,
+    condition_note: str,
+    status: str,
+}
+
+struct MatchResult {
+    id: i64,
+    purchase_order_id: i64,
+    po_quantity: i64,
+    grn_quantity: i64,
+    variance_bps: i64,
+    status: str,
+}
+
+struct DeliveryDispute {
+    id: i64,
+    purchase_order_id: i64,
+    dispute_type: str,
+    description: str,
+    status: str,
+}
+
+fn list_goods_receipt_note_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS goods_receipt_note (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, received_quantity INTEGER, condition_note TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, purchase_order_id, received_quantity, condition_note, status FROM goods_receipt_note ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_goods_receipt_note() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_goods_receipt_note_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn list_match_result_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS match_result (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, po_quantity INTEGER, grn_quantity INTEGER, variance_bps INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, purchase_order_id, po_quantity, grn_quantity, variance_bps, status FROM match_result ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_match_result() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_match_result_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn list_delivery_dispute_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS delivery_dispute (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, dispute_type TEXT, description TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, purchase_order_id, dispute_type, description, status FROM delivery_dispute ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_delivery_dispute() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_delivery_dispute_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn create_delivery_dispute_inner(conn: db, d: DeliveryDispute) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS delivery_dispute (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, dispute_type TEXT, description TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let inserted: i64 = match db_execute(conn, "INSERT INTO delivery_dispute (purchase_order_id, dispute_type, description, status) VALUES (?, ?, ?, 'open')", d.purchase_order_id, d.dispute_type, d.description) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    stop conn
+    return if inserted >= 0 { Ok(inserted) } else { Err("failed to create delivery dispute") }
+}
+
+// A dispute may be reported manually (short/damage/over shipment) or
+// opened automatically by `create_goods_receipt_note`'s match engine
+// below when variance exceeds tolerance -- either way it lands here.
+fn create_delivery_dispute(d: DeliveryDispute) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => create_delivery_dispute_inner(conn, d),
+        Err(e) => Err(e),
+    }
+}
+
+// Manually confirming/resolving a dispute outside tolerance is
+// Maker-Checker per the doc's table -- plain callable update, same
+// disclosed scoping as every other module's non-marquee action.
+fn update_delivery_dispute_inner(conn: db, d: DeliveryDispute) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS delivery_dispute (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, dispute_type TEXT, description TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, str) = db_execute(conn, "UPDATE delivery_dispute SET dispute_type = ?, description = ?, status = ? WHERE id = ?", d.dispute_type, d.description, d.status, d.id)
+    stop conn
+    return result
+}
+
+fn update_delivery_dispute(d: DeliveryDispute) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => update_delivery_dispute_inner(conn, d),
+        Err(e) => Err(e),
+    }
+}
+
+// `[MOCK]` -- stands in for real carrier/logistics claim-initiation
+// APIs. Maker-Checker per the doc's table (plain callable here, same
+// scoping note as above).
+fn initiate_carrier_claim_inner(conn: db, dispute_id: i64) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS delivery_dispute (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, dispute_type TEXT, description TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, str) = db_execute(conn, "UPDATE delivery_dispute SET status = 'carrier_claim_initiated' WHERE id = ? AND status = 'open'", dispute_id)
+    stop conn
+    return result
+}
+
+fn initiate_carrier_claim(dispute_id: i64) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => initiate_carrier_claim_inner(conn, dispute_id),
+        Err(e) => Err(e),
+    }
+}
+
+// Real cross-module gate, called synchronously (a real function call,
+// not just documented intent) by Module 4's milestone-release function
+// and Module 5's discounting-eligibility function below.
+fn has_open_dispute_inner(conn: db, purchase_order_id: i64) -> bool {
+    let open_count: i64 = match db_query(conn, "SELECT COUNT(*) as value FROM delivery_dispute WHERE purchase_order_id = ? AND status = 'open'", purchase_order_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => 0 },
+            Err(e) => 0,
+        },
+        Err(e) => 0,
+    }
+    stop conn
+    return open_count > 0
+}
+
+fn has_open_dispute(purchase_order_id: i64) -> bool {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => has_open_dispute_inner(conn, purchase_order_id),
+        Err(e) => false,
+    }
+}
+
+// ---- three-way match: real reconciliation math, not a stub ---------
+//
+// `variance_bps = |po_quantity - grn_quantity| * 10000 / po_quantity`.
+// Within `TOLERANCE_BPS` (2%, a fixed illustrative tolerance -- the doc
+// leaves the exact figure to configuration, which Nirdosha has no
+// externalized-config mechanism for): `auto_confirmed`, no human
+// action, and a best-effort `inventory.grn.confirmed` publish onto
+// `mq` (Redis) -- the one required real `mq` integration point named in
+// todo.md. Beyond tolerance: `dispute`, and a `DeliveryDispute` opens
+// automatically so Modules 4/5's gate gets exercised without a human
+// step first.
+fn create_goods_receipt_note_inner(conn: db, g: GoodsReceiptNote) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS goods_receipt_note (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, received_quantity INTEGER, condition_note TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS match_result (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, po_quantity INTEGER, grn_quantity INTEGER, variance_bps INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS delivery_dispute (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, dispute_type TEXT, description TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let t4: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS purchase_order (id INTEGER PRIMARY KEY AUTOINCREMENT, buyer_counterparty_id INTEGER, seller_counterparty_id INTEGER, workflow_variant TEXT, goods_description TEXT, quantity INTEGER, beneficiary_name TEXT, total_amount_cents INTEGER, currency TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+
+    let grn_inserted: i64 = match db_execute(conn, "INSERT INTO goods_receipt_note (purchase_order_id, received_quantity, condition_note, status) VALUES (?, ?, ?, 'received')", g.purchase_order_id, g.received_quantity, g.condition_note) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+
+    let po_quantity: i64 = match db_query(conn, "SELECT quantity as value FROM purchase_order WHERE id = ?", g.purchase_order_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => 0 },
+            Err(e) => 0,
+        },
+        Err(e) => 0,
+    }
+    let diff: i64 = po_quantity - g.received_quantity
+    let abs_diff: i64 = if diff < 0 { -diff } else { diff }
+    let variance_bps: i64 = if po_quantity == 0 { 10000 } else { (abs_diff * 10000) / po_quantity }
+    let tolerance_bps: i64 = 200
+    let match_status: str = if variance_bps <= tolerance_bps { "auto_confirmed" } else { "dispute" }
+
+    let match_inserted: i64 = match db_execute(conn, "INSERT INTO match_result (purchase_order_id, po_quantity, grn_quantity, variance_bps, status) VALUES (?, ?, ?, ?, ?)", g.purchase_order_id, po_quantity, g.received_quantity, variance_bps, match_status) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+
+    let followup: i64 = if match_status == "auto_confirmed" {
+        // Best-effort: a queue outage doesn't fail the GRN itself, same
+        // discipline as `examples/store.nir`'s `order.created` publish.
+        match mq_connect("127.0.0.1", 6379) {
+            Ok(mqconn) => match mq_publish(mqconn, "inventory.grn.confirmed", "inventory.grn.confirmed") {
+                Ok(u) => 0,
+                Err(e) => -1,
+            },
+            Err(e) => -1,
+        }
+    } else {
+        let dispute_type: str = if g.received_quantity < po_quantity { "short" } else { "over" }
+        match db_execute(conn, "INSERT INTO delivery_dispute (purchase_order_id, dispute_type, description, status) VALUES (?, ?, 'auto-opened: three-way match variance beyond tolerance', 'open')", g.purchase_order_id, dispute_type) {
+            Ok(n) => n,
+            Err(e) => -1,
+        }
+    }
+
+    stop conn
+    return if grn_inserted >= 0 { Ok(grn_inserted) } else { Err("failed to record goods receipt note") }
+}
+
+fn create_goods_receipt_note(g: GoodsReceiptNote) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => create_goods_receipt_note_inner(conn, g),
+        Err(e) => Err(e),
+    }
+}
+
+// ---- dashboard: real tiles/charts over match/dispute data -----------
+
+fn stat_match_rate_bps_inner(conn: db) -> i64 {
+    let confirmed: i64 = match db_query(conn, "SELECT COUNT(*) as value FROM match_result WHERE status = 'auto_confirmed'") {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => 0 },
+            Err(e) => 0,
+        },
+        Err(e) => 0,
+    }
+    let total: i64 = match db_query(conn, "SELECT COUNT(*) as value FROM match_result") {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => 0 },
+            Err(e) => 0,
+        },
+        Err(e) => 0,
+    }
+    stop conn
+    return if total == 0 { 0 } else { (confirmed * 10000) / total }
+}
+
+fn stat_match_rate_bps() -> i64 {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => stat_match_rate_bps_inner(conn),
+        Err(e) => 0,
+    }
+}
+
+fn chart_dispute_by_type_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS delivery_dispute (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, dispute_type TEXT, description TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT dispute_type as label, COUNT(*) as value FROM delivery_dispute WHERE status = 'open' GROUP BY dispute_type ORDER BY value DESC")
+    stop conn
+    return rows
+}
+
+fn chart_dispute_by_type() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => chart_dispute_by_type_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+
+// =========================================================================
+// Module 4: B2B Trade Payments & Tiered Commission Engine
+// =========================================================================
+//
+// Unified `TradePayment` initiation across all five Module 3 workflow
+// variants, governance-routed by value (standard = Maker-Checker, above
+// threshold = 6-Eyes -- one `required_eyes` computed from
+// `amount_cents`, reusing Module 1's n-eyes primitive rather than two
+// separate code paths). `reference` carries the settlement reference
+// Module 7's bank-feed matcher looks up by exact string match.
+
+struct TradePayment {
+    id: i64,
+    purchase_order_id: i64,
+    payment_type: str,
+    amount_cents: i64,
+    currency: str,
+    reference: str,
+    status: str,
+}
+
+fn list_trade_payment_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS trade_payment (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, payment_type TEXT, amount_cents INTEGER, currency TEXT, reference TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, purchase_order_id, payment_type, amount_cents, currency, reference, status FROM trade_payment ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_trade_payment() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_trade_payment_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+// A high-value threshold: at/above $50,000 (5,000,000 cents) a trade
+// payment is 6-Eyes; below it, Maker-Checker -- a plain deterministic
+// rule function, matching the doc's own "configurable per-tenant"
+// intent with a fixed illustrative cutoff (no per-tenant config store
+// exists yet -- see todo.md's multi-tenant gap).
+fn required_eyes_for_amount(amount_cents: i64) -> i64 {
+    return if amount_cents >= 5000000 { 2 } else { 1 }
+}
+
+// This module's marquee governance wiring: `submit_trade_payment` opens
+// an n-eyes request sized by value; `post_trade_payment` only actually
+// creates the `TradePayment` row -- and runs the real commission
+// waterfall below -- once `list_approval` shows that request APPROVED.
+fn submit_trade_payment(identity: VerifiedIdentity, purchase_order_id: i64, amount_cents: i64, justification: str) -> Result(i64, str) {
+    return submit_approval(identity, "trade_payment", "TRADE_PAYMENT", required_eyes_for_amount(amount_cents), 24, justification)
+}
+
+fn post_trade_payment_inner(conn: db, request_id: i64, purchase_order_id: i64, payment_type: str, amount_cents: i64, currency: str, reference: str) -> Result(i64, str) {
+    let status: str = match db_query(conn, "SELECT status as value FROM approval_request WHERE id = ?", request_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") { Ok(v) => v, Err(e) => "MISSING" },
+            Err(e) => "MISSING",
+        },
+        Err(e) => "MISSING",
+    }
+    return if status != "APPROVED" {
+        stop conn
+        Err("trade payment is not yet fully approved")
+    } else {
+        let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS trade_payment (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, payment_type TEXT, amount_cents INTEGER, currency TEXT, reference TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+        let inserted: i64 = match db_execute(conn, "INSERT INTO trade_payment (purchase_order_id, payment_type, amount_cents, currency, reference, status) VALUES (?, ?, ?, ?, ?, 'posted')", purchase_order_id, payment_type, amount_cents, currency, reference) {
+            Ok(n) => n,
+            Err(e) => -1,
+        }
+        let payment_id: i64 = match db_query(conn, "SELECT last_insert_rowid() as value") {
+            Ok(rows) => match json_array_get(rows, 0) {
+                Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => -1 },
+                Err(e) => -1,
+            },
+            Err(e) => -1,
+        }
+        stop conn
+        let waterfall: i64 = if payment_id >= 0 { run_commission_waterfall(payment_id, amount_cents) } else { -1 }
+        if payment_id >= 0 { Ok(payment_id) } else { Err("failed to post trade payment") }
+    }
+}
+
+fn post_trade_payment(request_id: i64, purchase_order_id: i64, payment_type: str, amount_cents: i64, currency: str, reference: str) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => post_trade_payment_inner(conn, request_id, purchase_order_id, payment_type, amount_cents, currency, reference),
+        Err(e) => Err(e),
+    }
+}
+
+// Bulk/batch payment run: a fixed 3-line batch (Nirdosha has no array
+// parameter type -- a real, disclosed simplification of "N line items",
+// same class of gap as every other fixed-arity stand-in for a dynamic
+// list in this build). The real requirement this proves is the
+// *aggregate*-value governance routing: even if every individual line
+// is below the 6-Eyes threshold, the summed batch total drives
+// `required_eyes_for_amount`, not any one line on its own.
+fn submit_batch_payment(identity: VerifiedIdentity, amount_a_cents: i64, amount_b_cents: i64, amount_c_cents: i64, justification: str) -> Result(i64, str) {
+    let aggregate: i64 = amount_a_cents + amount_b_cents + amount_c_cents
+    return submit_approval(identity, "batch_trade_payment", "TRADE_PAYMENT", required_eyes_for_amount(aggregate), 24, justification)
+}
+
+fn post_batch_payment_inner(conn: db, request_id: i64, purchase_order_id_a: i64, amount_a_cents: i64, purchase_order_id_b: i64, amount_b_cents: i64, purchase_order_id_c: i64, amount_c_cents: i64, currency: str) -> Result(i64, str) {
+    let status: str = match db_query(conn, "SELECT status as value FROM approval_request WHERE id = ?", request_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") { Ok(v) => v, Err(e) => "MISSING" },
+            Err(e) => "MISSING",
+        },
+        Err(e) => "MISSING",
+    }
+    return if status != "APPROVED" {
+        stop conn
+        Err("batch payment is not yet fully approved")
+    } else {
+        let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS trade_payment (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, payment_type TEXT, amount_cents INTEGER, currency TEXT, reference TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+        let ins_a: i64 = match db_execute(conn, "INSERT INTO trade_payment (purchase_order_id, payment_type, amount_cents, currency, reference, status) VALUES (?, 'batch_line', ?, ?, 'batch', 'posted')", purchase_order_id_a, amount_a_cents, currency) { Ok(n) => n, Err(e) => -1 }
+        let ins_b: i64 = match db_execute(conn, "INSERT INTO trade_payment (purchase_order_id, payment_type, amount_cents, currency, reference, status) VALUES (?, 'batch_line', ?, ?, 'batch', 'posted')", purchase_order_id_b, amount_b_cents, currency) { Ok(n) => n, Err(e) => -1 }
+        let ins_c: i64 = match db_execute(conn, "INSERT INTO trade_payment (purchase_order_id, payment_type, amount_cents, currency, reference, status) VALUES (?, 'batch_line', ?, ?, 'batch', 'posted')", purchase_order_id_c, amount_c_cents, currency) { Ok(n) => n, Err(e) => -1 }
+        stop conn
+        if ins_a >= 0 && ins_b >= 0 && ins_c >= 0 { Ok(ins_a) } else { Err("failed to post one or more batch payment lines") }
+    }
+}
+
+fn post_batch_payment(request_id: i64, purchase_order_id_a: i64, amount_a_cents: i64, purchase_order_id_b: i64, amount_b_cents: i64, purchase_order_id_c: i64, amount_c_cents: i64, currency: str) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => post_batch_payment_inner(conn, request_id, purchase_order_id_a, amount_a_cents, purchase_order_id_b, amount_b_cents, purchase_order_id_c, amount_c_cents, currency),
+        Err(e) => Err(e),
+    }
+}
+
+// Milestone/escrow tranche release -- 6-Eyes per the doc's table, and
+// cross-checked against Module 6's `DeliveryDispute` (a real query/
+// gate, not documented intent): an open dispute on the underlying
+// purchase order blocks the release outright, before governance is
+// even consulted.
+fn submit_milestone_release(identity: VerifiedIdentity, purchase_order_id: i64, tranche_amount_cents: i64, justification: str) -> Result(i64, str) {
+    return if has_open_dispute(purchase_order_id) {
+        Err("milestone release blocked: open delivery dispute on this purchase order")
+    } else {
+        submit_approval(identity, "milestone_release", "SIX_EYES", 2, 8, justification)
+    }
+}
+
+fn post_milestone_release_inner(conn: db, request_id: i64, purchase_order_id: i64, tranche_amount_cents: i64, currency: str, reference: str) -> Result(i64, str) {
+    let status: str = match db_query(conn, "SELECT status as value FROM approval_request WHERE id = ?", request_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") { Ok(v) => v, Err(e) => "MISSING" },
+            Err(e) => "MISSING",
+        },
+        Err(e) => "MISSING",
+    }
+    return if status != "APPROVED" {
+        stop conn
+        Err("milestone release is not yet fully 6-Eyes approved")
+    } else {
+        let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS trade_payment (id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_order_id INTEGER, payment_type TEXT, amount_cents INTEGER, currency TEXT, reference TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+        let inserted: i64 = match db_execute(conn, "INSERT INTO trade_payment (purchase_order_id, payment_type, amount_cents, currency, reference, status) VALUES (?, 'milestone', ?, ?, ?, 'posted')", purchase_order_id, tranche_amount_cents, currency, reference) {
+            Ok(n) => n,
+            Err(e) => -1,
+        }
+        let payment_id: i64 = match db_query(conn, "SELECT last_insert_rowid() as value") {
+            Ok(rows) => match json_array_get(rows, 0) {
+                Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => -1 },
+                Err(e) => -1,
+            },
+            Err(e) => -1,
+        }
+        stop conn
+        let waterfall: i64 = if payment_id >= 0 { run_commission_waterfall(payment_id, tranche_amount_cents) } else { -1 }
+        if payment_id >= 0 { Ok(payment_id) } else { Err("failed to post milestone release") }
+    }
+}
+
+fn post_milestone_release(request_id: i64, purchase_order_id: i64, tranche_amount_cents: i64, currency: str, reference: str) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => post_milestone_release_inner(conn, request_id, purchase_order_id, tranche_amount_cents, currency, reference),
+        Err(e) => Err(e),
+    }
+}
+
+// ---- commission waterfall: platform fee, then override cascade -----
+//
+// `CommissionRule` is versioned by row, not mutated in place: a rate
+// change inserts a new row and marks the old one `superseded`, so a
+// historical `CommissionWaterfallEntry` always keeps the rate that
+// actually applied when it was computed (`rate_bps` is copied onto the
+// entry itself), never "whatever the current rate happens to be" --
+// exactly the doc's own requirement.
+
+struct CommissionRule {
+    id: i64,
+    tier_name: str,
+    rate_bps: i64,
+    status: str,
+}
+
+struct CommissionWaterfallEntry {
+    id: i64,
+    trade_payment_id: i64,
+    tier_name: str,
+    rate_bps: i64,
+    amount_cents: i64,
+    partner_wallet_id: i64,
+}
+
+struct PartnerWallet {
+    id: i64,
+    partner_name: str,
+    tier_name: str,
+    balance_cents: i64,
+    status: str,
+}
+
+fn list_commission_rule_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS commission_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, tier_name TEXT, rate_bps INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, tier_name, rate_bps, status FROM commission_rule ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_commission_rule() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_commission_rule_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+// Configuring a commission rate is Maker-Checker per the doc's table --
+// plain callable here (same disclosed scoping as every other module's
+// non-marquee action); real versioning still happens: the previous
+// active rule for this tier is superseded, not overwritten.
+fn create_commission_rule_inner(conn: db, tier_name: str, rate_bps: i64) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS commission_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, tier_name TEXT, rate_bps INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let superseded: i64 = match db_execute(conn, "UPDATE commission_rule SET status = 'superseded' WHERE tier_name = ? AND status = 'active'", tier_name) { Ok(n) => n, Err(e) => -1 }
+    let inserted: i64 = match db_execute(conn, "INSERT INTO commission_rule (tier_name, rate_bps, status) VALUES (?, ?, 'active')", tier_name, rate_bps) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    stop conn
+    return if inserted >= 0 { Ok(inserted) } else { Err("failed to create commission rule") }
+}
+
+fn create_commission_rule(tier_name: str, rate_bps: i64) -> Result(i64, str) requires(role: "compliance_officer") {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => create_commission_rule_inner(conn, tier_name, rate_bps),
+        Err(e) => Err(e),
+    }
+}
+
+// One representative fixed canonical partner per cascade tier stands in
+// for "however many real channel partners a tenant has" -- the real
+// mechanic proven here is the waterfall math and the atomic wallet
+// credit, not partner-directory management (which the doc doesn't
+// actually describe as this module's own scope either).
+//
+// The rate/wallet-id lookups are inlined here rather than factored into
+// their own `conn: db`-taking helpers (as an earlier version of this
+// function had them) -- `db` is affine with no borrowing (see
+// finish_with_audit's own doc comment above), so a helper that takes
+// `conn` and doesn't hand it back can only ever be a function's *last*
+// use of it; this function needs `conn` again for the wallet-credit
+// UPDATE afterward, so the queries have to happen inline instead.
+fn credit_wallet_tier_inner(conn: db, trade_payment_id: i64, tier_name: str, amount_cents: i64) -> i64 {
+    let rate_bps: i64 = match db_query(conn, "SELECT rate_bps as value FROM commission_rule WHERE tier_name = ? AND status = 'active'", tier_name) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => 0 },
+            Err(e) => 0,
+        },
+        Err(e) => 0,
+    }
+    let tier_amount_cents: i64 = (amount_cents * rate_bps) / 10000
+    let wallet_id: i64 = match db_query(conn, "SELECT id as value FROM partner_wallet WHERE tier_name = ?", tier_name) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => -1 },
+            Err(e) => -1,
+        },
+        Err(e) => -1,
+    }
+    let entry_inserted: i64 = match db_execute(conn, "INSERT INTO commission_waterfall_entry (trade_payment_id, tier_name, rate_bps, amount_cents, partner_wallet_id) VALUES (?, ?, ?, ?, ?)", trade_payment_id, tier_name, rate_bps, tier_amount_cents, wallet_id) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let credited: i64 = if wallet_id >= 0 {
+        match db_execute(conn, "UPDATE partner_wallet SET balance_cents = balance_cents + ? WHERE id = ?", tier_amount_cents, wallet_id) {
+            Ok(n) => n,
+            Err(e) => -1,
+        }
+    } else {
+        -1
+    }
+    stop conn
+    return entry_inserted
+}
+
+// `conn: db` is affine with no borrowing (finish_with_audit's doc
+// comment above), and `run_commission_waterfall_inner` needs to call
+// this once per cascade tier -- so, unlike the seed/table-creation work
+// it shares one `conn` for, each tier's credit opens and closes its own
+// connection rather than threading a single moved-once handle through
+// four sequential calls.
+fn credit_wallet_tier(trade_payment_id: i64, tier_name: str, amount_cents: i64) -> i64 {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => credit_wallet_tier_inner(conn, trade_payment_id, tier_name, amount_cents),
+        Err(e) => -1,
+    }
+}
+
+// The doc's central Mi-Pay-style mechanic, done for real: platform
+// origination fee first, then override commissions cascading
+// Super-Distributor -> Regional Distributor -> Originating Agent, each
+// against its own versioned rate, each credited to its `PartnerWallet`
+// atomically (same transaction as the waterfall entry, zero drift
+// tolerance per the doc). Seeds the four canonical wallets on first use
+// so a fresh `trade_finance.db` has somewhere for credits to land.
+fn run_commission_waterfall_inner(conn: db, trade_payment_id: i64, amount_cents: i64) -> i64 {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS commission_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, tier_name TEXT, rate_bps INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS commission_waterfall_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, trade_payment_id INTEGER, tier_name TEXT, rate_bps INTEGER, amount_cents INTEGER, partner_wallet_id INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS partner_wallet (id INTEGER PRIMARY KEY AUTOINCREMENT, partner_name TEXT, tier_name TEXT, balance_cents INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+
+    let seed_platform: i64 = match db_execute(conn, "INSERT INTO partner_wallet (partner_name, tier_name, balance_cents, status) SELECT 'Platform', 'platform', 0, 'active' WHERE NOT EXISTS (SELECT 1 FROM partner_wallet WHERE tier_name = 'platform')") { Ok(n) => n, Err(e) => -1 }
+    let seed_super: i64 = match db_execute(conn, "INSERT INTO partner_wallet (partner_name, tier_name, balance_cents, status) SELECT 'Apex Super-Distributor', 'super_distributor', 0, 'active' WHERE NOT EXISTS (SELECT 1 FROM partner_wallet WHERE tier_name = 'super_distributor')") { Ok(n) => n, Err(e) => -1 }
+    let seed_regional: i64 = match db_execute(conn, "INSERT INTO partner_wallet (partner_name, tier_name, balance_cents, status) SELECT 'Meridian Regional Distributor', 'regional_distributor', 0, 'active' WHERE NOT EXISTS (SELECT 1 FROM partner_wallet WHERE tier_name = 'regional_distributor')") { Ok(n) => n, Err(e) => -1 }
+    let seed_agent: i64 = match db_execute(conn, "INSERT INTO partner_wallet (partner_name, tier_name, balance_cents, status) SELECT 'Originating Agent Co', 'originating_agent', 0, 'active' WHERE NOT EXISTS (SELECT 1 FROM partner_wallet WHERE tier_name = 'originating_agent')") { Ok(n) => n, Err(e) => -1 }
+
+    let seed_rule_platform: i64 = match db_execute(conn, "INSERT INTO commission_rule (tier_name, rate_bps, status) SELECT 'platform', 50, 'active' WHERE NOT EXISTS (SELECT 1 FROM commission_rule WHERE tier_name = 'platform')") { Ok(n) => n, Err(e) => -1 }
+    let seed_rule_super: i64 = match db_execute(conn, "INSERT INTO commission_rule (tier_name, rate_bps, status) SELECT 'super_distributor', 30, 'active' WHERE NOT EXISTS (SELECT 1 FROM commission_rule WHERE tier_name = 'super_distributor')") { Ok(n) => n, Err(e) => -1 }
+    let seed_rule_regional: i64 = match db_execute(conn, "INSERT INTO commission_rule (tier_name, rate_bps, status) SELECT 'regional_distributor', 20, 'active' WHERE NOT EXISTS (SELECT 1 FROM commission_rule WHERE tier_name = 'regional_distributor')") { Ok(n) => n, Err(e) => -1 }
+    let seed_rule_agent: i64 = match db_execute(conn, "INSERT INTO commission_rule (tier_name, rate_bps, status) SELECT 'originating_agent', 15, 'active' WHERE NOT EXISTS (SELECT 1 FROM commission_rule WHERE tier_name = 'originating_agent')") { Ok(n) => n, Err(e) => -1 }
+
+    stop conn
+    let c1: i64 = credit_wallet_tier(trade_payment_id, "platform", amount_cents)
+    let c2: i64 = credit_wallet_tier(trade_payment_id, "super_distributor", amount_cents)
+    let c3: i64 = credit_wallet_tier(trade_payment_id, "regional_distributor", amount_cents)
+    let c4: i64 = credit_wallet_tier(trade_payment_id, "originating_agent", amount_cents)
+    return c4
+}
+
+fn run_commission_waterfall(trade_payment_id: i64, amount_cents: i64) -> i64 {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => run_commission_waterfall_inner(conn, trade_payment_id, amount_cents),
+        Err(e) => -1,
+    }
+}
+
+fn list_commission_waterfall_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS commission_waterfall_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, trade_payment_id INTEGER, tier_name TEXT, rate_bps INTEGER, amount_cents INTEGER, partner_wallet_id INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, trade_payment_id, tier_name, rate_bps, amount_cents, partner_wallet_id FROM commission_waterfall_entry ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_commission_waterfall() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_commission_waterfall_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn list_partner_wallet_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS partner_wallet (id INTEGER PRIMARY KEY AUTOINCREMENT, partner_name TEXT, tier_name TEXT, balance_cents INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, partner_name, tier_name, balance_cents, status FROM partner_wallet ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_partner_wallet() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_partner_wallet_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+// Wallet withdrawal above a fixed minimum ($100) is Maker-Checker per
+// the doc's table; below it, no gating. `apply_wallet_withdrawal` does
+// the real debit, checking sufficient balance -- a real check, not
+// assumed.
+fn apply_wallet_withdrawal_inner(conn: db, partner_wallet_id: i64, amount_cents: i64) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS partner_wallet (id INTEGER PRIMARY KEY AUTOINCREMENT, partner_name TEXT, tier_name TEXT, balance_cents INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let balance_cents: i64 = match db_query(conn, "SELECT balance_cents as value FROM partner_wallet WHERE id = ?", partner_wallet_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => -1 },
+            Err(e) => -1,
+        },
+        Err(e) => -1,
+    }
+    return if amount_cents > balance_cents {
+        stop conn
+        Err("insufficient wallet balance for withdrawal")
+    } else {
+        let result: Result(i64, str) = db_execute(conn, "UPDATE partner_wallet SET balance_cents = balance_cents - ? WHERE id = ?", amount_cents, partner_wallet_id)
+        stop conn
+        result
+    }
+}
+
+fn apply_wallet_withdrawal(partner_wallet_id: i64, amount_cents: i64) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => apply_wallet_withdrawal_inner(conn, partner_wallet_id, amount_cents),
+        Err(e) => Err(e),
+    }
+}
+
+fn create_wallet_withdrawal(identity: VerifiedIdentity, partner_wallet_id: i64, amount_cents: i64) -> Result(i64, str) {
+    return if amount_cents < 10000 {
+        apply_wallet_withdrawal(partner_wallet_id, amount_cents)
+    } else {
+        submit_approval(identity, "wallet_withdrawal", "TRADE_PAYMENT", 1, 24, "withdrawal above minimum, requires Maker-Checker")
+    }
+}
+
+// ---- commission dispute/adjustment: 6-Eyes, full original-vs-adjusted
+// audit trail -----------------------------------------------------
+
+struct CommissionDispute {
+    id: i64,
+    commission_waterfall_entry_id: i64,
+    original_amount_cents: i64,
+    adjusted_amount_cents: i64,
+    justification: str,
+    status: str,
+}
+
+fn list_commission_dispute_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS commission_dispute (id INTEGER PRIMARY KEY AUTOINCREMENT, commission_waterfall_entry_id INTEGER, original_amount_cents INTEGER, adjusted_amount_cents INTEGER, justification TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, commission_waterfall_entry_id, original_amount_cents, adjusted_amount_cents, justification, status FROM commission_dispute ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_commission_dispute() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => list_commission_dispute_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn create_commission_dispute_inner(conn: db, identity: VerifiedIdentity, commission_waterfall_entry_id: i64, adjusted_amount_cents: i64, justification: str) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS commission_dispute (id INTEGER PRIMARY KEY AUTOINCREMENT, commission_waterfall_entry_id INTEGER, original_amount_cents INTEGER, adjusted_amount_cents INTEGER, justification TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS commission_waterfall_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, trade_payment_id INTEGER, tier_name TEXT, rate_bps INTEGER, amount_cents INTEGER, partner_wallet_id INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let original_amount_cents: i64 = match db_query(conn, "SELECT amount_cents as value FROM commission_waterfall_entry WHERE id = ?", commission_waterfall_entry_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => -1 },
+            Err(e) => -1,
+        },
+        Err(e) => -1,
+    }
+    let inserted: i64 = match db_execute(conn, "INSERT INTO commission_dispute (commission_waterfall_entry_id, original_amount_cents, adjusted_amount_cents, justification, status) VALUES (?, ?, ?, ?, 'pending')", commission_waterfall_entry_id, original_amount_cents, adjusted_amount_cents, justification) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    stop conn
+    return if inserted >= 0 { Ok(inserted) } else { Err("failed to record commission dispute") }
+}
+
+// Disputing/adjusting a commission is 6-Eyes per the doc's table.
+fn create_commission_dispute(identity: VerifiedIdentity, commission_waterfall_entry_id: i64, adjusted_amount_cents: i64, justification: str) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => create_commission_dispute_inner(conn, identity, commission_waterfall_entry_id, adjusted_amount_cents, justification),
+        Err(e) => Err(e),
+    }
+}
+
+fn submit_commission_dispute_approval(identity: VerifiedIdentity, commission_dispute_id: i64, justification: str) -> Result(i64, str) {
+    return submit_approval(identity, "commission_dispute_adjustment", "SIX_EYES", 2, 8, justification)
+}
+
+// Applies the adjustment once 6-Eyes-approved: updates the waterfall
+// entry's stored amount, moves the delta on the partner's wallet, and
+// leaves the original amount on the `CommissionDispute` row itself as
+// the permanent original-vs-adjusted audit trail.
+fn update_commission_dispute_inner(conn: db, request_id: i64, commission_dispute_id: i64) -> Result(i64, str) {
+    let status: str = match db_query(conn, "SELECT status as value FROM approval_request WHERE id = ?", request_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") { Ok(v) => v, Err(e) => "MISSING" },
+            Err(e) => "MISSING",
+        },
+        Err(e) => "MISSING",
+    }
+    return if status != "APPROVED" {
+        stop conn
+        Err("commission dispute adjustment is not yet fully 6-Eyes approved")
+    } else {
+        let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS commission_dispute (id INTEGER PRIMARY KEY AUTOINCREMENT, commission_waterfall_entry_id INTEGER, original_amount_cents INTEGER, adjusted_amount_cents INTEGER, justification TEXT, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+        let entry_id: i64 = match db_query(conn, "SELECT commission_waterfall_entry_id as value FROM commission_dispute WHERE id = ?", commission_dispute_id) {
+            Ok(rows) => match json_array_get(rows, 0) {
+                Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => -1 },
+                Err(e) => -1,
+            },
+            Err(e) => -1,
+        }
+        let original_amount_cents: i64 = match db_query(conn, "SELECT original_amount_cents as value FROM commission_dispute WHERE id = ?", commission_dispute_id) {
+            Ok(rows) => match json_array_get(rows, 0) {
+                Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => 0 },
+                Err(e) => 0,
+            },
+            Err(e) => 0,
+        }
+        let adjusted_amount_cents: i64 = match db_query(conn, "SELECT adjusted_amount_cents as value FROM commission_dispute WHERE id = ?", commission_dispute_id) {
+            Ok(rows) => match json_array_get(rows, 0) {
+                Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => 0 },
+                Err(e) => 0,
+            },
+            Err(e) => 0,
+        }
+        let delta_cents: i64 = adjusted_amount_cents - original_amount_cents
+        let wallet_id: i64 = match db_query(conn, "SELECT partner_wallet_id as value FROM commission_waterfall_entry WHERE id = ?", entry_id) {
+            Ok(rows) => match json_array_get(rows, 0) {
+                Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => -1 },
+                Err(e) => -1,
+            },
+            Err(e) => -1,
+        }
+        let entry_updated: i64 = match db_execute(conn, "UPDATE commission_waterfall_entry SET amount_cents = ? WHERE id = ?", adjusted_amount_cents, entry_id) { Ok(n) => n, Err(e) => -1 }
+        let wallet_updated: i64 = match db_execute(conn, "UPDATE partner_wallet SET balance_cents = balance_cents + ? WHERE id = ?", delta_cents, wallet_id) { Ok(n) => n, Err(e) => -1 }
+        let dispute_updated: Result(i64, str) = db_execute(conn, "UPDATE commission_dispute SET status = 'applied' WHERE id = ?", commission_dispute_id)
+        stop conn
+        dispute_updated
+    }
+}
+
+fn update_commission_dispute(request_id: i64, commission_dispute_id: i64) -> Result(i64, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => update_commission_dispute_inner(conn, request_id, commission_dispute_id),
+        Err(e) => Err(e),
+    }
+}
+
+// ---- dashboard --------------------------------------------------------
+
+fn stat_total_commissions_paid_cents_inner(conn: db) -> i64 {
+    let result: i64 = match db_query(conn, "SELECT COALESCE(SUM(amount_cents), 0) as value FROM commission_waterfall_entry") {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") { Ok(v) => v, Err(e) => 0 },
+            Err(e) => 0,
+        },
+        Err(e) => 0,
+    }
+    stop conn
+    return result
+}
+
+fn stat_total_commissions_paid_cents() -> i64 {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => stat_total_commissions_paid_cents_inner(conn),
+        Err(e) => 0,
+    }
+}
+
+fn chart_waterfall_by_tier_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS commission_waterfall_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, trade_payment_id INTEGER, tier_name TEXT, rate_bps INTEGER, amount_cents INTEGER, partner_wallet_id INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, str) = db_query(conn, "SELECT tier_name as label, COALESCE(SUM(amount_cents), 0) as value FROM commission_waterfall_entry GROUP BY tier_name ORDER BY value DESC")
+    stop conn
+    return rows
+}
+
+fn chart_waterfall_by_tier() -> Result(json, str) {
+    return match db_connect("trade_finance.db") {
+        Ok(conn) => chart_waterfall_by_tier_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn main() {}

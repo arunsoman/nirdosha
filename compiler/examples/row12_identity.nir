@@ -1,0 +1,84 @@
+// Row 12: first-class functions & user identity as a relying party.
+//
+// This example demonstrates the corrected Row 12 model: Nirdosha validates
+// tokens issued by external IdPs (mock OIDC/JWT and API key), derives
+// authorization views from verified claims, manages application sessions
+// separately from identity, issues/consumes refresh tokens, and checks
+// revocation. The runtime never mints identity tokens; it only consumes
+// and validates them.
+
+fn handle_authorized(identity: VerifiedIdentity) -> str {
+    let session: ApplicationSession = create_application_session(identity)
+    let cookie: str = session_cookie(session)
+    print("session cookie:", cookie)
+    return match extract_claim(identity, "department") {
+        Ok(claim_view) => claim_view.value,
+        Err(e) => e,
+    }
+}
+
+fn handle_identity(identity: VerifiedIdentity) -> str {
+    if identity_expired(identity, 1800000000) {
+        return "token expired"
+    }
+    if check_revocation(identity) {
+        return "token revoked"
+    }
+    return match check_role(identity, "physician") {
+        Ok(role_view) => handle_authorized(identity),
+        Err(e) => e,
+    }
+}
+
+fn handle_fresh_identity(identity: VerifiedIdentity) -> str {
+    let refresh: RefreshTokenHandle = new_refresh_token(2000000000)
+    return match exchange_refresh_token(identity, refresh, 1700000000) {
+        Ok(refreshed_identity) => handle_identity(refreshed_identity),
+        Err(e) => e,
+    }
+}
+
+fn handle_oidc_login(token: str, issuer: str, audience: str, jwks: str) -> str {
+    return match oidc_validate_token(token, issuer, audience, jwks) {
+        Ok(identity) => handle_fresh_identity(identity),
+        Err(e) => e,
+    }
+}
+
+fn handle_api_key(api_key: str, expected_hash: str) -> str {
+    return match validate_api_key(api_key, expected_hash) {
+        Ok(identity) => handle_identity(identity),
+        Err(e) => e,
+    }
+}
+
+fn main() -> str {
+    // A mock OIDC ID token, signed by the JWKS below. The token encodes:
+    //   sub: alice
+    //   iss: https://example.com
+    //   aud: my-app
+    //   exp: 2000000000
+    //   iat: 1700000000
+    //   roles: ["physician"]
+    //   department: "cardiology"
+    let token: str = "eyJhbGciOiAiSFMyNTYiLCAia2lkIjogImtleTEifQ.eyJzdWIiOiAiYWxpY2UiLCAiaXNzIjogImh0dHBzOi8vZXhhbXBsZS5jb20iLCAiYXVkIjogIm15LWFwcCIsICJleHAiOiAyMDAwMDAwMDAwLCAiaWF0IjogMTcwMDAwMDAwMCwgInJvbGVzIjogWyJwaHlzaWNpYW4iXSwgImRlcGFydG1lbnQiOiAiY2FyZGlvbG9neSJ9.nrFdeqNDwXWLeGzud6X9Q4ITzCXULzZBBK8y51LGYXs"
+
+    // The IdP's verification keys. Nirdosha holds *verification* keys only,
+    // never signing keys.
+    let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
+
+    let issuer: str = "https://example.com"
+    let audience: str = "my-app"
+
+    print("--- OIDC path ---")
+    let oidc_result: str = handle_oidc_login(token, issuer, audience, jwks)
+    print("OIDC result:", oidc_result)
+
+    print("--- API key path ---")
+    let api_key: str = "my-secret-api-key"
+    let expected_hash: str = "325ededd6c3b9988f623c7f964abb9b016b76b0f8b3474df0f7d7c23b941381f"
+    let api_result: str = handle_api_key(api_key, expected_hash)
+    print("API key result:", api_result)
+
+    return "done"
+}

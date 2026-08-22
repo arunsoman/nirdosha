@@ -50,6 +50,9 @@ nirdosha emit-ast <file.nir>          # print the parsed AST as JSON
 | TCP connection | `tcp` | **yes** | A real TCP socket (client or accepted server side); `stop` closes it once. |
 | TCP listener | `tcp_listener` | **yes** | A real bound+listening TCP socket; `accept` doesn't consume it, `stop` does. |
 | File handle | `file` | **yes** | A real local file (`open(path, mode)`); `send`/`recv`/`stop` reused verbatim from `tcp` — see `PROTOLANG_PORT.md`. |
+| Verified identity | `VerifiedIdentity` | no | Row 12: result of validating an external IdP token. Freely copyable. Fields: `subject`, `issuer`, `audience`, `expires_at`, `issued_at`, `claims_json`. |
+| Role proof | `RoleView` | no | Row 12: proof that `check_role(identity, role)` succeeded. Field: `role`. |
+| Claim proof | `ClaimView` | no | Row 12: proof that `extract_claim(identity, name)` succeeded. Field: `value`. |
 | Vector | `Vector(T, N)` | no | Fixed-length dense 1-D array, `N` a compile-time literal. `Vector(f64, 3) ≠ Vector(f64, 4)` — different types. |
 | Matrix | `Matrix(T, R, C)` | no | Fixed-shape dense 2-D array, row-major, `R`/`C` compile-time literals. |
 
@@ -143,12 +146,20 @@ to write them with). All require `f64` elements unless noted.
 - `kf_predict_state(x, P, F, Q) -> Vector` / `kf_predict_cov(x, P, F, Q) -> Matrix` — linear Kalman filter predict step (split in two — no tuple/struct return type exists).
 - `kf_update_state(x, P, z, H, R) -> Vector` / `kf_update_cov(...) -> Matrix` — update step.
 
+**Identity / relying party** (Row 12)
+- `oidc_validate_token(token: str, expected_issuer: str, expected_audience: str, jwks_json: str) -> Result(VerifiedIdentity, str)` — validates a mock OIDC/JWT ID token against the supplied JWKS JSON (HMAC-SHA256). Checks issuer, audience, and signature. Returns a `VerifiedIdentity` on success. The runtime never mints tokens; it only consumes externally-issued ones.
+- `check_role(identity: VerifiedIdentity, role: str) -> Result(RoleView, str)` — succeeds if `identity.claims_json` contains a `roles` array with the requested role.
+- `extract_claim(identity: VerifiedIdentity, name: str) -> Result(ClaimView, str)` — extracts a string claim from `identity.claims_json`.
+- `check_role_path(identity: VerifiedIdentity, path: str, role: str) -> Result(RoleView, str)` — `check_role`'s dotted-path sibling, for IdPs that nest the roles array under a path instead of a flat top-level `"roles"` field (e.g. Keycloak's `"realm_access.roles"`). `check_role`/`extract_claim` are unchanged and still the right call for a flat claim — including one whose own name contains a literal dot (Auth0-style namespaced claims like `"https://myapp.example.com/roles"`), which is a flat key, not a nested path.
+- `extract_claim_path(identity: VerifiedIdentity, path: str) -> Result(ClaimView, str)` — `extract_claim`'s dotted-path sibling, same nested-vs-flat distinction as `check_role_path` above.
+- `identity_expired(identity: VerifiedIdentity, now: i64) -> bool` — true if `now > identity.expires_at`.
+
 ---
 
 ## 6. Control flow, functions, ownership
 
 ```
-fn name(param: Ty, ...) -> RetTy effect(...)? { ... }   // RetTy omitted => unit
+fn name(param: Ty, ...) -> RetTy effect(...)? requires(...)? { ... }   // RetTy omitted => unit
 let x: Ty = expr
 x = expr                                    // reassignment, not a new binding
 return expr?
@@ -157,8 +168,14 @@ if cond { ... } else { ... }                // also usable as an expression: let
 audited "non-empty justification" { ... }   // suppresses codegen's Tier-1/2 guards inside; interpreter unaffected
 ```
 
-- **No `for` loops**, no closures/lambdas, no first-class functions
-  (`Expr::Call` names its callee by a resolved identifier, not a value).
+- **No `for` loops**, no closures/lambdas. **First-class functions do
+  exist** (interpreter-only — see §10 and "Privileged first-class
+  functions" below): a plain function name, used where a `fn(T1, T2) ->
+  R`-typed value is expected, evaluates to that function as a value —
+  `let f: fn(i64) -> i64 = double`, `f(21)`, or passing one as an
+  ordinary higher-order argument. Still no closures — a first-class
+  function value is just a target name, nothing captured (this language
+  has no enclosing-scope capture at all).
 - **Recursion works** — functions are looked up by name in a table, so
   direct and mutual recursion both work (see `fib` in `bench/corpus.json`).
 - **Ownership**: `box`/`thread`/`sandbox`/`tcp`/`tcp_listener`/`file` are
@@ -177,9 +194,48 @@ audited "non-empty justification" { ... }   // suppresses codegen's Tier-1/2 gua
   set and can't be combined with other names. Typeck-only; no codegen
   changes — the whole compiled subset (§10) is `pure` except `print`
   (`io`).
-- **No structs, enums, tuples, or generics** — the entire type surface is
-  the closed list in §2. This is why `kf_predict`/`kf_update` are split
-  into two builtins each: there's no way to return two values as one.
+- **No tuples** — `struct`/`enum`/`match` and generics exist (Row 11,
+  `nirdosha_row11_amendment.md`), so returning a record or sum type is
+  possible. The Kalman-filter builtins above remain split for historical
+  reasons, not because the language lacks product types.
+
+### 6a. Privileged first-class functions
+
+```
+fn transfer_funds(amount: i64) -> i64 requires(role: "admin") { ... }
+fn read_chart(id: str) -> str requires(claim: "department", "cardiology") { ... }
+
+acquire transfer_funds(proof)   // proof: RoleView/ClaimView -> Result(fn(...)->..., str)
+```
+
+A `requires(role: "<name>")` or `requires(claim: "<name>", "<value>")`
+annotation gates a function's *value*, not just its behavior: `fn`'s name
+has no direct-call path at all once gated — `transfer_funds(500)` and
+`let f = transfer_funds` are both **static** `TypeErrorKind::
+PrivilegedFnNotAcquired` errors, not runtime ones. `acquire fn_name(proof)`
+is the only way to obtain a callable value, and it demands a real proof:
+a `RoleView` (from `check_role`) for a `role` requirement, a `ClaimView`
+(from `extract_claim`) for a `claim` one — both already real values
+produced by the identity feature (§5's "Identity / relying party"),
+itself validating a token issued by an external IdP. Nirdosha never
+mints its own proof of privilege; "user management" stays entirely
+external, the same as `oidc_validate_token`'s own scope. `acquire`
+checks the proof's field against the requirement string at runtime
+(same spirit as `check_role`'s own string check) and returns
+`Result(fn(params) -> ret, str)`.
+
+This is deliberately different from an annotation-based checker like
+Spring's `@PreAuthorize`: there's no ambient thread-local security
+context to consult (or forget to consult) at each call site, and no AOP
+proxy to accidentally bypass by calling the underlying implementation
+directly — there *is* no underlying direct-call path to bypass to. The
+acquired value is an ordinary first-class function once obtained: pass
+it to code that has no idea it was privileged, store it in a struct,
+return it, call it many times — the check happens exactly once, at
+acquisition, not smeared across (or missing from) every call site.
+Interpreter-only for now, like every construct past §10's compiled
+subset — `nirdosha build` rejects `fn(..)->..`/`acquire` with a specific
+reason, never silently mis-compiles one.
 
 ---
 
@@ -295,6 +351,15 @@ never silently mis-compiled):
   `sandbox`/`stop`, `str`, `tcp`/`tcp_listener`/`connect`/`listen`/`accept`,
   `file`/`open` (21 Aug 2026, `PROTOLANG_PORT.md`'s file I/O port — joins
   this list, not an exception to it).
+- `fn(..)->..`/`acquire`/`requires(...)` — first-class and privileged
+  functions (§6a), joining this list the same way `struct`/`enum`/`match`
+  (Row 11) already did.
+- `screen`/`dashboard` (§11, Row 12) — consumed only by `nirdosha emit-ui`/
+  `nirdosha serve`. Unlike everything else on this list, these aren't
+  *rejected* by `nirdosha build`/`emit-llvm` — `codegen.rs` never
+  inspects `Program.screens`/`.dashboard` at all, so a program containing
+  them compiles cleanly; the declarations are just inert to codegen, with
+  nothing for them to lower to.
 
 **This matters directly for benchmarking**: a `Vector`/`Matrix` comparison
 against Julia is now compiled-vs-JIT, not interpreter-vs-JIT — see
@@ -303,3 +368,89 @@ now decisively beat Julia; the historical interpreted numbers are kept there
 too, labeled, for the record). Everything involving `box`/`thread`/`chan`/
 `sandbox`/`tcp`/`str` is still necessarily interpreted for now — that
 remains the fair caveat for any benchmark touching those.
+
+---
+
+## 11. `screen`/`dashboard` — declarative UI DSL (Row 12, `emit-ui`/`serve` only)
+
+`nirdosha emit-ui`/`nirdosha serve` already derive a full CRUD+dashboard
+web UI from nothing but a program's `struct` declarations and its
+`list_/create_/update_/delete_/get_<struct>` and `stat_/chart_<name>`
+function-naming conventions (`compiler/src/ui_gen.rs`) — no syntax
+needed at all for the common case. `screen`/`dashboard` blocks are an
+**optional, additive** layer on top of that inference, for the parts a
+naming convention can't express: a friendlier title, a relabeled field,
+or a custom action beyond plain create/update/delete. A `struct` with no
+matching `screen` block behaves exactly as before — nothing about this
+DSL is load-bearing for a program that never uses it.
+
+```nirdosha
+struct Product {
+    id: i64,
+    name: str,
+    price_cents: i64,
+    stock: i64,
+}
+
+fn list_product() -> Result(json, str) { ... }
+fn create_product(p: Product) -> Result(i64, str) requires(role: "admin") { ... }
+fn restock_product(id: i64) -> Result(i64, str) requires(role: "admin") { ... }
+
+screen Product {
+    title: "Catalog"
+    field name {
+        label: "Product Name"
+    }
+    action "Restock +10" -> restock_product {
+        style: "outlined"
+        confirm: "Restock this product by 10 units?"
+    }
+}
+
+dashboard {
+    tile "Products" -> stat_product_count
+    chart "By Price" -> chart_products_by_price
+}
+```
+
+**Grammar** (see `GRAMMAR.md`'s `screen_decl`/`dashboard_decl`
+productions for the full EBNF): `screen`/`dashboard` are real reserved
+keywords, top-level items like `struct`/`fn`. Inside a body, `field`/
+`action`/`paginate`/`tile`/`chart` are **contextual** keywords — matched
+by identifier text only in that one leading position, the same "keyword
+only within this slot" treatment `requires(role: ...)`'s own `role`/
+`claim` already get — so they stay ordinary identifiers everywhere else
+(a struct field or param can still be named `action`, as
+`examples/trade-finance/trade_finance.nir` already does). Every `key:
+value` slot is an ordinary expression — `parse_expr()` handles a string
+(`title: "Catalog"`), an int (`page_size: 25`), a bare function name
+(`list: list_product`), or a call (`view: role("admin", "analyst")`)
+alike, with no separate value grammar to learn.
+
+**What's checked today** (existence/shape only — typeck, not the
+parser): `screen <Name>` must name a real `struct`; every `field
+<fname>` must name a real field of it; `list`/`create`/`update`/
+`delete`, and every `action`'s `->` target, must resolve to a real
+function; `view`/`edit` must be `role(...)`/`claim(...)` calls with
+string-literal arguments (the same shape `requires(...)` itself already
+accepts); `dashboard`'s `tile`/`chart` targets must resolve to real
+functions.
+
+**What `screen`/`dashboard` currently change in the generated UI**:
+`title` overrides the nav label/heading/toast text (default: the struct
+name); `field <name> { label: "..." }` overrides that field's displayed
+label everywhere one is shown (default: the raw field name); `list`/
+`create`/`update`/`delete` override which function backs that slot
+(default: the `<kind>_<snake_case_struct_name>` convention); a declared
+`action "<label>" -> <fn> { style: "filled"|"outlined", confirm: "..." }`
+renders as an extra per-row button beyond the inferred CRUD set, calling
+`<fn>` with just the row's own primary-key-shaped first param (the same
+single-param shape a declared `delete` action already uses) —
+`window.confirm(...)`-gated when `confirm` is set.
+
+**What's parsed and typechecked but not yet wired into the generated
+UI**: `paginate { page_size, total }`, `field { searchable, sortable }`,
+`field { view, edit }` (role/claim visibility — parses, but nothing
+server-side enforces it yet), form insert-vs-update auto-hide-primary-key
+behavior. Tracked, with the reason each is still open, in
+`compiler/UI_DSL_TODO.md`.

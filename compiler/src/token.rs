@@ -63,6 +63,19 @@ pub enum Tok {
     /// using `io` or `network` as an ordinary variable/function name
     /// elsewhere in a program stays legal.
     Effect,
+    /// `requires(...)` — a `fn` declaration's optional privilege
+    /// annotation (see `ast::Requirement`). `role`/`claim` inside the
+    /// parens are deliberately **not** reserved keywords of their own —
+    /// matched by identifier text inside `requires(...)`'s parens only
+    /// (`parser.rs::parse_requires_annotation`), the same "keyword only
+    /// within one specific syntactic slot" treatment `effect(...)`'s own
+    /// names already get.
+    Requires,
+    /// `acquire name(proof)` — turns a `requires`-gated function into a
+    /// first-class, callable value once `proof` (a `RoleView`/`ClaimView`)
+    /// is checked against the requirement (`Expr::Acquire`). Shaped like
+    /// `spawn`/`sandbox`: a keyword, then a plain call, destructured.
+    Acquire,
     Audited,
     Transact,
     /// Row 11 (`nirdosha_row11_amendment.md`) — `struct`/`enum`
@@ -70,6 +83,22 @@ pub enum Tok {
     Struct,
     Enum,
     Match,
+    /// `screen <StructName> { ... }` — explicit, typechecked UI
+    /// authoring for one struct, layered on top of (never replacing)
+    /// `ui_gen.rs`'s pure convention-based inference for any struct with
+    /// no `screen` block. A real reserved keyword (unlike `field`/
+    /// `action`/`paginate`, matched by identifier text only *inside* a
+    /// `screen`/`dashboard` body — the same "keyword only within one
+    /// specific syntactic slot" treatment `effect(...)`/`transact`'s own
+    /// inner names already get, and necessary here: `action` is already
+    /// a real struct field/param name in `examples/trade-finance/
+    /// trade_finance.nir`).
+    Screen,
+    /// `dashboard { tile "..." -> stat_fn  chart "..." -> chart_fn }` —
+    /// supplements `ui_gen.rs`'s `stat_`/`chart_` naming-convention
+    /// inference; see `Screen`'s doc comment for the same reserved-vs-
+    /// contextual reasoning.
+    Dashboard,
     /// `Vector`/`Matrix` in *type* position (`Vector(f64, 3)`) — deliberately
     /// capitalized, distinct from the lowercase `TypeName` scalars, matching
     /// the surface syntax the unified plan's architecture table already
@@ -126,7 +155,7 @@ pub struct Token {
 
 const TYPE_NAMES: &[&str] = &[
     "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "f64", "bool", "unit", "str",
-    "tcp", "tcp_listener", "file", "json", "db",
+    "tcp", "tcp_listener", "file", "json", "db", "mq",
 ];
 
 #[derive(Debug, Clone)]
@@ -323,11 +352,15 @@ impl<'a> Lexer<'a> {
                     "accept" => Tok::Accept,
                     "open" => Tok::Open,
                     "effect" => Tok::Effect,
+                    "requires" => Tok::Requires,
+                    "acquire" => Tok::Acquire,
                     "audited" => Tok::Audited,
                     "transact" => Tok::Transact,
                     "struct" => Tok::Struct,
                     "enum" => Tok::Enum,
                     "match" => Tok::Match,
+                    "screen" => Tok::Screen,
+                    "dashboard" => Tok::Dashboard,
                     "Vector" => Tok::VectorKw,
                     "Matrix" => Tok::MatrixKw,
                     "true" => Tok::True,

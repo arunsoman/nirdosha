@@ -247,6 +247,24 @@ resolution discipline `Expr::Call` already applies to function names.
 `transact` already are (`GRAMMAR.md`'s `if_expr`/`transact_expr`): so
 `return match o { ... }` works.
 
+**Addendum (later session): the wildcard/binding-only gap named above is
+now closed, narrowly.** A `str`/`i64`/`bool` scrutinee (never `f64` —
+floating-point pattern equality is a footgun this form doesn't need to
+inherit) can now be matched against literal-value arms plus a mandatory
+trailing `_`, e.g. `match role { "admin" => .., "analyst" => .., _ =>
+.. }` — see `GRAMMAR.md`'s `literal_arm` production and
+`ast::LiteralPattern`. This is additive, not a revision of the reasoning
+above: an enum scrutinee still gets exactly the closed-variant-name
+match this section describes, unchanged. The two forms are never mixed
+within one `match` — `typeck.rs::check_match` dispatches on the
+scrutinee's own type (`Ty::Named` enum vs. `str`/`i64`/`bool`) before
+ever looking at an arm's pattern, so there's no new ambiguity to resolve
+the way Rust's `_`/bound-identifier scoping rule has to. Exhaustiveness
+for the literal form can't be the closed, syntactic check §3.4 relies on
+(`str`/`i64` aren't finite the way an enum's declared variant set is),
+so it's enforced structurally instead: exactly one `_` arm is required,
+and it must be last.
+
 ### 3.5 Ownership and refinement — extend two existing passes, add nothing new
 
 - **Affinity** (`ownership.rs`): a `struct`/`enum` is affine iff any of its

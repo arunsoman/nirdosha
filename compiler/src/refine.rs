@@ -343,6 +343,10 @@ impl Refiner {
                 }
                 Interval::unknown()
             }
+            Expr::Acquire(_, proof, _) => {
+                self.expr(proof, scopes);
+                Interval::unknown()
+            }
             Expr::If { cond, then_block, else_block, .. } => {
                 self.expr(cond, scopes);
                 let then_iv = self.block_value(then_block, scopes);
@@ -585,7 +589,8 @@ fn assigned_names(stmts: &[Stmt]) -> HashSet<String> {
             | Expr::Ref(inner, _)
             | Expr::Join(inner, _)
             | Expr::Recv(inner, _)
-            | Expr::StopSandbox(inner, _) => walk_expr(inner, names),
+            | Expr::StopSandbox(inner, _)
+            | Expr::Acquire(_, inner, _) => walk_expr(inner, names),
             Expr::Binary(_, l, r, _) => {
                 walk_expr(l, names);
                 walk_expr(r, names);

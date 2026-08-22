@@ -274,11 +274,17 @@ fn builtin_return_ty(name: &str) -> Option<Ty> {
         // struct so `match` exhaustiveness can be resolved without a general
         // builtin type-inference table.
         "oidc_validate_token" => Some(result_of(Ty::Named("VerifiedIdentity".to_string(), vec![]))),
-        "check_role" => Some(result_of(Ty::Named("RoleView".to_string(), vec![]))),
-        "extract_claim" => Some(result_of(Ty::Named("ClaimView".to_string(), vec![]))),
+        "check_role" | "check_role_path" => Some(result_of(Ty::Named("RoleView".to_string(), vec![]))),
+        "extract_claim" | "extract_claim_path" => Some(result_of(Ty::Named("ClaimView".to_string(), vec![]))),
+        "validate_api_key" => Some(result_of(Ty::Named("VerifiedIdentity".to_string(), vec![]))),
+        "exchange_refresh_token" => Some(result_of(Ty::Named("VerifiedIdentity".to_string(), vec![]))),
         "db_connect" => Some(result_of(Ty::Db)),
         "db_query" => Some(result_of(Ty::Json)),
         "db_execute" => Some(result_of(Ty::I64)),
+        "mq_connect" => Some(result_of(Ty::Mq)),
+        "mq_publish" => Some(result_of(Ty::Unit)),
+        "mq_consume" => Some(result_of(Ty::Str)),
+        "mock_issue_token" => Some(result_of(Ty::Str)),
         _ => None,
     }
 }
@@ -569,7 +575,8 @@ impl<'a> Checker<'a> {
                     // queries, the same way a `tcp`/`file` handle is
                     // meant to `send`/`recv` many times before its one
                     // `stop` (`Ty::Db`'s doc comment).
-                    let consume = !(i == 0 && matches!(name.as_str(), "db_query" | "db_execute"));
+                    let consume =
+                        !(i == 0 && matches!(name.as_str(), "db_query" | "db_execute" | "mq_publish" | "mq_consume"));
                     self.touch_expr(a, consume);
                 }
             }
@@ -673,6 +680,15 @@ impl<'a> Checker<'a> {
                 for a in args {
                     self.touch_expr(a, true);
                 }
+            }
+            Expr::Acquire(_, proof, _) => {
+                // `name` (the gated function) isn't a local binding to
+                // touch -- it's always a global fn (`typeck.rs::
+                // infer_acquire` already enforces that). `proof` is read,
+                // not consumed: `RoleView`/`ClaimView` aren't affine (same
+                // "read, don't move" treatment `check_role`/`extract_claim`'s
+                // own identity argument already gets as an ordinary call).
+                self.touch_expr(proof, false);
             }
             Expr::Join(inner, _) => {
                 // `join` consumes the whole handle -- a spawned

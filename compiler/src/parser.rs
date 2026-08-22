@@ -18,13 +18,61 @@ pub struct ParseError {
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    /// Nesting depth across `parse_expr`/`parse_unary` combined (the
+    /// grammar's two independent recursive-descent entry points --
+    /// parenthesized/bracketed sub-expressions recurse back through
+    /// `parse_expr`, while chained prefix operators like `!`/`-`/`*`/
+    /// `box`/`&` recurse through `parse_unary` directly, never touching
+    /// `parse_expr` per level). See `MAX_PARSE_DEPTH`'s doc comment for
+    /// why this exists at all.
+    depth: usize,
 }
+
+/// Past this many combined `parse_expr`/`parse_unary` nesting levels,
+/// fail with a normal `ParseError` instead of recursing further.
+/// Without this, a red-team finding confirmed a few KB of adversarial
+/// source (~1000 nested parens, or a few thousand chained unary `-`)
+/// reliably overflows the real Rust stack -- a hard, uncatchable
+/// process abort (SIGABRT via the stack guard page), not a panic --
+/// which matters most for any deployment that ever compiles/runs
+/// untrusted `.nir` source directly (a "paste your code" service; a
+/// live `nirdosha serve` instance itself only parses its own fixed file
+/// once at startup, not per request, so this specific path isn't
+/// reachable through its HTTP API -- see `interpreter::MAX_CALL_DEPTH`
+/// for the analogous *interpreter*-level guard that protects the part
+/// of an already-running app request handlers actually re-enter).
+/// 50 is conservative on purpose: legitimate hand-written expressions
+/// essentially never nest anywhere close to this deep. It has to be set
+/// low enough for a debug build's own default-stack-size crash
+/// threshold, which is far lower than release's: measured empirically,
+/// an unguarded debug build overflowed for real somewhere between depth
+/// 80 and 100 (parenthesized-expression nesting) on the default thread
+/// stack -- there's no bigger-stack wrapper for parsing the way
+/// `interpreter::run_on_big_stack` gives call depth much more headroom,
+/// so this constant has to stay safe on the *default* stack outright.
+const MAX_PARSE_DEPTH: usize = 50;
 
 type PResult<T> = Result<T, ParseError>;
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, pos: 0 }
+        Parser { toks, pos: 0, depth: 0 }
+    }
+
+    /// Shared entry/exit pair for `parse_expr`/`parse_unary` — see
+    /// `depth`'s and `MAX_PARSE_DEPTH`'s doc comments.
+    fn enter_nesting(&mut self) -> PResult<()> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            let span = self.span();
+            self.depth -= 1;
+            return Err(ParseError { message: "expression nested too deeply".to_string(), span });
+        }
+        Ok(())
+    }
+
+    fn exit_nesting(&mut self) {
+        self.depth -= 1;
     }
 
     fn peek(&self) -> &Token {
@@ -138,6 +186,34 @@ impl Parser {
             self.expect(&Tok::RParen, "`)`")?;
             return Ok(Ty::Matrix(Box::new(elem), rows, cols));
         }
+        // `fn(T1, T2) -> R` — a first-class function value's type. Reuses
+        // `Tok::Fn` (the same keyword a declaration starts with) rather
+        // than a second dedicated token, since the two are never
+        // syntactically ambiguous: a `fn` at declaration position is
+        // always followed by a name, never `(`.
+        if self.peek().tok == Tok::Fn {
+            self.bump();
+            self.expect(&Tok::LParen, "`(`")?;
+            let mut params = Vec::new();
+            if self.peek().tok != Tok::RParen {
+                loop {
+                    params.push(self.expect_type()?);
+                    if self.peek().tok == Tok::Comma {
+                        self.bump();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            self.expect(&Tok::RParen, "`)`")?;
+            let ret = if self.peek().tok == Tok::Arrow {
+                self.bump();
+                self.expect_type()?
+            } else {
+                Ty::Unit
+            };
+            return Ok(Ty::Fn(params, Box::new(ret)));
+        }
         match &self.peek().tok {
             Tok::TypeName(name) => {
                 let ty = Ty::from_name(name).expect("lexer only emits valid type names");
@@ -193,14 +269,158 @@ impl Parser {
         // user had written them — no special-casing anywhere downstream.
         let mut structs = prelude_structs();
         let mut enums = prelude_enums();
+        let mut screens = Vec::new();
+        let mut dashboard = None;
         while self.peek().tok != Tok::Eof {
             match self.peek().tok {
                 Tok::Struct => structs.push(self.parse_struct_decl()?),
                 Tok::Enum => enums.push(self.parse_enum_decl()?),
+                Tok::Screen => screens.push(self.parse_screen_decl()?),
+                Tok::Dashboard => {
+                    let d = self.parse_dashboard_decl()?;
+                    if dashboard.is_some() {
+                        return Err(ParseError {
+                            message: "only one `dashboard { ... }` block is allowed per program".to_string(),
+                            span: d.span,
+                        });
+                    }
+                    dashboard = Some(d);
+                }
                 _ => fns.push(self.parse_fn_decl()?),
             }
         }
-        Ok(Program { fns, structs, enums })
+        Ok(Program { fns, structs, enums, screens, dashboard })
+    }
+
+    /// One `key: value` slot shared by `screen`/`field`/`action`/
+    /// `paginate` bodies. The value is parsed as an ordinary expression —
+    /// `parse_expr()` handles string/int/bool literals, a bare `Ident`
+    /// (`list: list_product`), and a `Call` (`view: role("admin")`)
+    /// alike, with no dedicated value grammar. Typeck later narrows each
+    /// key to its expected shape.
+    fn parse_kv_entry(&mut self) -> PResult<KvEntry> {
+        let key = self.expect_ident()?;
+        self.expect(&Tok::Colon, "`:`")?;
+        let value = self.parse_expr()?;
+        Ok((key, value))
+    }
+
+    /// `screen_decl ::= "screen" IDENT "{" screen_item* "}"`
+    /// `screen_item ::= paginate_block | field_override | action_decl | kv_entry`
+    ///
+    /// Dispatch inside the body is on the first token's identifier TEXT
+    /// alone — `"paginate"`/`"field"`/`"action"` vs. anything else is a
+    /// plain `kv_entry` — so this stays LL(1) with no second-token
+    /// lookahead. `field`/`action`/`paginate` are therefore reserved only
+    /// as a screen body's leading key, exactly like `role`/`claim` inside
+    /// `requires(...)`; they remain ordinary identifiers everywhere else
+    /// (`trade_finance.nir` already uses `action` as a struct field name).
+    ///
+    /// `paginate { ... }` gets no dedicated `ScreenDecl` field — its
+    /// entries are folded directly into the screen's own `entries` list,
+    /// each key prefixed `"paginate."` (`paginate { page_size: 25 }`
+    /// becomes the entry `("paginate.page_size", 25)`). Flat and
+    /// prefix-filterable by typeck/`ui_gen.rs`, no new AST node needed.
+    fn parse_screen_decl(&mut self) -> PResult<ScreenDecl> {
+        let span = self.span();
+        self.expect(&Tok::Screen, "`screen`")?;
+        let struct_name = self.expect_ident()?;
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut entries = Vec::new();
+        let mut fields = Vec::new();
+        let mut actions = Vec::new();
+        while self.peek().tok != Tok::RBrace {
+            let is_kw = matches!(&self.peek().tok, Tok::Ident(s) if s == "paginate" || s == "field" || s == "action");
+            if is_kw {
+                let kw = self.expect_ident()?;
+                match kw.as_str() {
+                    "paginate" => {
+                        self.expect(&Tok::LBrace, "`{`")?;
+                        while self.peek().tok != Tok::RBrace {
+                            let (k, v) = self.parse_kv_entry()?;
+                            entries.push((format!("paginate.{k}"), v));
+                        }
+                        self.expect(&Tok::RBrace, "`}`")?;
+                    }
+                    "field" => fields.push(self.parse_field_override()?),
+                    "action" => actions.push(self.parse_action_decl()?),
+                    _ => unreachable!(),
+                }
+            } else {
+                entries.push(self.parse_kv_entry()?);
+            }
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(ScreenDecl { struct_name, entries, fields, actions, span })
+    }
+
+    /// `field_override ::= "field" IDENT "{" kv_entry* "}"`
+    fn parse_field_override(&mut self) -> PResult<FieldOverride> {
+        let span = self.span();
+        let field_name = self.expect_ident()?;
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut entries = Vec::new();
+        while self.peek().tok != Tok::RBrace {
+            entries.push(self.parse_kv_entry()?);
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(FieldOverride { field_name, entries, span })
+    }
+
+    /// `action_decl ::= "action" STRING "->" IDENT "{" kv_entry* "}"`
+    /// The trailing `{ ... }` is optional — `action "Delete" -> delete_product`
+    /// alone is a valid, style-less/confirm-less action.
+    fn parse_action_decl(&mut self) -> PResult<ActionDecl> {
+        let span = self.span();
+        let label = self.expect_str_lit("an action label")?;
+        self.expect(&Tok::Arrow, "`->`")?;
+        let target_fn = self.expect_ident()?;
+        let mut entries = Vec::new();
+        if self.peek().tok == Tok::LBrace {
+            self.bump();
+            while self.peek().tok != Tok::RBrace {
+                entries.push(self.parse_kv_entry()?);
+            }
+            self.expect(&Tok::RBrace, "`}`")?;
+        }
+        Ok(ActionDecl { label, target_fn, entries, span })
+    }
+
+    /// `dashboard_decl ::= "dashboard" "{" dashboard_item* "}"`
+    /// `dashboard_item ::= ("tile" | "chart") STRING "->" IDENT`
+    /// Same first-token-text dispatch as `screen`'s body; `tile`/`chart`
+    /// are reserved only as a dashboard body's leading item keyword.
+    fn parse_dashboard_decl(&mut self) -> PResult<DashboardDecl> {
+        let span = self.span();
+        self.expect(&Tok::Dashboard, "`dashboard`")?;
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut tiles = Vec::new();
+        let mut charts = Vec::new();
+        while self.peek().tok != Tok::RBrace {
+            let kw = self.expect_ident()?;
+            let item_span = self.span();
+            match kw.as_str() {
+                "tile" | "chart" => {
+                    let label = self.expect_str_lit("a tile/chart label")?;
+                    self.expect(&Tok::Arrow, "`->`")?;
+                    let target_fn = self.expect_ident()?;
+                    let m = MetricRef { label, target_fn, span: item_span };
+                    if kw == "tile" {
+                        tiles.push(m);
+                    } else {
+                        charts.push(m);
+                    }
+                }
+                other => {
+                    return Err(ParseError {
+                        message: format!("expected `tile` or `chart`, found identifier `{other}`"),
+                        span: item_span,
+                    });
+                }
+            }
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(DashboardDecl { tiles, charts, span })
     }
 
     // A `struct`/`enum` declaration's optional type-parameter list --
@@ -329,8 +549,9 @@ impl Parser {
             Ty::Unit
         };
         let declared_effects = self.parse_effect_annotation()?;
+        let requires = self.parse_requires_annotation()?;
         let body = self.parse_block()?;
-        Ok(FnDecl { name, params, ret, body, span, declared_effects })
+        Ok(FnDecl { name, params, ret, body, span, declared_effects, requires })
     }
 
     /// `effect(pure)` / `effect(io, network)` / ... — `None` if there's no
@@ -387,6 +608,55 @@ impl Parser {
             });
         }
         Ok(Some(set))
+    }
+
+    /// `requires(role: "admin")` / `requires(claim: "department",
+    /// "cardiology")` — `None` if there's no `requires(...)` at all (the
+    /// common, ungated case). `role`/`claim` are matched by identifier
+    /// text, same "keyword only within this one slot" treatment
+    /// `parse_effect_annotation`'s own names get.
+    fn parse_requires_annotation(&mut self) -> PResult<Option<Requirement>> {
+        if self.peek().tok != Tok::Requires {
+            return Ok(None);
+        }
+        self.bump();
+        self.expect(&Tok::LParen, "`(`")?;
+        let kind_span = self.span();
+        let kind = self.expect_ident()?;
+        self.expect(&Tok::Colon, "`:`")?;
+        let req = match kind.as_str() {
+            "role" => Requirement::Role(self.expect_str_lit("a role name")?),
+            "claim" => {
+                let name = self.expect_str_lit("a claim name")?;
+                self.expect(&Tok::Comma, "`,`")?;
+                let value = self.expect_str_lit("the claim's required value")?;
+                Requirement::Claim(name, value)
+            }
+            other => {
+                return Err(ParseError {
+                    message: format!("unknown requirement `{other}` — expected `role` or `claim`"),
+                    span: kind_span,
+                });
+            }
+        };
+        self.expect(&Tok::RParen, "`)`")?;
+        Ok(Some(req))
+    }
+
+    /// A bare string literal, for the handful of grammar slots (`requires`'
+    /// role/claim names, `audited`'s justification) that need one directly
+    /// rather than as part of a general expression.
+    fn expect_str_lit(&mut self, what: &str) -> PResult<String> {
+        match self.peek().tok.clone() {
+            Tok::Str(s) => {
+                self.bump();
+                Ok(s)
+            }
+            other => Err(ParseError {
+                message: format!("expected {what} as a string literal, found {other:?}"),
+                span: self.span(),
+            }),
+        }
     }
 
     // block ::= "{" stmt* "}"
@@ -463,7 +733,8 @@ impl Parser {
 
     // expr ::= if_expr | transact_expr | match_expr | assignment
     fn parse_expr(&mut self) -> PResult<Expr> {
-        if self.peek().tok == Tok::If {
+        self.enter_nesting()?;
+        let result = if self.peek().tok == Tok::If {
             self.parse_if_expr()
         } else if self.peek().tok == Tok::Transact {
             self.parse_transact_expr()
@@ -471,7 +742,9 @@ impl Parser {
             self.parse_match_expr()
         } else {
             self.parse_assignment()
-        }
+        };
+        self.exit_nesting();
+        result
     }
 
     // match_expr ::= "match" expr "{" match_arm ("," match_arm)* ","? "}"
@@ -490,9 +763,43 @@ impl Parser {
         let mut arms = Vec::new();
         loop {
             let arm_span = self.span();
-            let variant = self.expect_ident()?;
+            // Dispatch on the arm's first token alone (LL(1), same
+            // discipline every other contextual-word construct in this
+            // grammar already follows): a literal token or the specific
+            // identifier `_` is a new literal/wildcard pattern arm
+            // (`ast::LiteralPattern`); any other identifier is the
+            // original enum-variant arm, unchanged.
+            let (variant, pattern) = match &self.peek().tok {
+                Tok::Str(s) => {
+                    let s = s.clone();
+                    self.bump();
+                    (format!("{s:?}"), Some(LiteralPattern::Str(s)))
+                }
+                Tok::Int(n) => {
+                    let n = *n;
+                    self.bump();
+                    (n.to_string(), Some(LiteralPattern::Int(n)))
+                }
+                Tok::True => {
+                    self.bump();
+                    ("true".to_string(), Some(LiteralPattern::Bool(true)))
+                }
+                Tok::False => {
+                    self.bump();
+                    ("false".to_string(), Some(LiteralPattern::Bool(false)))
+                }
+                Tok::Ident(name) if name == "_" => {
+                    self.bump();
+                    ("_".to_string(), Some(LiteralPattern::Wildcard))
+                }
+                _ => (self.expect_ident()?, None),
+            };
             let mut bindings = Vec::new();
-            if self.peek().tok == Tok::LParen {
+            // Only the enum-variant form ever binds a payload — a
+            // literal/wildcard pattern arm has none, so `(...)` isn't
+            // even attempted for it (a stray `(` there falls through to
+            // the `=>` expectation below with a plain parse error).
+            if pattern.is_none() && self.peek().tok == Tok::LParen {
                 self.bump();
                 if self.peek().tok != Tok::RParen {
                     loop {
@@ -508,7 +815,7 @@ impl Parser {
             }
             self.expect(&Tok::FatArrow, "`=>`")?;
             let body = Box::new(self.parse_expr()?);
-            arms.push(MatchArm { variant, bindings, body, span: arm_span });
+            arms.push(MatchArm { variant, bindings, pattern, body, span: arm_span });
             if self.peek().tok == Tok::Comma {
                 self.bump();
                 if self.peek().tok == Tok::RBrace {
@@ -725,6 +1032,13 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
+        self.enter_nesting()?;
+        let result = self.parse_unary_inner();
+        self.exit_nesting();
+        result
+    }
+
+    fn parse_unary_inner(&mut self) -> PResult<Expr> {
         let span = self.span();
         match self.peek().tok {
             Tok::Bang => {
@@ -776,6 +1090,27 @@ impl Parser {
                     Expr::Call(name, args, _) => Ok(Expr::Spawn(name, args, span)),
                     _ => Err(ParseError {
                         message: "`spawn` requires a function call, e.g. `spawn worker(x)`".to_string(),
+                        span,
+                    }),
+                }
+            }
+            Tok::Acquire => {
+                self.bump();
+                // Same "parse a normal call, then destructure" trick as
+                // `spawn` above, restricted to exactly one argument (the
+                // proof) — enforced here rather than left to `typeck.rs`
+                // since it's a syntactic shape, not a type question.
+                let operand = self.parse_call()?;
+                match operand {
+                    Expr::Call(name, mut args, _) if args.len() == 1 => {
+                        Ok(Expr::Acquire(name, Box::new(args.remove(0)), span))
+                    }
+                    Expr::Call(..) => Err(ParseError {
+                        message: "`acquire` takes exactly one argument, the proof — e.g. `acquire transfer_funds(proof)`".to_string(),
+                        span,
+                    }),
+                    _ => Err(ParseError {
+                        message: "`acquire` requires a function call, e.g. `acquire transfer_funds(proof)`".to_string(),
                         span,
                     }),
                 }

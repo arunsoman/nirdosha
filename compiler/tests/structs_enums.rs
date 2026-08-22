@@ -286,16 +286,39 @@ fn wrong_variant_binding_arity_is_rejected_statically() {
 
 #[test]
 fn matching_a_non_enum_is_rejected_statically() {
+    // `f64` deliberately has no literal-match form (floating-point
+    // pattern equality is a footgun the `str`/`i64`/`bool` literal-match
+    // arms don't need to inherit — see `ast::LiteralPattern`'s doc
+    // comment) — still the one scrutinee type this rejects outright.
     let kind = first_type_error(
         r#"
         fn main() -> i64 {
-            return match 5 {
+            return match 5.0 {
                 Foo() => 1,
             }
         }
     "#,
     );
-    assert_eq!(kind, TypeErrorKind::NotAnEnum { found: Ty::I64 });
+    assert_eq!(kind, TypeErrorKind::NotAnEnum { found: Ty::F64 });
+}
+
+#[test]
+fn matching_an_int_with_an_enum_style_arm_is_rejected_statically() {
+    // `i64` (like `str`/`bool`) *is* a valid `match` scrutinee now — via
+    // the literal-pattern form, not the enum-variant form, so a bare
+    // `Foo() => ..` arm against it is a different, more specific error
+    // than "not a valid scrutinee at all".
+    let kind = first_type_error(
+        r#"
+        fn main() -> i64 {
+            return match 5 {
+                Foo() => 1,
+                _ => 0,
+            }
+        }
+    "#,
+    );
+    assert_eq!(kind, TypeErrorKind::MatchArmMustBeLiteral { scrutinee_ty: Ty::I64 });
 }
 
 #[test]

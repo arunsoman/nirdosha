@@ -209,6 +209,31 @@ fn declaring_pure_on_a_function_that_prints_is_a_type_error() {
 }
 
 #[test]
+fn declaring_pure_while_calling_through_a_function_valued_parameter_that_prints_is_a_type_error() {
+    // A fixed red-team finding: `effects.rs`'s `Expr::Call` arm only
+    // ever attributed effects via a global-name lookup, so a call
+    // through a local `fn(...)->...` parameter (an ordinary higher-order
+    // argument, no `acquire` involved at all) silently contributed
+    // nothing — `caller` here used to typecheck clean as `effect(pure)`
+    // no matter what `f` actually did at runtime.
+    let kind = first_type_error(
+        r#"
+        fn side_effect() -> i64 {
+            print(42)
+            return 1
+        }
+        fn caller(f: fn() -> i64) -> i64 effect(pure) {
+            return f()
+        }
+        fn main() -> i64 {
+            return caller(side_effect)
+        }
+    "#,
+    );
+    assert_eq!(kind, TypeErrorKind::EffectNotDeclared { fn_name: "caller".to_string(), missing: Effect::Io });
+}
+
+#[test]
 fn declaring_a_broader_effect_than_actually_used_is_not_an_error() {
     // Effect subsumption (goal.md §3): declaring more than you use is
     // fine, only the reverse is checked.

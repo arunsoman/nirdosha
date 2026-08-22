@@ -385,3 +385,49 @@ fn example_db_runs_to_completion() {
         other => panic!("expected Ok(Str(\"ada\")), got {other:?}"),
     }
 }
+
+// ---- parameterized queries: the only way to embed runtime data into SQL,
+// since Nirdosha `str` has no concatenation (LANGUAGE.md §2) -----------
+
+#[test]
+fn parameterized_execute_and_query_round_trip_runtime_values() {
+    let src = r#"
+        fn extract_name(row: json) -> str {
+            return match json_get_str(row, "name") {
+                Ok(name) => name,
+                Err(e) => e,
+            }
+        }
+        fn run_all(conn: db) -> str {
+            let created: i64 = match db_execute(conn, "CREATE TABLE items (name TEXT, price INTEGER)") {
+                Ok(n) => n,
+                Err(e) => -1,
+            }
+            let name: str = "widget"
+            let price: i64 = 42
+            let inserted: i64 = match db_execute(conn, "INSERT INTO items (name, price) VALUES (?, ?)", name, price) {
+                Ok(n) => n,
+                Err(e) => -1,
+            }
+            let found: str = match db_query(conn, "SELECT name FROM items WHERE price = ?", price) {
+                Ok(rows) => match json_array_get(rows, 0) {
+                    Ok(row) => extract_name(row),
+                    Err(e) => e,
+                },
+                Err(e) => e,
+            }
+            stop conn
+            return found
+        }
+        fn main() -> str {
+            return match db_connect(":memory:") {
+                Ok(conn) => run_all(conn),
+                Err(e) => e,
+            }
+        }
+    "#;
+    match run(src) {
+        Ok(Value::Str(s)) => assert_eq!(&*s, "widget"),
+        other => panic!("expected Ok(Str(\"widget\")), got {other:?}"),
+    }
+}

@@ -15,12 +15,18 @@ see `PHASE0.md`'s "Fifteenth update"), plus Row 11
 (`nirdosha_row11_amendment.md`) — `struct`/`enum` declarations (with
 type-parameter lists — layer 6, generics: `Pair(A, B)`), `match`,
 `expr.field` access, and the `Option(T)`/`Result(T, E)` prelude (layer
-7), injected into every program at parse time. Note that
+7), injected into every program at parse time — plus Row 12's `screen`/
+`dashboard` declarative UI DSL (LANGUAGE.md §11), consumed only by
+`nirdosha emit-ui`/`nirdosha serve`. Note that
 `spawn`/`join`/`thread`/`chan`/`send`/`recv`/`sandbox`/`stop`/`connect`/
 `struct`/`enum`/`match` are, so far, interpreter-only (`str`/`tcp`
 included) — `codegen.rs` rejects them explicitly, the same "reject, don't
 mis-compile" treatment `box`/`&` got before their own codegen support
-existed.
+existed. `screen`/`dashboard` are different in kind, not just degree:
+`codegen.rs` never inspects `Program.screens`/`.dashboard` at all (there's
+no expression inside either for it to walk), so `nirdosha build`/
+`emit-llvm` compile a program containing them cleanly — the declarations
+are simply inert to codegen, not rejected by it.
 
 ## Row 7 claim, stated precisely
 
@@ -88,7 +94,7 @@ parses as `return (x - y)` — one statement, a subtraction — never as
 ```ebnf
 program     ::= item*
 
-item        ::= fn_decl | struct_decl | enum_decl
+item        ::= fn_decl | struct_decl | enum_decl | screen_decl | dashboard_decl
 
 fn_decl     ::= "fn" ident "(" params? ")" ("->" type)? block
 
@@ -119,6 +125,37 @@ type_param_list ::= "(" ident ("," ident)* ")"
 // parameter list; `T` in `Some(T)` names the *enum's* own type parameter.
 enum_decl   ::= "enum" ident type_param_list? "{" variant ("," variant)* ","? "}"
 variant     ::= ident ("(" type ("," type)* ")")?
+
+// Row 12's UI DSL (`nirdosha emit-ui`/`nirdosha serve` only -- LANGUAGE.md
+// §11): an *optional, additive* layer over `ui_gen.rs`'s pure naming-
+// convention inference, never a replacement for it. `screen`/`dashboard`
+// are real reserved keywords, dispatched on like `struct`/`enum` above --
+// but `field`/`action`/`paginate` (inside `screen_item`) and `tile`/
+// `chart` (inside `dashboard_item`) are deliberately **not** reserved
+// globally. They're matched by identifier text only in this one leading
+// position of their own body -- exactly the precedent `requires(role:
+// ...)`'s own `role`/`claim` names already set in the real grammar
+// (`parser.rs::parse_requires_annotation`; `requires(...)`/`effect(...)`
+// itself isn't yet reflected in this file's own `fn_decl` production --
+// a pre-existing gap, not one this session introduced or is fixing) --
+// so LL(1) holds with no
+// second-token lookahead (dispatch is on the first token's text alone),
+// and `action` stays free to be an ordinary struct field/param name
+// everywhere else (`examples/trade-finance/trade_finance.nir` already
+// uses it that way). A `kv_entry`'s value is an ordinary `expr` (see
+// `expr`'s own production far below) -- a string, an int, a bare
+// function-naming `ident`, or a `role(...)`/`claim(...)` call alike --
+// deliberately reusing the general expression grammar rather than
+// inventing a second value grammar just for this DSL.
+screen_decl    ::= "screen" ident "{" screen_item* "}"
+screen_item    ::= paginate_block | field_override | action_decl | kv_entry
+paginate_block ::= "paginate" "{" kv_entry* "}"
+field_override ::= "field" ident "{" kv_entry* "}"
+action_decl    ::= "action" string "->" ident ("{" kv_entry* "}")?
+kv_entry       ::= ident ":" expr
+
+dashboard_decl ::= "dashboard" "{" dashboard_item* "}"
+dashboard_item ::= ("tile" | "chart") string "->" ident
 
 // No trailing comma — `params`/`args` (below) both require a following
 // item after every comma, so `fn f(a: i64,)` and `f(1, 2,)` are both
@@ -247,15 +284,25 @@ if_expr     ::= "if" expr block ("else" (block | if_expr))?
 // `assignment` — no ambiguity from that with a following `{`, since this
 // grammar has no brace-delimited struct-literal expression to confuse it
 // with (construction is always `Ident(args)` — see `struct_decl` above).
-// Exhaustiveness (every variant of the scrutinee's specific enum, exactly
-// once) and "every arm head resolves to a real variant name" are both
-// `typeck.rs` checks, not this grammar's — there is deliberately no
-// wildcard/binding-only catch-all pattern in v1 (§3.4), so every arm's
-// leading `ident` here is required to be exactly one of the enum's own
-// variant names, the same closed-identifier-resolution discipline
-// `call`'s own callee name already gets.
+//
+// Two arm shapes, dispatched by the arm's own first token (LL(1), same
+// discipline `call`'s callee-name resolution already gets) — never mixed
+// within one `match`, which `typeck.rs` enforces by the scrutinee's type,
+// not this grammar:
+//   - Enum-variant arm (v1's only shape): `ident` must resolve to one of
+//     the scrutinee enum's own variant names; exhaustiveness is every
+//     variant covered exactly once, no wildcard.
+//   - Literal-pattern arm (post-v1 addition, `str`/`i64`/`bool`
+//     scrutinees only — no `f64`, floating-point pattern equality is a
+//     footgun this form doesn't need): `literal` is a `str`/`int`/`bool`
+//     literal, or the wildcard `_`, never both a literal *and* bindings.
+//     Exhaustiveness requires exactly one `_` arm, last — a literal
+//     domain isn't closed the way an enum's variant set is, so there is
+//     no way to prove coverage without one.
 match_expr  ::= "match" expr "{" match_arm ("," match_arm)* ","? "}"
-match_arm   ::= ident ("(" ident ("," ident)* ")")? "=>" expr
+match_arm   ::= variant_arm | literal_arm
+variant_arm ::= ident ("(" ident ("," ident)* ")")? "=>" expr
+literal_arm ::= (str | int | "true" | "false" | "_") "=>" expr
 
 // `TRANSACT.md`'s durable-effect construct — **Layer 1 only** (this
 // repo's staged rollout): in-process, no durability log, no `retry`/
@@ -576,3 +623,16 @@ bug — llama.cpp doesn't accept a bare `|` starting a continuation line
 the way this EBNF's own visual style does), and a fidelity corpus
 compares accept/reject behavior against the real lexer+parser for every
 shipped example plus a set of hand-written positive/negative snippets.
+
+**Currently failing, and not by this session's own changes**:
+`nirdosha.gbnf` (119 lines) and `grammar_check/src/nirdosha.lalrpop`
+(182 lines) both predate Row 11 (`struct`/`enum`/`match`/generics)
+entirely, and haven't caught up since — the fidelity corpus's "every
+shipped example is accepted by both" test fails on `examples/
+transact.nir` today, independent of and before this session's own
+`screen`/`dashboard` addition (which also isn't reflected in either
+file, for the same reason). Catching both files up to the compiler's
+actual current grammar is effectively a from-scratch rewrite of both,
+not an incremental sync; see `compiler/UI_DSL_TODO.md` for the finding
+in full rather than a claim, made here, that these stay in lockstep with
+`GRAMMAR.md` — they don't, today.

@@ -2,12 +2,15 @@ pub mod ast;
 pub mod codegen;
 pub mod effects;
 pub mod interpreter;
+pub mod observability;
 pub mod ownership;
 pub mod parser;
 pub mod refine;
+pub mod serve;
 pub mod smt;
 pub mod token;
 pub mod typeck;
+pub mod ui_gen;
 
 use interpreter::{Interpreter, Value};
 use parser::Parser;
@@ -23,6 +26,15 @@ use token::Lexer;
 /// message; a caller that wants the structured `span`/`kind` data
 /// (goal.md row 9) should drive the stages directly instead.
 pub fn run(src: &str) -> Result<Value, String> {
+    run_with_tracer(src, None)
+}
+
+/// Same pipeline as `run`, plus a way to hand `Interpreter::new`'s result
+/// a pre-built `tracer` — the "small, named plumbing gap" the
+/// observability design plan calls out (`main.rs`'s `--otel-console` is
+/// the one caller that actually wants this today; every other caller
+/// keeps using plain `run`, which is just this with `tracer: None`).
+pub fn run_with_tracer(src: &str, tracer: Option<std::sync::Arc<observability::Tracer>>) -> Result<Value, String> {
     let toks = Lexer::new(src)
         .tokenize()
         .map_err(|e| format!("lex error at {}:{}: {}", e.span.line, e.span.col, e.message))?;
@@ -37,9 +49,11 @@ pub fn run(src: &str) -> Result<Value, String> {
         let joined = errors.iter().map(|e| format!("ownership error: {e}")).collect::<Vec<_>>().join("\n");
         return Err(joined);
     }
-    Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src))
-        .run_main()
-        .map_err(|e| format!("runtime error: {e}"))
+    let mut interp = Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src));
+    if let Some(t) = tracer {
+        interp = interp.with_tracer(t);
+    }
+    interp.run_main_on_big_stack().map_err(|e| format!("runtime error: {e}"))
 }
 
 /// goal.md row 9's actual content: a caller that wants the structured
@@ -84,6 +98,16 @@ pub enum RunFailure {
 /// themselves instead of a pre-formatted string — see `main.rs`'s
 /// `--format=json` for the one caller that actually wants this today.
 pub fn run_diagnostic(src: &str) -> Result<Value, RunFailure> {
+    run_diagnostic_with_tracer(src, None)
+}
+
+/// Same relationship `run_with_tracer` has to `run` — `main.rs`'s
+/// `--otel-console --format=json` combination is the one caller that
+/// needs both at once.
+pub fn run_diagnostic_with_tracer(
+    src: &str,
+    tracer: Option<std::sync::Arc<observability::Tracer>>,
+) -> Result<Value, RunFailure> {
     let toks = Lexer::new(src).tokenize().map_err(|e| {
         RunFailure::Lex(format!("lex error at {}:{}: {}", e.span.line, e.span.col, e.message))
     })?;
@@ -96,7 +120,9 @@ pub fn run_diagnostic(src: &str) -> Result<Value, RunFailure> {
     if let Err(errors) = ownership::check_ownership(&program) {
         return Err(RunFailure::Diagnostics(errors.into_iter().map(Diagnostic::Ownership).collect()));
     }
-    Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src))
-        .run_main()
-        .map_err(|e| RunFailure::Diagnostics(vec![Diagnostic::Runtime(e)]))
+    let mut interp = Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src));
+    if let Some(t) = tracer {
+        interp = interp.with_tracer(t);
+    }
+    interp.run_main_on_big_stack().map_err(|e| RunFailure::Diagnostics(vec![Diagnostic::Runtime(e)]))
 }

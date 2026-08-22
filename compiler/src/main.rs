@@ -14,7 +14,25 @@ fn main() -> ExitCode {
     // `cmd_interpret`'s caller needing its own flag-parsing loop.
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let format_json = raw.iter().any(|a| a == "--format=json");
-    let mut args = raw.into_iter().filter(|a| a != "--format=json");
+    // `--otel-console` (observability layer 1's local stdout tracer) is
+    // scanned exactly the way `--format=json` already is — an
+    // interpret-only, host-controlled switch that can appear anywhere on
+    // the command line, not a subcommand or a per-command flag. `--otel`/
+    // `--otel-endpoint=...` parse (so a caller who reaches for the
+    // eventual real-OTLP flags gets a clear, non-zero-exit message, not
+    // "unknown file `--otel`") but aren't implemented yet — real export is
+    // layer 2 (see the observability design plan).
+    let otel_console = raw.iter().any(|a| a == "--otel-console");
+    let otel_unimplemented = raw.iter().any(|a| a == "--otel" || a.starts_with("--otel-endpoint"));
+    if otel_unimplemented {
+        eprintln!(
+            "--otel/--otel-endpoint: real OTLP export isn't implemented yet (observability layer 2). \
+             Use --otel-console for layer 1's local stdout tracer."
+        );
+        return ExitCode::FAILURE;
+    }
+    let mut args =
+        raw.into_iter().filter(|a| a != "--format=json" && a != "--otel-console");
     let first = match args.next() {
         Some(a) => a,
         None => {
@@ -27,24 +45,37 @@ fn main() -> ExitCode {
         "build" => cmd_build(args),
         "emit-llvm" => cmd_emit_llvm(args),
         "emit-ast" => cmd_emit_ast(args),
+        "emit-ui" => cmd_emit_ui(args),
+        "serve" => cmd_serve(args),
         // Not a user-facing subcommand — the *only* caller is a `sandbox`
         // handle's own `Expr::SpawnSandbox` (see interpreter.rs), which
         // execs this exact binary with this exact flag to become the
         // separate OS process a sandbox handle actually points at.
         // Deliberately absent from `print_usage()` for the same reason.
         "--sandbox-worker" => cmd_sandbox_worker(args),
-        path => cmd_interpret(path, format_json),
+        path => cmd_interpret(path, format_json, otel_console),
     }
 }
 
 fn print_usage() {
     eprintln!("usage:");
-    eprintln!("  nirdosha <file.nir> [--format=json]  interpret");
+    eprintln!("  nirdosha <file.nir> [--format=json] [--otel-console]");
+    eprintln!("                                      interpret");
     eprintln!("                                      (--format=json: structured diagnostics on failure)");
+    eprintln!("                                      (--otel-console: print a JSON trace span per");
+    eprintln!("                                       effectful call to stdout -- layer 1, see");
+    eprintln!("                                       the observability design plan; --otel/");
+    eprintln!("                                       --otel-endpoint aren't implemented until layer 2)");
     eprintln!("  nirdosha build <file.nir> -o <out> [--opt0]");
     eprintln!("                                      compile to a native binary (LLVM, -O2 by default)");
     eprintln!("  nirdosha emit-llvm <file.nir>       print the generated LLVM IR");
     eprintln!("  nirdosha emit-ast <file.nir>        print the parsed AST as JSON (goal.md row 9)");
+    eprintln!("  nirdosha emit-ui <file.nir> [-o out.html]");
+    eprintln!("                                      derive a Material-styled web UI from struct/fn conventions");
+    eprintln!("  nirdosha serve <file.nir> [--port 8080] [--jwks-file P --issuer S --audience S]");
+    eprintln!("                             [--identity-base URL]");
+    eprintln!("                                      run the program as a real HTTP service (UI at GET /,");
+    eprintln!("                                      API at POST /api/<fn>) -- see src/serve.rs");
 }
 
 fn read_source(path: &str) -> Result<String, ExitCode> {
@@ -72,22 +103,29 @@ fn print_value(v: &Value) -> ExitCode {
         | Value::Sandbox(_)
         | Value::Tcp(_)
         | Value::TcpListener(_)
-        | Value::File(_) => {
+        | Value::File(_)
+        | Value::Mq(_) => {
             println!("=> {v:?}")
         }
         Value::Vector(_) | Value::Matrix(..) => println!("=> {v:?}"),
-        Value::Struct(..) | Value::Enum(..) | Value::Json(_) | Value::Db(_) => println!("=> {v:?}"),
+        Value::Struct(..) | Value::Enum(..) | Value::Json(_) | Value::Db(_) | Value::Fn(_) => println!("=> {v:?}"),
     }
     ExitCode::SUCCESS
 }
 
-fn cmd_interpret(path: &str, format_json: bool) -> ExitCode {
+fn cmd_interpret(path: &str, format_json: bool, otel_console: bool) -> ExitCode {
     let src = match read_source(path) {
         Ok(s) => s,
         Err(code) => return code,
     };
+    // Observability layer 1: `--otel-console` builds one `Tracer` up
+    // front and hands it down through `lib.rs`'s `_with_tracer` variants
+    // — `None` here is exactly `run`/`run_diagnostic`'s own behavior, so
+    // an ordinary interpret run (the overwhelming common case) pays
+    // nothing extra.
+    let tracer = if otel_console { Some(nirdosha::observability::Tracer::new_console()) } else { None };
     if format_json {
-        return match nirdosha::run_diagnostic(&src) {
+        return match nirdosha::run_diagnostic_with_tracer(&src, tracer) {
             Ok(v) => print_value(&v),
             // Lex/parse errors aren't part of `Diagnostic` yet (see
             // `lib.rs`'s doc comment) — they stay plain text even under
@@ -104,7 +142,7 @@ fn cmd_interpret(path: &str, format_json: bool) -> ExitCode {
             }
         };
     }
-    match nirdosha::run(&src) {
+    match nirdosha::run_with_tracer(&src, tracer) {
         Ok(v) => print_value(&v),
         Err(msg) => {
             eprintln!("{msg}");
@@ -256,6 +294,124 @@ fn cmd_emit_ast(mut args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
+/// `nirdosha emit-ui <file.nir> [-o out.html]` — derives a self-contained,
+/// Material-styled HTML/JS app from the program's `struct` declarations
+/// and `list_/create_/update_/delete_/get_<struct>` naming convention
+/// (`ui_gen::generate`). Unlike `emit-ast`, this needs the *typed*
+/// program (`typecheck_and_own`, same gate `build`/`emit-llvm` use) —
+/// screen inference reads resolved struct fields and function
+/// signatures, not raw syntax.
+fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut input: Option<String> = None;
+    let mut output: Option<String> = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-o" => output = args.next(),
+            other => input = Some(other.to_string()),
+        }
+    }
+    let Some(path) = input else {
+        eprintln!("usage: nirdosha emit-ui <file.nir> [-o out.html]");
+        return ExitCode::FAILURE;
+    };
+    let src = match read_source(&path) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let program = match typecheck_and_own(&src) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let registry = nirdosha::ast::TypeRegistry::build(&program);
+    let effects = nirdosha::effects::infer_effects(&program, &registry);
+    let html = nirdosha::ui_gen::generate(&program, &effects, None);
+    match output {
+        Some(out) => match std::fs::write(&out, html) {
+            Ok(()) => {
+                println!("wrote {out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error writing {out}: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        None => {
+            println!("{html}");
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// `nirdosha serve <file.nir> [--port 8080] [--jwks-file P --issuer S
+/// --audience S] [--identity-base URL]` — runs the program as a real
+/// HTTP service via `serve::run` (`tiny_http`; see `src/serve.rs`'s
+/// module doc for the request-handling design and, importantly, the
+/// authz gate it adds on top of `Interpreter::call_named`, which by
+/// itself does not enforce `requires(role: ...)`). `--jwks-file`/
+/// `--issuer`/`--audience` are all-or-nothing: without them, any
+/// `Authorization: Bearer` header is rejected with a clear 500 rather
+/// than silently accepted or silently ignored, and any `requires`-gated
+/// handler is simply unreachable (every caller gets 401) — an honest
+/// failure mode, not a security hole disguised as "it just worked."
+fn cmd_serve(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut input: Option<String> = None;
+    let mut port: u16 = 8080;
+    let mut jwks_file: Option<String> = None;
+    let mut issuer: Option<String> = None;
+    let mut audience: Option<String> = None;
+    let mut identity_base: Option<String> = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--port" => port = args.next().and_then(|s| s.parse().ok()).unwrap_or(port),
+            "--jwks-file" => jwks_file = args.next(),
+            "--issuer" => issuer = args.next(),
+            "--audience" => audience = args.next(),
+            "--identity-base" => identity_base = args.next(),
+            other => input = Some(other.to_string()),
+        }
+    }
+    let Some(path) = input else {
+        eprintln!("usage: nirdosha serve <file.nir> [--port 8080] [--jwks-file P --issuer S --audience S] [--identity-base URL]");
+        return ExitCode::FAILURE;
+    };
+    let src = match read_source(&path) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let program = match typecheck_and_own(&src) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let auth = match (jwks_file, issuer, audience) {
+        (Some(path), Some(issuer), Some(audience)) => match std::fs::read_to_string(&path) {
+            Ok(jwks_json) => Some(nirdosha::serve::AuthConfig { jwks_json, issuer, audience }),
+            Err(e) => {
+                eprintln!("error reading {path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        (None, None, None) => None,
+        _ => {
+            eprintln!("--jwks-file/--issuer/--audience must be given together, or not at all");
+            return ExitCode::FAILURE;
+        }
+    };
+    match nirdosha::serve::run(std::sync::Arc::new(program), port, auth, identity_base.as_deref()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// The process a `sandbox name(args)` expression actually spawns (see
 /// `interpreter.rs`'s `spawn_sandbox`): re-lex/parse/typecheck the source
 /// file it was handed, look up `name`, parse the remaining argv strings
@@ -319,7 +475,7 @@ fn cmd_sandbox_worker(mut args: impl Iterator<Item = String>) -> ExitCode {
     }
 
     let interp = Interpreter::new(Arc::new(program), Arc::from(src.as_str()));
-    match interp.call_named(&fn_name, &vals) {
+    match interp.call_named_on_big_stack(&fn_name, &vals) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("sandbox worker: runtime error: {e}");

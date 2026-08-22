@@ -1,0 +1,31 @@
+// Exercises `emit-ui`: a plain `struct` plus the `list_/create_/update_/
+// delete_<struct>` naming convention derives a full CRUD screen
+// (ui_gen.rs's `Screen`/`Action`); `delete_todo` additionally takes a
+// `VerifiedIdentity` and is `requires(role: "admin")`-gated, exercising
+// emit-ui's login screen + role-gated action derivation.
+
+struct Todo {
+    id: i64,
+    title: str,
+    done: bool,
+}
+
+fn list_todo() -> str {
+    return "[]"
+}
+
+fn create_todo(t: Todo) -> str {
+    return t.title
+}
+
+fn update_todo(t: Todo) -> str {
+    return t.title
+}
+
+fn delete_todo(identity: VerifiedIdentity, id: i64) -> i64 requires(role: "admin") {
+    return id
+}
+
+fn main() -> str {
+    return list_todo()
+}

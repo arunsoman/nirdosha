@@ -12,3 +12,5 @@ base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
 rusqlite = { version = "0.31", features = ["bundled"] }
+redis = "0.27"
+tiny_http = "0.12"

@@ -195,6 +195,7 @@ fn llvm_ty(ty: &Ty) -> Result<String, CodegenError> {
         ),
         Ty::Json => unsupported("codegen doesn't support `json` yet — JSON is interpreter-only for now"),
         Ty::Db => unsupported("codegen doesn't support `db` yet — DB connectivity is interpreter-only for now"),
+        Ty::Mq => unsupported("codegen doesn't support `mq` yet — message-queue connectivity is interpreter-only for now"),
         // A fixed-size, two-word value — pointer to the byte data plus an
         // explicit `i64` length, never NUL-terminated-only (a `str`'s
         // bytes are whatever the source literal's escapes resolved to,
@@ -239,6 +240,10 @@ fn llvm_ty(ty: &Ty) -> Result<String, CodegenError> {
             "codegen doesn't support `{name}` yet — struct/enum/match (Row 11) are interpreter-only \
              for now, see nirdosha_row11_amendment.md"
         )),
+        Ty::Fn(_, _) => unsupported(
+            "codegen doesn't support `fn(..)->..` yet — first-class/privileged functions \
+             (requires/acquire) are interpreter-only for now",
+        ),
         Ty::Error => unreachable!("a program with a type error is never handed to codegen"),
     }
 }
@@ -448,6 +453,10 @@ fn check_expr(e: &Expr, ctor_names: &std::collections::HashSet<&str>) -> Result<
         Expr::Spawn(_, _, _) | Expr::Join(_, _) => {
             unsupported("codegen doesn't support `spawn`/`join` yet — interpreter-only for now")
         }
+        Expr::Acquire(_, _, _) => unsupported(
+            "codegen doesn't support `acquire` yet — first-class/privileged functions \
+             are interpreter-only for now",
+        ),
         // `chan` construction itself is still unsupported (Phase D2) —
         // but `send`/`recv` are the same two AST nodes `tcp`'s I/O reuses
         // (typeck.rs's `Expr::Send`/`Expr::Recv` arms dispatch on the
@@ -1496,6 +1505,7 @@ impl Codegen<'_> {
                 Ok(val)
             }
             Expr::Spawn(_, _, _)
+            | Expr::Acquire(_, _, _)
             | Expr::Join(_, _)
             | Expr::Chan(_)
             | Expr::SpawnSandbox(_, _, _)

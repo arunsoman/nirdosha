@@ -174,7 +174,7 @@ fn local_ty(e: &Expr, scopes: &Scopes) -> Ty {
 /// algebra and geometry/Kalman-filter set is pure (reads its arguments,
 /// returns a value, nothing else); only `print` and the RNG trio touch
 /// anything outside the computation itself.
-fn builtin_effect(name: &str) -> EffectSet {
+pub(crate) fn builtin_effect(name: &str) -> EffectSet {
     let mut s = EffectSet::new();
     match name {
         "print" => {
@@ -202,6 +202,12 @@ fn builtin_effect(name: &str) -> EffectSet {
         "db_connect" | "db_query" | "db_execute" => {
             s.insert(Effect::Io);
         }
+        // Unlike `db` (SQLite, a local file), a queue is a real network
+        // service -- same tag `http_get`/`connect`/`tcp` above get, not
+        // `Io` (`Ty::Mq`'s doc comment).
+        "mq_connect" | "mq_publish" | "mq_consume" => {
+            s.insert(Effect::Network);
+        }
         _ => {}
     }
     s
@@ -226,6 +232,30 @@ fn walk_expr(e: &Expr, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, 
                 acc.extend(builtin_effect(name));
             } else if let Some(callee) = known.get(name) {
                 acc.extend(callee.iter().copied());
+            } else if matches!(scopes.get(name), Some(Ty::Fn(..))) {
+                // Call-through-value: `name` is a local `fn(...)->...`
+                // binding (an ordinary higher-order parameter, or the
+                // `Ok(f)` a successful `acquire` produced — both are
+                // just a local name of type `Ty::Fn` by the time we get
+                // here, indistinguishable without real points-to
+                // tracking this pass doesn't do), not a name `known`
+                // resolves directly. A fixed red-team finding: this used
+                // to silently attribute *nothing*, so a plain
+                // `fn caller(f: fn()->i64) -> i64 effect(pure) { f() }`
+                // typechecked clean no matter what `f` actually pointed
+                // to and did at runtime -- unsound for the same reason
+                // ordinary `known.get(name)` resolution exists at all.
+                // We don't track which function(s) a given local could
+                // actually be bound to, so the sound conservative
+                // answer is "it could be anything already in this
+                // program" -- the union of every function's own
+                // inferred effects, not just this call's literal name.
+                // Coarser than real flow analysis, but correct: it
+                // never under-reports the way silence did, and it's
+                // still no worse than assuming all four tags outright
+                // since it only ever includes effects some real function
+                // in this program actually has.
+                acc.extend(known.values().flat_map(|fx| fx.iter().copied()));
             }
         }
         Expr::If { cond, then_block, else_block, .. } => {
@@ -246,6 +276,20 @@ fn walk_expr(e: &Expr, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, 
                 acc.extend(callee.iter().copied());
             }
         }
+        // `acquire` itself performs no effect — it only checks `proof`
+        // against the requirement, it doesn't invoke the gated function.
+        // The resulting value's *own* call site (`Expr::Call` on a
+        // `Ty::Fn`-typed local, e.g. the `f` in `Ok(f) => f(...)`) used
+        // to be a real, silently-unsound gap here — `known.get(name)`
+        // can't find a local binding's name, so nothing about the
+        // privileged function's actual effects (or, more generally, an
+        // *ordinary* higher-order parameter's — a fixed red-team finding
+        // showed this wasn't specific to `acquire` at all) was ever
+        // attributed to a caller holding one. `Expr::Call`'s own arm
+        // above now handles this directly (any call through a local
+        // `Ty::Fn` binding conservatively unions every function's
+        // inferred effects), so this arm only needs to walk `proof`.
+        Expr::Acquire(_, proof, _) => walk_expr(proof, scopes, known, registry, acc),
         Expr::Join(inner, _) => {
             acc.insert(Effect::Concurrent);
             walk_expr(inner, scopes, known, registry, acc);

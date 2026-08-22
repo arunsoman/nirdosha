@@ -1,0 +1,437 @@
+// A revenue assurance app, entirely in Nirdosha -- data model, business
+// logic, and its own web UI (`emit-ui`, derived, not hand-written).
+//
+//     nirdosha serve examples/rev-assurence/rev_assurance.nir --port 8081 \
+//       --jwks-file <jwks.json> --issuer https://mock-idp.local \
+//       --audience store-app --identity-base http://localhost:9090
+//
+// (reuses `examples/identity_mock.nir` as its login server -- see that
+// file's header; run it on port 9090 first, same JWKS.)
+//
+// ---- what this actually does -------------------------------------------
+//
+// Revenue assurance, minimally but honestly: usage records (what a
+// subscriber actually consumed, rated at the correct price) and billing
+// records (what was actually invoiced) are ingested separately, per
+// (subscriber, service, period). `reconcile_period` finds every mismatch
+// between the two as a single SQL statement -- a `Discrepancy` row per
+// leak -- rather than looping over JSON in Nirdosha source (which would
+// need a "dummy" JSON value on every failure path; see
+// `examples/store.nir`'s own header comment on why that's awkward here).
+// Analysts then work the resulting case list from the derived UI.
+//
+// `db` is affine with no borrowing (`examples/db.nir`'s doc comment), so
+// every function below opens, uses, and `stop`s its own connection to
+// `rev_assurance.db`, same discipline `examples/store.nir` already
+// follows.
+//
+// `create_/update_*` and `reconcile_period` are `requires(role:
+// "analyst")` -- raw usage/billing ingestion and case handling are
+// controlled actions; the dashboard and case list are open to any
+// signed-in-or-not viewer, same as `examples/store.nir`'s product catalog.
+
+struct UsageRecord {
+    id: i64,
+    subscriber_id: str,
+    service_type: str,
+    period: str,
+    usage_units: i64,
+    rated_amount_cents: i64,
+}
+
+struct BillingRecord {
+    id: i64,
+    subscriber_id: str,
+    service_type: str,
+    period: str,
+    billed_amount_cents: i64,
+}
+
+struct Discrepancy {
+    id: i64,
+    subscriber_id: str,
+    service_type: str,
+    period: str,
+    expected_cents: i64,
+    billed_cents: i64,
+    leakage_cents: i64,
+    status: str,
+}
+
+// ---- usage records: ingest (analyst) + view --------------------------
+
+fn list_usage_record_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS usage_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, usage_units INTEGER, rated_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS billing_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, billed_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS discrepancies (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, expected_cents INTEGER, billed_cents INTEGER, leakage_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, subscriber_id, service_type, period, usage_units, rated_amount_cents FROM usage_records ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_usage_record() -> Result(json, str) {
+    return match db_connect("rev_assurance.db") {
+        Ok(conn) => list_usage_record_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn create_usage_record_inner(conn: db, u: UsageRecord) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS usage_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, usage_units INTEGER, rated_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS billing_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, billed_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS discrepancies (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, expected_cents INTEGER, billed_cents INTEGER, leakage_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, str) = db_execute(conn, "INSERT INTO usage_records (subscriber_id, service_type, period, usage_units, rated_amount_cents) VALUES (?, ?, ?, ?, ?)", u.subscriber_id, u.service_type, u.period, u.usage_units, u.rated_amount_cents)
+    stop conn
+    return result
+}
+
+fn create_usage_record(u: UsageRecord) -> Result(i64, str) requires(role: "analyst") {
+    return match db_connect("rev_assurance.db") {
+        Ok(conn) => create_usage_record_inner(conn, u),
+        Err(e) => Err(e),
+    }
+}
+
+// ---- billing records: ingest (analyst) + view -------------------------
+
+fn list_billing_record_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS usage_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, usage_units INTEGER, rated_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS billing_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, billed_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS discrepancies (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, expected_cents INTEGER, billed_cents INTEGER, leakage_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, subscriber_id, service_type, period, billed_amount_cents FROM billing_records ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_billing_record() -> Result(json, str) {
+    return match db_connect("rev_assurance.db") {
+        Ok(conn) => list_billing_record_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn create_billing_record_inner(conn: db, b: BillingRecord) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS usage_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, usage_units INTEGER, rated_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS billing_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, billed_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS discrepancies (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, expected_cents INTEGER, billed_cents INTEGER, leakage_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, str) = db_execute(conn, "INSERT INTO billing_records (subscriber_id, service_type, period, billed_amount_cents) VALUES (?, ?, ?, ?)", b.subscriber_id, b.service_type, b.period, b.billed_amount_cents)
+    stop conn
+    return result
+}
+
+fn create_billing_record(b: BillingRecord) -> Result(i64, str) requires(role: "analyst") {
+    return match db_connect("rev_assurance.db") {
+        Ok(conn) => create_billing_record_inner(conn, b),
+        Err(e) => Err(e),
+    }
+}
+
+// ---- reconciliation: one SQL statement finds every leak ----------------
+
+fn reconcile_period_inner(conn: db, period: str) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS usage_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, usage_units INTEGER, rated_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS billing_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, billed_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS discrepancies (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, expected_cents INTEGER, billed_cents INTEGER, leakage_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+
+    // Idempotent: re-running for the same period replaces its still-open
+    // findings rather than piling up duplicates. Cases an analyst has
+    // already moved to "investigating"/"resolved"/"false_positive" are
+    // left alone -- only "open" ones are superseded.
+    let cleared: i64 = match db_execute(conn, "DELETE FROM discrepancies WHERE period = ? AND status = 'open'", period) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+
+    // The reconciliation itself: every (subscriber, service) pair for
+    // this period where the rated usage doesn't match what was actually
+    // billed (a missing billing row counts as billed = 0). SQL does the
+    // correlation -- no Nirdosha-side loop over JSON needed.
+    let inserted: Result(i64, str) = db_execute(
+        conn,
+        "INSERT INTO discrepancies (subscriber_id, service_type, period, expected_cents, billed_cents, leakage_cents, status) SELECT u.subscriber_id, u.service_type, u.period, u.rated_amount_cents, COALESCE(b.billed_amount_cents, 0), u.rated_amount_cents - COALESCE(b.billed_amount_cents, 0), 'open' FROM usage_records u LEFT JOIN billing_records b ON b.subscriber_id = u.subscriber_id AND b.service_type = u.service_type AND b.period = u.period WHERE u.period = ? AND u.rated_amount_cents <> COALESCE(b.billed_amount_cents, 0)",
+        period
+    )
+    stop conn
+    return inserted
+}
+
+fn reconcile_period(period: str) -> Result(i64, str) requires(role: "analyst") {
+    return match db_connect("rev_assurance.db") {
+        Ok(conn) => reconcile_period_inner(conn, period),
+        Err(e) => Err(e),
+    }
+}
+
+// ---- discrepancies: the case list --------------------------------------
+
+fn list_discrepancy_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS usage_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, usage_units INTEGER, rated_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS billing_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, billed_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS discrepancies (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, expected_cents INTEGER, billed_cents INTEGER, leakage_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, subscriber_id, service_type, period, expected_cents, billed_cents, leakage_cents, status FROM discrepancies ORDER BY leakage_cents DESC")
+    stop conn
+    return rows
+}
+
+fn list_discrepancy() -> Result(json, str) {
+    return match db_connect("rev_assurance.db") {
+        Ok(conn) => list_discrepancy_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn update_discrepancy_inner(conn: db, d: Discrepancy) -> Result(i64, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS usage_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, usage_units INTEGER, rated_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS billing_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, billed_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS discrepancies (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, expected_cents INTEGER, billed_cents INTEGER, leakage_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, str) = db_execute(conn, "UPDATE discrepancies SET status = ? WHERE id = ?", d.status, d.id)
+    stop conn
+    return result
+}
+
+// An analyst edits a case's `status` (e.g. "investigating"/"resolved"/
+// "false_positive") through the derived table's inline Edit -- every
+// other field round-trips unchanged, since `update_discrepancy` takes
+// the whole struct (the `update_<S>(x: S)` convention).
+fn update_discrepancy(d: Discrepancy) -> Result(i64, str) requires(role: "analyst") {
+    return match db_connect("rev_assurance.db") {
+        Ok(conn) => update_discrepancy_inner(conn, d),
+        Err(e) => Err(e),
+    }
+}
+
+// ---- dashboard: tiles + charts, derived by `stat_`/`chart_` naming ----
+
+fn stat_open_discrepancies_inner(conn: db) -> i64 {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS usage_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, usage_units INTEGER, rated_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS billing_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, billed_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS discrepancies (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, expected_cents INTEGER, billed_cents INTEGER, leakage_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let count: i64 = match db_query(conn, "SELECT COUNT(*) as value FROM discrepancies WHERE status = 'open'") {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") {
+                Ok(v) => v,
+                Err(e) => 0,
+            },
+            Err(e) => 0,
+        },
+        Err(e) => 0,
+    }
+    stop conn
+    return count
+}
+
+fn stat_open_discrepancies() -> i64 {
+    return match db_connect("rev_assurance.db") {
+        Ok(conn) => stat_open_discrepancies_inner(conn),
+        Err(e) => 0,
+    }
+}
+
+fn stat_total_leakage_cents_inner(conn: db) -> i64 {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS usage_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, usage_units INTEGER, rated_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS billing_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, billed_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS discrepancies (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, expected_cents INTEGER, billed_cents INTEGER, leakage_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let total: i64 = match db_query(conn, "SELECT COALESCE(SUM(leakage_cents), 0) as value FROM discrepancies WHERE status <> 'false_positive'") {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") {
+                Ok(v) => v,
+                Err(e) => 0,
+            },
+            Err(e) => 0,
+        },
+        Err(e) => 0,
+    }
+    stop conn
+    return total
+}
+
+fn stat_total_leakage_cents() -> i64 requires(role: "analyst") {
+    return match db_connect("rev_assurance.db") {
+        Ok(conn) => stat_total_leakage_cents_inner(conn),
+        Err(e) => 0,
+    }
+}
+
+fn stat_leakage_rate_bps_inner(conn: db) -> i64 {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS usage_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, usage_units INTEGER, rated_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS billing_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, billed_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS discrepancies (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, expected_cents INTEGER, billed_cents INTEGER, leakage_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let expected: i64 = match db_query(conn, "SELECT COALESCE(SUM(expected_cents), 0) as value FROM discrepancies WHERE status <> 'false_positive'") {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") {
+                Ok(v) => v,
+                Err(e) => 0,
+            },
+            Err(e) => 0,
+        },
+        Err(e) => 0,
+    }
+    let leaked: i64 = match db_query(conn, "SELECT COALESCE(SUM(leakage_cents), 0) as value FROM discrepancies WHERE status <> 'false_positive'") {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") {
+                Ok(v) => v,
+                Err(e) => 0,
+            },
+            Err(e) => 0,
+        },
+        Err(e) => 0,
+    }
+    stop conn
+    // Basis points, guarding the division `LANGUAGE.md` §4 says traps on
+    // a zero divisor -- no expected revenue yet means a 0 bps rate, not
+    // a runtime trap.
+    return if expected == 0 {
+        0
+    } else {
+        leaked * 10000 / expected
+    }
+}
+
+fn stat_leakage_rate_bps() -> i64 requires(role: "analyst") {
+    return match db_connect("rev_assurance.db") {
+        Ok(conn) => stat_leakage_rate_bps_inner(conn),
+        Err(e) => 0,
+    }
+}
+
+fn chart_leakage_by_service_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS usage_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, usage_units INTEGER, rated_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS billing_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, billed_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS discrepancies (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, expected_cents INTEGER, billed_cents INTEGER, leakage_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let rows: Result(json, str) = db_query(conn, "SELECT service_type as label, COALESCE(SUM(leakage_cents), 0) as value FROM discrepancies WHERE status <> 'false_positive' GROUP BY service_type ORDER BY value DESC")
+    stop conn
+    return rows
+}
+
+fn chart_leakage_by_service() -> Result(json, str) {
+    return match db_connect("rev_assurance.db") {
+        Ok(conn) => chart_leakage_by_service_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn chart_discrepancies_by_status_inner(conn: db) -> Result(json, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS usage_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, usage_units INTEGER, rated_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS billing_records (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, billed_amount_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS discrepancies (id INTEGER PRIMARY KEY AUTOINCREMENT, subscriber_id TEXT, service_type TEXT, period TEXT, expected_cents INTEGER, billed_cents INTEGER, leakage_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let rows: Result(json, str) = db_query(conn, "SELECT status as label, COUNT(*) as value FROM discrepancies GROUP BY status ORDER BY value DESC")
+    stop conn
+    return rows
+}
+
+fn chart_discrepancies_by_status() -> Result(json, str) {
+    return match db_connect("rev_assurance.db") {
+        Ok(conn) => chart_discrepancies_by_status_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn main() {}

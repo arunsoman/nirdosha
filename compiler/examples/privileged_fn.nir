@@ -1,0 +1,41 @@
+// Privileged first-class functions: a `requires`-gated function's *value*
+// (not just its behavior) is unobtainable without presenting proof — an
+// externally-issued, already-validated `RoleView`/`ClaimView` from the
+// identity feature (oidc_validate_token -> check_role/extract_claim).
+// `transfer_funds(500)` or `let f = transfer_funds` here would both be
+// *compile-time* errors: `acquire` is the only path to a callable value.
+
+fn transfer_funds(amount: i64) -> i64 requires(role: "physician") {
+    return amount
+}
+
+// An ordinary (ungated) function is already a first-class value just by
+// naming it -- no proof needed.
+fn double(x: i64) -> i64 {
+    return x * 2
+}
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x)
+}
+
+fn main() -> i64 {
+    print(apply(double, 21))
+
+    // Same mock JWT/JWKS fixture `tests/row12_identity.rs` and
+    // `tests/privileged_fn.rs` both use — claims: roles=["physician"],
+    // department="cardiology".
+    let token: str = "eyJhbGciOiAiSFMyNTYiLCAia2lkIjogImtleTEifQ.eyJzdWIiOiAiYWxpY2UiLCAiaXNzIjogImh0dHBzOi8vZXhhbXBsZS5jb20iLCAiYXVkIjogIm15LWFwcCIsICJleHAiOiAyMDAwMDAwMDAwLCAiaWF0IjogMTcwMDAwMDAwMCwgInJvbGVzIjogWyJwaHlzaWNpYW4iXSwgImRlcGFydG1lbnQiOiAiY2FyZGlvbG9neSJ9.nrFdeqNDwXWLeGzud6X9Q4ITzCXULzZBBK8y51LGYXs"
+    let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
+
+    return match oidc_validate_token(token, "https://example.com", "my-app", jwks) {
+        Ok(identity) => match check_role(identity, "physician") {
+            Ok(proof) => match acquire transfer_funds(proof) {
+                Ok(f) => f(500),
+                Err(e) => -1,
+            },
+            Err(e) => -2,
+        },
+        Err(e) => -3,
+    }
+}

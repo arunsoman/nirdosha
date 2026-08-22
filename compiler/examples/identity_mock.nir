@@ -1,0 +1,52 @@
+// A mock identity provider, shared by every `nirdosha serve`d example
+// that needs a login -- `examples/store.nir` and
+// `examples/rev-assurence/rev_assurance.nir` both point their
+// `--identity-base` at this same process (`nirdosha serve
+// examples/identity_mock.nir --port 9090`), and both `nirdosha serve`
+// instances are started with `--audience store-app` to trust it.
+// `POST /api/login {"subject":"...","role":"admin"}` mints a real
+// signed token via `mock_issue_token` (the deliberate, explicitly-named
+// inverse of `oidc_validate_token` -- see its own doc comment in
+// interpreter.rs) against a fixed, published JWKS. The token then
+// validates through the *real*, unmodified `oidc_validate_token` on the
+// relying app's own server -- that round-trip is what makes this useful
+// as a stand-in for a real IdP during local development, not a
+// parallel/fake auth mechanism.
+//
+// Recognized roles: `"admin"`, `"analyst"` (store/rev-assurance), plus
+// `examples/trade-finance/`'s doc-accurate RBAC vocabulary --
+// `"system_admin"`, `"corporate_seller"`, `"corporate_buyer"`,
+// `"bank_ops"`, `"compliance_officer"`, `"channel_partner"` -- or
+// anything else, which becomes `"customer"`. Nirdosha `str` has no
+// concatenation or parsing (LANGUAGE.md §2), so there's no way to turn
+// an arbitrary free-text role list into JSON claims dynamically;
+// picking between a fixed set of literal, pre-written claims payloads
+// via `==` is what's actually expressible. A real IdP obviously
+// wouldn't have this limit.
+//
+// `issued_at` is a fixed literal, not a real clock reading -- Nirdosha
+// has no wall-clock builtin (deliberate: LANGUAGE.md §9's determinism
+// stance), so tokens are minted with a generous fixed ttl instead of
+// expiring realistically. Fine for a local mock; would need a real
+// clock source to not be.
+
+fn login(subject: str, role: str) -> Result(str, str) {
+    let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
+    // Literal-pattern `match` over `str` (post-v1 addition to Row 11's
+    // originally enum-only `match` -- `nirdosha_row11_amendment.md`
+    // §3.4's addendum) -- a real switch, not a nested if-else chain.
+    let claims_json: str = match role {
+        "admin" => "{\"roles\":[\"admin\"]}",
+        "analyst" => "{\"roles\":[\"analyst\"]}",
+        "system_admin" => "{\"roles\":[\"system_admin\"]}",
+        "corporate_seller" => "{\"roles\":[\"corporate_seller\"]}",
+        "corporate_buyer" => "{\"roles\":[\"corporate_buyer\"]}",
+        "bank_ops" => "{\"roles\":[\"bank_ops\"]}",
+        "compliance_officer" => "{\"roles\":[\"compliance_officer\"]}",
+        "channel_partner" => "{\"roles\":[\"channel_partner\"]}",
+        _ => "{\"roles\":[\"customer\"]}",
+    }
+    return mock_issue_token(subject, "https://mock-idp.local", "store-app", 1700000000, 999999999, claims_json, jwks)
+}
+
+fn main() {}

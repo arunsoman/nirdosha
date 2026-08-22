@@ -191,6 +191,28 @@ pub enum Ty {
     /// `Ty::Json`) stays the same regardless of which real driver crate
     /// answers it underneath.
     Db,
+    /// A handle to a real, open message-queue connection (`mq_connect(host,
+    /// port)` — see `Expr::Call`'s `"mq_connect"` arm). Affine, same
+    /// reason and same shape as `Ty::Db`: one owner, `stop`-closed once.
+    /// Unlike `Db` (SQLite, a local file — `Effect::Io`), a queue is a
+    /// real network service, so `mq_*` builtins carry `Effect::Network`
+    /// instead (see `effects.rs`). Layer 1 targets Redis specifically
+    /// (`redis` crate; `LPUSH`/`BLPOP` back `mq_publish`/`mq_consume`) —
+    /// same "the Nirdosha-facing surface stays the same regardless of the
+    /// driver underneath" stance `Ty::Db`'s doc comment already takes.
+    Mq,
+    /// A first-class function value — `fn(T1, T2) -> R`. Just a name
+    /// under the hood (`Value::Fn` in `interpreter.rs`); this language has
+    /// no closures, so there's no captured environment to carry, which is
+    /// what keeps this a plain, freely-copyable reference rather than
+    /// something `ownership.rs` has to treat specially — see `is_affine`.
+    /// Produced two ways: naming a plain top-level `fn` directly where a
+    /// `Ty::Fn` is expected, or `acquire`ing a `requires`-gated one after
+    /// its proof checks out (`Expr::Acquire`, `ast::Requirement`) — a
+    /// `requires`-gated function's name is rejected everywhere *except*
+    /// `acquire`'s callee position (`TypeErrorKind::PrivilegedFnNotAcquired`),
+    /// so this is the only way to end up holding one.
+    Fn(Vec<Ty>, Box<Ty>),
     /// A user-declared `struct`/`enum` name, plus its concrete type
     /// arguments (`nirdosha_row11_amendment.md` — Row 11, layer 6:
     /// generics). `Point` is `Named("Point", [])`; `Pair(i64, str)` is
@@ -239,6 +261,7 @@ impl Ty {
             "file" => Ty::File,
             "json" => Ty::Json,
             "db" => Ty::Db,
+            "mq" => Ty::Mq,
             _ => return None,
         })
     }
@@ -272,6 +295,10 @@ impl Ty {
             Ty::File => "file".to_string(),
             Ty::Json => "json".to_string(),
             Ty::Db => "db".to_string(),
+            Ty::Mq => "mq".to_string(),
+            Ty::Fn(params, ret) => {
+                format!("fn({}) -> {}", params.iter().map(Ty::name).collect::<Vec<_>>().join(", "), ret.name())
+            }
             Ty::Named(name, args) if args.is_empty() => name.clone(),
             Ty::Named(name, args) => {
                 format!("{name}({})", args.iter().map(Ty::name).collect::<Vec<_>>().join(", "))
@@ -297,6 +324,8 @@ impl Ty {
                 | Ty::File
                 | Ty::Json
                 | Ty::Db
+                | Ty::Mq
+                | Ty::Fn(_, _)
                 | Ty::Named(_, _)
                 | Ty::F64
                 | Ty::Vector(_, _)
@@ -361,7 +390,8 @@ impl Ty {
         // computation at once, so it has to be freely copyable — see its
         // own doc comment for where the actual ownership-transfer happens
         // instead (a channel's *payload*, at `send`, not the handle).
-        matches!(self, Ty::Box(_) | Ty::Thread(_) | Ty::Sandbox | Ty::Tcp | Ty::TcpListener | Ty::File | Ty::Db)
+        matches!(self, Ty::Box(_) | Ty::Thread(_) | Ty::Sandbox | Ty::Tcp | Ty::TcpListener | Ty::File | Ty::Db | Ty::Mq)
+        // `Ty::Fn` deliberately excluded — see its own doc comment.
     }
 
     /// goal.md row 4's runtime fallback (Tier 2, §4): `interpreter.rs`
@@ -419,6 +449,8 @@ impl Ty {
             | Ty::File
             | Ty::Json
             | Ty::Db
+            | Ty::Mq
+            | Ty::Fn(_, _)
             | Ty::Named(_, _)
             | Ty::F64
             | Ty::Vector(_, _)
@@ -584,6 +616,44 @@ pub fn prelude_structs() -> Vec<StructDecl> {
             fields: vec![Field { name: "value".to_string(), ty: Ty::Str }],
             span,
         },
+        // Row 12 continued: application session and refresh-token lifecycle.
+        // ApplicationSession is separate from VerifiedIdentity and manages
+        // the browser/session state.
+        StructDecl {
+            name: "ApplicationSession".to_string(),
+            type_params: vec![],
+            fields: vec![
+                Field { name: "session_id".to_string(), ty: Ty::Str },
+                Field { name: "identity_subject".to_string(), ty: Ty::Str },
+                Field { name: "identity_issuer".to_string(), ty: Ty::Str },
+                Field { name: "created_at".to_string(), ty: Ty::I64 },
+                Field { name: "expires_at".to_string(), ty: Ty::I64 },
+                Field { name: "last_accessed_at".to_string(), ty: Ty::I64 },
+            ],
+            span,
+        },
+        // RefreshTokenHandle is affine (box i64 field) — represents a
+        // runtime-managed refresh token slot.
+        StructDecl {
+            name: "RefreshTokenHandle".to_string(),
+            type_params: vec![],
+            fields: vec![
+                Field { name: "handle".to_string(), ty: Ty::Box(Box::new(Ty::I64)) },
+                Field { name: "expires_at".to_string(), ty: Ty::I64 },
+            ],
+            span,
+        },
+        // Generic pair for returning two values together (used by refresh
+        // token exchange).
+        StructDecl {
+            name: "Pair".to_string(),
+            type_params: vec!["A".to_string(), "B".to_string()],
+            fields: vec![
+                Field { name: "first".to_string(), ty: Ty::Named("A".to_string(), vec![]) },
+                Field { name: "second".to_string(), ty: Ty::Named("B".to_string(), vec![]) },
+            ],
+            span,
+        },
     ]
 }
 
@@ -655,6 +725,62 @@ pub struct FnDecl {
     /// effect the body never actually uses is not an error — the same
     /// generosity ProtoLang's own effect-subsumption rule gives.
     pub declared_effects: Option<std::collections::BTreeSet<Effect>>,
+    /// `requires(role: "admin")` / `requires(claim: "department", "cardiology")`
+    /// — `None` when the declaration has no `requires(...)` at all (the
+    /// common case: an ordinary function, callable directly and freely
+    /// usable as a `Ty::Fn` value). `Some(req)` gates *both* direct calls
+    /// and bare value-references to this name — `typeck.rs` rejects each
+    /// with `TypeErrorKind::PrivilegedFnNotAcquired` — leaving `acquire`
+    /// (`Expr::Acquire`) as the only path to a callable value, gated on
+    /// presenting a matching `RoleView`/`ClaimView` proof. See
+    /// `Requirement`'s own doc comment.
+    pub requires: Option<Requirement>,
+}
+
+/// What `acquire` (`Expr::Acquire`) demands proof of before a `requires`-
+/// gated function (`FnDecl::requires`) becomes a callable `Ty::Fn` value.
+/// Deliberately reuses the identity feature's own proof types
+/// (`RoleView`/`ClaimView`, produced by `check_role`/`extract_claim`)
+/// rather than inventing a parallel credential type — "user management
+/// happens in an external system" already means an outside IdP is the
+/// root of trust (`oidc_validate_token`); this is just the missing piece
+/// that makes holding one of those proofs the *only* way to obtain a
+/// callable value for a gated function, checked once at acquisition
+/// instead of re-checked (or forgotten) at every call site.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Requirement {
+    /// `requires(role: "admin")` — `acquire` needs a `RoleView` whose
+    /// `role` field equals this string (i.e. `check_role(identity,
+    /// "admin")` must have already succeeded).
+    Role(String),
+    /// `requires(claim: "department", "cardiology")` — `acquire` needs a
+    /// `ClaimView` whose `value` field equals the second string (i.e.
+    /// `extract_claim(identity, "department")` must have succeeded and
+    /// yielded exactly `"cardiology"`).
+    Claim(String, String),
+}
+
+impl Requirement {
+    /// The proof type `acquire` demands for this requirement — always one
+    /// of the identity feature's own prelude structs (`prelude_structs`),
+    /// never a new type: `check_role`/`extract_claim` already produce
+    /// exactly these.
+    pub fn proof_ty(&self) -> Ty {
+        match self {
+            Requirement::Role(_) => Ty::Named("RoleView".to_string(), vec![]),
+            Requirement::Claim(..) => Ty::Named("ClaimView".to_string(), vec![]),
+        }
+    }
+
+    /// Human-readable fragment for diagnostics — always reads naturally
+    /// after a function name, e.g. "`transfer_funds` requires role
+    /// \"admin\"".
+    pub fn describe(&self) -> String {
+        match self {
+            Requirement::Role(role) => format!("requires role \"{role}\""),
+            Requirement::Claim(name, value) => format!("requires claim \"{name}\" = \"{value}\""),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -760,6 +886,18 @@ pub enum Expr {
     /// see `Ty::Thread`'s doc comment for why that reuse is the actual
     /// content of the race-freedom claim, not incidental.
     Spawn(String, Vec<Expr>, Span),
+    /// `acquire name(proof)` — the only way to obtain a callable
+    /// `Ty::Fn` value for a `requires`-gated function (`FnDecl::requires`,
+    /// `Requirement`). Shaped exactly like `Expr::Spawn` (a name plus a
+    /// single argument, not an arbitrary expression) for the same reuse
+    /// reason: `name` is looked up as a top-level fn, its `requires`
+    /// checked against `proof`'s type (`RoleView` for a role requirement,
+    /// `ClaimView` for a claim one). Evaluates to `Ty::Named("Result",
+    /// [Ty::Fn(params, ret), Ty::Str])` — `Ok(f)` if `proof`'s field
+    /// matches the requirement, `Err(reason)` otherwise. `name` must not
+    /// be a local variable — this always resolves a global function, the
+    /// same restriction `Expr::Spawn`'s callee already has.
+    Acquire(String, Box<Expr>, Span),
     /// `join expr` — blocks until the spawned computation `expr` (which
     /// must be `Ty::Thread`-typed) finishes, consumes the handle (it's
     /// affine — a single join, like a single free), and yields its
@@ -874,11 +1012,17 @@ pub enum Expr {
     /// literal" node to pair this with.
     FieldAccess(Box<Expr>, String, Span),
     /// `match scrutinee { variant(bindings) => body, ... }`
-    /// (`nirdosha_row11_amendment.md` §3.4). An `expr`, not a `stmt`, for
-    /// the same reason `if`/`transact` already are: `return match o {
-    /// ... }` has to work. Exhaustiveness (every variant of the
-    /// scrutinee's specific enum, exactly once, no wildcard/binding-only
-    /// catch-all in v1) is `typeck.rs`'s job, not this type's.
+    /// (`nirdosha_row11_amendment.md` §3.4), extended (post-v1) to also
+    /// accept a `str`/`i64`/`bool` scrutinee matched against literal-
+    /// value arms plus a mandatory trailing `_` — see `MatchArm::pattern`.
+    /// An `expr`, not a `stmt`, for the same reason `if`/`transact`
+    /// already are: `return match o { ... }` has to work. Exhaustiveness
+    /// is `typeck.rs`'s job, not this type's: every variant of the
+    /// scrutinee's specific enum exactly once for the original enum
+    /// form, or every literal arm plus exactly one trailing `_` for the
+    /// literal form (a literal domain like `str`/`i64` isn't closed the
+    /// way an enum's variant set is, so there's no way to prove
+    /// coverage without a wildcard).
     Match { scrutinee: Box<Expr>, arms: Vec<MatchArm>, span: Span },
 }
 
@@ -888,10 +1032,39 @@ pub enum Expr {
 /// payload already use, no named-field binding in v1.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MatchArm {
+    /// The enum-variant form's payload-binding name, kept exactly as
+    /// before when `pattern` is `None`. When `pattern` is `Some(_)`
+    /// (a literal or `_` arm), this instead holds a human-readable
+    /// display form of that pattern (`"admin"`/`5`/`true`/`_`) purely
+    /// for error messages and duplicate-arm detection — deliberately
+    /// *not* a real variant name, so `TypeRegistry::find_variant` (used
+    /// by `ownership.rs`/`effects.rs`) safely returns `None` for it and
+    /// those passes' existing "no such variant" fallback already does
+    /// the right thing with zero changes to either file.
     pub variant: String,
     pub bindings: Vec<String>,
+    /// `None` — this arm names an enum variant (today's only v1 shape).
+    /// `Some(_)` — this arm is a literal-value or `_` pattern; `bindings`
+    /// is always empty in that case (the parser never populates it for
+    /// these, there's no payload to bind).
+    pub pattern: Option<LiteralPattern>,
     pub body: Box<Expr>,
     pub span: Span,
+}
+
+/// A literal-value `match` arm's pattern — the non-enum sibling
+/// `nirdosha_row11_amendment.md` §3.4 named as a disclosed v1 gap
+/// ("no wildcard/binding-only catch-all patterns"). Only `str`/`i64`/
+/// `bool` scrutinees get this form (no `f64`: floating-point pattern
+/// equality is a real footgun `match`'s int/str/bool literal form
+/// doesn't need to inherit). `Wildcard` (`_`) is required exactly once,
+/// last, whenever any arm uses this form — see `typeck.rs::check_literal_match`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum LiteralPattern {
+    Str(String),
+    Int(i64),
+    Bool(bool),
+    Wildcard,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -917,6 +1090,7 @@ impl Expr {
             | Expr::Deref(_, s)
             | Expr::Ref(_, s)
             | Expr::Spawn(_, _, s)
+            | Expr::Acquire(_, _, s)
             | Expr::Join(_, s)
             | Expr::Chan(s)
             | Expr::Send(_, _, s)
@@ -941,6 +1115,79 @@ pub struct Program {
     pub fns: Vec<FnDecl>,
     pub structs: Vec<StructDecl>,
     pub enums: Vec<EnumDecl>,
+    /// Declared `screen <Struct> { ... }` blocks (Row 12 UI DSL). Layered
+    /// on top of `ui_gen.rs`'s pure convention-based inference, never a
+    /// replacement for it — a struct with no matching `ScreenDecl` here
+    /// keeps today's full inferred UI unchanged; see `ui_gen::build_screens`.
+    pub screens: Vec<ScreenDecl>,
+    /// At most one `dashboard { ... }` block — supplements (doesn't
+    /// replace) `stat_`/`chart_` naming-convention inference.
+    pub dashboard: Option<DashboardDecl>,
+}
+
+/// One `key: value` slot inside a `screen`/`dashboard`/`field`/`action`
+/// body — `title: "Catalog"`, `page_size: 25`, `view: role("admin")`.
+/// The value is an ordinary `Expr` (the parser reuses `parse_expr()`
+/// unchanged); typeck narrows each key to its expected shape rather than
+/// the parser inventing a second value grammar. See `ast.rs` module docs
+/// / the UI DSL design doc for the full key vocabulary.
+pub type KvEntry = (String, Expr);
+
+/// `field <name> { ... }` inside a `screen` block — overrides/supplements
+/// one field's label, formatting, searchability, sortability, and
+/// view/edit visibility for the struct's inferred UI. Every entry is a
+/// plain `KvEntry`; typeck (not the parser) enforces which keys are
+/// recognized and what shape their values must have.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FieldOverride {
+    pub field_name: String,
+    pub entries: Vec<KvEntry>,
+    pub span: Span,
+}
+
+/// `action "<label>" -> <target_fn> { ... }` inside a `screen` block — a
+/// custom row/toolbar action beyond the inferred create/update/delete
+/// set, e.g. `action "Restock" -> restock_product { style: "outlined" }`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ActionDecl {
+    pub label: String,
+    pub target_fn: String,
+    pub entries: Vec<KvEntry>,
+    pub span: Span,
+}
+
+/// `screen <StructName> { ... }` — a top-level declaration overriding/
+/// supplementing the inferred UI for one struct. `entries` holds the
+/// screen-level `key: value` slots (`title: "..."`, `list: list_product`,
+/// `paginate { ... }` folds its own entries in under the `"paginate"`
+/// key as a nested-entries convenience — see `parse_screen_decl`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ScreenDecl {
+    pub struct_name: String,
+    pub entries: Vec<KvEntry>,
+    pub fields: Vec<FieldOverride>,
+    pub actions: Vec<ActionDecl>,
+    pub span: Span,
+}
+
+/// `tile "<label>" -> <fn>` or `chart "<label>" -> <fn>` inside a
+/// `dashboard` block — same shape for both, distinguished by which
+/// `Vec` in `DashboardDecl` it lands in.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MetricRef {
+    pub label: String,
+    pub target_fn: String,
+    pub span: Span,
+}
+
+/// `dashboard { tile "..." -> stat_fn  chart "..." -> chart_fn }` — a
+/// single top-level block supplementing `stat_`/`chart_` naming-
+/// convention inference in `ui_gen.rs`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DashboardDecl {
+    pub tiles: Vec<MetricRef>,
+    pub charts: Vec<MetricRef>,
+    pub span: Span,
 }
 
 /// Resolves `Ty::Named` references against a program's own `struct`/
@@ -1253,7 +1500,41 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "oidc_validate_token",
     "check_role",
     "extract_claim",
+    // `check_role`/`extract_claim`'s dotted-path siblings -- additive,
+    // for IdPs that nest the role array/claim under a path instead of a
+    // flat top-level field (e.g. Keycloak's `realm_access.roles`).
+    // `check_role`/`extract_claim` are unchanged and still the right
+    // tool for a flat claim, including one whose own name contains a
+    // literal dot (Auth0-style namespaced claims) -- see
+    // `interpreter.rs::json_field_path`'s doc comment.
+    "check_role_path",
+    "extract_claim_path",
     "identity_expired",
+    // Row 12 continued: session management, refresh tokens, revocation,
+    // and an API-key adapter.
+    "create_application_session",
+    "session_cookie",
+    "new_refresh_token",
+    "exchange_refresh_token",
+    "check_revocation",
+    "validate_api_key",
+    // A plain SHA-256 hex digest, infallible (any `str` hashes to
+    // something) -- exposes the same hasher `validate_api_key` already
+    // uses internally, as a general-purpose builtin. `sha256_hex(s)`
+    // hashes one string; `sha256_hex(a, b)` hashes both in sequence
+    // (no concatenation operator exists to combine them first) -- the
+    // one thing a real hash-chained audit log
+    // (`hash = sha256_hex(prev_hash, payload)`) needs that wasn't
+    // otherwise reachable from Nirdosha source.
+    "sha256_hex",
+    // A red-team finding, fixed: `.nir` code comparing two secret-derived
+    // strings (a decision-link token against its stored value, say) had
+    // no way to do it other than `==`, which short-circuits on the first
+    // differing byte -- a timing side channel on whatever secret
+    // comparison the program was trying to do. Backed by the same
+    // constant-time comparison `interpreter.rs`'s own JWT signature
+    // check now uses internally (also a fixed red-team finding).
+    "constant_time_str_eq",
     // DB, layer 1: SQLite only (`rusqlite`, "bundled" -- statically
     // linked, no system `libsqlite3`). `Ty::Db`'s doc comment has the
     // full design; the short version: one connection handle, `stop`-able
@@ -1269,6 +1550,18 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "db_connect",
     "db_query",
     "db_execute",
+    // `Ty::Mq`'s doc comment has the full design: one connection handle,
+    // `stop`-able like `db`, backed by Redis (`LPUSH`/`BLPOP`).
+    // `mq_connect(host, port)`, `mq_publish(conn, queue, message)`,
+    // `mq_consume(conn, queue, timeout_secs)` -- every fallible one
+    // returns `Result(_, str)`, same convention as `db`/JSON/HTTP.
+    "mq_connect",
+    "mq_publish",
+    "mq_consume",
+    // Row 12's deliberate mock-only exception to "the runtime never
+    // mints tokens" -- see its own doc comment at the builtin's typeck
+    // signature (`typeck.rs`) for why the `mock_` prefix is load-bearing.
+    "mock_issue_token",
 ];
 
 pub fn is_builtin(name: &str) -> bool {

@@ -228,6 +228,24 @@ pub enum TypeErrorKind {
     /// (`nirdosha_row11_amendment.md` §3.4), so exhaustiveness means
     /// "every declared variant, exactly once."
     NonExhaustiveMatch { enum_name: String, missing: Vec<String> },
+    /// A literal-pattern `match` (scrutinee `str`/`i64`/`bool`, not an
+    /// enum) has no trailing `_` arm -- a literal domain isn't closed
+    /// the way an enum's variant set is, so there's no way to prove
+    /// every case is covered without one.
+    NonExhaustiveLiteralMatch { found: Ty },
+    /// `_` appeared somewhere other than the last arm of a literal
+    /// `match` -- every arm after it would be unreachable.
+    WildcardArmNotLast,
+    /// A literal `match`'s arm pattern is a literal of the wrong type
+    /// for the scrutinee (e.g. an `i64` pattern against a `str`
+    /// scrutinee).
+    LiteralPatternTypeMismatch { scrutinee_ty: Ty, pattern_ty: Ty },
+    /// A `match` on an enum scrutinee had an arm written as a literal/
+    /// `_` pattern instead of naming one of the enum's variants.
+    MatchArmMustBeVariant { enum_name: String },
+    /// A `match` on a `str`/`i64`/`bool` scrutinee had an arm written as
+    /// a bare variant-style name instead of a literal/`_` pattern.
+    MatchArmMustBeLiteral { scrutinee_ty: Ty },
     /// A `struct`/`enum` declares the same type-parameter name twice
     /// (`struct Pair(A, A) { .. }`) — layer 6, generics.
     DuplicateTypeParam(String),
@@ -251,6 +269,54 @@ pub enum TypeErrorKind {
     /// from "no expected type at all" to "no expected type *and* the
     /// arguments alone don't determine every parameter."
     GenericConstructorNeedsExplicitType { name: String },
+    /// `name` is a `requires`-gated function (`ast::FnDecl::requires`)
+    /// referenced somewhere other than `acquire`'s own callee position —
+    /// a direct call (`transfer_funds(500)`) or a bare value-reference
+    /// (`let f = transfer_funds`). This *is* the enforcement: the only
+    /// way to end up holding a callable value for a gated function is to
+    /// go through `acquire` and present a matching proof (see
+    /// `ast::Requirement`).
+    PrivilegedFnNotAcquired { name: String, requirement: Requirement },
+    /// `acquire`'s callee named a real function, but one with no
+    /// `requires(...)` annotation at all — nothing to acquire (an
+    /// ordinary function is already a first-class value, just by naming
+    /// it directly).
+    AcquireOfUngatedFn(String),
+    /// A direct `RoleView(...)`/`ClaimView(...)` constructor call —
+    /// these two prelude structs are `acquire`'s proof types (see
+    /// `Requirement::proof_ty`), meant to be producible only by
+    /// `check_role`/`extract_claim` after a real `oidc_validate_token`.
+    /// Every other prelude/user struct is legitimately constructible via
+    /// the ordinary `Name(args...)` call syntax (`infer_struct_
+    /// construction`'s own doc comment) — these two are singled out
+    /// because letting user code build one directly is a forged proof:
+    /// `acquire gated_fn(RoleView("admin"))` would satisfy the type
+    /// checker's `requirement.proof_ty()` check with zero relation to
+    /// any validated identity, defeating `requires`/`acquire` entirely.
+    UnforgeableProofConstruction(String),
+
+    // ---- Row 12's UI DSL (`screen`/`dashboard`) ----------------------
+    /// `screen <Name>` where `<Name>` is not a declared struct.
+    UnknownScreenStruct(String),
+    /// `field <fname>` inside a `screen <Struct>` where `<Struct>` has no
+    /// field named `<fname>`.
+    UnknownScreenField { struct_name: String, field_name: String },
+    /// A `list`/`create`/`update`/`delete` screen entry, or an `action`'s
+    /// `->` target, that doesn't resolve to a real user-defined function.
+    ScreenFnNotFound { key: String, fn_name: String },
+    /// `list`/`create`/`update`/`delete`, or an `action`'s `->` target,
+    /// whose value isn't a bare function name (`Expr::Ident`) — e.g. a
+    /// string or integer literal was written where a function reference
+    /// was expected.
+    ScreenFnNotAnIdent(String),
+    /// A `view`/`edit` field-visibility entry that isn't a `role(...)`/
+    /// `claim(...)` call with string-literal arguments — the same shape
+    /// `requires(...)` already enforces via `ast::Requirement`, reused
+    /// here rather than inventing a second visibility grammar.
+    InvalidVisibilityExpr { key: String },
+    /// A `dashboard` `tile`/`chart` target that doesn't resolve to a real
+    /// user-defined function.
+    UnknownDashboardFn { metric_kind: String, fn_name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -446,7 +512,7 @@ impl std::fmt::Display for TypeError {
             ),
             TypeErrorKind::NotAnEnum { found } => write!(
                 f,
-                "{line}:{col}: `match` needs an enum type, found `{}`",
+                "{line}:{col}: `match` needs an enum, `str`, `i64`, or `bool` scrutinee, found `{}`",
                 found.name()
             ),
             TypeErrorKind::UnknownVariant { enum_name, variant } => write!(
@@ -466,6 +532,29 @@ impl std::fmt::Display for TypeError {
                 "{line}:{col}: `match` on `{enum_name}` doesn't cover: {}",
                 missing.join(", ")
             ),
+            TypeErrorKind::NonExhaustiveLiteralMatch { found } => write!(
+                f,
+                "{line}:{col}: `match` on `{}` needs a trailing `_` arm -- `str`/`i64`/`bool` aren't closed the way an enum's variants are",
+                found.name()
+            ),
+            TypeErrorKind::WildcardArmNotLast => {
+                write!(f, "{line}:{col}: `_` must be the last arm of a `match`")
+            }
+            TypeErrorKind::LiteralPatternTypeMismatch { scrutinee_ty, pattern_ty } => write!(
+                f,
+                "{line}:{col}: `match` on `{}` has an arm pattern of type `{}`",
+                scrutinee_ty.name(),
+                pattern_ty.name()
+            ),
+            TypeErrorKind::MatchArmMustBeVariant { enum_name } => write!(
+                f,
+                "{line}:{col}: `match` on enum `{enum_name}` arms must name a variant, not a literal or `_` pattern"
+            ),
+            TypeErrorKind::MatchArmMustBeLiteral { scrutinee_ty } => write!(
+                f,
+                "{line}:{col}: `match` on `{}` arms must be a literal or `_`, not a variant-style name",
+                scrutinee_ty.name()
+            ),
             TypeErrorKind::DuplicateTypeParam(p) => {
                 write!(f, "{line}:{col}: type parameter `{p}` is declared more than once")
             }
@@ -477,6 +566,46 @@ impl std::fmt::Display for TypeError {
                 f,
                 "{line}:{col}: `{name}`'s type argument(s) can't be inferred here — \
                  an expected type is needed (e.g. an explicit `let` annotation)"
+            ),
+            TypeErrorKind::PrivilegedFnNotAcquired { name, requirement } => write!(
+                f,
+                "{line}:{col}: `{name}` {} — acquire it first (`acquire {name}(proof)`) \
+                 and call the resulting value instead",
+                requirement.describe()
+            ),
+            TypeErrorKind::AcquireOfUngatedFn(name) => write!(
+                f,
+                "{line}:{col}: `{name}` has no `requires(...)` annotation — nothing to acquire; \
+                 name it directly to get a first-class value (`let f = {name}`)"
+            ),
+            TypeErrorKind::UnforgeableProofConstruction(name) => write!(
+                f,
+                "{line}:{col}: `{name}` can't be constructed directly — it's a proof value only \
+                 `check_role`/`extract_claim` may produce, against a real validated identity"
+            ),
+            TypeErrorKind::UnknownScreenStruct(name) => {
+                write!(f, "{line}:{col}: `screen {name}` — no struct named `{name}` is declared")
+            }
+            TypeErrorKind::UnknownScreenField { struct_name, field_name } => write!(
+                f,
+                "{line}:{col}: `field {field_name}` — struct `{struct_name}` has no field named `{field_name}`"
+            ),
+            TypeErrorKind::ScreenFnNotFound { key, fn_name } => write!(
+                f,
+                "{line}:{col}: `{key}: {fn_name}` — no function named `{fn_name}` is declared"
+            ),
+            TypeErrorKind::ScreenFnNotAnIdent(key) => write!(
+                f,
+                "{line}:{col}: `{key}` must name a function directly (e.g. `{key}: list_product`)"
+            ),
+            TypeErrorKind::InvalidVisibilityExpr { key } => write!(
+                f,
+                "{line}:{col}: `{key}` must be `role(\"...\")` or `claim(\"...\", \"...\")` \
+                 with string-literal arguments"
+            ),
+            TypeErrorKind::UnknownDashboardFn { metric_kind, fn_name } => write!(
+                f,
+                "{line}:{col}: `{metric_kind} ... -> {fn_name}` — no function named `{fn_name}` is declared"
             ),
         }
     }
@@ -507,6 +636,11 @@ enum MatchWant<'t> {
 struct FnSig {
     params: Vec<Ty>,
     ret: Ty,
+    /// Mirrors `ast::FnDecl::requires` — carried here too so every place
+    /// that already looks a name up in `sigs` (direct calls, bare
+    /// value-references, `acquire`) can enforce the gate without a
+    /// second lookup table.
+    requires: Option<Requirement>,
 }
 
 /// A lexical scope stack from declared name to declared `Ty` — the static
@@ -643,7 +777,11 @@ pub fn typecheck(program: &Program) -> Result<(), Vec<TypeError>> {
         c.validate_ty(&f.ret, f.span, &[]);
         c.sigs.insert(
             f.name.clone(),
-            FnSig { params: f.params.iter().map(|p| p.ty.clone()).collect(), ret: f.ret.clone() },
+            FnSig {
+                params: f.params.iter().map(|p| p.ty.clone()).collect(),
+                ret: f.ret.clone(),
+                requires: f.requires.clone(),
+            },
         );
     }
 
@@ -654,6 +792,18 @@ pub fn typecheck(program: &Program) -> Result<(), Vec<TypeError>> {
             c.error(TypeErrorKind::MainMustTakeNoParams, span);
         }
         Some(_) => {}
+    }
+
+    // ---- Row 12: `screen`/`dashboard` DSL -----------------------------
+    // Existence/shape checks only (this phase): struct/field/fn names
+    // resolve, `view`/`edit` are well-formed `role(...)`/`claim(...)`
+    // calls. Signature-shape enforcement for pagination/search/sort
+    // params is a later phase — tracked in `compiler/UI_DSL_TODO.md`.
+    for screen in &program.screens {
+        c.check_screen(screen);
+    }
+    if let Some(dash) = &program.dashboard {
+        c.check_dashboard(dash);
     }
 
     for f in &program.fns {
@@ -687,6 +837,109 @@ impl<'a> Checker<'a> {
     fn error(&mut self, kind: TypeErrorKind, span: Span) {
         if !self.silent {
             self.errors.push(TypeError { kind, span });
+        }
+    }
+
+    /// A `key: value` entry expected to name a function directly
+    /// (`list`/`create`/`update`/`delete`, an action's `->` target, a
+    /// dashboard tile/chart's `->` target) — `value` must be a bare
+    /// `Expr::Ident` naming a real, user-defined function in `c.sigs`.
+    /// Builtins are deliberately excluded: every one of these slots names
+    /// a function the *program* defines to serve that screen/tile.
+    fn check_fn_ref(&mut self, key: &str, value: &Expr) {
+        match value {
+            Expr::Ident(name, span) => {
+                if !self.sigs.contains_key(name) {
+                    self.error(
+                        TypeErrorKind::ScreenFnNotFound { key: key.to_string(), fn_name: name.clone() },
+                        *span,
+                    );
+                }
+            }
+            other => self.error(TypeErrorKind::ScreenFnNotAnIdent(key.to_string()), other.span()),
+        }
+    }
+
+    /// `view: role("admin")` / `edit: claim("department", "cardiology")`
+    /// — same shape `requires(...)` already accepts (`ast::Requirement`),
+    /// checked structurally here since these arrive as ordinary `Expr`
+    /// values (parsed by `parse_expr()`, not `parse_requires_annotation`).
+    fn check_visibility_expr(&mut self, key: &str, value: &Expr) {
+        let ok = match value {
+            Expr::Call(name, args, _) if name == "role" => {
+                !args.is_empty() && args.iter().all(|a| matches!(a, Expr::Str(..)))
+            }
+            Expr::Call(name, args, _) if name == "claim" => {
+                args.len() == 2 && args.iter().all(|a| matches!(a, Expr::Str(..)))
+            }
+            _ => false,
+        };
+        if !ok {
+            self.error(TypeErrorKind::InvalidVisibilityExpr { key: key.to_string() }, value.span());
+        }
+    }
+
+    /// `screen <Struct> { ... }` — existence/shape checks only; see the
+    /// module-level note above `typecheck`'s `screens`/`dashboard` pass.
+    fn check_screen(&mut self, screen: &ScreenDecl) {
+        let Some(fields) = self.registry.struct_fields(&screen.struct_name) else {
+            self.error(TypeErrorKind::UnknownScreenStruct(screen.struct_name.clone()), screen.span);
+            return;
+        };
+        let field_names: std::collections::HashSet<&str> =
+            fields.iter().map(|f| f.name.as_str()).collect();
+
+        for (key, value) in &screen.entries {
+            match key.as_str() {
+                "list" | "create" | "update" | "delete" => self.check_fn_ref(key, value),
+                // "paginate.page_size" / "paginate.total" / any other
+                // slot: value shape isn't enforced yet (Phase 1 scope is
+                // existence/shape for struct/field/fn/visibility only).
+                _ => {}
+            }
+        }
+        for fo in &screen.fields {
+            if !field_names.contains(fo.field_name.as_str()) {
+                self.error(
+                    TypeErrorKind::UnknownScreenField {
+                        struct_name: screen.struct_name.clone(),
+                        field_name: fo.field_name.clone(),
+                    },
+                    fo.span,
+                );
+            }
+            for (key, value) in &fo.entries {
+                match key.as_str() {
+                    "view" | "edit" => self.check_visibility_expr(key, value),
+                    _ => {}
+                }
+            }
+        }
+        for action in &screen.actions {
+            self.check_fn_ref("action", &Expr::Ident(action.target_fn.clone(), action.span));
+        }
+    }
+
+    /// `dashboard { tile "..." -> fn  chart "..." -> fn }` — each
+    /// `MetricRef`'s target must resolve to a real function.
+    fn check_dashboard(&mut self, dash: &DashboardDecl) {
+        for t in &dash.tiles {
+            self.check_metric_ref("tile", t);
+        }
+        for c in &dash.charts {
+            self.check_metric_ref("chart", c);
+        }
+    }
+
+    fn check_metric_ref(&mut self, metric_kind: &str, m: &MetricRef) {
+        if !self.sigs.contains_key(&m.target_fn) {
+            self.error(
+                TypeErrorKind::UnknownDashboardFn {
+                    metric_kind: metric_kind.to_string(),
+                    fn_name: m.target_fn.clone(),
+                },
+                m.span,
+            );
         }
     }
 
@@ -750,6 +1003,12 @@ impl<'a> Checker<'a> {
                 self.validate_ty(inner, span, in_scope_params)
             }
             Ty::Vector(inner, _) | Ty::Matrix(inner, _, _) => self.validate_ty(inner, span, in_scope_params),
+            Ty::Fn(params, ret) => {
+                for p in params {
+                    self.validate_ty(p, span, in_scope_params);
+                }
+                self.validate_ty(ret, span, in_scope_params);
+            }
             _ => {}
         }
     }
@@ -919,10 +1178,26 @@ impl<'a> Checker<'a> {
             Expr::Bool(_, _) => Ty::Bool,
             Expr::Ident(name, span) => match scopes.get(name) {
                 Some(t) => t,
-                None => {
-                    self.error(TypeErrorKind::UnknownVar(name.clone()), *span);
-                    Ty::Error
-                }
+                // Not a local binding — a bare top-level fn name is still
+                // legal here (`let f: fn(..)->.. = transfer_funds`, or
+                // passing one as a higher-order argument): first-class
+                // functions are just ordinary values, so a plain function
+                // name resolves the same way a local variable's name
+                // would. A `requires`-gated function's name is the one
+                // exception (`PrivilegedFnNotAcquired` — `acquire` is the
+                // only way to get a value for one of those).
+                None => match self.sigs.get(name.as_str()) {
+                    Some(sig) if sig.requires.is_some() => {
+                        let requirement = sig.requires.clone().unwrap();
+                        self.error(TypeErrorKind::PrivilegedFnNotAcquired { name: name.clone(), requirement }, *span);
+                        Ty::Error
+                    }
+                    Some(sig) => Ty::Fn(sig.params.clone(), Box::new(sig.ret.clone())),
+                    None => {
+                        self.error(TypeErrorKind::UnknownVar(name.clone()), *span);
+                        Ty::Error
+                    }
+                },
             },
             Expr::Unary(op, inner, span) => {
                 if literal_value(e).is_some() {
@@ -950,6 +1225,7 @@ impl<'a> Checker<'a> {
             }
             Expr::Binary(op, lhs, rhs, span) => self.infer_binary(*op, lhs, rhs, expected_ret, scopes, *span),
             Expr::Call(name, args, span) => self.infer_call(name, args, expected_ret, scopes, *span, None),
+            Expr::Acquire(name, proof, span) => self.infer_acquire(name, proof, expected_ret, scopes, *span),
             Expr::If { cond, then_block, else_block, span } => {
                 self.check_if(cond, then_block, else_block.as_deref(), *span, None, expected_ret, scopes)
             }
@@ -1104,6 +1380,10 @@ impl<'a> Checker<'a> {
                     // one-time consuming close, reused a fourth time
                     // (`Ty::Db`'s doc comment).
                     Ty::Db => Ty::Unit,
+                    // ...and closes an `mq_connect(host, port)` handle —
+                    // same one-time consuming close, reused a fifth time
+                    // (`Ty::Mq`'s doc comment).
+                    Ty::Mq => Ty::Unit,
                     other => {
                         self.error(TypeErrorKind::ExpectedSandboxType { found: other }, *span);
                         Ty::Error
@@ -1375,6 +1655,30 @@ impl<'a> Checker<'a> {
         span: Span,
         expected: Option<&Ty>,
     ) -> Ty {
+        // First-class function call-through-value: `name` shadows a local
+        // binding whose type is `Ty::Fn(params, ret)` (either a plain
+        // top-level fn named directly, or the result of a successful
+        // `acquire`) — dispatched by checking `args` against the type's
+        // own carried param list, exactly like an ordinary call, just
+        // without a `sigs` lookup (the callee isn't known by name here,
+        // only by the value flowing through `name`). Checked ahead of
+        // every other resolution (builtin/struct/global fn) the same way
+        // `Expr::Ident`'s own local-scope lookup always wins first.
+        if let Some(Ty::Fn(params, ret)) = scopes.get(name) {
+            if params.len() != args.len() {
+                self.error(
+                    TypeErrorKind::ArityMismatch { fn_name: name.to_string(), want: params.len(), got: args.len() },
+                    span,
+                );
+            }
+            for (arg, want) in args.iter().zip(params.iter()) {
+                self.check(arg, want, expected_ret, scopes);
+            }
+            for extra in args.iter().skip(params.len()) {
+                self.infer(extra, expected_ret, scopes);
+            }
+            return *ret;
+        }
         if is_builtin(name) {
             return self.infer_builtin_call(name, args, expected_ret, scopes, span);
         }
@@ -1385,6 +1689,23 @@ impl<'a> Checker<'a> {
         // proved these names can't collide with a function/builtin, so
         // checking them ahead of `self.sigs` is safe and unambiguous.
         if self.registry.is_struct(name) {
+            // `RoleView`/`ClaimView` are `acquire`'s proof types (see
+            // `Requirement::proof_ty`) — the *only* legitimate way to
+            // hold one is `check_role`/`extract_claim` returning it
+            // after a real `oidc_validate_token`. Every other struct in
+            // the language, prelude or user-declared, is legitimately
+            // constructible this way (`infer_struct_construction`'s own
+            // doc comment) — these two are singled out because a direct
+            // `RoleView("admin")` here would let `acquire gated_fn(...)`
+            // typecheck against a forged proof with zero relation to any
+            // validated identity, defeating `requires`/`acquire` outright.
+            if name == "RoleView" || name == "ClaimView" {
+                self.error(TypeErrorKind::UnforgeableProofConstruction(name.to_string()), span);
+                for a in args {
+                    self.infer(a, expected_ret, scopes);
+                }
+                return Ty::Error;
+            }
             return self.infer_struct_construction(name, args, expected, expected_ret, scopes, span);
         }
         if let Some((enum_name, variant)) = self.registry.find_variant(name) {
@@ -1399,6 +1720,19 @@ impl<'a> Checker<'a> {
             }
             return Ty::Error;
         };
+        // A `requires`-gated function has no direct-call path at all —
+        // `acquire` (`infer_acquire`) is the only place that's allowed to
+        // resolve this name against `sigs`. Still type-checks the
+        // arguments (so a bad call reports its own errors too, not just
+        // this one), same "don't cascade, but don't go silent either"
+        // pattern `UnknownFn`'s branch above already follows.
+        if let Some(requirement) = sig.requires.clone() {
+            self.error(TypeErrorKind::PrivilegedFnNotAcquired { name: name.to_string(), requirement }, span);
+            for a in args {
+                self.infer(a, expected_ret, scopes);
+            }
+            return Ty::Error;
+        }
         let params = sig.params.clone();
         let ret = sig.ret.clone();
         if params.len() != args.len() {
@@ -1417,6 +1751,39 @@ impl<'a> Checker<'a> {
             self.infer(extra, expected_ret, scopes);
         }
         ret
+    }
+
+    /// `acquire name(proof)` (`Expr::Acquire`) — the only path that's
+    /// allowed to turn a `requires`-gated function's name into a callable
+    /// `Ty::Fn` value. `name` must be a real, gated top-level function
+    /// (never a builtin/struct/local — mirrors `infer_spawn`'s identical
+    /// "always a global fn" restriction); `proof`'s type must match what
+    /// the requirement demands (`Requirement::proof_ty`). Always produces
+    /// `Result(Ty::Fn(params, ret), str)`, the same prelude `Result` every
+    /// other fallible identity builtin (`check_role`/`extract_claim`)
+    /// already returns — `Err` means the proof didn't match, checked at
+    /// runtime (`interpreter.rs`'s `Expr::Acquire` arm), not here: a
+    /// `RoleView`'s `role` field is an ordinary runtime string, the same
+    /// reason `check_role` itself is runtime-checked.
+    fn infer_acquire(&mut self, name: &str, proof: &Expr, expected_ret: &Ty, scopes: &mut Scopes, span: Span) -> Ty {
+        if is_builtin(name) || self.registry.is_struct(name) || self.registry.find_variant(name).is_some() {
+            self.error(TypeErrorKind::UnknownFn(name.to_string()), span);
+            self.infer(proof, expected_ret, scopes);
+            return Ty::Error;
+        }
+        let Some(sig) = self.sigs.get(name) else {
+            self.error(TypeErrorKind::UnknownFn(name.to_string()), span);
+            self.infer(proof, expected_ret, scopes);
+            return Ty::Error;
+        };
+        let Some(requirement) = sig.requires.clone() else {
+            self.error(TypeErrorKind::AcquireOfUngatedFn(name.to_string()), span);
+            self.infer(proof, expected_ret, scopes);
+            return Ty::Error;
+        };
+        let fn_ty = Ty::Fn(sig.params.clone(), Box::new(sig.ret.clone()));
+        self.check(proof, &requirement.proof_ty(), expected_ret, scopes);
+        Ty::Named("Result".to_string(), vec![fn_ty, Ty::Str])
     }
 
     /// `Point(1.0, 2.0)` — a struct constructor call, checked exactly
@@ -1591,6 +1958,15 @@ impl<'a> Checker<'a> {
         scopes: &mut Scopes,
     ) -> Ty {
         let st = self.infer(scrutinee, expected_ret, scopes);
+
+        // Literal-pattern match: a `str`/`i64`/`bool` scrutinee is never
+        // an enum, so it gets its own dedicated checking path (mandatory
+        // trailing `_`, no variant/payload resolution at all) rather
+        // than being folded into the enum path below.
+        if matches!(st, Ty::Str | Ty::I64 | Ty::Bool) {
+            return self.check_literal_match(&st, arms, span, want, expected_ret, scopes);
+        }
+
         // `enum_name`/`type_args` are the scrutinee's own already-concrete
         // instantiation (layer 6, generics) — a `match` scrutinee is
         // always a fully-inferred *value*, never a fresh construction, so
@@ -1613,23 +1989,36 @@ impl<'a> Checker<'a> {
         let mut result: Option<Ty> = None;
 
         for arm in arms {
-            let payload: Vec<Ty> = match &enum_name {
-                Some(en) => match self.registry.find_variant(&arm.variant) {
-                    Some((owner, v)) if owner == en => {
-                        v.payload.iter().map(|t| substitute_ty(t, &enum_subst)).collect()
-                    }
-                    _ => {
-                        self.error(
-                            TypeErrorKind::UnknownVariant { enum_name: en.clone(), variant: arm.variant.clone() },
-                            arm.span,
-                        );
-                        Vec::new()
-                    }
-                },
-                None => Vec::new(),
+            // A literal/`_` pattern arm inside what typechecked as an
+            // enum match is a real error, not a variant lookup -- report
+            // it and treat the arm as having no payload, same recovery
+            // shape `UnknownVariant` below already uses.
+            if arm.pattern.is_some() {
+                if let Some(en) = &enum_name {
+                    self.error(TypeErrorKind::MatchArmMustBeVariant { enum_name: en.clone() }, arm.span);
+                }
+            }
+            let payload: Vec<Ty> = if arm.pattern.is_some() {
+                Vec::new()
+            } else {
+                match &enum_name {
+                    Some(en) => match self.registry.find_variant(&arm.variant) {
+                        Some((owner, v)) if owner == en => {
+                            v.payload.iter().map(|t| substitute_ty(t, &enum_subst)).collect()
+                        }
+                        _ => {
+                            self.error(
+                                TypeErrorKind::UnknownVariant { enum_name: en.clone(), variant: arm.variant.clone() },
+                                arm.span,
+                            );
+                            Vec::new()
+                        }
+                    },
+                    None => Vec::new(),
+                }
             };
 
-            if !seen.insert(arm.variant.clone()) {
+            if arm.pattern.is_none() && !seen.insert(arm.variant.clone()) {
                 self.error(TypeErrorKind::DuplicateMatchArm { variant: arm.variant.clone() }, arm.span);
             }
             if payload.len() != arm.bindings.len() {
@@ -1690,6 +2079,119 @@ impl<'a> Checker<'a> {
             if !missing.is_empty() {
                 self.error(TypeErrorKind::NonExhaustiveMatch { enum_name: en.clone(), missing }, span);
             }
+        }
+
+        match want {
+            MatchWant::Statement => Ty::Unit,
+            MatchWant::Check(w) => w.clone(),
+            MatchWant::Infer => result.unwrap_or(Ty::Unit),
+        }
+    }
+
+    /// `match` on a `str`/`i64`/`bool` scrutinee -- the non-enum sibling
+    /// `check_match` delegates to above. Every arm's pattern must be a
+    /// literal of the scrutinee's own type (or `_`), and exactly one `_`
+    /// is required, last: a literal domain isn't closed the way an
+    /// enum's variant set is, so there's no way to prove every case is
+    /// covered without a trailing wildcard. The per-arm body-checking
+    /// tail duplicates `check_match`'s (three short lines) rather than
+    /// sharing it -- the enum path's version is entangled with payload
+    /// bindings this path has none of, and the duplication is small.
+    fn check_literal_match(
+        &mut self,
+        st: &Ty,
+        arms: &[MatchArm],
+        span: Span,
+        want: MatchWant,
+        expected_ret: &Ty,
+        scopes: &mut Scopes,
+    ) -> Ty {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut wildcard_seen = false;
+        let mut result: Option<Ty> = None;
+
+        for (i, arm) in arms.iter().enumerate() {
+            match &arm.pattern {
+                Some(LiteralPattern::Wildcard) => {
+                    if wildcard_seen {
+                        self.error(TypeErrorKind::DuplicateMatchArm { variant: "_".to_string() }, arm.span);
+                    }
+                    wildcard_seen = true;
+                    if i != arms.len() - 1 {
+                        self.error(TypeErrorKind::WildcardArmNotLast, arm.span);
+                    }
+                }
+                Some(LiteralPattern::Str(_)) => {
+                    if *st != Ty::Str {
+                        self.error(
+                            TypeErrorKind::LiteralPatternTypeMismatch { scrutinee_ty: st.clone(), pattern_ty: Ty::Str },
+                            arm.span,
+                        );
+                    }
+                    if !seen.insert(arm.variant.clone()) {
+                        self.error(TypeErrorKind::DuplicateMatchArm { variant: arm.variant.clone() }, arm.span);
+                    }
+                }
+                Some(LiteralPattern::Int(_)) => {
+                    if *st != Ty::I64 {
+                        self.error(
+                            TypeErrorKind::LiteralPatternTypeMismatch { scrutinee_ty: st.clone(), pattern_ty: Ty::I64 },
+                            arm.span,
+                        );
+                    }
+                    if !seen.insert(arm.variant.clone()) {
+                        self.error(TypeErrorKind::DuplicateMatchArm { variant: arm.variant.clone() }, arm.span);
+                    }
+                }
+                Some(LiteralPattern::Bool(_)) => {
+                    if *st != Ty::Bool {
+                        self.error(
+                            TypeErrorKind::LiteralPatternTypeMismatch { scrutinee_ty: st.clone(), pattern_ty: Ty::Bool },
+                            arm.span,
+                        );
+                    }
+                    if !seen.insert(arm.variant.clone()) {
+                        self.error(TypeErrorKind::DuplicateMatchArm { variant: arm.variant.clone() }, arm.span);
+                    }
+                }
+                None => {
+                    self.error(TypeErrorKind::MatchArmMustBeLiteral { scrutinee_ty: st.clone() }, arm.span);
+                }
+            }
+
+            scopes.push();
+            let arm_ty = match want {
+                MatchWant::Statement => {
+                    self.infer(&arm.body, expected_ret, scopes);
+                    Ty::Unit
+                }
+                MatchWant::Check(w) => {
+                    self.check(&arm.body, w, expected_ret, scopes);
+                    w.clone()
+                }
+                MatchWant::Infer => self.infer(&arm.body, expected_ret, scopes),
+            };
+            scopes.pop();
+
+            if matches!(want, MatchWant::Infer) {
+                result = Some(match result {
+                    None => arm_ty,
+                    Some(prev) => {
+                        if prev != Ty::Error && arm_ty != Ty::Error && prev != arm_ty {
+                            self.error(TypeErrorKind::TypeMismatch { expected: prev.clone(), found: arm_ty }, arm.span);
+                            Ty::Error
+                        } else if prev == Ty::Error {
+                            prev
+                        } else {
+                            arm_ty
+                        }
+                    }
+                });
+            }
+        }
+
+        if !wildcard_seen {
+            self.error(TypeErrorKind::NonExhaustiveLiteralMatch { found: st.clone() }, span);
         }
 
         match want {
@@ -2031,9 +2533,68 @@ impl<'a> Checker<'a> {
                 self.check(&args[1], &Ty::Str, expected_ret, scopes);
                 result_of(Ty::Named("ClaimView".to_string(), vec![]))
             }
+            ("check_role_path", 3) => {
+                self.check(&args[0], &Ty::Named("VerifiedIdentity".to_string(), vec![]), expected_ret, scopes);
+                self.check(&args[1], &Ty::Str, expected_ret, scopes); // dotted path to the roles array
+                self.check(&args[2], &Ty::Str, expected_ret, scopes); // role
+                result_of(Ty::Named("RoleView".to_string(), vec![]))
+            }
+            ("extract_claim_path", 2) => {
+                self.check(&args[0], &Ty::Named("VerifiedIdentity".to_string(), vec![]), expected_ret, scopes);
+                self.check(&args[1], &Ty::Str, expected_ret, scopes); // dotted path to the claim
+                result_of(Ty::Named("ClaimView".to_string(), vec![]))
+            }
             ("identity_expired", 2) => {
                 self.check(&args[0], &Ty::Named("VerifiedIdentity".to_string(), vec![]), expected_ret, scopes);
                 self.check(&args[1], &Ty::I64, expected_ret, scopes);
+                Ty::Bool
+            }
+            // Row 12 continued: session, refresh, revocation, API-key.
+            ("create_application_session", 1) => {
+                self.check(&args[0], &Ty::Named("VerifiedIdentity".to_string(), vec![]), expected_ret, scopes);
+                Ty::Named("ApplicationSession".to_string(), vec![])
+            }
+            ("session_cookie", 1) => {
+                self.check(&args[0], &Ty::Named("ApplicationSession".to_string(), vec![]), expected_ret, scopes);
+                Ty::Str
+            }
+            ("new_refresh_token", 1) => {
+                self.check(&args[0], &Ty::I64, expected_ret, scopes);
+                Ty::Named("RefreshTokenHandle".to_string(), vec![])
+            }
+            ("exchange_refresh_token", 3) => {
+                self.check(&args[0], &Ty::Named("VerifiedIdentity".to_string(), vec![]), expected_ret, scopes);
+                self.check(&args[1], &Ty::Named("RefreshTokenHandle".to_string(), vec![]), expected_ret, scopes);
+                self.check(&args[2], &Ty::I64, expected_ret, scopes);
+                result_of(Ty::Named("VerifiedIdentity".to_string(), vec![]))
+            }
+            ("check_revocation", 1) => {
+                self.check(&args[0], &Ty::Named("VerifiedIdentity".to_string(), vec![]), expected_ret, scopes);
+                Ty::Bool
+            }
+            ("validate_api_key", 2) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes);
+                self.check(&args[1], &Ty::Str, expected_ret, scopes);
+                result_of(Ty::Named("VerifiedIdentity".to_string(), vec![]))
+            }
+            // Infallible -- any `str` hashes to something -- so no
+            // `Result` wrap, same as `session_cookie`. The 2-arg form
+            // hashes both parts in sequence rather than concatenating
+            // first (there's no `+` on `str` to do that with) -- the
+            // one thing a hash-chained audit log needs: `hash =
+            // sha256_hex(prev_hash, payload)`.
+            ("sha256_hex", 1) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes);
+                Ty::Str
+            }
+            ("sha256_hex", 2) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes);
+                self.check(&args[1], &Ty::Str, expected_ret, scopes);
+                Ty::Str
+            }
+            ("constant_time_str_eq", 2) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes);
+                self.check(&args[1], &Ty::Str, expected_ret, scopes);
                 Ty::Bool
             }
             // DB, layer 1 (`Ty::Db`'s doc comment).
@@ -2041,15 +2602,70 @@ impl<'a> Checker<'a> {
                 self.check(&args[0], &Ty::Str, expected_ret, scopes); // path
                 result_of(Ty::Db)
             }
-            ("db_query", 2) => {
+            // `db_query`/`db_execute` accept up to 8 trailing bind-value
+            // arguments (`?` placeholders in `sql`, SQLite-positional) --
+            // the *only* route to a parameterized query, since `str` has
+            // no concatenation (LANGUAGE.md §2): there's no way to build
+            // a dynamic SQL string in Nirdosha source at all otherwise.
+            // Each bind value's own type isn't constrained here (`infer`
+            // only, not `check` against one fixed `Ty`) -- it can be
+            // `str`/`i64`/`f64`/`bool`, whichever a caller's data
+            // actually is; `interpreter.rs`'s `sql_bind_params` is the
+            // real (runtime) gate on that, same "some proven away
+            // statically, some at runtime" split every Tier-2 check here
+            // already makes (`LANGUAGE.md` §8).
+            ("db_query", n) if (2..=10).contains(&n) => {
                 self.check(&args[0], &Ty::Db, expected_ret, scopes);
                 self.check(&args[1], &Ty::Str, expected_ret, scopes); // sql
+                for a in &args[2..] {
+                    self.infer(a, expected_ret, scopes);
+                }
                 result_of(Ty::Json)
             }
-            ("db_execute", 2) => {
+            ("db_execute", n) if (2..=10).contains(&n) => {
                 self.check(&args[0], &Ty::Db, expected_ret, scopes);
                 self.check(&args[1], &Ty::Str, expected_ret, scopes); // sql
+                for a in &args[2..] {
+                    self.infer(a, expected_ret, scopes);
+                }
                 result_of(Ty::I64)
+            }
+            // MQ, layer 1 (`Ty::Mq`'s doc comment) -- Redis-backed, same
+            // `Result(_, str)` convention as `db`.
+            ("mq_connect", 2) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes); // host
+                self.check(&args[1], &Ty::I64, expected_ret, scopes); // port
+                result_of(Ty::Mq)
+            }
+            ("mq_publish", 3) => {
+                self.check(&args[0], &Ty::Mq, expected_ret, scopes);
+                self.check(&args[1], &Ty::Str, expected_ret, scopes); // queue
+                self.check(&args[2], &Ty::Str, expected_ret, scopes); // message
+                result_of(Ty::Unit)
+            }
+            ("mq_consume", 3) => {
+                self.check(&args[0], &Ty::Mq, expected_ret, scopes);
+                self.check(&args[1], &Ty::Str, expected_ret, scopes); // queue
+                self.check(&args[2], &Ty::I64, expected_ret, scopes); // timeout_secs
+                result_of(Ty::Str)
+            }
+            // Row 12's deliberate mock-only exception -- the inverse of
+            // `oidc_validate_token`: signs a token instead of verifying
+            // one. `mock_` is load-bearing, not decorative -- see
+            // `interpreter.rs`'s `mock_issue_token` doc comment.
+            // `issued_at` is an explicit argument, not a hidden wall-clock
+            // read, so the builtin stays deterministic/pure (`effects.rs`
+            // classifies it via the default `_ => {}` arm, same as
+            // `json_*` -- no new effect tag needed).
+            ("mock_issue_token", 7) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes); // subject
+                self.check(&args[1], &Ty::Str, expected_ret, scopes); // issuer
+                self.check(&args[2], &Ty::Str, expected_ret, scopes); // audience
+                self.check(&args[3], &Ty::I64, expected_ret, scopes); // issued_at
+                self.check(&args[4], &Ty::I64, expected_ret, scopes); // ttl_secs
+                self.check(&args[5], &Ty::Str, expected_ret, scopes); // claims_json
+                self.check(&args[6], &Ty::Str, expected_ret, scopes); // jwks_json
+                result_of(Ty::Str)
             }
             _ => {
                 for a in args {
@@ -2071,10 +2687,11 @@ impl<'a> Checker<'a> {
     fn builtin_arity_hint(&self, name: &str) -> usize {
         match name {
             "dot" | "cross" | "solve" | "json_get" | "json_get_str" | "json_get_i64" | "json_get_f64"
-            | "json_get_bool" | "json_array_get" | "check_role" | "extract_claim" | "db_query" | "db_execute" => 2,
-            "http_get" | "https_get" => 3,
-            "oidc_validate_token" => 4,
-            "http_post" | "https_post" => 4,
+            | "json_get_bool" | "json_array_get" | "check_role" | "extract_claim" | "extract_claim_path"
+            | "db_query" | "db_execute" | "validate_api_key" | "mq_connect" | "constant_time_str_eq" => 2,
+            "http_get" | "https_get" | "exchange_refresh_token" | "mq_publish" | "mq_consume" | "check_role_path" => 3,
+            "http_post" | "https_post" | "oidc_validate_token" => 4,
+            "mock_issue_token" => 7,
             _ => 1,
         }
     }

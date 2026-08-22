@@ -1,0 +1,294 @@
+// A real online store, served with `nirdosha serve examples/store.nir
+// --port 8080 --jwks-file <jwks.json> --issuer https://mock-idp.local
+// --audience store-app --identity-base http://localhost:9090`.
+//
+// - Catalog (`Product`) is plain CRUD (`list_/create_/update_/delete_`),
+//   SQLite-backed (`store.db`, a real file so state persists across
+//   requests -- `db` is affine with no borrowing, so every function
+//   below opens, uses, and `stop`s its own connection, same discipline
+//   `examples/db.nir` documents). `create_/update_/delete_product` are
+//   `requires(role: "admin")` -- only an identity with that role (from
+//   `examples/identity_mock.nir`) can touch the catalog.
+// - `checkout` is the real end-to-end flow: looks up the product's
+//   live price/stock (never trusts a client-supplied total), calls the
+//   mock payment gateway (`examples/payments_mock.nir`) over plain
+//   `http_post`, and only on a successful charge decrements stock and
+//   inserts the `Order` row -- all with parameterized queries (`?`
+//   placeholders bound via `db_execute`/`db_query`'s trailing
+//   arguments), since Nirdosha `str` has no concatenation and so no way
+//   to build a dynamic SQL string any other way.
+//
+// Known, deliberate scope limits (see the online-store plan): checkout
+// takes one `product_id`/`qty` pair, not a multi-line JSON cart --
+// avoiding a `json`-typed value ever needing a "dummy" fallback inside a
+// loop, which the language's current match-arms-are-single-expressions
+// rule makes awkward; a real cart is a natural next step once the
+// language grows friendlier JSON-array iteration. The payment gateway
+// call sends a fixed, static body (`"{}"`)  for the same reason: the
+// *real* computed total is what actually gets persisted to `orders`,
+// via a parameterized query, not passed through the HTTP call.
+
+struct Product {
+    id: i64,
+    name: str,
+    price_cents: i64,
+    stock: i64,
+}
+
+struct Order {
+    id: i64,
+    customer_subject: str,
+    total_cents: i64,
+    status: str,
+}
+
+// ---- catalog: plain CRUD, SQLite-backed --------------------------------
+
+fn list_product_inner(conn: db) -> Result(json, str) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price_cents INTEGER, stock INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, name, price_cents, stock FROM products ORDER BY id")
+    stop conn
+    return rows
+}
+
+fn list_product() -> Result(json, str) {
+    return match db_connect("store.db") {
+        Ok(conn) => list_product_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+fn create_product_inner(conn: db, p: Product) -> Result(i64, str) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price_cents INTEGER, stock INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, str) = db_execute(conn, "INSERT INTO products (name, price_cents, stock) VALUES (?, ?, ?)", p.name, p.price_cents, p.stock)
+    stop conn
+    return result
+}
+
+fn create_product(p: Product) -> Result(i64, str) requires(role: "admin") {
+    return match db_connect("store.db") {
+        Ok(conn) => create_product_inner(conn, p),
+        Err(e) => Err(e),
+    }
+}
+
+fn update_product_inner(conn: db, p: Product) -> Result(i64, str) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price_cents INTEGER, stock INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, str) = db_execute(conn, "UPDATE products SET name = ?, price_cents = ?, stock = ? WHERE id = ?", p.name, p.price_cents, p.stock, p.id)
+    stop conn
+    return result
+}
+
+fn update_product(p: Product) -> Result(i64, str) requires(role: "admin") {
+    return match db_connect("store.db") {
+        Ok(conn) => update_product_inner(conn, p),
+        Err(e) => Err(e),
+    }
+}
+
+fn delete_product_inner(conn: db, id: i64) -> Result(i64, str) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price_cents INTEGER, stock INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, str) = db_execute(conn, "DELETE FROM products WHERE id = ?", id)
+    stop conn
+    return result
+}
+
+fn delete_product(id: i64) -> Result(i64, str) requires(role: "admin") {
+    return match db_connect("store.db") {
+        Ok(conn) => delete_product_inner(conn, id),
+        Err(e) => Err(e),
+    }
+}
+
+// A custom `screen` action (below) beyond plain CRUD -- bumps stock by a
+// fixed +10 rather than taking a quantity param, because a declared
+// custom action's client-side handler currently sends only the row's id
+// (mirrors `delete_product`'s own single-param call), the same v1 limit
+// `compiler/UI_DSL_TODO.md` tracks for a future multi-param action form.
+fn restock_product_inner(conn: db, id: i64) -> Result(i64, str) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price_cents INTEGER, stock INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, str) = db_execute(conn, "UPDATE products SET stock = stock + 10 WHERE id = ?", id)
+    stop conn
+    return result
+}
+
+fn restock_product(id: i64) -> Result(i64, str) requires(role: "admin") {
+    return match db_connect("store.db") {
+        Ok(conn) => restock_product_inner(conn, id),
+        Err(e) => Err(e),
+    }
+}
+
+// Row 12's `screen` DSL: an explicit, typechecked override layered on top
+// of the plain struct/CRUD-naming inference above -- everything not
+// mentioned here (the `create`/`update`/`delete` slots, the `id`/
+// `price_cents`/`stock` fields) still comes from inference unchanged.
+// See LANGUAGE.md's "screen / dashboard" section and GRAMMAR.md's
+// `screen_decl` production for the full syntax.
+screen Product {
+    title: "Catalog"
+    field name {
+        label: "Product Name"
+    }
+    action "Restock +10" -> restock_product {
+        style: "outlined"
+        confirm: "Restock this product by 10 units?"
+    }
+}
+
+// ---- admin: view all orders --------------------------------------------
+
+fn list_order_inner(conn: db) -> Result(json, str) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, customer_subject TEXT, total_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let rows: Result(json, str) = db_query(conn, "SELECT id, customer_subject, total_cents, status FROM orders ORDER BY id DESC")
+    stop conn
+    return rows
+}
+
+fn list_order() -> Result(json, str) requires(role: "admin") {
+    return match db_connect("store.db") {
+        Ok(conn) => list_order_inner(conn),
+        Err(e) => Err(e),
+    }
+}
+
+// ---- checkout: the real end-to-end flow --------------------------------
+
+// `mq` is affine with no borrowing, same as `db` (`Ty::Mq`'s doc
+// comment) -- its own connect/use/stop lives in one function, same
+// discipline `db`'s helpers above already follow.
+fn publish_order_created(mqconn: mq) -> i64 {
+    let published: i64 = match mq_publish(mqconn, "order.created", "order.created") {
+        Ok(u) => 0,
+        Err(e) => -1,
+    }
+    stop mqconn
+    return published
+}
+
+fn checkout_inner(conn: db, identity: VerifiedIdentity, product_id: i64, qty: i64) -> Result(Order, str) {
+    let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price_cents INTEGER, stock INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let t2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, customer_subject TEXT, total_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+
+    let price_cents: i64 = match db_query(conn, "SELECT price_cents FROM products WHERE id = ?", product_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "price_cents") {
+                Ok(p) => p,
+                Err(e) => -1,
+            },
+            Err(e) => -1,
+        },
+        Err(e) => -1,
+    }
+    let stock: i64 = match db_query(conn, "SELECT stock FROM products WHERE id = ?", product_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "stock") {
+                Ok(s) => s,
+                Err(e) => -1,
+            },
+            Err(e) => -1,
+        },
+        Err(e) => -1,
+    }
+
+    // Validate everything up front, into one flag -- deliberately no
+    // early `stop conn`/`return` per guard: the ownership checker can't
+    // prove `conn` still reaches a later use once *any* branch consumes
+    // it (confirmed empirically -- see this file's header comment), so
+    // every path stops `conn` exactly once, at the very end, uniformly.
+    let valid: bool = qty > 0 && price_cents >= 0 && qty <= stock
+
+    // The mock payment gateway (`examples/payments_mock.nir`) -- a
+    // fixed, static request body, deliberately: the real total is what
+    // gets persisted below, via a bound parameter, not threaded through
+    // this call (see this file's header comment on why).
+    let charged: bool = if valid {
+        match http_post("127.0.0.1", 9091, "/api/charge", "{}") {
+            Ok(resp) => resp.status == 200,
+            Err(e) => false,
+        }
+    } else {
+        false
+    }
+
+    let total_cents: i64 = price_cents * qty
+    let subject: str = identity.subject
+
+    let order_id: i64 = if charged {
+        let dec: i64 = match db_execute(conn, "UPDATE products SET stock = stock - ? WHERE id = ?", qty, product_id) {
+            Ok(n) => n,
+            Err(e) => -1,
+        }
+        let inserted: i64 = match db_execute(conn, "INSERT INTO orders (customer_subject, total_cents, status) VALUES (?, ?, ?)", subject, total_cents, "paid") {
+            Ok(n) => n,
+            Err(e) => -1,
+        }
+        // Best-effort: an `order.created` event on the "order.created"
+        // Redis queue. `mq` is affine, same as `db` -- its own tiny
+        // connect/publish/stop helper below, not folded into `conn`'s
+        // scope. A queue outage doesn't fail the checkout itself (the
+        // order is already durably in `orders`); it just means nothing
+        // is listening for the event this time.
+        let published: i64 = match mq_connect("127.0.0.1", 6379) {
+            Ok(mqconn) => publish_order_created(mqconn),
+            Err(e) => -1,
+        }
+        match db_query(conn, "SELECT last_insert_rowid() as oid") {
+            Ok(rows) => match json_array_get(rows, 0) {
+                Ok(row) => match json_get_i64(row, "oid") {
+                    Ok(i) => i,
+                    Err(e) => -1,
+                },
+                Err(e) => -1,
+            },
+            Err(e) => -1,
+        }
+    } else {
+        -1
+    }
+
+    stop conn
+
+    return if order_id >= 0 {
+        Ok(Order(order_id, subject, total_cents, "paid"))
+    } else {
+        if valid {
+            Err("payment gateway declined the charge")
+        } else {
+            Err("checkout failed: unknown product, non-positive qty, or insufficient stock")
+        }
+    }
+}
+
+fn checkout(identity: VerifiedIdentity, product_id: i64, qty: i64) -> Result(Order, str) {
+    return match db_connect("store.db") {
+        Ok(conn) => checkout_inner(conn, identity, product_id, qty),
+        Err(e) => Err(e),
+    }
+}
+
+fn main() {}
