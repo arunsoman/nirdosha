@@ -182,6 +182,45 @@ pub enum TypeErrorKind {
     /// underlying reason: no declared-signature table exists for
     /// builtins to look a return type up from).
     CannotUseBuiltinInTransact { name: String },
+    /// `transact`'s optional `precheck` slot must return `bool`, exactly
+    /// the same rule and reason as `TransactVerifyMustReturnBool` — it
+    /// decides whether the block aborts before anything durable is ever
+    /// written, the same "checked like an `if` condition" treatment.
+    TransactPrecheckMustReturnBool { found: Ty },
+    /// `transact`'s `network` slot must reference the implicit `txn_id:
+    /// str` binding somewhere in its own argument list — the idempotency
+    /// key a crash-replayed resend relies on the downstream system to
+    /// dedupe (`TRANSACT.md`'s durability section: no local mechanism can
+    /// make `network` itself exactly-once without that cooperation, so
+    /// the language at least forces every `network` call to carry the
+    /// key that makes it possible). Checked syntactically — `txn_id` must
+    /// appear as a bare argument expression — not semantically; this
+    /// can't prove the callee actually *uses* it, only that it received
+    /// it, the same honesty limit `TransactVerifyMustReturnBool`'s
+    /// "checked like an `if`" analogy already accepts elsewhere in this
+    /// construct.
+    TransactNetworkMustUseTxnId,
+    /// `transact`'s `verify` slot's arguments must each be exactly the
+    /// implicit `network` or `txn_id` binding -- never an outer-scope
+    /// variable from the enclosing function. This is what makes crash
+    /// replay from the narrow `"pending"` window (a crash during/right
+    /// after `network`, before `verify` ever ran in the original
+    /// process) *fully* reconstructable: `network`'s result and `txn_id`
+    /// are always known to `Interpreter::replay_pending_transactions`,
+    /// so `verify`'s exact original call can always be rebuilt from
+    /// them, with no dependence on state that crashed away.  Matches
+    /// `verify`'s own documented contract anyway ("inspect `network`'s
+    /// outcome," per `TRANSACT.md`) -- every worked example already
+    /// satisfies this (`verify: check(network)`).
+    TransactVerifyArgsMustBeImplicitBindings,
+    /// A `transact` slot's argument, or `network`/`verify`'s own declared
+    /// return type, isn't one of the four plain scalars
+    /// (`Ty::is_transact_scalar`) the durability log can serialize and
+    /// replay after a crash — a resource handle (`db`/`tcp`/`thread`/
+    /// `sandbox`) or an aggregate/struct/enum value can't survive a
+    /// process restart, so nothing that crosses `transact`'s durability
+    /// boundary is allowed to be one.
+    TransactValueNotDurable { where_: String, found: Ty },
     /// This function's declared `effect(...)` annotation (`ast::FnDecl::
     /// declared_effects`) didn't list `missing` — but `effects::
     /// infer_effects` found it in the body anyway (directly, or
@@ -478,6 +517,25 @@ impl std::fmt::Display for TypeError {
             TypeErrorKind::CannotUseBuiltinInTransact { name } => write!(
                 f,
                 "{line}:{col}: `{name}` is a builtin and can't be used as a `transact` slot"
+            ),
+            TypeErrorKind::TransactPrecheckMustReturnBool { found } => write!(
+                f,
+                "{line}:{col}: `transact`'s `precheck` slot must return `bool`, found `{}`",
+                found.name()
+            ),
+            TypeErrorKind::TransactNetworkMustUseTxnId => write!(
+                f,
+                "{line}:{col}: `transact`'s `network` slot must pass the implicit `txn_id` binding as one of its arguments"
+            ),
+            TypeErrorKind::TransactVerifyArgsMustBeImplicitBindings => write!(
+                f,
+                "{line}:{col}: `transact`'s `verify` slot's arguments must each be exactly `network` or `txn_id` -- \
+                 no outer variable, so a crash before `verify` ever ran can still safely replay it"
+            ),
+            TypeErrorKind::TransactValueNotDurable { where_, found } => write!(
+                f,
+                "{line}:{col}: `transact`'s durability log can't record `{}` ({where_}) -- only i8/16/32/64, u8/16/32/64, usize, f64, bool, and str are allowed to cross a `transact` boundary",
+                found.name()
             ),
             TypeErrorKind::EffectNotDeclared { fn_name, missing } => write!(
                 f,
@@ -1281,7 +1339,8 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Spawn(name, args, span) => self.infer_spawn(name, args, expected_ret, scopes, *span),
-            Expr::Transact { network, verify, commit, compensate, log, .. } => self.infer_transact(
+            Expr::Transact { precheck, network, verify, commit, compensate, log, .. } => self.infer_transact(
+                precheck.as_ref(),
                 network,
                 verify,
                 commit,
@@ -1584,6 +1643,7 @@ impl<'a> Checker<'a> {
     /// anything else.
     fn infer_transact(
         &mut self,
+        precheck: Option<&TransactSlot>,
         network: &TransactSlot,
         verify: &TransactSlot,
         commit: &TransactSlot,
@@ -1594,18 +1654,53 @@ impl<'a> Checker<'a> {
     ) -> Ty {
         scopes.push();
 
-        let network_ty = self.infer_transact_slot(network, expected_ret, scopes);
+        // `txn_id` is bound before `precheck` even runs (interpreter.rs's
+        // `Expr::Transact` arm generates it first) so it's in scope for
+        // every slot, but only `network` is required to actually pass it
+        // (checked below) -- the idempotency key a crash-replayed resend
+        // needs.
+        scopes.define("txn_id", Ty::Str);
+
+        // `precheck`/`log` are never logged or replayed (`Expr::Transact`'s
+        // doc comment) -- no durability-scalar constraint on either.
+        if let Some(p) = precheck {
+            let precheck_ty = self.infer_transact_slot(p, expected_ret, scopes);
+            if precheck_ty != Ty::Bool && precheck_ty != Ty::Error {
+                self.error(TypeErrorKind::TransactPrecheckMustReturnBool { found: precheck_ty }, p.span);
+            }
+        }
+
+        // `network`'s args and its own declared return type both cross
+        // the durability boundary: the return type becomes the `network`
+        // binding, persisted into the log before `verify` runs.
+        let network_ty = self.infer_transact_slot_durable(network, expected_ret, scopes, "network", true);
+        if !network.args.iter().any(|a| matches!(a, Expr::Ident(name, _) if name == "txn_id")) {
+            self.error(TypeErrorKind::TransactNetworkMustUseTxnId, network.span);
+        }
         scopes.define("network", network_ty);
 
-        let verify_ty = self.infer_transact_slot(verify, expected_ret, scopes);
+        // `verify`'s args cross the boundary too (a crash resuming from
+        // `network_done` has to re-run `verify` with its original
+        // arguments); its return type is separately forced to `bool`
+        // just below, already scalar, so `check_return` is `false` here.
+        let verify_ty = self.infer_transact_slot_durable(verify, expected_ret, scopes, "verify", false);
         if verify_ty != Ty::Bool && verify_ty != Ty::Error {
             self.error(TypeErrorKind::TransactVerifyMustReturnBool { found: verify_ty.clone() }, verify.span);
         }
+        if !verify.args.iter().all(|a| matches!(a, Expr::Ident(name, _) if name == "network" || name == "txn_id")) {
+            self.error(TypeErrorKind::TransactVerifyArgsMustBeImplicitBindings, verify.span);
+        }
         scopes.define("verify", verify_ty);
 
-        self.infer_transact_slot(commit, expected_ret, scopes);
+        // `commit`/`compensate`'s own return type is deliberately left
+        // unconstrained here (not durability-checked): it's allowed to be
+        // a `Result<T, E>` -- the interpreter's `Expr::Transact` arm
+        // treats an `Err` there as a failure to retry, the same way a
+        // trap already is. Only their arguments need to be durable (they
+        // get logged so a crash can retry just that slot).
+        self.infer_transact_slot_durable(commit, expected_ret, scopes, "commit", false);
         if let Some(c) = compensate {
-            self.infer_transact_slot(c, expected_ret, scopes);
+            self.infer_transact_slot_durable(c, expected_ret, scopes, "compensate", false);
         }
         if let Some(l) = log {
             self.infer_transact_slot(l, expected_ret, scopes);
@@ -1635,6 +1730,42 @@ impl<'a> Checker<'a> {
             return Ty::Error;
         }
         self.infer_call(&slot.name, &slot.args, expected_ret, scopes, slot.span, None)
+    }
+
+    /// `infer_transact_slot` plus the durability-log scalar constraint
+    /// (`Ty::is_transact_scalar`) on the callee's declared parameter
+    /// types (always) and its declared return type (only when
+    /// `check_return`) -- see the three call sites in `infer_transact`
+    /// for exactly which slots need which half. Reads the already-built
+    /// `self.sigs` table rather than re-inferring each argument
+    /// expression a second time; `is_builtin` slots already returned
+    /// `Ty::Error` out of `infer_transact_slot` above and have no `sigs`
+    /// entry, so the `sigs.get` below simply finds nothing for them --
+    /// no double-reporting of `CannotUseBuiltinInTransact`.
+    fn infer_transact_slot_durable(
+        &mut self,
+        slot: &TransactSlot,
+        expected_ret: &Ty,
+        scopes: &mut Scopes,
+        where_: &'static str,
+        check_return: bool,
+    ) -> Ty {
+        let ty = self.infer_transact_slot(slot, expected_ret, scopes);
+        let params_and_ret = self.sigs.get(&slot.name).map(|sig| (sig.params.clone(), sig.ret.clone()));
+        if let Some((params, ret)) = params_and_ret {
+            for p in &params {
+                if !p.is_transact_scalar() {
+                    self.error(
+                        TypeErrorKind::TransactValueNotDurable { where_: where_.to_string(), found: p.clone() },
+                        slot.span,
+                    );
+                }
+            }
+            if check_return && ret != Ty::Error && !ret.is_transact_scalar() {
+                self.error(TypeErrorKind::TransactValueNotDurable { where_: where_.to_string(), found: ret }, slot.span);
+            }
+        }
+        ty
     }
 
     /// `expected` is `Some(want)` only when called from a real value
@@ -2343,6 +2474,10 @@ impl<'a> Checker<'a> {
                 t if t.is_integer() => Ty::Unit,
                 found => self.wrong_arg(name, "an integer", found, span),
             },
+            ("sleep_ms", 1) => {
+                self.check(&args[0], &Ty::I64, expected_ret, scopes);
+                Ty::Unit
+            }
             ("rand_f64", 0) => Ty::F64,
             ("rand_gaussian", 2) => {
                 self.check(&args[0], &Ty::F64, expected_ret, scopes);

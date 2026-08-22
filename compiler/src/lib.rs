@@ -9,6 +9,7 @@ pub mod refine;
 pub mod serve;
 pub mod smt;
 pub mod token;
+pub mod transact_log;
 pub mod typeck;
 pub mod ui_gen;
 
@@ -34,7 +35,27 @@ pub fn run(src: &str) -> Result<Value, String> {
 /// observability design plan calls out (`main.rs`'s `--otel-console` is
 /// the one caller that actually wants this today; every other caller
 /// keeps using plain `run`, which is just this with `tracer: None`).
+/// `transact`'s durability log defaults to a unique per-call temp file
+/// (`Interpreter::new`'s own default); `main.rs`'s `run`/`serve` commands
+/// use `run_with_transact_log` below instead, for a stable path a
+/// restart's crash replay can actually find again.
 pub fn run_with_tracer(src: &str, tracer: Option<std::sync::Arc<observability::Tracer>>) -> Result<Value, String> {
+    run_with_tracer_and_transact_log(src, tracer, None)
+}
+
+/// Same as `run_with_tracer`, plus a caller-chosen, stable
+/// `transact_log_path` (`Interpreter::with_transact_log_path`) — real
+/// crash-replay continuity across separate process invocations needs
+/// this; only a caller with a real source *file* to derive one from can
+/// meaningfully supply it (`main.rs`'s `run`/`serve` commands do; a bare
+/// `src: &str` with no file, e.g. every other caller in this codebase
+/// including this file's own tests, has no such path and keeps getting
+/// `Interpreter::new`'s unique-per-call temp-file default via `None`).
+pub fn run_with_tracer_and_transact_log(
+    src: &str,
+    tracer: Option<std::sync::Arc<observability::Tracer>>,
+    transact_log_path: Option<std::path::PathBuf>,
+) -> Result<Value, String> {
     let toks = Lexer::new(src)
         .tokenize()
         .map_err(|e| format!("lex error at {}:{}: {}", e.span.line, e.span.col, e.message))?;
@@ -52,6 +73,28 @@ pub fn run_with_tracer(src: &str, tracer: Option<std::sync::Arc<observability::T
     let mut interp = Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src));
     if let Some(t) = tracer {
         interp = interp.with_tracer(t);
+    }
+    if let Some(p) = transact_log_path {
+        interp = interp.with_transact_log_path(p);
+    }
+    // Crash replay (`TRANSACT.md`'s Layer 4) before `main` ever runs --
+    // gated on a cheap textual pre-check (the keyword has to appear in
+    // source for the construct to be used at all) so a program with no
+    // `transact` never touches the durability log's filesystem path,
+    // matching `Interpreter::transact_log`'s own "only opened when a
+    // program actually needs it" laziness. Only a hard failure to even
+    // *read* the log aborts startup; `ReplayOutcome::StillPending`/
+    // `Stuck` rows are surfaced for visibility, not fatal -- they stay
+    // durably recorded and eligible for the next replay regardless.
+    if src.contains("transact") {
+        match interp.replay_pending_transactions() {
+            Ok(outcomes) => {
+                for o in &outcomes {
+                    eprintln!("transact replay: {o:?}");
+                }
+            }
+            Err(e) => return Err(format!("transact durability log error during crash replay: {e}")),
+        }
     }
     interp.run_main_on_big_stack().map_err(|e| format!("runtime error: {e}"))
 }
@@ -108,6 +151,18 @@ pub fn run_diagnostic_with_tracer(
     src: &str,
     tracer: Option<std::sync::Arc<observability::Tracer>>,
 ) -> Result<Value, RunFailure> {
+    run_diagnostic_with_tracer_and_transact_log(src, tracer, None)
+}
+
+/// Same as `run_diagnostic_with_tracer`, plus `run_with_tracer_and_
+/// transact_log`'s own `transact_log_path` + startup crash-replay --
+/// `main.rs`'s `--otel-console --format=json` combination (with
+/// `--transact-log`) is the one caller that needs all three at once.
+pub fn run_diagnostic_with_tracer_and_transact_log(
+    src: &str,
+    tracer: Option<std::sync::Arc<observability::Tracer>>,
+    transact_log_path: Option<std::path::PathBuf>,
+) -> Result<Value, RunFailure> {
     let toks = Lexer::new(src).tokenize().map_err(|e| {
         RunFailure::Lex(format!("lex error at {}:{}: {}", e.span.line, e.span.col, e.message))
     })?;
@@ -123,6 +178,19 @@ pub fn run_diagnostic_with_tracer(
     let mut interp = Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src));
     if let Some(t) = tracer {
         interp = interp.with_tracer(t);
+    }
+    if let Some(p) = transact_log_path {
+        interp = interp.with_transact_log_path(p);
+    }
+    if src.contains("transact") {
+        match interp.replay_pending_transactions() {
+            Ok(outcomes) => {
+                for o in &outcomes {
+                    eprintln!("transact replay: {o:?}");
+                }
+            }
+            Err(e) => return Err(RunFailure::Diagnostics(vec![Diagnostic::Runtime(e)])),
+        }
     }
     interp.run_main_on_big_stack().map_err(|e| RunFailure::Diagnostics(vec![Diagnostic::Runtime(e)]))
 }

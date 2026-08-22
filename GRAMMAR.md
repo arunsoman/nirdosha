@@ -304,25 +304,35 @@ match_arm   ::= variant_arm | literal_arm
 variant_arm ::= ident ("(" ident ("," ident)* ")")? "=>" expr
 literal_arm ::= (str | int | "true" | "false" | "_") "=>" expr
 
-// `TRANSACT.md`'s durable-effect construct — **Layer 1 only** (this
-// repo's staged rollout): in-process, no durability log, no `retry`/
-// `timeout` on `network` (those are Layer 2+, and not part of this
-// production yet). Slot order is fixed — `network`, `verify`, `commit`,
-// then optional `compensate`, then optional `log` — never permutation-
-// parsed, the same fixed-arity discipline every other multi-part
-// construct in this grammar already has. `network`/`verify`/`commit`/
-// `compensate`/`log` are matched by identifier *text* here, not
-// reserved as `Tok` keywords (see `parser.rs::parse_transact_slot`) —
-// the same non-keyword treatment `TYPE_NAMES` (token.rs) already gives
-// scalar type names. `call` is `ident "(" (expr ("," expr)*)? ")"` —
-// exactly `Expr::Call`'s own shape, the same "parse normally, then
-// validate what came out" restriction `spawn`/`sandbox` already enforce
-// on their own operand: a slot is one named call, never an arbitrary
-// expression. `transact { ... }` is itself a value (`bool`) — an `expr`
-// production, not a `stmt` one, specifically so `return transact {
-// ... }` works exactly like `return if c {..} else {..}` already does.
+// `TRANSACT.md`'s durable-effect construct — all five layers are
+// implemented (in-process control flow, a real durability log, crash
+// replay, `network`'s own `retry`/`timeout`, and a real cross-process
+// `network`/`commit` test). Slot order is fixed — optional `precheck`,
+// then `network` (with its own optional `retry`/`timeout` modifiers),
+// `verify`, `commit`, then optional `compensate`, then optional `log` —
+// never permutation-parsed, the same fixed-arity discipline every other
+// multi-part construct in this grammar already has.
+// `precheck`/`network`/`verify`/`commit`/`compensate`/`log`/`retry`/
+// `timeout` are matched by identifier *text* here, not reserved as
+// `Tok` keywords (see `parser.rs::parse_transact_slot`/
+// `parse_optional_int_modifier`) — the same non-keyword treatment
+// `TYPE_NAMES` (token.rs) already gives scalar type names. `call` is
+// `ident "(" (expr ("," expr)*)? ")"` — exactly `Expr::Call`'s own
+// shape, the same "parse normally, then validate what came out"
+// restriction `spawn`/`sandbox` already enforce on their own operand: a
+// slot is one named call, never an arbitrary expression. `transact {
+// ... }` is itself a value (`bool`) — an `expr` production, not a
+// `stmt` one, specifically so `return transact { ... }` works exactly
+// like `return if c {..} else {..}` already does. `network`'s call must
+// pass the implicit `txn_id: str` binding as one of its arguments
+// (typeck-enforced, `TransactNetworkMustUseTxnId`); `verify`'s
+// arguments are further restricted to exactly `network`/`txn_id`
+// (`TransactVerifyArgsMustBeImplicitBindings`) — see `TRANSACT.md`'s
+// "Crash replay" section for why. `retry`/`timeout` are plain `int_lit`,
+// no unit suffix (no duration-literal syntax invented for this).
 transact_expr ::= "transact" "{"
-                     "network"    ":" call
+                     ("precheck"  ":" call)?
+                     "network"    ":" call ("retry" int_lit)? ("timeout" int_lit)?
                      "verify"     ":" call
                      "commit"     ":" call
                      ("compensate" ":" call)?

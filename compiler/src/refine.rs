@@ -483,7 +483,12 @@ impl Refiner {
             // `bool`) — but every slot's arguments still get walked, the
             // same "walk args for their own proofs" treatment
             // `Expr::Call`'s arm above already gives.
-            Expr::Transact { network, verify, commit, compensate, log, .. } => {
+            Expr::Transact { precheck, network, verify, commit, compensate, log, .. } => {
+                if let Some(p) = precheck {
+                    for a in &p.args {
+                        self.expr(a, scopes);
+                    }
+                }
                 for a in &network.args {
                     self.expr(a, scopes);
                 }
@@ -630,7 +635,12 @@ fn assigned_names(stmts: &[Stmt]) -> HashSet<String> {
                 names.insert(name.clone());
                 walk_expr(rhs, names);
             }
-            Expr::Transact { network, verify, commit, compensate, log, .. } => {
+            Expr::Transact { precheck, network, verify, commit, compensate, log, .. } => {
+                if let Some(p) = precheck {
+                    for a in &p.args {
+                        walk_expr(a, names);
+                    }
+                }
                 for a in &network.args {
                     walk_expr(a, names);
                 }

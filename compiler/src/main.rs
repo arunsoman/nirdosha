@@ -31,8 +31,19 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let mut args =
-        raw.into_iter().filter(|a| a != "--format=json" && a != "--otel-console");
+    // `--transact-log=<path>` (`transact`'s durability log, `TRANSACT.md`'s
+    // Layers 3-4) -- same up-front, interpret-only scan as `--format=json`/
+    // `--otel-console`, so it can appear anywhere on the command line.
+    // `cmd_interpret`'s default when omitted is `<source-file>.transact.db`
+    // -- a stable, program-derived path a restart's crash replay can
+    // actually find again (`Interpreter::new`'s own default, a random
+    // per-instance temp file, exists only for callers with no real source
+    // file at all, e.g. `nirdosha::run(src: &str)`).
+    let transact_log_path: Option<String> =
+        raw.iter().find_map(|a| a.strip_prefix("--transact-log=").map(String::from));
+    let mut args = raw
+        .into_iter()
+        .filter(|a| a != "--format=json" && a != "--otel-console" && !a.starts_with("--transact-log="));
     let first = match args.next() {
         Some(a) => a,
         None => {
@@ -46,14 +57,14 @@ fn main() -> ExitCode {
         "emit-llvm" => cmd_emit_llvm(args),
         "emit-ast" => cmd_emit_ast(args),
         "emit-ui" => cmd_emit_ui(args),
-        "serve" => cmd_serve(args),
+        "serve" => cmd_serve(args, transact_log_path),
         // Not a user-facing subcommand — the *only* caller is a `sandbox`
         // handle's own `Expr::SpawnSandbox` (see interpreter.rs), which
         // execs this exact binary with this exact flag to become the
         // separate OS process a sandbox handle actually points at.
         // Deliberately absent from `print_usage()` for the same reason.
         "--sandbox-worker" => cmd_sandbox_worker(args),
-        path => cmd_interpret(path, format_json, otel_console),
+        path => cmd_interpret(path, format_json, otel_console, transact_log_path),
     }
 }
 
@@ -113,7 +124,7 @@ fn print_value(v: &Value) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_interpret(path: &str, format_json: bool, otel_console: bool) -> ExitCode {
+fn cmd_interpret(path: &str, format_json: bool, otel_console: bool, transact_log_path: Option<String>) -> ExitCode {
     let src = match read_source(path) {
         Ok(s) => s,
         Err(code) => return code,
@@ -124,8 +135,13 @@ fn cmd_interpret(path: &str, format_json: bool, otel_console: bool) -> ExitCode 
     // an ordinary interpret run (the overwhelming common case) pays
     // nothing extra.
     let tracer = if otel_console { Some(nirdosha::observability::Tracer::new_console()) } else { None };
+    // `transact`'s durability log: `--transact-log=<path>` if given,
+    // otherwise `<source-file>.transact.db` -- a stable, program-derived
+    // default so a restart's crash replay finds the previous run's
+    // pending rows without the caller having to remember a flag.
+    let transact_log = std::path::PathBuf::from(transact_log_path.unwrap_or_else(|| format!("{path}.transact.db")));
     if format_json {
-        return match nirdosha::run_diagnostic_with_tracer(&src, tracer) {
+        return match nirdosha::run_diagnostic_with_tracer_and_transact_log(&src, tracer, Some(transact_log)) {
             Ok(v) => print_value(&v),
             // Lex/parse errors aren't part of `Diagnostic` yet (see
             // `lib.rs`'s doc comment) — they stay plain text even under
@@ -142,7 +158,7 @@ fn cmd_interpret(path: &str, format_json: bool, otel_console: bool) -> ExitCode 
             }
         };
     }
-    match nirdosha::run_with_tracer(&src, tracer) {
+    match nirdosha::run_with_tracer_and_transact_log(&src, tracer, Some(transact_log)) {
         Ok(v) => print_value(&v),
         Err(msg) => {
             eprintln!("{msg}");
@@ -357,7 +373,7 @@ fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
 /// than silently accepted or silently ignored, and any `requires`-gated
 /// handler is simply unreachable (every caller gets 401) — an honest
 /// failure mode, not a security hole disguised as "it just worked."
-fn cmd_serve(mut args: impl Iterator<Item = String>) -> ExitCode {
+fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<String>) -> ExitCode {
     let mut input: Option<String> = None;
     let mut port: u16 = 8080;
     let mut jwks_file: Option<String> = None;
@@ -403,7 +419,14 @@ fn cmd_serve(mut args: impl Iterator<Item = String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match nirdosha::serve::run(std::sync::Arc::new(program), port, auth, identity_base.as_deref()) {
+    // `transact`'s durability log: one stable path for the whole server's
+    // lifetime, shared by every request's own `Interpreter`
+    // (`serve::dispatch` builds a fresh one per request already, for
+    // isolation) — never a fresh temp file per request, which would
+    // scatter a durable transaction's rows across files nothing ever
+    // replays together, and would leak one file per request forever.
+    let transact_log = std::path::PathBuf::from(transact_log_path.unwrap_or_else(|| format!("{path}.transact.db")));
+    match nirdosha::serve::run(std::sync::Arc::new(program), port, auth, identity_base.as_deref(), transact_log) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("{msg}");

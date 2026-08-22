@@ -830,28 +830,53 @@ impl Parser {
     }
 
     // transact_expr ::= "transact" "{"
-    //                      "network"    ":" call
+    //                      ("precheck"  ":" call)?
+    //                      "network"    ":" call ("retry" int_lit)? ("timeout" int_lit)?
     //                      "verify"     ":" call
     //                      "commit"     ":" call
     //                      ("compensate" ":" call)?
     //                      ("log"        ":" call)?
     //                    "}"
-    // TRANSACT.md's Layer 1 grammar -- no `retry`/`timeout` on `network`
-    // yet (Layer 2), no durability log (Layer 3+). Slot order is fixed,
-    // not permutation-parsed: "no permutation parsing, keeps this LL(1)
-    // the same way every other fixed-arity form in this grammar already
-    // is" (TRANSACT.md).
+    // Slot order is fixed, not permutation-parsed: "no permutation
+    // parsing, keeps this LL(1) the same way every other fixed-arity
+    // form in this grammar already is" (TRANSACT.md).
     fn parse_transact_expr(&mut self) -> PResult<Expr> {
         let span = self.span();
         self.expect(&Tok::Transact, "`transact`")?;
         self.expect(&Tok::LBrace, "`{`")?;
+        let precheck = self.parse_optional_transact_slot("precheck")?;
         let network = self.parse_transact_slot("network")?;
+        let network_retry = self.parse_optional_int_modifier("retry")?;
+        let network_timeout = self.parse_optional_int_modifier("timeout")?;
         let verify = self.parse_transact_slot("verify")?;
         let commit = self.parse_transact_slot("commit")?;
         let compensate = self.parse_optional_transact_slot("compensate")?;
         let log = self.parse_optional_transact_slot("log")?;
         self.expect(&Tok::RBrace, "`}`")?;
-        Ok(Expr::Transact { network, verify, commit, compensate, log, span })
+        Ok(Expr::Transact { precheck, network, network_retry, network_timeout, verify, commit, compensate, log, span })
+    }
+
+    // `("retry"|"timeout") int_lit` — same non-keyword, matched-by-text
+    // treatment `parse_transact_slot`'s own `label` already gets (see its
+    // doc comment); plain `int_lit`, no unit suffix, TRANSACT.md's own
+    // decision against inventing a duration literal for `timeout`.
+    fn parse_optional_int_modifier(&mut self, label: &str) -> PResult<Option<i64>> {
+        match &self.peek().tok {
+            Tok::Ident(s) if s == label => {
+                self.bump();
+                let span = self.span();
+                match self.peek().tok {
+                    Tok::Int(n) => {
+                        self.bump();
+                        Ok(Some(n))
+                    }
+                    ref other => {
+                        Err(ParseError { message: format!("expected an integer literal after `{label}`, found {other:?}"), span })
+                    }
+                }
+            }
+            _ => Ok(None),
+        }
     }
 
     // One `label ":" call` slot. `label` is a fixed word, matched by

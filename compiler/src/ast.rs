@@ -357,6 +357,19 @@ impl Ty {
         matches!(self, Ty::Vector(_, _) | Ty::Matrix(_, _, _))
     }
 
+    /// True for the four plain scalar types a `transact` block's
+    /// durability log can actually serialize and replay after a crash —
+    /// `Str` included, everything else (a resource handle like `Db`/
+    /// `Tcp`/`Thread`/`Sandbox`, or an aggregate/struct/enum) excluded.
+    /// `typeck.rs::infer_transact_slot` requires every `transact` slot's
+    /// arguments, and `network`/`verify`'s own declared return types, to
+    /// satisfy this — a live resource handle can't survive a process
+    /// restart, so nothing that crosses `transact`'s durability boundary
+    /// is allowed to be one (`TRANSACT.md`'s durability section).
+    pub fn is_transact_scalar(&self) -> bool {
+        self.is_numeric() || matches!(self, Ty::Bool | Ty::Str)
+    }
+
     /// The property that makes ownership meaningful: an affine value has
     /// exactly one owner at a time, and using it (other than reading
     /// *through* it — see `Expr::Deref`) transfers that ownership rather
@@ -980,25 +993,51 @@ pub enum Expr {
     /// empty `[]` is a parse error, not a value this variant can hold —
     /// there would be no way to infer an element type for it.
     ArrayLit(Vec<Expr>, Span),
-    /// `transact { network: call verify: call commit: call (compensate:
-    /// call)? (log: call)? }` — `TRANSACT.md`'s durable-effect construct.
-    /// **Layer 1 only** (this repo's staged rollout, `TRANSACT.md`'s own
-    /// "layers, not a syntax spec" section): in-process, no durability
-    /// log, no `retry`/`timeout` on `network` — those are Layer 2+.
-    /// `network` and `verify` become implicit local bindings (typed from
-    /// each call's own declared return type), visible to every slot after
-    /// them; this is an `Expr`, not a `Stmt`, specifically so `return
-    /// transact { ... }` works exactly like `return if c {..} else {..}`
-    /// already does — "the same block-value convention `if` already
-    /// uses," per `TRANSACT.md`. Evaluates to `true` if `commit` ran
-    /// (`verify` was `true`), `false` if `compensate` ran or would have
-    /// (`verify` was `false`, whether or not a `compensate` slot exists)
-    /// — see `interpreter.rs`'s `Expr::Transact` arm for the exact
-    /// five-step protocol, and `typeck.rs::infer_transact_slot` for why
-    /// every slot's callee is restricted to a user-defined function
-    /// (never a builtin).
+    /// `transact { precheck: call? network: call verify: call commit: call
+    /// (compensate: call)? (log: call)? }` — `TRANSACT.md`'s durable-effect
+    /// construct. **Layers 1, 3, and 4** of this repo's staged rollout are
+    /// implemented (in-process control flow, a durable log, crash replay);
+    /// `retry`/`timeout` on `network` itself (Layer 2) and cross-process
+    /// `network`/`commit` (Layer 5) remain future work. `network` and
+    /// `verify` become implicit local bindings (typed from each call's own
+    /// declared return type, restricted to `Ty::is_transact_scalar` so the
+    /// durability log can serialize them), visible to every slot after
+    /// them; `txn_id: str` is a third implicit binding, generated before
+    /// `precheck` runs, that `network`'s own arguments are required to
+    /// reference (the idempotency key a crash-replayed resend relies on
+    /// downstream to dedupe). This is an `Expr`, not a `Stmt`, specifically
+    /// so `return transact { ... }` works exactly like `return if c {..}
+    /// else {..}` already does — "the same block-value convention `if`
+    /// already uses," per `TRANSACT.md`. Evaluates to `true` if `commit`
+    /// ran (`verify` was `true`), `false` if `compensate` ran or would have
+    /// (`verify` was `false`, whether or not a `compensate` slot exists),
+    /// or `false` immediately if `precheck` returned `false` — see
+    /// `interpreter.rs`'s `Expr::Transact` arm for the exact protocol
+    /// (including the commit/compensate retry-and-escalate semantics), and
+    /// `typeck.rs::infer_transact_slot` for why every slot's callee is
+    /// restricted to a user-defined function (never a builtin).
     Transact {
+        /// Runs before `txn_id` is even generated, before anything is
+        /// written to the durability log. Must return `bool` (checked
+        /// like `verify`); `false` aborts the whole block immediately,
+        /// with nothing durable ever recorded — the fix for "the DB was
+        /// already down before `network` ran" (`TRANSACT.md`'s
+        /// durability section): a cheap, fast-failing check stops the
+        /// block before any real-world side effect fires.
+        precheck: Option<TransactSlot>,
         network: TransactSlot,
+        /// `network`'s own `retry N` modifier (TRANSACT.md's Layer 2) —
+        /// total attempts, not extra retries beyond the first (`None`
+        /// here means the same thing as an explicit `retry 1`: exactly
+        /// one attempt). A trap or a timeout both count as a failed
+        /// attempt; `verify == false` is never a retry condition — see
+        /// `interpreter.rs`'s `Expr::Transact` arm.
+        network_retry: Option<i64>,
+        /// `network`'s own `timeout N` modifier, whole seconds, no unit
+        /// suffix (TRANSACT.md's own decision against inventing a
+        /// duration literal). Enforced per attempt, not across the whole
+        /// retry loop.
+        network_timeout: Option<i64>,
         verify: TransactSlot,
         commit: TransactSlot,
         compensate: Option<TransactSlot>,
@@ -1442,6 +1481,16 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "rand_seed",
     "rand_f64",
     "rand_gaussian",
+    // A real wall-clock sleep, `sleep_ms(milliseconds)` -- the one
+    // concrete way `.nir` source can simulate a slow/hanging call, which
+    // `transact`'s `network: ... timeout N` (TRANSACT.md's Layer 2)
+    // otherwise has nothing to be tested or demonstrated against. Same
+    // honest, explicit departure from the determinism story `timeout`
+    // itself already is (`goal.md`'s determinism section only covers
+    // `rand_seed`'s RNG stream) -- not part of the RNG's own
+    // `Effect::Rng` tag, since this touches real wall-clock time, not
+    // the interpreter's seeded PRNG state.
+    "sleep_ms",
     "distance",
     "bearing",
     "lla_to_ecef",

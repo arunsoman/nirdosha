@@ -122,6 +122,10 @@ pub fn error_kind_name(kind: &crate::interpreter::ErrorKind) -> &'static str {
         SingularMatrix => "SingularMatrix",
         RngNotSeeded => "RngNotSeeded",
         CallStackOverflow { .. } => "CallStackOverflow",
+        TransactLogUnavailable { .. } => "TransactLogUnavailable",
+        TransactCommitPending { .. } => "TransactCommitPending",
+        TransactCompensatePending { .. } => "TransactCompensatePending",
+        TransactNetworkTimedOut { .. } => "TransactNetworkTimedOut",
     }
 }
 

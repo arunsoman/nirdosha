@@ -183,6 +183,11 @@ pub(crate) fn builtin_effect(name: &str) -> EffectSet {
         "rand_seed" | "rand_f64" | "rand_gaussian" => {
             s.insert(Effect::Rng);
         }
+        // A real wall-clock sleep -- `Io`, not `Rng` (nothing to do with
+        // the seeded PRNG stream).
+        "sleep_ms" => {
+            s.insert(Effect::Io);
+        }
         // Same effect `connect`/`listen`/`accept`/`tcp`'s `send`/`recv`/
         // `stop` already get -- `http_get`/`http_post` are a real TCP
         // connection under the hood.
@@ -381,8 +386,10 @@ fn walk_expr(e: &Expr, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, 
         // Every slot is restricted to a named user-function call
         // (`TRANSACT.md`) — no builtin to classify, just each callee's own
         // known effects, same as an ordinary `Expr::Call`.
-        Expr::Transact { network, verify, commit, compensate, log, .. } => {
-            let slots = std::iter::once(network)
+        Expr::Transact { precheck, network, verify, commit, compensate, log, .. } => {
+            let slots = precheck
+                .iter()
+                .chain(std::iter::once(network))
                 .chain(std::iter::once(verify))
                 .chain(std::iter::once(commit))
                 .chain(compensate.iter())

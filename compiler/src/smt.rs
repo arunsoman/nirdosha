@@ -426,7 +426,12 @@ impl Checker<'_> {
             // result isn't a number this pass models (`typeck.rs` fixes
             // it at `bool`), but every slot's arguments still get walked
             // for their own proofs.
-            Expr::Transact { network, verify, commit, compensate, log, .. } => {
+            Expr::Transact { precheck, network, verify, commit, compensate, log, .. } => {
+                if let Some(p) = precheck {
+                    for a in &p.args {
+                        self.expr(a, scopes);
+                    }
+                }
                 for a in &network.args {
                     self.expr(a, scopes);
                 }
@@ -652,7 +657,12 @@ fn assigned_names(stmts: &[Stmt]) -> HashSet<String> {
                 names.insert(name.clone());
                 walk_expr(rhs, names);
             }
-            Expr::Transact { network, verify, commit, compensate, log, .. } => {
+            Expr::Transact { precheck, network, verify, commit, compensate, log, .. } => {
+                if let Some(p) = precheck {
+                    for a in &p.args {
+                        walk_expr(a, names);
+                    }
+                }
                 for a in &network.args {
                     walk_expr(a, names);
                 }

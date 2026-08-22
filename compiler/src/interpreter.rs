@@ -51,6 +51,7 @@ use crate::ast::*;
 use crate::effects::{self, EffectSet};
 use crate::observability;
 use crate::token::Span;
+use crate::transact_log::{PendingTxn, TransactLog};
 
 /// Renamed on import — this file's own `Value` enum would otherwise
 /// collide with `serde_json::Value`'s name at every use site.
@@ -749,6 +750,35 @@ pub enum ErrorKind {
     /// comment): "deterministic by default" means every draw traces
     /// back to an explicit seed, not a silently-chosen one.
     RngNotSeeded,
+    /// `transact`'s durability log (`transact_log.rs`) couldn't be
+    /// opened, or a write to it failed -- a real I/O condition (disk
+    /// full, permissions, a locked file), not a `.nir` program bug.
+    /// Deliberately fatal to the whole `transact` block rather than
+    /// silently downgraded to "no durability this time": the entire
+    /// point of this construct is that a caller can rely on the log
+    /// having actually been written before proceeding, so a log that
+    /// can't be written to must stop the block, not quietly drop the
+    /// guarantee it exists to provide.
+    TransactLogUnavailable { message: String },
+    /// `commit`'s retry-with-backoff budget (`run_transact_write_slot`)
+    /// was exhausted while `network` had already succeeded -- a
+    /// deliberate trap, not a guess at `true`/`false`: the durable log
+    /// entry is left `commit_pending`, and `replay_pending_transactions`
+    /// (a restart, or the same reconciliation run again later) keeps
+    /// retrying it independently of whatever this trap's caller does.
+    /// See `TRANSACT.md`'s durability section for why this is "stuck and
+    /// visible" on purpose rather than auto-`compensate`d.
+    TransactCommitPending { txn_id: String },
+    /// Same as `TransactCommitPending`, for the `compensate` slot --
+    /// `verify` was `false` and `compensate` itself is the write that's
+    /// now stuck, left `compensate_pending` in the durable log.
+    TransactCompensatePending { txn_id: String },
+    /// `network`'s own `timeout N` modifier (TRANSACT.md's Layer 2)
+    /// elapsed before the call returned -- counted as a failed attempt
+    /// by `Interpreter::call_network_with_retry`, same as a trap. Only
+    /// ever the *final* error reported once `retry`'s attempt budget
+    /// (default 1) is exhausted.
+    TransactNetworkTimedOut { seconds: i64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -806,6 +836,22 @@ impl std::fmt::Display for RuntimeError {
                 "{line}:{col}: call stack depth exceeded while calling `{fn_name}` — \
                  likely unbounded recursion"
             ),
+            ErrorKind::TransactLogUnavailable { message } => {
+                write!(f, "{line}:{col}: transact durability log unavailable: {message}")
+            }
+            ErrorKind::TransactCommitPending { txn_id } => write!(
+                f,
+                "{line}:{col}: transact {txn_id}: `network` succeeded but `commit` has not been confirmed \
+                 (retries exhausted) — durably recorded as `commit_pending`, will keep being retried"
+            ),
+            ErrorKind::TransactCompensatePending { txn_id } => write!(
+                f,
+                "{line}:{col}: transact {txn_id}: `compensate` has not been confirmed (retries exhausted) — \
+                 durably recorded as `compensate_pending`, will keep being retried"
+            ),
+            ErrorKind::TransactNetworkTimedOut { seconds } => {
+                write!(f, "{line}:{col}: `transact`'s `network` slot timed out after {seconds}s")
+            }
         }
     }
 }
@@ -871,6 +917,18 @@ fn result_ok(v: Value) -> Value {
 fn result_err(message: impl Into<String>) -> Value {
     let s: Arc<str> = Arc::from(message.into());
     Value::Enum(Arc::from("Result"), Arc::from("Err"), Arc::from(vec![Value::Str(s)]))
+}
+
+/// True iff `v` is a real Nirdosha `Result(_, _)` value in its `Err`
+/// variant -- `run_transact_write_slot`'s "auto-recognize `Result<T,E>`,
+/// treat `Err` as a failure" half of the fix for `commit`'s previously-
+/// discarded return value. `false` for anything else, including a `Result`
+/// in its `Ok` variant and every non-`Result` type (a `commit`/`compensate`
+/// slot's return type is otherwise unconstrained, per `TRANSACT.md`'s own
+/// "Decisions" section -- this only ever narrows a `Result`, never widens
+/// what counts as failure for any other return shape).
+fn is_result_err(v: &Value) -> bool {
+    matches!(v, Value::Enum(name, variant, _) if name.as_ref() == "Result" && variant.as_ref() == "Err")
 }
 
 /// A short, human-readable name for a JSON value's own dynamic shape --
@@ -1247,6 +1305,45 @@ fn session_secret_hex() -> &'static str {
 /// credential — nothing about the `.nir` determinism contract depends
 /// on a session *id* being reproducible the way a program's own return
 /// value must be.
+/// `transact`'s implicit `txn_id: str` binding -- the idempotency key a
+/// crash-replayed resend of `network` relies on the downstream system to
+/// dedupe (`TRANSACT.md`'s durability section). Same construction as
+/// `application_session_value`'s own unpredictable, always-unique suffix
+/// just below (`session_secret_hex()` + real-time nanoseconds + a
+/// per-process counter, hashed) -- reused wholesale rather than
+/// duplicated, since the requirement is identical: unpredictable,
+/// unique even for two `transact` blocks entered in the same nanosecond,
+/// with no bearing on the `.nir` determinism contract (a `txn_id`'s only
+/// job is to be an opaque, never-repeating key, not a reproducible
+/// value).
+/// `Interpreter::transact_log_path`'s default -- a unique per-instance
+/// file under the OS temp dir, so parallel `cargo test` runs (or any
+/// two `Interpreter`s constructed without an explicit
+/// `with_transact_log_path`) never share, and can't corrupt, the same
+/// SQLite file. `main.rs`'s `run`/`serve` commands override this with a
+/// stable, source-file-derived path instead -- see
+/// `with_transact_log_path`'s own doc comment for why a random default
+/// would defeat crash-replay's whole purpose there.
+fn default_transact_log_path() -> std::path::PathBuf {
+    static PATH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let counter = PATH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("nirdosha-transact-{}-{nanos}-{counter}.db", std::process::id()))
+}
+
+fn generate_txn_id() -> String {
+    static TXN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let counter = TXN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let real_now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    sha256_hex_chain(&[session_secret_hex(), &real_now_nanos.to_string(), &counter.to_string()])
+}
+
 fn application_session_value(subject: &str, issuer: &str, now: i64) -> Value {
     static SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let counter = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1893,6 +1990,11 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
         "rand_seed" => {
             let Value::Int(seed) = &args[0] else { unreachable!("typeck.rs already proved this is an integer") };
             *rng.borrow_mut() = Some(RngState::seed(*seed as u64));
+            Ok(Value::Unit)
+        }
+        "sleep_ms" => {
+            let Value::Int(ms) = &args[0] else { unreachable!("typeck.rs already proved this is an integer") };
+            std::thread::sleep(std::time::Duration::from_millis((*ms).max(0) as u64));
             Ok(Value::Unit)
         }
         "rand_f64" => match rng.borrow_mut().as_mut() {
@@ -2697,6 +2799,22 @@ pub struct Interpreter {
     /// self-recursion abort the whole `nirdosha serve` process for every
     /// concurrent caller, not just the one that triggered it).
     call_depth: std::cell::Cell<usize>,
+    /// Where `transact`'s durability log lives on disk -- always has
+    /// *some* value, so a program that uses `transact` can't forget to
+    /// turn durability on (no flag to omit). `Interpreter::new`'s default
+    /// is a unique-per-instance file under `std::env::temp_dir()`, safe
+    /// for parallel `cargo test` runs and for any bare `run(src: &str)`
+    /// caller with no real source file to derive a stable path from, but
+    /// with no cross-process replay continuity. `main.rs`'s `run`/`serve`
+    /// commands override this via `with_transact_log_path` to
+    /// `<source-file>.transact.db` (or `--transact-log <path>`) instead
+    /// -- a stable, program-derived path a restart can find again, which
+    /// is the whole point for real CLI/server usage.
+    transact_log_path: std::path::PathBuf,
+    /// The actual open connection, lazy -- see `Interpreter::transact_log`
+    /// (this file) for why: only a program that actually contains a
+    /// `transact` ever touches the filesystem for this at all.
+    transact_log_cell: std::cell::OnceCell<Arc<TransactLog>>,
 }
 
 /// Past this many nested `call()`s, fail cleanly instead of overflowing
@@ -2803,6 +2921,27 @@ impl RngState {
     }
 }
 
+/// One `transact` row's outcome after
+/// `Interpreter::replay_pending_transactions` processes it -- see that
+/// method's own doc comment for the recoverability boundary this
+/// reflects.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplayOutcome {
+    /// Reached a terminal state (`committed`/`compensated`) during this
+    /// replay pass.
+    Resolved { txn_id: String, committed: bool },
+    /// A write (`commit`/`compensate`) was attempted and its retry
+    /// budget was exhausted again -- still non-terminal, still durably
+    /// recorded, eligible to be retried on the next
+    /// `replay_pending_transactions` call.
+    StillPending { txn_id: String },
+    /// Could not be resumed automatically -- see `reason`. Left exactly
+    /// as it was in the durability log; needs an operator, or the
+    /// original request's caller reissuing the same operation through a
+    /// legitimate new path.
+    Stuck { txn_id: String, reason: String },
+}
+
 impl Interpreter {
     pub fn new(program: Arc<Program>, source: Arc<str>) -> Self {
         let fn_index = program.fns.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect();
@@ -2815,11 +2954,25 @@ impl Interpreter {
             fn_effects: std::cell::OnceCell::new(),
             rng: std::cell::RefCell::new(None),
             call_depth: std::cell::Cell::new(0),
+            transact_log_path: default_transact_log_path(),
+            transact_log_cell: std::cell::OnceCell::new(),
         }
     }
 
     pub fn with_sandbox_exe(mut self, path: std::path::PathBuf) -> Self {
         self.sandbox_exe = Some(path);
+        self
+    }
+
+    /// Overrides `transact_log_path`'s default (a unique per-instance
+    /// temp file) with a stable, caller-chosen path -- `main.rs`'s `run`/
+    /// `serve` commands use this to point at `<source-file>.transact.db`
+    /// (or an explicit `--transact-log <path>`), so a restart's crash
+    /// replay (`replay_pending_transactions`) can actually find the
+    /// previous run's pending rows. Same builder shape as
+    /// `with_sandbox_exe`/`with_tracer`.
+    pub fn with_transact_log_path(mut self, path: std::path::PathBuf) -> Self {
+        self.transact_log_path = path;
         self
     }
 
@@ -2856,6 +3009,161 @@ impl Interpreter {
     /// position for "the CLI asked for this."
     pub fn call_named(&self, name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
         self.call(name, args, Span { line: 0, col: 0 })
+    }
+
+    /// Resumes every `transact` row not yet in a terminal state --
+    /// `TRANSACT.md`'s Layer 4. Call once at process startup (`main.rs`'s
+    /// `run`/`serve` commands do, before ever calling `main`/serving a
+    /// request) -- not automatic inside `Interpreter::new`, so a test or
+    /// embedder that constructs an `Interpreter` doesn't get a surprise
+    /// side effect.
+    ///
+    /// ## The recoverability boundary
+    ///
+    /// - `state == "commit_pending"` / `"compensate_pending"`: fully
+    ///   resumable -- the callee name and its exact evaluated arguments
+    ///   were durably captured before the crash
+    ///   (`TransactLog::mark_commit_pending`/`mark_compensate_pending`),
+    ///   so this is just `run_transact_write_slot` again, identical to
+    ///   the live path.
+    /// - `state == "network_done"` or `"pending"`: `network`'s result
+    ///   (once re-confirmed, for `"pending"`) and `verify`'s exact
+    ///   arguments are always reconstructable -- `verify`'s arguments are
+    ///   statically restricted to `network`/`txn_id`
+    ///   (`typeck.rs::TransactVerifyArgsMustBeImplicitBindings`),
+    ///   specifically so this is always possible. But `commit`/
+    ///   `compensate`'s own arguments can legitimately reference outer-
+    ///   scope variables from the enclosing function call (an `amount`
+    ///   parameter, e.g.) that crashed away with the original process and
+    ///   were never durably captured -- that only happens once
+    ///   `mark_commit_pending`/`mark_compensate_pending` has actually run.
+    ///   If `verify` turns out to require a write this replay pass can't
+    ///   durably reconstruct the arguments for, the row is reported
+    ///   `ReplayOutcome::Stuck` rather than guessed at -- the one honest,
+    ///   named gap in an otherwise-complete durability story: a crash
+    ///   that preempts a write's own argument-logging needs the original
+    ///   request's context back, not more cleverness in this file.
+    pub fn replay_pending_transactions(&self) -> Result<Vec<ReplayOutcome>, RuntimeError> {
+        let span = Span { line: 0, col: 0 };
+        let tlog = self.transact_log(span)?;
+        let unresolved = tlog.list_unresolved().map_err(|e| self.transact_log_err(e, span))?;
+        Ok(unresolved.into_iter().map(|txn| self.replay_one(&tlog, txn, span)).collect())
+    }
+
+    fn replay_one(&self, tlog: &TransactLog, txn: PendingTxn, span: Span) -> ReplayOutcome {
+        let txn_id = txn.txn_id.clone();
+
+        match txn.state.as_str() {
+            "commit_pending" => {
+                let args = txn.commit_args.unwrap_or_default();
+                return self.replay_write(tlog, txn_id, &txn.commit_fn, &args, span, "committed", true);
+            }
+            "compensate_pending" => {
+                let args = txn.compensate_args.unwrap_or_default();
+                let compensate_fn =
+                    txn.compensate_fn.expect("state = compensate_pending implies a compensate slot exists");
+                return self.replay_write(tlog, txn_id, &compensate_fn, &args, span, "compensated", false);
+            }
+            _ => {}
+        }
+
+        // `"pending"`: `network`'s outcome is unknown -- re-invoke it
+        // (same `txn_id`, relies on downstream idempotency, see this
+        // method's own doc comment) and durably record the result.
+        // `"network_done"`: already have it.
+        let network_result = if txn.state == "pending" {
+            match self.call_network_with_retry(&txn.network_fn, &txn.network_args, span, txn.network_retry, txn.network_timeout) {
+                Ok(v) => match tlog.record_network_result(&txn_id, &v) {
+                    Ok(()) => v,
+                    Err(e) => {
+                        return ReplayOutcome::Stuck {
+                            txn_id,
+                            reason: format!("`network` succeeded but its result couldn't be durably recorded: {e}"),
+                        }
+                    }
+                },
+                Err(e) => {
+                    return ReplayOutcome::Stuck { txn_id, reason: format!("`network` is still failing on replay: {e}") }
+                }
+            }
+        } else {
+            match txn.network_result {
+                Some(v) => v,
+                None => {
+                    return ReplayOutcome::Stuck {
+                        txn_id,
+                        reason: "state is network_done but no network_result was recorded (should be unreachable)"
+                            .to_string(),
+                    }
+                }
+            }
+        };
+
+        let verify_args: Vec<Value> = txn
+            .verify_arg_kinds
+            .iter()
+            .map(|k| match k.as_str() {
+                "network" => network_result.clone(),
+                "txn_id" => Value::Str(Arc::from(txn_id.as_str())),
+                other => unreachable!("TransactLog::begin_pending only ever writes \"network\"/\"txn_id\", got {other:?}"),
+            })
+            .collect();
+        let verified = match self.call(&txn.verify_fn, &verify_args, span) {
+            Ok(Value::Bool(b)) => b,
+            Ok(v) => {
+                return ReplayOutcome::Stuck {
+                    txn_id,
+                    reason: format!("`verify` returned `{}`, not `bool` (should be unreachable)", v.ty_name()),
+                }
+            }
+            Err(e) => return ReplayOutcome::Stuck { txn_id, reason: format!("`verify` failed on replay: {e}") },
+        };
+        let _ = tlog.record_verify(&txn_id, &verify_args, verified);
+
+        if verified {
+            let Some(commit_args) = txn.commit_args else {
+                return ReplayOutcome::Stuck {
+                    txn_id,
+                    reason: "verify succeeded but commit's arguments were never durably captured before the crash \
+                             (they may reference outer-scope variables only the original call had) -- this needs \
+                             the original request's context, not more replay"
+                        .to_string(),
+                };
+            };
+            self.replay_write(tlog, txn_id, &txn.commit_fn, &commit_args, span, "committed", true)
+        } else if let Some(compensate_fn) = txn.compensate_fn {
+            let Some(compensate_args) = txn.compensate_args else {
+                return ReplayOutcome::Stuck {
+                    txn_id,
+                    reason: "verify returned false but compensate's arguments were never durably captured before \
+                             the crash (they may reference outer-scope variables only the original call had) -- \
+                             this needs the original request's context, not more replay"
+                        .to_string(),
+                };
+            };
+            self.replay_write(tlog, txn_id, &compensate_fn, &compensate_args, span, "compensated", false)
+        } else {
+            let _ = tlog.mark_terminal(&txn_id, "compensated");
+            ReplayOutcome::Resolved { txn_id, committed: false }
+        }
+    }
+
+    fn replay_write(
+        &self,
+        tlog: &TransactLog,
+        txn_id: String,
+        fn_name: &str,
+        args: &[Value],
+        span: Span,
+        terminal_state: &'static str,
+        committed: bool,
+    ) -> ReplayOutcome {
+        let pending_err: fn(String) -> ErrorKind =
+            if committed { |id| ErrorKind::TransactCommitPending { txn_id: id } } else { |id| ErrorKind::TransactCompensatePending { txn_id: id } };
+        match self.run_transact_write_slot(tlog, &txn_id, fn_name, args, span, terminal_state, pending_err) {
+            Ok(()) => ReplayOutcome::Resolved { txn_id, committed },
+            Err(_) => ReplayOutcome::StillPending { txn_id },
+        }
     }
 
     /// Same as `call_named`, but run on a thread with a much larger
@@ -2971,11 +3279,178 @@ impl Interpreter {
     /// name isn't a builtin, so — unlike `Expr::Call`'s own arm, which
     /// has to dispatch both ways — this always goes through `self.call`.
     fn eval_transact_slot(&self, slot: &TransactSlot, env: &mut Env) -> SResult<Value> {
+        let vals = self.eval_transact_slot_args(slot, env)?;
+        self.call(&slot.name, &vals, slot.span).map_err(Signal::Err)
+    }
+
+    /// Just the argument-evaluation half of `eval_transact_slot` --
+    /// `network`/`verify`/`commit`/`compensate`'s own `Expr::Transact`
+    /// handling needs the evaluated `Value`s on their own, to durably log
+    /// them (`TransactLog::begin_pending` and friends) *before* actually
+    /// invoking the callee.
+    fn eval_transact_slot_args(&self, slot: &TransactSlot, env: &mut Env) -> SResult<Vec<Value>> {
         let mut vals = Vec::with_capacity(slot.args.len());
         for a in &slot.args {
             vals.push(self.eval_expr(a, env)?);
         }
-        self.call(&slot.name, &vals, slot.span).map_err(Signal::Err)
+        Ok(vals)
+    }
+
+    /// `commit`/`compensate` (the two `transact` slots that retry on
+    /// failure) share this: run `fn_name(args)`, treat either a trap or
+    /// an `Err(_)` from a `Result<T, E>`-shaped return as a failure
+    /// (closing the exact silent-discard hole that motivated this whole
+    /// durability pass -- `commit`'s return type used to be "unconstrained
+    /// and discarded", so a `db_execute` failure inside it was invisible),
+    /// and retry with bounded exponential backoff. Never falls through to
+    /// a different slot on failure -- `compensate` only ever runs because
+    /// `verify` was `false`, a business decision, never because `commit`
+    /// hit an infra fault (`TRANSACT.md`'s durability section: auto-
+    /// compensating a real, already-`network`-succeeded effect because a
+    /// local write hiccuped would be its own partial-failure-shaped bug).
+    /// If the retry budget is exhausted, this traps with `pending_err`
+    /// rather than guessing `true`/`false` -- the durable log entry is
+    /// left exactly as `mark_commit_pending`/`mark_compensate_pending`
+    /// left it, non-terminal, for `replay_pending_transactions` (a
+    /// restart, or the same reconciliation run again later) to keep
+    /// retrying independently of whatever the original caller did with
+    /// the trap.
+    fn run_transact_write_slot(
+        &self,
+        tlog: &TransactLog,
+        txn_id: &str,
+        fn_name: &str,
+        args: &[Value],
+        span: Span,
+        terminal_state: &'static str,
+        pending_err: impl Fn(String) -> ErrorKind,
+    ) -> Result<(), RuntimeError> {
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut attempt: u32 = 0;
+        loop {
+            let outcome = self.call(fn_name, args, span);
+            let failed = match &outcome {
+                Err(_) => true,
+                Ok(v) => is_result_err(v),
+            };
+            if !failed {
+                let _ = tlog.mark_terminal(txn_id, terminal_state);
+                return Ok(());
+            }
+            attempt += 1;
+            let _ = tlog.bump_attempts(txn_id);
+            if attempt >= MAX_ATTEMPTS {
+                return Err(RuntimeError { kind: pending_err(txn_id.to_string()), span });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20u64 << attempt.min(10)));
+        }
+    }
+
+    /// TRANSACT.md's Layer 2: `network`'s own `retry`/`timeout`
+    /// modifiers. `retry` is total attempts, not extra retries beyond
+    /// the first (`None`/absent means exactly one attempt, matching
+    /// TRANSACT.md's "default 1 -- i.e. no retry"); a trap *or* a
+    /// timeout both count as a failed attempt. "Retry only reacts to a
+    /// trap, never to `verify == false`" (TRANSACT.md's own Decisions)
+    /// holds trivially here -- this only ever wraps the `network` call
+    /// itself, `verify` hasn't even run yet. No backoff between
+    /// attempts: TRANSACT.md's own protocol text doesn't call for one on
+    /// `network` (unlike `run_transact_write_slot`'s `commit`/
+    /// `compensate` retry, which is this file's own addition, not part
+    /// of the original locked design) -- re-invokes the exact same call
+    /// expression with the same already-evaluated `args`, per
+    /// TRANSACT.md's own Layer 2 note.
+    fn call_network_with_retry(
+        &self,
+        name: &str,
+        args: &[Value],
+        span: Span,
+        retry: Option<i64>,
+        timeout: Option<i64>,
+    ) -> Result<Value, RuntimeError> {
+        let max_attempts = retry.unwrap_or(1).max(1);
+        let mut last_err = None;
+        for _ in 0..max_attempts {
+            match self.call_with_timeout(name, args, span, timeout) {
+                Ok(v) => return Ok(v),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.expect("max_attempts >= 1, so the loop always runs at least once"))
+    }
+
+    /// One attempt of `name(args)`, aborted if `timeout` seconds elapse
+    /// first. `None` skips the whole timeout apparatus and just calls
+    /// `self.call` directly -- the common case, zero extra cost.
+    ///
+    /// A real wall-clock read and a real background thread -- an
+    /// explicit, called-out departure from the determinism story
+    /// (`goal.md`'s determinism section only covers `rand_seed`'s RNG
+    /// stream; this is new, unavoidable nondeterminism, same honesty
+    /// `SANDBOXING.md` already gives "`recv` can block forever"). This
+    /// interpreter isn't `Sync` (`rng`'s `RefCell`, `call_depth`'s
+    /// `Cell`), so the timed call can't run `self` on another thread the
+    /// way a true preemptive timeout would -- instead, exactly the
+    /// pattern `Expr::Spawn` already uses (see its own doc comment): a
+    /// brand new `Interpreter` sharing only cheap `Arc` clones of the
+    /// immutable program/source/tracer/sandbox_exe, sent its result over
+    /// a channel. A `recv_timeout` past the deadline gives up waiting and
+    /// reports `TransactNetworkTimedOut` -- but the spawned thread itself
+    /// is *not* killed (Rust has no such mechanism); like `SANDBOXING.md`'s
+    /// `recv`, it keeps running in the background and its eventual result
+    /// (if any) is simply discarded when the channel's other end drops.
+    fn call_with_timeout(&self, name: &str, args: &[Value], span: Span, timeout: Option<i64>) -> Result<Value, RuntimeError> {
+        let Some(secs) = timeout else {
+            return self.call(name, args, span);
+        };
+        let program = Arc::clone(&self.program);
+        let source = Arc::clone(&self.source);
+        let sandbox_exe = self.sandbox_exe.clone();
+        let tracer = self.tracer.clone();
+        let name_owned = name.to_string();
+        let args_owned = args.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut interp = Interpreter::new(program, source);
+            if let Some(exe) = sandbox_exe {
+                interp = interp.with_sandbox_exe(exe);
+            }
+            if let Some(t) = tracer {
+                interp = interp.with_tracer(t);
+            }
+            let result = interp.call(&name_owned, &args_owned, span);
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(secs.max(0) as u64)) {
+            Ok(result) => result,
+            Err(_) => Err(RuntimeError { kind: ErrorKind::TransactNetworkTimedOut { seconds: secs }, span }),
+        }
+    }
+
+    /// Lazily opens (and caches) this interpreter's durability log --
+    /// `OnceCell`, the same "computed at most once, only when a program
+    /// actually needs it" idiom `fn_effects` already uses, so a program
+    /// that never uses `transact` never touches the filesystem at all.
+    /// The path itself (`transact_log_path`) always has *some* value
+    /// (`Interpreter::new`'s default is a unique per-process temp file;
+    /// `with_transact_log_path` overrides it) -- what's lazy here is only
+    /// the actual file I/O of opening/creating it.
+    fn transact_log(&self, span: Span) -> Result<Arc<TransactLog>, RuntimeError> {
+        if let Some(log) = self.transact_log_cell.get() {
+            return Ok(Arc::clone(log));
+        }
+        let log = Arc::new(TransactLog::open(&self.transact_log_path).map_err(|e| self.transact_log_err(e, span))?);
+        // `OnceCell::set` failing here would mean another call already
+        // won the race -- can't happen: every `eval_expr` call is on the
+        // one thread that owns this `Interpreter` instance (see
+        // `Interpreter::rng`'s doc comment for the identical single-
+        // owning-thread argument), so this is really just "set, unwrap".
+        let _ = self.transact_log_cell.set(Arc::clone(&log));
+        Ok(log)
+    }
+
+    fn transact_log_err(&self, e: rusqlite::Error, span: Span) -> RuntimeError {
+        RuntimeError { kind: ErrorKind::TransactLogUnavailable { message: e.to_string() }, span }
     }
 
     fn call(&self, name: &str, arg_vals: &[Value], span: Span) -> Result<Value, RuntimeError> {
@@ -3475,21 +3950,85 @@ impl Interpreter {
                 let v = self.eval_expr(inner, env)?;
                 Ok(Value::Ref(Box::new(v)))
             }
-            Expr::Transact { network, verify, commit, compensate, log, .. } => {
-                // TRANSACT.md's five-step protocol, Layer 1 slice: no
-                // durability log, no retry/timeout — `network` runs
-                // exactly once. `env.push()`/`pop()` scopes `network`/
+            Expr::Transact { precheck, network, network_retry, network_timeout, verify, commit, compensate, log, span } => {
+                // TRANSACT.md's full durability protocol (Layers 1, 3,
+                // 4): `precheck` can abort before anything durable is
+                // written; `network`'s intent and result are logged
+                // before/after it runs (the actual crash-safety
+                // boundary); `commit`/`compensate` retry-with-backoff on
+                // failure and trap (never silently compensate, never
+                // silently succeed) if the retry budget is exhausted --
+                // see this file's `run_transact_write_slot` and
+                // `replay_pending_transactions` for the other half of
+                // this protocol (resuming a row after a crash).
+                // `env.push()`/`pop()` scopes `txn_id`/`network`/
                 // `verify`'s implicit bindings to just this block, same
                 // as `TRANSACT.md`'s "scoped only inside the transact
                 // block."
                 env.push();
 
-                // Steps 1-2: `network` runs, its result becomes an
-                // implicit local binding visible to every slot after it.
+                let txn_id = generate_txn_id();
+                env.define("txn_id", Value::Str(Arc::from(txn_id.as_str())), Ty::Str);
+
+                // `precheck`: nothing durable exists yet, so a `false`
+                // here just aborts -- the fix for "the DB was already
+                // down before `network` ran" (`TRANSACT.md`'s durability
+                // section).
+                if let Some(p) = precheck {
+                    let precheck_val = self.eval_transact_slot(p, env)?;
+                    let passed = match &precheck_val {
+                        Value::Bool(b) => *b,
+                        v => return Err(mismatch("bool", v.ty_name(), p.span)),
+                    };
+                    if !passed {
+                        env.pop();
+                        return Ok(Value::Bool(false));
+                    }
+                }
+
+                let tlog = self.transact_log(*span)?;
+
+                // Step 1: durably record intent, *then* run `network`.
+                // Every slot's *callee name* is captured right here, up
+                // front -- all four are statically known (typeck already
+                // proved `verify`'s arguments are each exactly `network`
+                // or `txn_id` -- `TransactVerifyArgsMustBeImplicitBindings`
+                // -- so `verify_arg_kinds` below is always well-formed).
                 // typeck already proved `network.name` resolves to a
-                // user function (`infer_transact_slot` rejects builtins),
-                // so `find_fn` is guaranteed to succeed here.
-                let network_val = self.eval_transact_slot(network, env)?;
+                // user function (`infer_transact_slot` rejects
+                // builtins), so `find_fn`/`call` are guaranteed to
+                // succeed on the name itself here.
+                let network_args = self.eval_transact_slot_args(network, env)?;
+                let verify_arg_kinds: Vec<&str> = verify
+                    .args
+                    .iter()
+                    .map(|a| match a {
+                        Expr::Ident(name, _) if name == "network" => "network",
+                        Expr::Ident(name, _) if name == "txn_id" => "txn_id",
+                        _ => unreachable!(
+                            "typeck.rs::TransactVerifyArgsMustBeImplicitBindings already restricted this"
+                        ),
+                    })
+                    .collect();
+                tlog.begin_pending(
+                    &txn_id,
+                    &network.name,
+                    &network_args,
+                    *network_retry,
+                    *network_timeout,
+                    &verify.name,
+                    &verify_arg_kinds,
+                    &commit.name,
+                    compensate.as_ref().map(|c| c.name.as_str()),
+                )
+                .map_err(|e| self.transact_log_err(e, *span))?;
+                let network_val = self
+                    .call_network_with_retry(&network.name, &network_args, network.span, *network_retry, *network_timeout)
+                    .map_err(Signal::Err)?;
+                // Recorded before `verify` runs -- a restart that finds
+                // this row already past `state = "pending"` never
+                // re-invokes `network` again.
+                tlog.record_network_result(&txn_id, &network_val).map_err(|e| self.transact_log_err(e, *span))?;
                 let network_ty = self
                     .find_fn(&network.name)
                     .expect("typeck already proved this resolves to a user fn")
@@ -3497,28 +4036,64 @@ impl Interpreter {
                     .clone();
                 env.define("network", network_val, network_ty);
 
-                // Step 3: `verify` runs, sees `network`.
-                let verify_val = self.eval_transact_slot(verify, env)?;
+                // Step 2: `verify` runs, sees `network`. Its own
+                // callee/args are logged first too -- a crash resuming
+                // from `state = "network_done"` has to re-run `verify`
+                // with its exact original arguments.
+                let verify_args = self.eval_transact_slot_args(verify, env)?;
+                let verify_val = self.call(&verify.name, &verify_args, verify.span).map_err(Signal::Err)?;
                 let verified = match &verify_val {
                     Value::Bool(b) => *b,
                     v => return Err(mismatch("bool", v.ty_name(), verify.span)),
                 };
+                tlog.record_verify(&txn_id, &verify_args, verified).map_err(|e| self.transact_log_err(e, *span))?;
                 env.define("verify", verify_val, Ty::Bool);
 
-                // Step 4/5: commit-or-compensate, then a best-effort
-                // `log` (never itself part of the durability contract —
-                // there is no durability log yet in Layer 1).
+                // Step 3/4: commit-or-compensate. Neither falls through
+                // to the other on failure -- `compensate` stays reserved
+                // for `verified == false` only, a deliberate business
+                // rejection, never an infra fault
+                // (`run_transact_write_slot`'s own doc comment).
                 let committed = if verified {
-                    self.eval_transact_slot(commit, env)?;
+                    let commit_args = self.eval_transact_slot_args(commit, env)?;
+                    tlog.mark_commit_pending(&txn_id, &commit_args).map_err(|e| self.transact_log_err(e, *span))?;
+                    self.run_transact_write_slot(
+                        &tlog,
+                        &txn_id,
+                        &commit.name,
+                        &commit_args,
+                        commit.span,
+                        "committed",
+                        |id| ErrorKind::TransactCommitPending { txn_id: id },
+                    )?;
                     true
+                } else if let Some(c) = compensate {
+                    let compensate_args = self.eval_transact_slot_args(c, env)?;
+                    tlog.mark_compensate_pending(&txn_id, &compensate_args)
+                        .map_err(|e| self.transact_log_err(e, *span))?;
+                    self.run_transact_write_slot(
+                        &tlog,
+                        &txn_id,
+                        &c.name,
+                        &compensate_args,
+                        c.span,
+                        "compensated",
+                        |id| ErrorKind::TransactCompensatePending { txn_id: id },
+                    )?;
+                    false
                 } else {
-                    if let Some(c) = compensate {
-                        self.eval_transact_slot(c, env)?;
-                    }
+                    // No `compensate` slot to run -- nothing pending,
+                    // terminal immediately.
+                    let _ = tlog.mark_terminal(&txn_id, "compensated");
                     false
                 };
+
+                // `log`, always best-effort: TRANSACT.md's own text --
+                // "never itself part of the durability contract, never
+                // replayed" -- a trap inside it must never undo an
+                // already-successfully-committed/compensated `transact`.
                 if let Some(l) = log {
-                    self.eval_transact_slot(l, env)?;
+                    let _ = self.eval_transact_slot(l, env);
                 }
 
                 env.pop();

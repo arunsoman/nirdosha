@@ -580,7 +580,7 @@ impl<'a> Checker<'a> {
                     self.touch_expr(a, consume);
                 }
             }
-            Expr::Transact { network, verify, commit, compensate, log, .. } => {
+            Expr::Transact { precheck, network, verify, commit, compensate, log, .. } => {
                 // `TRANSACT.md`'s own Layer 1 scope decision: "ownership
                 // — slots are ordinary calls — nothing new for
                 // ownership.rs to reason about, same as SANDBOXING.md's
@@ -599,6 +599,11 @@ impl<'a> Checker<'a> {
                 // independent `Value` clone, never a raw alias), just an
                 // enforcement gap left for a later layer if it matters
                 // in practice.
+                if let Some(p) = precheck {
+                    for a in &p.args {
+                        self.touch_expr(a, true);
+                    }
+                }
                 for a in &network.args {
                     self.touch_expr(a, true);
                 }

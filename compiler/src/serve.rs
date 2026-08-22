@@ -75,11 +75,36 @@ fn header(name: &str, value: &str) -> tiny_http::Header {
 /// the served UI so its login screen talks to a real (mock) identity
 /// app instead of the pure client-side stub (`ui_gen::generate`'s doc
 /// comment).
-pub fn run(program: Arc<Program>, port: u16, auth: Option<AuthConfig>, identity_base: Option<&str>) -> Result<(), String> {
+pub fn run(
+    program: Arc<Program>,
+    port: u16,
+    auth: Option<AuthConfig>,
+    identity_base: Option<&str>,
+    transact_log_path: std::path::PathBuf,
+) -> Result<(), String> {
     let registry = crate::ast::TypeRegistry::build(&program);
     let effects = crate::effects::infer_effects(&program, &registry);
     let ui_html = crate::ui_gen::generate(&program, &effects, identity_base);
     let auth = Arc::new(auth);
+    let transact_log_path = Arc::new(transact_log_path);
+
+    // Crash replay (`TRANSACT.md`'s Layer 4) once, before the server ever
+    // accepts a request -- not per-request (unlike `dispatch`'s own fresh
+    // `Interpreter`, one per request for isolation): replaying the same
+    // durable log twice per request would be wasted work, and the whole
+    // point is to resolve whatever crashed *before* new traffic arrives.
+    {
+        let replay_interp =
+            Interpreter::new(Arc::clone(&program), Arc::from("")).with_transact_log_path((*transact_log_path).clone());
+        match replay_interp.replay_pending_transactions() {
+            Ok(outcomes) => {
+                for o in &outcomes {
+                    eprintln!("transact replay: {o:?}");
+                }
+            }
+            Err(e) => return Err(format!("transact durability log error during startup crash replay: {e}")),
+        }
+    }
 
     let server = tiny_http::Server::http(("0.0.0.0", port)).map_err(|e| format!("failed to bind :{port}: {e}"))?;
     eprintln!("nirdosha serve: listening on http://0.0.0.0:{port}  (GET / for the UI, POST /api/<fn> for the API)");
@@ -132,7 +157,7 @@ pub fn run(program: Arc<Program>, port: u16, auth: Option<AuthConfig>, identity_
                 // (`call_named_on_big_stack`, which `dispatch` already
                 // goes through).
                 let (status, payload) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    dispatch(&program, fn_name, &body, auth_header.as_deref(), auth.as_ref().as_ref())
+                    dispatch(&program, fn_name, &body, auth_header.as_deref(), auth.as_ref().as_ref(), &transact_log_path)
                 })) {
                     Ok(result) => result,
                     Err(_) => (500, json_err(&format!("`{fn_name}` panicked while handling this request"))),
@@ -162,7 +187,14 @@ pub fn run(program: Arc<Program>, port: u16, auth: Option<AuthConfig>, identity_
 /// `tiny_http` types below this line, which is what makes `tests/
 /// serve.rs` able to exercise it without spinning up a real socket for
 /// every case (only the true end-to-end tests need a real port).
-fn dispatch(program: &Arc<Program>, fn_name: &str, body: &str, auth_header: Option<&str>, auth: Option<&AuthConfig>) -> (u16, String) {
+fn dispatch(
+    program: &Arc<Program>,
+    fn_name: &str,
+    body: &str,
+    auth_header: Option<&str>,
+    auth: Option<&AuthConfig>,
+    transact_log_path: &std::path::Path,
+) -> (u16, String) {
     let Some(f) = program.fns.iter().find(|f| f.name == fn_name) else {
         return (404, json_err(&format!("no such function `{fn_name}`")));
     };
@@ -249,7 +281,7 @@ fn dispatch(program: &Arc<Program>, fn_name: &str, body: &str, auth_header: Opti
     }
 
     let program_arc = Arc::clone(program);
-    let interp = Interpreter::new(program_arc, Arc::from(""));
+    let interp = Interpreter::new(program_arc, Arc::from("")).with_transact_log_path(transact_log_path.to_path_buf());
     match interp.call_named_on_big_stack(fn_name, &args) {
         Ok(result) => match encode_value(&result, program) {
             Ok(json) => (200, json.to_string()),
