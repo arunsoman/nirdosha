@@ -18,11 +18,16 @@ type-parameter lists — layer 6, generics: `Pair(A, B)`), `match`,
 7), injected into every program at parse time — plus Row 12's `screen`/
 `dashboard` declarative UI DSL (LANGUAGE.md §11), consumed only by
 `nirdosha emit-ui`/`nirdosha serve`. Note that
-`spawn`/`join`/`thread`/`chan`/`send`/`recv`/`sandbox`/`stop`/`connect`/
-`struct`/`enum`/`match` are, so far, interpreter-only (`str`/`tcp`
-included) — `codegen.rs` rejects them explicitly, the same "reject, don't
-mis-compile" treatment `box`/`&` got before their own codegen support
-existed. `screen`/`dashboard` are different in kind, not just degree:
+`spawn`/`join`/`thread`/`chan`/`send`/`recv`/`sandbox`/`stop`/`struct`/
+`enum`/`match` are, so far, interpreter-only — `codegen.rs` rejects them
+explicitly, the same "reject, don't mis-compile" treatment `box`/`&`
+(and, later, `str`/`tcp`/`connect`) got before *their* own codegen support
+existed. `box`/`&`/`*`, `str`, and `tcp`/`connect`/`listen`/`accept`/
+`send`/`recv` (the `tcp` case of the last two, not the `chan` one) are
+**compiled** now — see `LANGUAGE.md` §10 for the current, verified list;
+this file only tracks grammar scope, not compiled-vs-interpreter status,
+so check §10 directly rather than inferring it from this paragraph's
+history. `screen`/`dashboard` are different in kind, not just degree:
 `codegen.rs` never inspects `Program.screens`/`.dashboard` at all (there's
 no expression inside either for it to walk), so `nirdosha build`/
 `emit-llvm` compile a program containing them cleanly — the declarations

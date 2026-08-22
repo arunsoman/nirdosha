@@ -347,9 +347,10 @@ before the next:
    special-casing anywhere else in the checker, which is itself the proof
    the mechanism is general enough to earn its place in `std`.
 8. **Out of scope, as designed** — `struct`/`enum`/`match` join
-   `box`/`thread`/`chan`/`sandbox`/`tcp`/`str` on the "interpreter-only,
-   rejected not mis-compiled" list (`LANGUAGE.md` §10), not an exception
-   to it. Since the prelude means `Program.enums` is never actually empty,
+   `thread`/`chan`/`sandbox` on the "interpreter-only, rejected not
+   mis-compiled" list (`LANGUAGE.md` §10 — `box`/`tcp`/`str` compile now,
+   so they've dropped off it), not an exception to it. Since the prelude
+   means `Program.enums` is never actually empty,
    `codegen.rs::check_supported` can't reject on declaration presence
    alone any more — it rejects a program only if it actually *constructs*
    a struct/variant (a name lookup against the declared constructor set,
@@ -390,7 +391,7 @@ is what §3 actually specifies rather than assumes into existence.
 | Gap | Why Row 11 doesn't touch it |
 |---|---|
 | No package manager, no LSP, no real users | Ecosystem/tooling/adoption — `goal.md` §9's standing gap, unrelated to the type system |
-| `box`/`thread`/`chan`/`sandbox`/`tcp`/`str` still interpreter-only | Backend codegen work already tracked (`LANGUAGE.md` §10); `struct`/`enum` join that list, they don't shorten it |
+| `thread`/`chan`/`sandbox`/`file`/`db`/`mq`/`json` still interpreter-only (`box`/`tcp`/`str` compile now) | Backend codegen work already tracked (`LANGUAGE.md` §10); `struct`/`enum` join that list, they don't shorten it |
 | No mechanized safety proof | `goal.md` §9 item 2 — Lean4/Coq work, orthogonal to adding type formers |
 | `?`-propagation, effects, config-as-code's actual `env()` builtin | Real follow-ons named above and in `PROTOLANG_PORT.md`, each its own design question once its prerequisite (Row 11, in this case) exists |
 

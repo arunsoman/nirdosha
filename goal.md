@@ -57,10 +57,11 @@ of the others (§1, §7).
 > (extending `refine.rs`/`smt.rs`'s static-proof boundary set — the
 > Tier-1 bonus prover, not required for correctness) is still open.
 > Codegen doesn't compile any of it — `struct`/`enum`/`match` join the
-> existing interpreter-only list (`box`/`thread`/`chan`/`sandbox`/`tcp`/
-> `str`), rejected explicitly, not silently mis-compiled; a program that
-> never actually constructs/matches one still compiles normally, since
-> the `Option`/`Result` prelude's mere presence isn't itself a use.
+> interpreter-only list (`thread`/`chan`/`sandbox` — `box`/`tcp`/`str`
+> compile now, see `LANGUAGE.md` §10), rejected explicitly, not silently
+> mis-compiled; a program that never actually constructs/matches one
+> still compiles normally, since the `Option`/`Result` prelude's mere
+> presence isn't itself a use.
 
 ---
 
@@ -521,10 +522,13 @@ goal, worked until each is true, not until the calendar says stop:
    block, so tight loops building `Vector`/`Matrix` values blew the stack
    past a few thousand iterations; fixed by hoisting all allocas
    unconditionally, the standard technique, with a regression test added.
-   `box`/`thread`/`chan`/`sandbox`/`tcp`/`str` are still interpreter-only —
-   "hardware-native speed" (row 5) now covers scalars and dense linear
-   algebra, not yet those. That's the next slice of this item, not a new
-   item — row 5 isn't fully closed until they compile too.
+   `box`/`str`/`tcp` compile now too (see `LANGUAGE.md` §10);
+   `struct`/`enum`/`match`, `thread`/`chan`/`sandbox`, `file`/`json`/
+   `db`/`mq`, and Row 12 identity are still interpreter-only —
+   "hardware-native speed" (row 5) now covers scalars, `str`, `box`,
+   `tcp`, and dense linear algebra, not yet those. That's the next slice
+   of this item, not a new item — row 5 isn't fully closed until they
+   compile too.
 2. **Prove the safety claims formally.** Row 1–4's "no GC, no races, no
    deadlocks, no overflow" is currently "the type system is believed to
    guarantee this," backed by tests, not a mechanized proof. §7 already

@@ -309,15 +309,38 @@ comment). No other source of nondeterminism exists in the language
 
 ## 10. What's compiled vs. interpreter-only
 
-**Updated 21 Aug 2026** — `Vector`/`Matrix` moved from "interpreter-only"
-to "compiled" (`goal.md` §9 item 1). `nirdosha build`/`emit-llvm` now
-support:
+**Updated 22 Aug 2026** — corrected against `check_supported`'s actual
+`unsupported(...)` call sites and real compiled-binary test runs, not
+just this section's own prior prose: `box`/`&`/`*`, `str`, and
+`tcp`/`tcp_listener`/`connect`/`listen`/`accept` were previously (and
+incorrectly) listed below as interpreter-only — all three have real
+codegen and were confirmed working end-to-end (a compiled `box i64`
+round-tripped through a function param and `*`; a compiled `str`
+program branched on `==` and printed the result; a compiled binary did
+a real `connect`/`send`/`recv`/`stop` round trip against a live TCP
+server). This drift is exactly why this doc note now says to verify
+against `check_supported` directly before trusting this section, rather
+than the reverse.
+
+`nirdosha build`/`emit-llvm` now support:
 
 - `i8`/`i16`/`i32`/`i64`, `bool`, `unit`, `f64` scalars.
 - All scalar arithmetic/comparison operators, `if`/`while`, function
-  calls (including recursion), `print` on integer/`f64`/`bool` args.
+  calls (including recursion), `print` on integer/`f64`/`str` args (not
+  yet `bool`/`unit` — a real, narrow gap, not an oversight: no existing
+  example needs it).
 - Tier-1/2 bounds and divide-by-zero guards (elided where proven safe —
   see §8), and `audited`'s suppression of them.
+- **`box`/`&`/`*`** — real heap allocation (`nir_alloc`) *and* real,
+  automatic free (`nir_free`) driven by `ownership.rs`'s `FreeMap`
+  (`emit_box_free`, called at each binding's last use) — not a leak.
+- **`str`** — literals, `==`/`!=`, use as an `if` condition, `print`,
+  and ordinary (non-`main`) function parameters/returns. One real,
+  narrow gap: `main` itself can't directly `return str` yet (must
+  `print` it instead) — that's the actual caveat, not "`str` is
+  interpreter-only."
+- **`tcp`/`tcp_listener`** — `connect`/`listen`/`accept`/`send`/`recv`/
+  `stop` over real sockets.
 - **`Vector`/`Matrix`, fully** — literals, dynamic (runtime-expression)
   indexing with a proven-or-checked bounds guard, all elementwise operators
   and every legal shape of `*`, `==`/`!=`, and every dense-linear-algebra/
@@ -347,13 +370,26 @@ Interpreter-only (rejected by `check_supported` with a specific reason,
 never silently mis-compiled):
 
 - `u8..usize` (needs a signed/unsigned instruction choice not yet made).
-- `box`/`&`/`*` (pointer deref), `thread`/`spawn`/`join`, `chan`/`send`/`recv`,
-  `sandbox`/`stop`, `str`, `tcp`/`tcp_listener`/`connect`/`listen`/`accept`,
-  `file`/`open` (21 Aug 2026, `PROTOLANG_PORT.md`'s file I/O port — joins
-  this list, not an exception to it).
+- `struct`/`enum`/`match` (Row 11) and any `Ty::Named` reaching a
+  param/`let`/return type — the biggest remaining gap.
+- `thread`/`spawn`/`join`, `chan`/`send`/`recv` (channel — distinct from
+  the already-compiled `tcp`), `sandbox`/`stop`.
+- `file`/`open` (`PROTOLANG_PORT.md`'s file I/O port).
+- `json`/`db`/`mq` (`Ty::Json`/`Ty::Db`/`Ty::Mq`) and every Row 12
+  identity/session/API-key builtin (`oidc_validate_token`,
+  `check_role(_path)`, `extract_claim(_path)`, sessions, refresh,
+  revocation) — the identity ones are additionally blocked on
+  `VerifiedIdentity`/`RoleView`/`ClaimView` being structs.
+- `http_get`/`http_post`/`https_get`/`https_post`, `sha256_hex`,
+  `constant_time_str_eq`, `mock_issue_token`, `rand_seed`/`rand_f64`/
+  `rand_gaussian` (no RNG state exists in generated code yet) — every
+  builtin not in `codegen.rs`'s `PHASE4_BUILTINS`/`PHASE5_BUILTINS` lists.
+- `transact`.
 - `fn(..)->..`/`acquire`/`requires(...)` — first-class and privileged
   functions (§6a), joining this list the same way `struct`/`enum`/`match`
   (Row 11) already did.
+- `print` on `bool`/`unit` arguments (no existing example needs it).
+- `main` returning `str` directly (must `print` it instead).
 - `screen`/`dashboard` (§11, Row 12) — consumed only by `nirdosha emit-ui`/
   `nirdosha serve`. Unlike everything else on this list, these aren't
   *rejected* by `nirdosha build`/`emit-llvm` — `codegen.rs` never
@@ -365,9 +401,10 @@ never silently mis-compiled):
 against Julia is now compiled-vs-JIT, not interpreter-vs-JIT — see
 `benchmarks/RESULTS.md` for the re-run numbers (all four Group A benchmarks
 now decisively beat Julia; the historical interpreted numbers are kept there
-too, labeled, for the record). Everything involving `box`/`thread`/`chan`/
-`sandbox`/`tcp`/`str` is still necessarily interpreted for now — that
-remains the fair caveat for any benchmark touching those.
+too, labeled, for the record). A benchmark touching `struct`/`enum`/`match`,
+`thread`/`chan`/`sandbox`, `file`, `json`/`db`/`mq`, or any Row 12 identity
+builtin is still necessarily interpreted for now — `box`/`tcp`/`str` no
+longer carry that caveat.
 
 ---
 

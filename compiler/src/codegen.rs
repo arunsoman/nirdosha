@@ -10,16 +10,26 @@
 //! (plenty of small production and hobby ones) use exactly this strategy.
 //!
 //! **Scoped to what's honestly supported, not silently narrowed.**
-//! `check_supported` rejects, with a specific reason, anything outside:
-//! signed integers (`i8`/`i16`/`i32`/`i64`), `bool`, `unit` — no
-//! `u8`..`usize` (deferred: LLVM's `icmp`/`div` need a signed-vs-unsigned
-//! instruction choice this pass doesn't make yet), no `box`/`&`/`*`
-//! (compiling real heap allocation and move semantics to native code is
-//! a separate, larger undertaking — ownership.rs's proof exists, but
-//! nothing yet *executes* on it, matching that module's own "not yet
-//! load-bearing" framing), and `print` only for integer-typed arguments
-//! (every existing example only ever prints integers — printing `bool`
-//! is a real, narrow, documented gap, not an oversight).
+//! `check_supported`'s own `unsupported(...)` call sites are the
+//! authoritative list of what's rejected — treat that function itself as
+//! the source of truth, not this comment, which has drifted out of sync
+//! with what actually compiles more than once already (see
+//! `LANGUAGE.md` §10's "Updated 22 Aug 2026" note for a concrete
+//! example: this file's own earlier doc comment claimed `box`/`&`/`*`
+//! had no codegen, when `nir_alloc`/`nir_free` (driven by
+//! `ownership.rs`'s `FreeMap`) already compiled real heap alloc/free by
+//! the time that claim was read again). As of this writing: signed
+//! integers (`i8`/`i16`/`i32`/`i64`), `bool`, `unit`, `f64`, `str`,
+//! `box`/`&`/`*`, `tcp`/`tcp_listener`, and `Vector`/`Matrix` (plus most
+//! of the dense-linalg/geometry/Kalman builtin surface) all compile.
+//! Rejected: `u8`..`usize` (deferred: LLVM's `icmp`/`div` need a
+//! signed-vs-unsigned instruction choice this pass doesn't make yet),
+//! `struct`/`enum`/`match` (Row 11, the largest remaining gap),
+//! `thread`/`chan`/`sandbox`/`file`/`json`/`db`/`mq`/`transact`/every
+//! Row 12 identity builtin, `fn(..)->..`/`acquire`/`requires(...)`, and
+//! `print` for `bool`/`unit` arguments specifically (every existing
+//! example only ever prints integer/`f64`/`str` values — this is a real,
+//! narrow, documented gap, not an oversight).
 //!
 //! **Tier 1 vs Tier 2 finally means something.** `refine.rs` and
 //! `smt.rs` both proved things and both said, explicitly, "not wired to
@@ -171,12 +181,14 @@ fn llvm_ty(ty: &Ty) -> Result<String, CodegenError> {
         // passed by value exactly like `Ty::Str`'s `{ptr, i64}` above,
         // just narrower. `Ref` needs no allocation of its own (it's
         // always just an existing binding's own storage address —
-        // `Codegen::expr`'s `Expr::Ref` arm), and `Box` needs one heap
-        // allocation at construction (`nir_alloc`) but no `free` logic
-        // yet in this phase (see `Expr::Box`'s doc comment — a later
-        // phase threads `ownership.rs`'s already-proven move data into
-        // codegen to free at last-use; this phase deliberately leaks,
-        // stated here rather than silently).
+        // `Codegen::expr`'s `Expr::Ref` arm). `Box` allocates on the heap
+        // at construction (`nir_alloc`, `Expr::Box`'s own codegen) and is
+        // freed for real: `ownership.rs`'s `FreeMap` records each
+        // binding's last use, and `emit_frees_for_names`/`emit_box_free`
+        // emit `nir_free` for it at every scope-closing point that data
+        // lists — confirmed in generated IR (`nirdosha emit-llvm`) for a
+        // simple `let b: box i64 = ...` case: the `nir_free` call is
+        // really there, right after `b`'s last use.
         Ty::Box(_) | Ty::Ref(_) => Ok("ptr".to_string()),
         Ty::Thread(_) => unsupported(format!(
             "codegen doesn't support `{}` yet — spawn/join are interpreter-only for now \
@@ -525,8 +537,10 @@ fn check_expr(e: &Expr, ctor_names: &std::collections::HashSet<&str>) -> Result<
         // `TRANSACT.md`'s own decision: "Compiled backend (codegen.rs) is
         // out of scope until the interpreter version is proven" — same
         // "reject, don't mis-compile" treatment every other unimplemented
-        // construct gets (`box`, `thread`, `chan`, `sandbox`, `tcp` per
-        // `LANGUAGE.md` §10). `transact` joins that list, not an
+        // construct gets (`thread`, `chan`, `sandbox`, `struct`/`enum`/
+        // `match`, `db`/`mq`/`json` — see `LANGUAGE.md` §10 for the
+        // current list; `box`/`tcp` compile now, so they've dropped off
+        // it). `transact` joins the still-unsupported list, not an
         // exception to it.
         Expr::Transact { .. } => {
             unsupported("codegen doesn't support `transact` yet — interpreter-only for now")
@@ -1523,14 +1537,17 @@ impl Codegen<'_> {
             // an ordinary `expr()` result, never routed through
             // `expr_ptr()`'s sret convention.
             //
-            // **Deliberately leaks — no `free` here.** `ownership.rs`
-            // already proves single ownership and last-use (see its
-            // module doc), which is what a real free-insertion pass
-            // would consume; that bridge doesn't exist in codegen yet.
-            // Threading it through and emitting `nir_free` at last-use
-            // is a later, separate phase — staged this way so the
-            // allocation/deref/borrow half is independently reviewable
-            // and testable first, not because this is an oversight.
+            // **Allocation only — the `free` half lives elsewhere, not
+            // because it's missing.** This arm just calls `nir_alloc`;
+            // the matching `nir_free` is emitted later, at whichever
+            // scope-closing point actually owns this box's last use
+            // (`ownership.rs`'s `FreeMap`, consumed by
+            // `emit_frees_for_names`/`emit_box_free`) — a real, working
+            // free, not a placeholder (confirmed in generated IR for a
+            // simple `let`-bound box). Keeping allocation and free as two
+            // separate emission sites mirrors how the rest of this file
+            // separates "construct a value" from "clean it up when its
+            // scope ends."
             Expr::Box(inner, _) => {
                 let inner_ty = self.local_ty_of(inner, scopes);
                 let size = ty_byte_size(&inner_ty);

@@ -350,6 +350,8 @@ practice:
   asymmetry is "Crash replay"'s named `Stuck` gap above.
 - **Compiled backend (`codegen.rs`) is out of scope until the interpreter
   version is proven** — same "reject, don't mis-compile" treatment every
-  other unimplemented construct gets today (`box`, `thread`, `chan`,
-  `sandbox`, `tcp` are all still interpreter-only per `LANGUAGE.md` §10;
-  `transact` joins that list, not an exception to it).
+  other unimplemented construct gets today (`thread`, `chan`, `sandbox`,
+  `struct`/`enum`/`match`, `db`/`mq`/`json` are still interpreter-only
+  per `LANGUAGE.md` §10 — `box`/`tcp` compile now, so they've dropped off
+  that list; `transact` joins the still-unsupported one, not an
+  exception to it).
