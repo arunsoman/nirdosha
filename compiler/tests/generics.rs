@@ -1,8 +1,8 @@
 //! Tests for Row 11 layer 6 (generics on `struct`/`enum` declarations)
 //! and layer 7 (the `Option(T)`/`Result(T, E)` prelude —
 //! `nirdosha_row11_amendment.md` §3.6). Type identity is
-//! structural-per-instantiation, not erased (`Pair(i64, str)` and
-//! `Pair(f64, bool)` are simply different, unrelated `Ty`s), and
+//! structural-per-instantiation, not erased (`Duo(i64, str)` and
+//! `Duo(f64, bool)` are simply different, unrelated `Ty`s), and
 //! construction/match resolve type arguments either from an expected
 //! type at the call site or, failing that, structurally from the
 //! arguments themselves.
@@ -33,12 +33,12 @@ fn first_type_error(src: &str) -> TypeErrorKind {
 #[test]
 fn generic_struct_construction_and_field_access_round_trip() {
     let src = r#"
-        struct Pair(A, B) {
+        struct Duo(A, B) {
             first: A,
             second: B,
         }
         fn main() -> i64 {
-            let p: Pair(i64, str) = Pair(1, "one")
+            let p: Duo(i64, str) = Duo(1, "one")
             return p.first
         }
     "#;
@@ -52,15 +52,15 @@ fn generic_struct_construction_and_field_access_round_trip() {
 fn two_different_instantiations_are_structurally_distinct_types() {
     let kind = first_type_error(
         r#"
-        struct Pair(A, B) {
+        struct Duo(A, B) {
             first: A,
             second: B,
         }
-        fn takes_int_str(p: Pair(i64, str)) -> i64 {
+        fn takes_int_str(p: Duo(i64, str)) -> i64 {
             return p.first
         }
         fn main() -> i64 {
-            let p: Pair(f64, bool) = Pair(1.0, true)
+            let p: Duo(f64, bool) = Duo(1.0, true)
             return takes_int_str(p)
         }
     "#,
@@ -68,8 +68,8 @@ fn two_different_instantiations_are_structurally_distinct_types() {
     assert_eq!(
         kind,
         TypeErrorKind::TypeMismatch {
-            expected: Ty::Named("Pair".to_string(), vec![Ty::I64, Ty::Str]),
-            found: Ty::Named("Pair".to_string(), vec![Ty::F64, Ty::Bool]),
+            expected: Ty::Named("Duo".to_string(), vec![Ty::I64, Ty::Str]),
+            found: Ty::Named("Duo".to_string(), vec![Ty::F64, Ty::Bool]),
         }
     );
 }
@@ -79,12 +79,12 @@ fn generic_construction_infers_type_args_structurally_with_no_expected_type() {
     // `print` doesn't pin an expected type -- the type arguments have to
     // come from the constructor's own arguments instead.
     let src = r#"
-        struct Pair(A, B) {
+        struct Duo(A, B) {
             first: A,
             second: B,
         }
         fn main() -> unit {
-            print(Pair(1, "one"))
+            print(Duo(1, "one"))
         }
     "#;
     let program = parse_ok(src);
@@ -94,15 +94,15 @@ fn generic_construction_infers_type_args_structurally_with_no_expected_type() {
 #[test]
 fn generic_construction_via_a_function_argument_uses_the_declared_param_type() {
     let src = r#"
-        struct Pair(A, B) {
+        struct Duo(A, B) {
             first: A,
             second: B,
         }
-        fn sum_first_two(p: Pair(i64, i64)) -> i64 {
+        fn sum_first_two(p: Duo(i64, i64)) -> i64 {
             return p.first + p.second
         }
         fn main() -> i64 {
-            return sum_first_two(Pair(2, 3))
+            return sum_first_two(Duo(2, 3))
         }
     "#;
     match run(src) {
@@ -115,17 +115,17 @@ fn generic_construction_via_a_function_argument_uses_the_declared_param_type() {
 fn wrong_type_argument_count_is_rejected_statically() {
     let kind = first_type_error(
         r#"
-        struct Pair(A, B) {
+        struct Duo(A, B) {
             first: A,
             second: B,
         }
         fn main() -> i64 {
-            let p: Pair(i64) = Pair(1, 2)
+            let p: Duo(i64) = Duo(1, 2)
             return 0
         }
     "#,
     );
-    assert_eq!(kind, TypeErrorKind::WrongTypeArity { name: "Pair".to_string(), want: 2, got: 1 });
+    assert_eq!(kind, TypeErrorKind::WrongTypeArity { name: "Duo".to_string(), want: 2, got: 1 });
 }
 
 #[test]

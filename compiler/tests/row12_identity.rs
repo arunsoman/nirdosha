@@ -21,6 +21,9 @@ fn run_with_token(token: &str) -> Value {
     let src = format!(
         r#"
 fn handle_identity(identity: VerifiedIdentity) -> str {{
+    if check_revocation(identity) {{
+        return "token revoked"
+    }}
     if identity_expired(identity, 1800000000) {{
         return "token expired"
     }}
@@ -107,8 +110,35 @@ fn missing_claim_is_rejected() {
 
 #[test]
 fn revoked_token_is_rejected() {
-    let token = "eyJhbGciOiAiSFMyNTYiLCAia2lkIjogImtleTEifQ.eyJzdWIiOiAiYWxpY2UiLCAiaXNzIjogImh0dHBzOi8vZXhhbXBsZS5jb20iLCAiYXVkIjogIm15LWFwcCIsICJleHAiOiAyMDAwMDAwMDAwLCAiaWF0IjogMTcwMDAwMDAwMCwgInJvbGVzIjogWyJwaHlzaWNpYW4iXSwgImRlcGFydG1lbnQiOiAiY2FyZGlvbG9neSIsICJyZXZva2VkIjogdHJ1ZX0.q2m7q2m7q2m7q2m7q2m7q2m7q2m7q2m7q2m7q2m7q2m7q2m7q2m7";
-    expect_str(run_with_token(token), "token revoked");
+    // Unlike every other fixture in this file (a hand-encoded base64 JWT
+    // with a pre-computed HS256 signature), this one is minted at test
+    // time via `mock_issue_token` (dogfooding the language's own
+    // builtin, the same way `tests/serve.rs::mint_token` already does) —
+    // hand-computing a valid HMAC-SHA256 signature for a one-off claims
+    // payload isn't practical to keep correct by hand, and a token with
+    // a bad signature would be rejected for *that* reason before
+    // `check_revocation` is ever reached, silently testing the wrong
+    // thing (a real, fixed pre-existing bug this file had: the original
+    // fixture here had a garbage signature, and `handle_identity` never
+    // even called `check_revocation` at all).
+    let mint_src = format!(
+        r#"
+fn main() -> str {{
+    return match mock_issue_token("alice", "{issuer}", "{audience}", 1700000000, 300000000, "{{\"roles\":[\"physician\"],\"department\":\"cardiology\",\"revoked\":true}}", "{jwks}") {{
+        Ok(token) => token,
+        Err(e) => e,
+    }}
+}}
+"#,
+        issuer = ISSUER,
+        audience = AUDIENCE,
+        jwks = escape_nir_str(JWKS),
+    );
+    let token = match run(&mint_src) {
+        Ok(Value::Str(s)) => s.to_string(),
+        other => panic!("expected a minted token, got {other:?}"),
+    };
+    expect_str(run_with_token(&token), "token revoked");
 }
 
 fn run_raw(src: &str) -> Value {
@@ -153,15 +183,12 @@ fn main() -> str {
     let token: str = "eyJhbGciOiAiSFMyNTYiLCAia2lkIjogImtleTEifQ.eyJzdWIiOiAiYWxpY2UiLCAiaXNzIjogImh0dHBzOi8vZXhhbXBsZS5jb20iLCAiYXVkIjogIm15LWFwcCIsICJleHAiOiAyMDAwMDAwMDAwLCAiaWF0IjogMTcwMDAwMDAwMCwgInJvbGVzIjogWyJwaHlzaWNpYW4iXSwgImRlcGFydG1lbnQiOiAiY2FyZGlvbG9neSJ9.nrFdeqNDwXWLeGzud6X9Q4ITzCXULzZBBK8y51LGYXs"
     let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
     return match oidc_validate_token(token, "https://example.com", "my-app", jwks) {
-        Ok(identity) => {
-            let refresh: RefreshTokenHandle = new_refresh_token(2000000000)
-            return match exchange_refresh_token(identity, refresh, 1700000000) {
-                Ok(refreshed) => match extract_claim(refreshed, "department") {
-                    Ok(claim_view) => claim_view.value,
-                    Err(e) => e,
-                },
+        Ok(identity) => match exchange_refresh_token(identity, new_refresh_token(2000000000), 1700000000) {
+            Ok(refreshed) => match extract_claim(refreshed, "department") {
+                Ok(claim_view) => claim_view.value,
                 Err(e) => e,
-            }
+            },
+            Err(e) => e,
         },
         Err(e) => e,
     }
@@ -177,12 +204,9 @@ fn main() -> str {
     let token: str = "eyJhbGciOiAiSFMyNTYiLCAia2lkIjogImtleTEifQ.eyJzdWIiOiAiYWxpY2UiLCAiaXNzIjogImh0dHBzOi8vZXhhbXBsZS5jb20iLCAiYXVkIjogIm15LWFwcCIsICJleHAiOiAyMDAwMDAwMDAwLCAiaWF0IjogMTcwMDAwMDAwMCwgInJvbGVzIjogWyJwaHlzaWNpYW4iXSwgImRlcGFydG1lbnQiOiAiY2FyZGlvbG9neSJ9.nrFdeqNDwXWLeGzud6X9Q4ITzCXULzZBBK8y51LGYXs"
     let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
     return match oidc_validate_token(token, "https://example.com", "my-app", jwks) {
-        Ok(identity) => {
-            let refresh: RefreshTokenHandle = new_refresh_token(1600000000)
-            return match exchange_refresh_token(identity, refresh, 1700000000) {
-                Ok(_) => "should not succeed",
-                Err(e) => e,
-            }
+        Ok(identity) => match exchange_refresh_token(identity, new_refresh_token(1600000000), 1700000000) {
+            Ok(_) => "should not succeed",
+            Err(e) => e,
         },
         Err(e) => e,
     }
@@ -198,11 +222,7 @@ fn main() -> str {
     let token: str = "eyJhbGciOiAiSFMyNTYiLCAia2lkIjogImtleTEifQ.eyJzdWIiOiAiYWxpY2UiLCAiaXNzIjogImh0dHBzOi8vZXhhbXBsZS5jb20iLCAiYXVkIjogIm15LWFwcCIsICJleHAiOiAyMDAwMDAwMDAwLCAiaWF0IjogMTcwMDAwMDAwMCwgInJvbGVzIjogWyJwaHlzaWNpYW4iXSwgImRlcGFydG1lbnQiOiAiY2FyZGlvbG9neSJ9.nrFdeqNDwXWLeGzud6X9Q4ITzCXULzZBBK8y51LGYXs"
     let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
     return match oidc_validate_token(token, "https://example.com", "my-app", jwks) {
-        Ok(identity) => {
-            let session: ApplicationSession = create_application_session(identity)
-            let cookie: str = session_cookie(session)
-            return cookie
-        },
+        Ok(identity) => session_cookie(create_application_session(identity)),
         Err(e) => e,
     }
 }

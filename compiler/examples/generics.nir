@@ -1,10 +1,10 @@
 // Row 11 layer 6 (generics) + layer 7 (the Option(T)/Result(T, E)
 // prelude) -- `nirdosha_row11_amendment.md` §3.6. Type identity is
-// structural-per-instantiation, not erased: `Pair(i64, i64)` is a real,
+// structural-per-instantiation, not erased: `Duo(i64, i64)` is a real,
 // concrete `Ty`, the same way `Vector(f64, 3)` already is. No
 // monomorphizer pass exists or is needed -- see `ast::substitute_ty`.
 
-struct Pair(A, B) {
+struct Duo(A, B) {
     first: A,
     second: B,
 }
@@ -14,7 +14,7 @@ enum Either(A, B) {
     Right(B),
 }
 
-fn sum_pair(p: Pair(i64, i64)) -> i64 {
+fn sum_pair(p: Duo(i64, i64)) -> i64 {
     return p.first + p.second
 }
 
@@ -33,7 +33,7 @@ fn pick(e: Either(i64, i64)) -> i64 {
 }
 
 fn main() -> i64 {
-    let p: Pair(i64, i64) = Pair(2, 3)
+    let p: Duo(i64, i64) = Duo(2, 3)
     let a: i64 = sum_pair(p)
 
     let o: Option(i64) = Some(2)
