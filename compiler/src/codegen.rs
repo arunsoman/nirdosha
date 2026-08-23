@@ -4236,13 +4236,11 @@ impl Codegen<'_> {
                 } else {
                     Err(CodegenError {
                         message: format!("equality not supported for named type `{name}` in compiled code"),
-                        span,
                     })
                 }
             }
             _ => Err(CodegenError {
-                message: format!("equality not supported for `{ty}` in compiled code"),
-                span,
+                message: format!("equality not supported for `{ty:?}` in compiled code"),
             }),
         }
     }
