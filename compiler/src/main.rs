@@ -175,13 +175,27 @@ fn cmd_interpret(path: &str, format_json: bool, otel_console: bool, transact_log
 /// `emit_llvm_ir` themselves, since it's specific to this backend, not a
 /// property of the language generally.
 fn typecheck_and_own(src: &str) -> Result<nirdosha::ast::Program, String> {
+    typecheck_and_own_impl(src, true)
+}
+
+/// Same as `typecheck_and_own`, but does not require a `fn main()` — for
+/// commands that never execute an entrypoint (`serve`, `emit-ui`,
+/// `--sandbox-worker`; see `typeck::typecheck_optional_main`'s doc
+/// comment for why each of those doesn't need one).
+fn typecheck_and_own_optional_main(src: &str) -> Result<nirdosha::ast::Program, String> {
+    typecheck_and_own_impl(src, false)
+}
+
+fn typecheck_and_own_impl(src: &str, require_main: bool) -> Result<nirdosha::ast::Program, String> {
     let toks = nirdosha::token::Lexer::new(src)
         .tokenize()
         .map_err(|e| format!("lex error at {}:{}: {}", e.span.line, e.span.col, e.message))?;
     let program = nirdosha::parser::Parser::new(toks)
         .parse_program()
         .map_err(|e| format!("parse error at {}:{}: {}", e.span.line, e.span.col, e.message))?;
-    if let Err(errors) = nirdosha::typeck::typecheck(&program) {
+    let type_result =
+        if require_main { nirdosha::typeck::typecheck(&program) } else { nirdosha::typeck::typecheck_optional_main(&program) };
+    if let Err(errors) = type_result {
         let joined = errors.iter().map(|e| format!("type error: {e}")).collect::<Vec<_>>().join("\n");
         return Err(joined);
     }
@@ -334,7 +348,7 @@ fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let program = match typecheck_and_own(&src) {
+    let program = match typecheck_and_own_optional_main(&src) {
         Ok(p) => p,
         Err(msg) => {
             eprintln!("{msg}");
@@ -409,7 +423,7 @@ fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<S
         Ok(s) => s,
         Err(code) => return code,
     };
-    let program = match typecheck_and_own(&src) {
+    let program = match typecheck_and_own_optional_main(&src) {
         Ok(p) => p,
         Err(msg) => {
             eprintln!("{msg}");
@@ -463,7 +477,7 @@ fn cmd_sandbox_worker(mut args: impl Iterator<Item = String>) -> ExitCode {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let program = match typecheck_and_own(&src) {
+    let program = match typecheck_and_own_optional_main(&src) {
         Ok(p) => p,
         Err(msg) => {
             eprintln!("{msg}");

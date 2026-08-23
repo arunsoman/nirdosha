@@ -767,8 +767,28 @@ pub struct Checker<'a> {
 /// Type-check a whole program. `Ok(())` means every function body is well
 /// typed *and* proved to return on every path where its signature demands
 /// a value — the interpreter should never be run on a program this
-/// rejects.
+/// rejects. Requires a zero-arg `fn main()` — the entrypoint every
+/// `run`/`build`/`emit-llvm` caller is about to execute.
 pub fn typecheck(program: &Program) -> Result<(), Vec<TypeError>> {
+    typecheck_impl(program, true)
+}
+
+/// Same checks as `typecheck`, but does not require a `fn main()`. For
+/// callers that never execute an entrypoint — `nirdosha serve` (every
+/// `fn` is reached individually via `POST /api/<fn>`, not through
+/// `main`), `emit-ui` (reads `fn`/`struct`/`screen` declarations to
+/// render UI, never runs anything), and `--sandbox-worker` (calls one
+/// named fn directly, per that command's own doc comment: "there's no
+/// `main` to run here"). A generated nirdosha-lane program is exactly
+/// this shape by design (`nirdosha-default-pipeline-plan.md`: one
+/// project, N `module { }` blocks of `fn`/`screen` constructs, no
+/// `main`), so requiring one here would make every such program
+/// permanently unservable.
+pub fn typecheck_optional_main(program: &Program) -> Result<(), Vec<TypeError>> {
+    typecheck_impl(program, false)
+}
+
+fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeError>> {
     let registry = TypeRegistry::build(program);
     let mut c = Checker { sigs: HashMap::new(), errors: Vec::new(), registry, silent: false };
 
@@ -870,7 +890,8 @@ pub fn typecheck(program: &Program) -> Result<(), Vec<TypeError>> {
     }
 
     match c.sigs.get("main") {
-        None => c.error(TypeErrorKind::NoMainFn, Span { line: 0, col: 0 }),
+        None if require_main => c.error(TypeErrorKind::NoMainFn, Span { line: 0, col: 0 }),
+        None => {}
         Some(sig) if !sig.params.is_empty() => {
             let span = program.fns.iter().find(|f| f.name == "main").unwrap().span;
             c.error(TypeErrorKind::MainMustTakeNoParams, span);
