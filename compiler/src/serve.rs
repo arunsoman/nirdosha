@@ -113,10 +113,11 @@ pub fn run(
     identity_base: Option<&str>,
     transact_log_path: std::path::PathBuf,
     db_path: Option<String>,
+    theme: Option<&crate::ui_gen::Theme>,
 ) -> Result<(), String> {
     let registry = crate::ast::TypeRegistry::build(&program);
     let effects = crate::effects::infer_effects(&program, &registry);
-    let ui_html = crate::ui_gen::generate(&program, &effects, identity_base, db_path.is_some());
+    let ui_html = crate::ui_gen::generate(&program, &effects, identity_base, db_path.is_some(), theme);
     let auth = Arc::new(auth);
     let transact_log_path = Arc::new(transact_log_path);
     // `--db <path>`: opens one shared connection, direct rusqlite (not

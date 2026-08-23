@@ -206,6 +206,18 @@ fn typecheck_and_own_impl(src: &str, require_main: bool) -> Result<nirdosha::ast
     Ok(program)
 }
 
+/// `--theme <path>` for `emit-ui`/`serve` — reads a JSON file matching
+/// `ui_gen::Theme`'s shape (every field optional, see that struct's own
+/// doc comment) and layers it over the baked-in MD3 tokens. `None` (no
+/// flag given) keeps output byte-identical to before this flag existed.
+fn load_theme(path: Option<&str>) -> Result<Option<nirdosha::ui_gen::Theme>, String> {
+    let Some(path) = path else { return Ok(None) };
+    let text = std::fs::read_to_string(path).map_err(|e| format!("error reading {path}: {e}"))?;
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|e| format!("error parsing {path} as a theme JSON object: {e}"))
+}
+
 fn cmd_build(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;
@@ -334,14 +346,16 @@ fn cmd_emit_ast(mut args: impl Iterator<Item = String>) -> ExitCode {
 fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;
+    let mut theme_path: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-o" => output = args.next(),
+            "--theme" => theme_path = args.next(),
             other => input = Some(other.to_string()),
         }
     }
     let Some(path) = input else {
-        eprintln!("usage: nirdosha emit-ui <file.nir> [-o out.html]");
+        eprintln!("usage: nirdosha emit-ui <file.nir> [-o out.html] [--theme theme.json]");
         return ExitCode::FAILURE;
     };
     let src = match read_source(&path) {
@@ -355,9 +369,16 @@ fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let theme = match load_theme(theme_path.as_deref()) {
+        Ok(t) => t,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
     let registry = nirdosha::ast::TypeRegistry::build(&program);
     let effects = nirdosha::effects::infer_effects(&program, &registry);
-    let html = nirdosha::ui_gen::generate(&program, &effects, None, false);
+    let html = nirdosha::ui_gen::generate(&program, &effects, None, false, theme.as_ref());
     match output {
         Some(out) => match std::fs::write(&out, html) {
             Ok(()) => {
@@ -401,10 +422,12 @@ fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<S
     let mut audience: Option<String> = None;
     let mut identity_base: Option<String> = None;
     let mut db_path: Option<String> = None;
+    let mut theme_path: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--host" => host = args.next().unwrap_or(host),
             "--port" => port = args.next().and_then(|s| s.parse().ok()).unwrap_or(port),
+            "--theme" => theme_path = args.next(),
             "--jwks-file" => jwks_file = args.next(),
             "--issuer" => issuer = args.next(),
             "--audience" => audience = args.next(),
@@ -415,7 +438,7 @@ fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<S
     }
     let Some(path) = input else {
         eprintln!(
-            "usage: nirdosha serve <file.nir> [--host 127.0.0.1] [--port 8080] [--jwks-file P --issuer S --audience S] [--identity-base URL] [--db PATH]"
+            "usage: nirdosha serve <file.nir> [--host 127.0.0.1] [--port 8080] [--jwks-file P --issuer S --audience S] [--identity-base URL] [--db PATH] [--theme theme.json]"
         );
         return ExitCode::FAILURE;
     };
@@ -425,6 +448,13 @@ fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<S
     };
     let program = match typecheck_and_own_optional_main(&src) {
         Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let theme = match load_theme(theme_path.as_deref()) {
+        Ok(t) => t,
         Err(msg) => {
             eprintln!("{msg}");
             return ExitCode::FAILURE;
@@ -451,7 +481,7 @@ fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<S
     // scatter a durable transaction's rows across files nothing ever
     // replays together, and would leak one file per request forever.
     let transact_log = std::path::PathBuf::from(transact_log_path.unwrap_or_else(|| format!("{path}.transact.db")));
-    match nirdosha::serve::run(std::sync::Arc::new(program), &host, port, auth, identity_base.as_deref(), transact_log, db_path) {
+    match nirdosha::serve::run(std::sync::Arc::new(program), &host, port, auth, identity_base.as_deref(), transact_log, db_path, theme.as_ref()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("{msg}");

@@ -21,7 +21,7 @@ fn emit_ui(src: &str) -> String {
     check_ownership(&program).expect("ownership check should succeed");
     let registry = TypeRegistry::build(&program);
     let effects = infer_effects(&program, &registry);
-    generate(&program, &effects, None, false)
+    generate(&program, &effects, None, false, None)
 }
 
 #[test]
@@ -308,4 +308,62 @@ fn struct_with_no_screen_block_is_unaffected_by_the_dsl_existing() {
         html.contains(r#""name":"Plain","singular":false,"snake":"plain","table":"plain","title":"Plain""#),
         "a struct with no screen block should get its own name as the title, unaffected by Product's block"
     );
+}
+
+#[test]
+fn no_theme_produces_no_theme_override_block() {
+    let html = emit_ui("fn main() {}");
+    // The placeholder is always substituted; absent a theme, it must
+    // vanish rather than leak into the output.
+    assert!(!html.contains("__NIRDOSHA_THEME_OVERRIDE__"));
+    assert!(!html.contains("--md-primary: #ff0000"));
+}
+
+#[test]
+fn theme_overrides_only_the_tokens_it_sets() {
+    use nirdosha::ui_gen::Theme;
+    let src = "fn main() {}";
+    let toks = nirdosha::token::Lexer::new(src).tokenize().unwrap();
+    let program = nirdosha::parser::Parser::new(toks).parse_program().unwrap();
+    nirdosha::typeck::typecheck(&program).unwrap();
+    nirdosha::ownership::check_ownership(&program).unwrap();
+    let registry = TypeRegistry::build(&program);
+    let effects = infer_effects(&program, &registry);
+    let theme = Theme {
+        primary_light: Some("#ff0000".to_string()),
+        radius_sm: Some("2px".to_string()),
+        ..Default::default()
+    };
+    let html = generate(&program, &effects, None, false, Some(&theme));
+
+    // The theme's own tokens appear...
+    assert!(html.contains("--md-primary: #ff0000;"));
+    assert!(html.contains("--md-radius-sm: 2px;"));
+    // ...but a token the theme never set is untouched (still the MD3
+    // default, not overwritten to empty/garbage).
+    assert!(html.contains("--md-radius-lg: 28px;"));
+    // No dark-mode override block at all when no *_dark field was set.
+    assert!(!html.contains("--md-primary: #ff0000;\n    }\n  }\n  @media (prefers-color-scheme: dark) {\n    :root {\n"));
+}
+
+#[test]
+fn theme_value_containing_markup_is_dropped_not_injected() {
+    use nirdosha::ui_gen::Theme;
+    let src = "fn main() {}";
+    let toks = nirdosha::token::Lexer::new(src).tokenize().unwrap();
+    let program = nirdosha::parser::Parser::new(toks).parse_program().unwrap();
+    nirdosha::typeck::typecheck(&program).unwrap();
+    nirdosha::ownership::check_ownership(&program).unwrap();
+    let registry = TypeRegistry::build(&program);
+    let effects = infer_effects(&program, &registry);
+    let theme = Theme {
+        font_sans: Some("</style><script>alert(1)</script>".to_string()),
+        ..Default::default()
+    };
+    let out = generate(&program, &effects, None, false, Some(&theme));
+    // The base template legitimately has its own <script> (the baked-in
+    // renderer) -- what must NOT happen is the theme's payload landing
+    // verbatim in the output as a second, injected one.
+    assert!(!out.contains("alert(1)"));
+    assert!(!out.contains("--md-font: </style>"));
 }

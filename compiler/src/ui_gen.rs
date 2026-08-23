@@ -897,7 +897,13 @@ fn manifest_json(screens: &[Screen]) -> String {
 /// deliberate, disclosed degradation, not a broken feature, for any
 /// screen whose author-written `list_<struct>` does custom joins/logic
 /// the generic endpoint can't see.
-pub fn generate(program: &Program, effects: &HashMap<String, FnEffects>, identity_base: Option<&str>, server_table_api: bool) -> String {
+pub fn generate(
+    program: &Program,
+    effects: &HashMap<String, FnEffects>,
+    identity_base: Option<&str>,
+    server_table_api: bool,
+    theme: Option<&Theme>,
+) -> String {
     let screens = build_screens(program, effects);
     let manifest = manifest_json(&screens);
     let stats = metrics_json(&build_stats(program));
@@ -912,6 +918,88 @@ pub fn generate(program: &Program, effects: &HashMap<String, FnEffects>, identit
         .replace("__NIRDOSHA_CHARTS__", &charts)
         .replace("__NIRDOSHA_IDENTITY_BASE__", &identity_base_js)
         .replace("__NIRDOSHA_SERVER_TABLE_API__", if server_table_api { "true" } else { "false" })
+        .replace("__NIRDOSHA_THEME_OVERRIDE__", &theme_override_css(theme))
+}
+
+/// Optional per-project theme, layered on top of the baked-in Material
+/// Design 3 token set (`ui_gen_template.html`'s own `:root`/dark `:root`
+/// blocks) rather than replacing it — every field is `Option`, and an
+/// absent field simply leaves that token at its MD3 default. Sourced from
+/// protobox's `DesignSpec`/DESIGN.md (`be-v2/src/plugins/languages/
+/// nirdosha.py`'s theme mapper writes this as JSON next to the project's
+/// `.nir` entrypoint) — deliberately a narrow token set (primary/
+/// on-primary/primary-container/on-primary-container color roles, corner
+/// radii, one font stack), not a full re-theme: nirdosha's generated UI
+/// has exactly one layout (`ui_gen_template.html`'s nav-rail + top-app-bar
+/// shell, driven entirely by the manifest, same as before this existed),
+/// so there is no per-component styling surface to expose beyond these
+/// tokens without inventing one.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct Theme {
+    pub primary_light: Option<String>,
+    pub on_primary_light: Option<String>,
+    pub primary_container_light: Option<String>,
+    pub on_primary_container_light: Option<String>,
+    pub primary_dark: Option<String>,
+    pub on_primary_dark: Option<String>,
+    pub primary_container_dark: Option<String>,
+    pub on_primary_container_dark: Option<String>,
+    pub radius_sm: Option<String>,
+    pub radius_md: Option<String>,
+    pub radius_lg: Option<String>,
+    pub font_sans: Option<String>,
+}
+
+/// A CSS value is only ever a bare hex color, a CSS length (`12px`,
+/// `0.5rem`, ...), or a font-family list here (`ui_gen.rs`'s only three
+/// `Theme` value shapes) — never markup. Reject anything containing `<`,
+/// `>`, `{`, or `}` outright rather than trying to validate each shape
+/// precisely: those four characters are the only ones that could break
+/// out of "one CSS custom-property declaration value" into a new rule or
+/// (via `<`/`>`) out of the `<style>` element entirely, and a theme file
+/// with a legitimate value never needs any of them.
+fn theme_value_is_safe(v: &str) -> bool {
+    !v.is_empty() && !v.contains(['<', '>', '{', '}'])
+}
+
+fn theme_override_css(theme: Option<&Theme>) -> String {
+    let Some(t) = theme else { return String::new() };
+    let push = |out: &mut Vec<String>, indent: &str, prop: &str, value: &Option<String>| {
+        if let Some(v) = value {
+            if theme_value_is_safe(v) {
+                out.push(format!("{indent}--{prop}: {v};"));
+            }
+        }
+    };
+
+    let mut light = Vec::new();
+    push(&mut light, "    ", "md-primary", &t.primary_light);
+    push(&mut light, "    ", "md-on-primary", &t.on_primary_light);
+    push(&mut light, "    ", "md-primary-container", &t.primary_container_light);
+    push(&mut light, "    ", "md-on-primary-container", &t.on_primary_container_light);
+    push(&mut light, "    ", "md-radius-sm", &t.radius_sm);
+    push(&mut light, "    ", "md-radius-md", &t.radius_md);
+    push(&mut light, "    ", "md-radius-lg", &t.radius_lg);
+    push(&mut light, "    ", "md-font", &t.font_sans);
+
+    let mut dark = Vec::new();
+    push(&mut dark, "      ", "md-primary", &t.primary_dark);
+    push(&mut dark, "      ", "md-on-primary", &t.on_primary_dark);
+    push(&mut dark, "      ", "md-primary-container", &t.primary_container_dark);
+    push(&mut dark, "      ", "md-on-primary-container", &t.on_primary_container_dark);
+
+    let mut out = String::new();
+    if !light.is_empty() {
+        out.push_str("  :root {\n");
+        out.push_str(&light.join("\n"));
+        out.push_str("\n  }\n");
+    }
+    if !dark.is_empty() {
+        out.push_str("  @media (prefers-color-scheme: dark) {\n    :root {\n");
+        out.push_str(&dark.join("\n"));
+        out.push_str("\n    }\n  }\n");
+    }
+    out
 }
 
 /// The one baked-in design: a Material Design 3 token set (color roles,
