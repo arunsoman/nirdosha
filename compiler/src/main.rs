@@ -83,7 +83,7 @@ fn print_usage() {
     eprintln!("  nirdosha emit-ast <file.nir>        print the parsed AST as JSON (goal.md row 9)");
     eprintln!("  nirdosha emit-ui <file.nir> [-o out.html]");
     eprintln!("                                      derive a Material-styled web UI from struct/fn conventions");
-    eprintln!("  nirdosha serve <file.nir> [--port 8080] [--jwks-file P --issuer S --audience S]");
+    eprintln!("  nirdosha serve <file.nir> [--host 127.0.0.1] [--port 8080] [--jwks-file P --issuer S --audience S]");
     eprintln!("                             [--identity-base URL] [--db PATH]");
     eprintln!("                                      run the program as a real HTTP service (UI at GET /,");
     eprintln!("                                      API at POST /api/<fn>) -- see src/serve.rs");
@@ -380,6 +380,7 @@ fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
 /// failure mode, not a security hole disguised as "it just worked."
 fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<String>) -> ExitCode {
     let mut input: Option<String> = None;
+    let mut host: String = "127.0.0.1".to_string();
     let mut port: u16 = 8080;
     let mut jwks_file: Option<String> = None;
     let mut issuer: Option<String> = None;
@@ -388,6 +389,7 @@ fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<S
     let mut db_path: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--host" => host = args.next().unwrap_or(host),
             "--port" => port = args.next().and_then(|s| s.parse().ok()).unwrap_or(port),
             "--jwks-file" => jwks_file = args.next(),
             "--issuer" => issuer = args.next(),
@@ -399,7 +401,7 @@ fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<S
     }
     let Some(path) = input else {
         eprintln!(
-            "usage: nirdosha serve <file.nir> [--port 8080] [--jwks-file P --issuer S --audience S] [--identity-base URL] [--db PATH]"
+            "usage: nirdosha serve <file.nir> [--host 127.0.0.1] [--port 8080] [--jwks-file P --issuer S --audience S] [--identity-base URL] [--db PATH]"
         );
         return ExitCode::FAILURE;
     };
@@ -435,7 +437,7 @@ fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<S
     // scatter a durable transaction's rows across files nothing ever
     // replays together, and would leak one file per request forever.
     let transact_log = std::path::PathBuf::from(transact_log_path.unwrap_or_else(|| format!("{path}.transact.db")));
-    match nirdosha::serve::run(std::sync::Arc::new(program), port, auth, identity_base.as_deref(), transact_log, db_path) {
+    match nirdosha::serve::run(std::sync::Arc::new(program), &host, port, auth, identity_base.as_deref(), transact_log, db_path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("{msg}");

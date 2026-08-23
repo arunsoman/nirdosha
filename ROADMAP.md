@@ -102,6 +102,16 @@ messages.
   `enum`/`struct` `==`/`!=` typechecked but had no interpreter arm
   (traps at runtime) — fixed in `interpreter.rs::eval_binary`. Full
   detail in `LANGUAGE.md` §6b.
+- **2026-08-24 — Security review of interpreter/typeck/ownership/
+  serve paths.** Fixed: HTTP/HTTPS request-line/header injection;
+  constant-time `validate_api_key` comparison; propagation of
+  `transact` terminal-log write failures; `O_EXCL` sandbox temp-source
+  creation to block symlink races; 10 MiB HTTP response cap; 1 MiB
+  `nirdosha serve` request-body cap; `127.0.0.1` default bind with new
+  `--host` flag; `catch_unwind` around the generic table-query route.
+  Known risks deferred to future Track-A work: sandbox Unix-socket peer
+  authentication, CORS defaults, and table-route function-level auth
+  alignment.
 
 ---
 
@@ -161,24 +171,21 @@ soon — independent of Track B, since the interpreter path
 (`nirdosha serve`) is what will run those apps regardless of how much
 of Track B has landed.*
 
-- `[OPEN]` **A1. Security review** of the interpreter/typeck/ownership/
-  serve paths before anything critical is built on top. Use the
-  `security-review` skill.
-- `[OPEN]` **A2. Systematic correctness-gap sweep.** The pattern found
+- `[OPEN]` **A1. Systematic correctness-gap sweep.** The pattern found
   this session — `enum`/`struct` `==` typechecked but had no
   interpreter arm, traps at runtime (fixed) — was found by accident,
   not a deliberate audit. Needs a real pass across operator × type
   combinations, not opportunistic discovery.
-- `[OPEN]` **A3. `transact` durability under real failure conditions** —
+- `[OPEN]` **A2. `transact` durability under real failure conditions** —
   actually kill the process mid-transaction under load and confirm
   crash-replay behaves, not just trust the existing test suite.
-- `[OPEN]` **A4. Deployment story for the interpreted path** —
+- `[OPEN]` **A3. Deployment story for the interpreted path** —
   containerize `nirdosha serve` + source properly; secrets/JWKS
   handling; this is buildable now, independent of Track B.
-- `[OPEN]` **A5. Observability wired to something real** — the OTel
+- `[OPEN]` **A4. Observability wired to something real** — the OTel
   tracer (`observability.rs`) exists; connect it to an actual
   collector/backend for a real deployment.
-- `[OPEN]` **A6. Compatibility/versioning policy.** The str-ban
+- `[OPEN]` **A5. Compatibility/versioning policy.** The str-ban
   (2026-08-23) was a breaking language change shipped in one session —
   need a real policy before a deployed critical app can trust future
   changes won't silently break it.
@@ -278,9 +285,9 @@ interpreter/compiler capabilities, not blocked on either track.
 
 ## Suggested near-term order
 
-Given "critical apps soon": **A1 (security review) first**, since it's
-the fastest way to find out whether "soon" is actually safe, and it
-doesn't block on anything else. A2–A6 and C1 can run in parallel with
-each other and with the start of B1. B1–B9 is the long track — pick up
-items as they become relevant to what's actually being built, not in
-lockstep.
+Given "critical apps soon": the security review (now `[DONE]`) has
+already landed; **A1 (correctness-gap sweep) is the next concrete
+blocking work**, since it finds the class of bugs the review just
+illustrated. A2–A5 and C1 can run in parallel with each other and
+with the start of B1. B1–B9 is the long track — pick up items as they
+become relevant to what's actually being built, not in lockstep.

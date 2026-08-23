@@ -1484,8 +1484,26 @@ pub(crate) fn db_row_to_json(row: &rusqlite::Row, column_names: &[String]) -> ru
 /// Builds the raw request bytes `http_request`/`https_request` both send
 /// — one HTTP/1.1 request line, a fixed header set, and the body (if
 /// any). Shared so the two transports can never drift on what they
-/// actually put on the wire.
-fn build_http_request(method: &str, host: &str, path: &str, body: Option<&str>) -> Vec<u8> {
+/// actually put on the wire. Returns `Err` if any component contains
+/// newlines, which would let an attacker inject arbitrary headers or
+/// split the request.
+fn build_http_request(method: &str, host: &str, path: &str, body: Option<&str>) -> Result<Vec<u8>, String> {
+    // Prevent request-line / header injection. `method` is supplied by the
+    // compiler as a fixed literal, but validate it anyway; `host` and `path`
+    // come from user-provided `str` values and must not contain line breaks.
+    let allowed_methods: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
+    if !allowed_methods.iter().any(|m| *m == method) {
+        return Err(format!("unsupported HTTP method `{method}`"));
+    }
+    if method.chars().any(|c| c == '\r' || c == '\n')
+        || host.chars().any(|c| c == '\r' || c == '\n')
+        || path.chars().any(|c| c == '\r' || c == '\n')
+    {
+        return Err("HTTP method, host, or path contains a line break".to_string());
+    }
+    // A request target that is empty or lacks a leading `/` can confuse some
+    // servers; normalize to `/` while still allowing query strings and paths.
+    let path = if path.is_empty() || !path.starts_with('/') { format!("/{path}") } else { path.to_string() };
     let mut request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: nirdosha\r\nAccept: */*\r\n"
     );
@@ -1496,7 +1514,7 @@ fn build_http_request(method: &str, host: &str, path: &str, body: Option<&str>) 
     request.push_str("\r\n");
     let mut request_bytes = request.into_bytes();
     request_bytes.extend_from_slice(req_body_bytes);
-    request_bytes
+    Ok(request_bytes)
 }
 
 /// Splits a raw HTTP response into a status code and a body — the other
@@ -1577,9 +1595,23 @@ fn send_and_receive<S: std::io::Read + std::io::Write + HalfCloseWrite>(mut stre
         return result_err(e.to_string());
     }
     stream.half_close_write();
+    // Cap the total response size to avoid unbounded allocation when a peer
+    // sends a huge or infinite response. 10 MiB is generous for the JSON
+    // payloads this language consumes.
+    const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
     let mut raw = Vec::new();
-    if let Err(e) = stream.read_to_end(&mut raw) {
-        return result_err(e.to_string());
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if raw.len() + n > MAX_RESPONSE_BYTES {
+                    return result_err("HTTP response exceeded maximum size (10 MiB)".to_string());
+                }
+                raw.extend_from_slice(&buf[..n]);
+            }
+            Err(e) => return result_err(e.to_string()),
+        }
     }
     parse_http_response(&raw)
 }
@@ -1593,11 +1625,15 @@ fn http_request(host: &str, port: i64, method: &str, path: &str, body: Option<&s
         Ok(p) => p,
         Err(_) => return result_err(format!("port {port} is not a valid 0-65535 TCP port")),
     };
+    let request = match build_http_request(method, host, path, body) {
+        Ok(r) => r,
+        Err(e) => return result_err(e),
+    };
     let stream = match std::net::TcpStream::connect((host, port)) {
         Ok(s) => s,
         Err(e) => return result_err(e.to_string()),
     };
-    send_and_receive(stream, &build_http_request(method, host, path, body))
+    send_and_receive(stream, &request)
 }
 
 /// `https_get`/`https_post`'s shared implementation — same request/
@@ -1613,6 +1649,10 @@ fn https_request(host: &str, port: i64, method: &str, path: &str, body: Option<&
         Ok(p) => p,
         Err(_) => return result_err(format!("port {port} is not a valid 0-65535 TCP port")),
     };
+    let request = match build_http_request(method, host, path, body) {
+        Ok(r) => r,
+        Err(e) => return result_err(e),
+    };
     let tcp = match std::net::TcpStream::connect((host, port)) {
         Ok(s) => s,
         Err(e) => return result_err(e.to_string()),
@@ -1625,7 +1665,7 @@ fn https_request(host: &str, port: i64, method: &str, path: &str, body: Option<&
         Ok(s) => s,
         Err(e) => return result_err(format!("TLS handshake failed: {e}")),
     };
-    send_and_receive(stream, &build_http_request(method, host, path, body))
+    send_and_receive(stream, &request)
 }
 
 fn as_f64(v: &Value) -> f64 {
@@ -2501,7 +2541,7 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
             let (Value::Str(api_key), Value::Str(expected_hash)) = (&args[0], &args[1]) else {
                 unreachable!("typeck.rs already proved two strs")
             };
-            if sha256_hex(api_key).as_str() != expected_hash.as_ref() {
+            if !constant_time_eq(sha256_hex(api_key).as_str(), expected_hash.as_ref()) {
                 return Ok(result_err("invalid API key".to_string()));
             }
             let claims_json = r#"{"service_account":"api-client","roles":["physician"],"department":"radiology"}"#;
@@ -3152,8 +3192,10 @@ impl Interpreter {
             };
             self.replay_write(tlog, txn_id, &compensate_fn, &compensate_args, span, "compensated", false)
         } else {
-            let _ = tlog.mark_terminal(&txn_id, "compensated");
-            ReplayOutcome::Resolved { txn_id, committed: false }
+            match tlog.mark_terminal(&txn_id, "compensated") {
+                Ok(()) => ReplayOutcome::Resolved { txn_id, committed: false },
+                Err(_e) => ReplayOutcome::StillPending { txn_id },
+            }
         }
     }
 
@@ -3343,7 +3385,13 @@ impl Interpreter {
                 Ok(v) => is_result_err(v),
             };
             if !failed {
-                let _ = tlog.mark_terminal(txn_id, terminal_state);
+                // The effect succeeded. If we cannot durably record that,
+                // replay will re-run it later; for non-idempotent effects
+                // that is a real bug, so treat a log-write failure here as a
+                // runtime error rather than silently returning success.
+                if let Err(e) = tlog.mark_terminal(txn_id, terminal_state) {
+                    return Err(self.transact_log_err(e, span));
+                }
                 return Ok(());
             }
             attempt += 1;
@@ -4093,7 +4141,8 @@ impl Interpreter {
                 } else {
                     // No `compensate` slot to run -- nothing pending,
                     // terminal immediately.
-                    let _ = tlog.mark_terminal(&txn_id, "compensated");
+                    tlog.mark_terminal(&txn_id, "compensated")
+                        .map_err(|e| self.transact_log_err(e, *span))?;
                     false
                 };
 
@@ -4742,7 +4791,20 @@ impl Interpreter {
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut tmp = std::env::temp_dir();
         tmp.push(format!("nirdosha_sandbox_{}_{n}.nir", std::process::id()));
-        if let Err(e) = std::fs::write(&tmp, self.source.as_bytes()) {
+        // Create the temp source file atomically with `create_new` so a
+        // pre-existing file or symlink can't redirect the write elsewhere
+        // (a local symlink race in the shared temp directory).
+        let mut tmp_file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(Signal::Err(RuntimeError {
+                    kind: ErrorKind::SandboxSpawnFailed { message: e.to_string() },
+                    span,
+                }));
+            }
+        };
+        if let Err(e) = std::io::Write::write_all(&mut tmp_file, self.source.as_bytes()) {
+            let _ = std::fs::remove_file(&tmp);
             return Err(Signal::Err(RuntimeError {
                 kind: ErrorKind::SandboxSpawnFailed { message: e.to_string() },
                 span,

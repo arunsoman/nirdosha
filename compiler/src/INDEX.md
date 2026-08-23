@@ -293,3 +293,15 @@ part.
 - `571`/`573`/`588` `fn assigned_names`/`walk_stmts`/`walk_expr`
 
 ## main.rs (517 lines, as of 2026-08-23)
+- `7` `fn main` — CLI entry point: pulls `--format=json`/`--otel-console`/`--transact-log=` off anywhere in argv, then dispatches on the first remaining arg to a subcommand (`build`/`emit-llvm`/`emit-ast`/`emit-ui`/`serve`/`--sandbox-worker`), or `cmd_interpret` if the first arg is just a path
+- `71` `fn print_usage`
+- `92` `fn read_source`
+- `103` `fn print_value` — renders a successful run's result uniformly regardless of entry point (`run`/`run_diagnostic`); `--format=json` only changes how *failures* are reported
+- `127` `fn cmd_interpret` — the default (no subcommand) path: parse → typecheck → own-check → `Interpreter::run_main`
+- `177` `fn typecheck_and_own` — the shared parse+typecheck+ownership pipeline every subcommand but `emit-ast` gates on; `codegen.rs::check_supported` is a separate, narrower, backend-specific gate run later inside `build`/`emit-llvm` themselves
+- `195` `fn cmd_build` — `nirdosha build <file> -o <out> [--opt0]`: full pipeline → `codegen::build` → native binary
+- `240` `fn cmd_emit_llvm` — same pipeline, prints IR text instead of linking
+- `278` `fn cmd_emit_ast` — parses only (not the full `typecheck_and_own` gate) — a program that doesn't yet typecheck is still legitimate to inspect here, unlike `build`/`emit-llvm`/`emit-ui`
+- `320` `fn cmd_emit_ui` — needs the *typed* program (screen inference reads resolved struct fields/fn signatures), same gate as `build`/`emit-llvm`
+- `381` `fn cmd_serve` — binds `serve.rs::run`; a bearer token with no server-side `AuthConfig` is a clear 500, not silently accepted or ignored
+- `455` `fn cmd_sandbox_worker` — not a user-facing subcommand; the only caller is a `sandbox` handle's own `Expr::SpawnSandbox`, which execs this same binary with `--sandbox-worker` to become the child process

@@ -69,6 +69,36 @@ fn header(name: &str, value: &str) -> tiny_http::Header {
     tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("header name/value are plain ASCII here")
 }
 
+/// Maximum request body size accepted by either `POST` route. `tiny_http`
+/// already buffers the whole body; this cap prevents a single huge request
+/// from exhausting the server's memory.
+const MAX_BODY_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+fn read_limited_body(request: &mut tiny_http::Request) -> Result<String, (u16, String)> {
+    let mut buf = Vec::new();
+    let reader = request.as_reader();
+    let mut remaining = MAX_BODY_BYTES;
+    let mut chunk = [0u8; 4096];
+    while remaining > 0 {
+        let n = chunk.len().min(remaining as usize);
+        match reader.read(&mut chunk[..n]) {
+            Ok(0) => break,
+            Ok(k) => {
+                buf.extend_from_slice(&chunk[..k]);
+                remaining -= k as u64;
+            }
+            Err(e) => return Err((413, json_err(&format!("request body too large or unreadable: {e}")))),
+        }
+    }
+    if remaining == 0 && !matches!(reader.read(&mut [0u8; 1]), Ok(0)) {
+        return Err((413, json_err("request body exceeded maximum size (1 MiB)")));
+    }
+    match String::from_utf8(buf) {
+        Ok(body) => Ok(body),
+        Err(e) => Err((400, json_err(&format!("request body is not valid UTF-8: {e}")))),
+    }
+}
+
 /// Starts serving `program` on `port` and blocks forever (one request at
 /// a time — see the module doc; this is a demo/dev entry point, not a
 /// tuned production server). `identity_base`, if given, is baked into
@@ -77,6 +107,7 @@ fn header(name: &str, value: &str) -> tiny_http::Header {
 /// comment).
 pub fn run(
     program: Arc<Program>,
+    host: &str,
     port: u16,
     auth: Option<AuthConfig>,
     identity_base: Option<&str>,
@@ -141,8 +172,8 @@ pub fn run(
         }
     }
 
-    let server = tiny_http::Server::http(("0.0.0.0", port)).map_err(|e| format!("failed to bind :{port}: {e}"))?;
-    eprintln!("nirdosha serve: listening on http://0.0.0.0:{port}  (GET / for the UI, POST /api/<fn> for the API)");
+    let server = tiny_http::Server::http((host, port)).map_err(|e| format!("failed to bind {host}:{port}: {e}"))?;
+    eprintln!("nirdosha serve: listening on http://{host}:{port}  (GET / for the UI, POST /api/<fn> for the API)");
 
     for mut request in server.incoming_requests() {
         let method = request.method().clone();
@@ -169,8 +200,17 @@ pub fn run(
 
         if method == tiny_http::Method::Post {
             if let Some(table) = url.strip_prefix("/_nirdosha/table/") {
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
+                let body = match read_limited_body(&mut request) {
+                    Ok(b) => b,
+                    Err(status_body) => {
+                        let mut resp = tiny_http::Response::from_string(status_body.1).with_status_code(status_body.0);
+                        for h in cors_headers() {
+                            resp.add_header(h);
+                        }
+                        let _ = request.respond(resp);
+                        continue;
+                    }
+                };
                 // Same bearer-token resolution `dispatch` uses -- this
                 // route bypasses `dispatch` entirely (talks straight to
                 // SQLite, not through the interpreter), so without this
@@ -183,7 +223,10 @@ pub fn run(
                     .map(|h| h.value.as_str().to_string());
                 let (status, payload) = match &table_db {
                     Some(db) => match resolve_identity(auth_header.as_deref(), auth.as_ref().as_ref()) {
-                        Ok(identity) => dispatch_table_query(db, &table_catalog, table, &body, &program, identity.as_ref()),
+                        Ok(identity) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            dispatch_table_query(db, &table_catalog, table, &body, &program, identity.as_ref())
+                        }))
+                        .unwrap_or_else(|_| (500, json_err("internal server error"))),
                         Err(status_body) => status_body,
                     },
                     None => (404, json_err("no --db was passed to `nirdosha serve`; the generic table-query route is disabled")),
@@ -198,8 +241,17 @@ pub fn run(
                 continue;
             }
             if let Some(fn_name) = url.strip_prefix("/api/") {
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
+                let body = match read_limited_body(&mut request) {
+                    Ok(b) => b,
+                    Err(status_body) => {
+                        let mut resp = tiny_http::Response::from_string(status_body.1).with_status_code(status_body.0);
+                        for h in cors_headers() {
+                            resp.add_header(h);
+                        }
+                        let _ = request.respond(resp);
+                        continue;
+                    }
+                };
                 let auth_header = request
                     .headers()
                     .iter()
