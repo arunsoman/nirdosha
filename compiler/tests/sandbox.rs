@@ -59,7 +59,7 @@ fn example_sandbox_runs_to_completion() {
     // fixed against -- it only ever "passed" because its assertion never
     // checked what the sandboxed child actually ran, so a fast-failing
     // wrong-binary child looked the same as a correctly-killed real one.
-    let src = include_str!("../examples/sandbox.nir");
+    let src = include_str!("../../examples/sandbox.nir");
     let program = parse_ok(src);
     typecheck(&program).expect("should typecheck cleanly");
     check_ownership(&program).expect("should ownership-check cleanly");

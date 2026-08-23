@@ -37,7 +37,7 @@ fn the_grammar_file_is_valid_gbnf_per_llama_cpps_real_parser() {
 #[test]
 fn every_shipped_example_is_accepted_by_both_the_real_parser_and_the_gbnf_grammar() {
     let grammar = nirdosha_grammar_export::parse(&grammar_text());
-    let examples_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../compiler/examples");
+    let examples_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples");
     let mut checked = 0;
     for entry in std::fs::read_dir(examples_dir).expect("examples/ should exist") {
         let path = entry.expect("dir entry should read").path();

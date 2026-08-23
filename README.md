@@ -379,28 +379,28 @@ pulled in for the SMT refinement layer (row 4).
 
 ```sh
 # Interpret (always works for every construct)
-nirdosha compiler/examples/hello.nir
+nirdosha examples/hello.nir
 
 # Compile to a native binary (subset — see LANGUAGE.md §10)
-nirdosha build compiler/examples/matrices.nir -o matrices
+nirdosha build examples/matrices.nir -o matrices
 ./matrices
 
 # Inspect the program
-nirdosha emit-llvm compiler/examples/matrices.nir   # print LLVM IR
-nirdosha emit-ast  compiler/examples/matrices.nir  # print AST as JSON
+nirdosha emit-llvm examples/matrices.nir   # print LLVM IR
+nirdosha emit-ast  examples/matrices.nir  # print AST as JSON
 ```
 
 ### Generate / serve a UI
 
 ```sh
-nirdosha emit-ui compiler/examples/store.nir -o store.html   # self-contained CRUD HTML
-nirdosha serve   compiler/examples/store.nir --port 8080     # JSON API server
+nirdosha emit-ui examples/store.nir -o store.html   # self-contained CRUD HTML
+nirdosha serve   examples/store.nir --port 8080     # JSON API server
 ```
 
 ### Structured diagnostics (for LLM/agent loops)
 
 ```sh
-nirdosha compiler/examples/broken.nir --format=json   # Diagnostic JSON on failure
+nirdosha examples/broken.nir --format=json   # Diagnostic JSON on failure
 ```
 
 ### Explore the language

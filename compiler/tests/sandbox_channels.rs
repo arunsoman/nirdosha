@@ -39,7 +39,7 @@ fn interp(program: nirdosha::ast::Program, src: &str) -> Interpreter {
 
 #[test]
 fn example_sandbox_channels_runs_to_completion() {
-    let src = include_str!("../examples/sandbox_channels.nir");
+    let src = include_str!("../../examples/sandbox_channels.nir");
     let program = parse_ok(src);
     typecheck(&program).expect("should typecheck cleanly");
     check_ownership(&program).expect("should ownership-check cleanly");

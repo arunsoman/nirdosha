@@ -200,7 +200,7 @@ pub(crate) fn builtin_effect(name: &str) -> EffectSet {
         // default already gives them `EffectSet::new()`; named here only
         // so a reader doesn't have to wonder whether they were missed).
         "json_parse" | "json_get" | "json_get_str" | "json_get_i64" | "json_get_f64" | "json_get_bool"
-        | "json_array_len" | "json_array_get" => {}
+        | "json_array_len" | "json_array_get" | "json_set_str" => {}
         // Same effect `file`'s `open`/`send`/`recv`/`stop` already get --
         // SQLite (layer 1's only backend -- `Ty::Db`'s doc comment) is a
         // local file, not a network service.

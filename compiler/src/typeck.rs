@@ -393,15 +393,6 @@ pub enum TypeErrorKind {
     /// Two `on` transitions out of the *same* `state` share an event
     /// name — `advance_<workflow>` couldn't dispatch unambiguously.
     WorkflowDuplicateEvent { workflow: String, state: String, event: String },
-    /// An `on_entry`/`on_exit` action referenced `data.<field>`, but the
-    /// enclosing `workflow`'s `data { ... }` block declares no field by
-    /// that name.
-    WorkflowUnknownDataField { workflow: String, field: String },
-    /// An `on_entry`/`on_exit` action referenced `link_<Event>`, but the
-    /// enclosing `state` declares no `link`-marked outgoing transition
-    /// named `<Event>` — the minted-token binding only exists for the
-    /// specific state whose `on_entry` mints it, right before running.
-    WorkflowUnknownLinkBinding { workflow: String, state: String, event: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -746,16 +737,6 @@ impl std::fmt::Display for TypeError {
                 "{line}:{col}: `workflow {workflow}`'s state `{state}` declares the event `{event}` on \
                  more than one outgoing transition"
             ),
-            TypeErrorKind::WorkflowUnknownDataField { workflow, field } => write!(
-                f,
-                "{line}:{col}: `workflow {workflow}` has no `data` field named `{field}`"
-            ),
-            TypeErrorKind::WorkflowUnknownLinkBinding { workflow, state, event } => write!(
-                f,
-                "{line}:{col}: `workflow {workflow}`'s state `{state}` has no `link`-marked outgoing \
-                 transition named `{event}` — `link_{event}` is only in scope inside the `on_entry` of \
-                 the state that declares it"
-            ),
         }
     }
 }
@@ -987,7 +968,7 @@ fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeE
     // that still has the original `state`/`on_entry`/`on_exit` syntax to
     // point diagnostics at.
     for w in &program.workflows {
-        check_workflow_decl(w, &mut c.errors);
+        c.check_workflow_decl(w);
     }
 
     // Effect enforcement runs only over an otherwise-clean program —
@@ -1013,107 +994,6 @@ fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeE
     }
 }
 
-/// `WorkflowDecl`'s structural rules — every non-terminal `state` has a
-/// way out, every transition target exists, no ambiguous event dispatch,
-/// and every `data.<field>`/`link_<Event>` reference inside an action
-/// call resolves. Doesn't need `TypeRegistry`/`Checker`'s machinery (no
-/// type inference here, just name resolution against the workflow's own
-/// declared shape), so this stays a plain free function rather than
-/// another `Checker` method.
-fn check_workflow_decl(w: &WorkflowDecl, errors: &mut Vec<TypeError>) {
-    let state_names: std::collections::HashSet<&str> = w.states.iter().map(|s| s.name.as_str()).collect();
-    let data_fields: std::collections::HashSet<&str> = w.data.iter().map(|f| f.name.as_str()).collect();
-
-    for s in &w.states {
-        if !s.terminal && s.transitions.is_empty() {
-            errors.push(TypeError {
-                kind: TypeErrorKind::WorkflowStateHasNoTransitions { workflow: w.name.clone(), state: s.name.clone() },
-                span: s.span,
-            });
-        }
-
-        let mut seen_events: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let mut link_events: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for t in &s.transitions {
-            if !state_names.contains(t.target.as_str()) {
-                errors.push(TypeError {
-                    kind: TypeErrorKind::WorkflowUnknownTargetState {
-                        workflow: w.name.clone(),
-                        state: s.name.clone(),
-                        target: t.target.clone(),
-                    },
-                    span: t.span,
-                });
-            }
-            if !seen_events.insert(t.event.as_str()) {
-                errors.push(TypeError {
-                    kind: TypeErrorKind::WorkflowDuplicateEvent {
-                        workflow: w.name.clone(),
-                        state: s.name.clone(),
-                        event: t.event.clone(),
-                    },
-                    span: t.span,
-                });
-            }
-            if t.via_link {
-                link_events.insert(t.event.as_str());
-            }
-        }
-
-        for action in s.on_entry.iter().chain(s.on_exit.iter()) {
-            for arg in &action.args {
-                check_workflow_action_arg(arg, w, &data_fields, &link_events, &s.name, errors);
-            }
-        }
-    }
-}
-
-/// Walks one `on_entry`/`on_exit` action-call argument expression
-/// looking for `data.<field>`/`link_<Event>` references, recursively
-/// (an argument can itself be a nested call, e.g. `f(data.risk_score)`).
-fn check_workflow_action_arg(
-    e: &Expr,
-    w: &WorkflowDecl,
-    data_fields: &std::collections::HashSet<&str>,
-    link_events: &std::collections::HashSet<&str>,
-    state: &str,
-    errors: &mut Vec<TypeError>,
-) {
-    match e {
-        Expr::FieldAccess(base, field, span) => {
-            if let Expr::Ident(name, _) = base.as_ref() {
-                if name == "data" && !data_fields.contains(field.as_str()) {
-                    errors.push(TypeError {
-                        kind: TypeErrorKind::WorkflowUnknownDataField { workflow: w.name.clone(), field: field.clone() },
-                        span: *span,
-                    });
-                }
-            } else {
-                check_workflow_action_arg(base, w, data_fields, link_events, state, errors);
-            }
-        }
-        Expr::Ident(name, span) => {
-            if let Some(event) = name.strip_prefix("link_") {
-                if !link_events.contains(event) {
-                    errors.push(TypeError {
-                        kind: TypeErrorKind::WorkflowUnknownLinkBinding {
-                            workflow: w.name.clone(),
-                            state: state.to_string(),
-                            event: event.to_string(),
-                        },
-                        span: *span,
-                    });
-                }
-            }
-        }
-        Expr::Call(_, args, _) => {
-            for a in args {
-                check_workflow_action_arg(a, w, data_fields, link_events, state, errors);
-            }
-        }
-        _ => {}
-    }
-}
 
 impl<'a> Checker<'a> {
     fn error(&mut self, kind: TypeErrorKind, span: Span) {
@@ -1322,6 +1202,88 @@ impl<'a> Checker<'a> {
 
         if f.ret != Ty::Unit && !definitely_returns(&f.body.stmts) {
             self.error(TypeErrorKind::NotAllPathsReturn { fn_name: f.name.clone() }, f.span);
+        }
+    }
+
+    /// `WorkflowDecl`'s own rules (`WORKFLOW.md`): every non-terminal
+    /// `state` has a way out, every transition target exists, no
+    /// ambiguous event dispatch — and, crucially, every `on_entry`/
+    /// `on_exit` action call is *really* type-checked, not just
+    /// name-resolved. `instance_id`/`data`/`link_<Event>` become real
+    /// `Scopes` bindings (same mechanism `check_fn` above uses for a
+    /// function's own parameters), then each action's call expression is
+    /// synthesized and run through this checker's own `infer`
+    /// (`infer_call`, specifically) exactly as if it were an ordinary
+    /// call inside a function body — so `data.<field>` gets the real
+    /// `NoSuchField` check, `link_<Event>` gets the real `UnknownVar`
+    /// check, and (the actual gap this closes) every argument's type
+    /// gets checked against the callee's real declared parameter types,
+    /// arity included — a `send_email(conn, to, wrong_type_arg, vars)`
+    /// is now exactly as much a compile error as it would be anywhere
+    /// else in this language, not silently accepted because this was the
+    /// one call site nothing looked at.
+    fn check_workflow_decl(&mut self, w: &WorkflowDecl) {
+        let state_names: std::collections::HashSet<&str> = w.states.iter().map(|s| s.name.as_str()).collect();
+        let data_ty = Ty::Named(format!("{}Data", w.name), vec![]);
+        let link_token_ty = Ty::Named(format!("{}LinkToken", w.name), vec![]);
+
+        for s in &w.states {
+            if !s.terminal && s.transitions.is_empty() {
+                self.error(
+                    TypeErrorKind::WorkflowStateHasNoTransitions { workflow: w.name.clone(), state: s.name.clone() },
+                    s.span,
+                );
+            }
+
+            let mut seen_events: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut link_events: Vec<&str> = Vec::new();
+            for t in &s.transitions {
+                if !state_names.contains(t.target.as_str()) {
+                    self.error(
+                        TypeErrorKind::WorkflowUnknownTargetState {
+                            workflow: w.name.clone(),
+                            state: s.name.clone(),
+                            target: t.target.clone(),
+                        },
+                        t.span,
+                    );
+                }
+                if !seen_events.insert(t.event.as_str()) {
+                    self.error(
+                        TypeErrorKind::WorkflowDuplicateEvent {
+                            workflow: w.name.clone(),
+                            state: s.name.clone(),
+                            event: t.event.clone(),
+                        },
+                        t.span,
+                    );
+                }
+                if t.via_link {
+                    link_events.push(t.event.as_str());
+                }
+            }
+
+            // `on_exit` only ever sees `instance_id`/`data` — the state
+            // being left has no `link_<Event>` binding of its own to
+            // offer (that only exists for the state being *entered*).
+            let mut exit_scopes = Scopes::new();
+            exit_scopes.define("instance_id", Ty::I64);
+            exit_scopes.define("data", data_ty.clone());
+            for action in &s.on_exit {
+                let call = Expr::Call(action.name.clone(), action.args.clone(), action.span);
+                self.infer(&call, &Ty::Unit, &mut exit_scopes);
+            }
+
+            let mut entry_scopes = Scopes::new();
+            entry_scopes.define("instance_id", Ty::I64);
+            entry_scopes.define("data", data_ty.clone());
+            for event in &link_events {
+                entry_scopes.define(&format!("link_{event}"), link_token_ty.clone());
+            }
+            for action in &s.on_entry {
+                let call = Expr::Call(action.name.clone(), action.args.clone(), action.span);
+                self.infer(&call, &Ty::Unit, &mut entry_scopes);
+            }
         }
     }
 
@@ -2864,6 +2826,21 @@ impl<'a> Checker<'a> {
                 self.check(&args[1], &Ty::Str, expected_ret, scopes);
                 result_of(Ty::Bool)
             }
+            // `json_get_str`'s inverse — the one JSON-construction builtin
+            // this language has (WORKFLOW.md's `notify`/`send_email`
+            // `vars` payloads need at least this much): sets `key` to a
+            // `str` value on a JSON object, or starts a fresh one if `doc`
+            // is `null` (the shape `json_parse("{}")` and `json_parse("null")`
+            // both already produce). Any other JSON shape (an array, a
+            // scalar) is a runtime `Err`, not a type error — the same
+            // "some proven statically, some at runtime" split `json_get`'s
+            // own key-not-found case already makes.
+            ("json_set_str", 3) => {
+                self.check(&args[0], &Ty::Json, expected_ret, scopes);
+                self.check(&args[1], &Ty::Str, expected_ret, scopes);
+                self.check(&args[2], &Ty::Str, expected_ret, scopes);
+                result_of(Ty::Json)
+            }
             ("json_array_len", 1) => {
                 self.check(&args[0], &Ty::Json, expected_ret, scopes);
                 result_of(Ty::I64)
@@ -3138,6 +3115,7 @@ impl<'a> Checker<'a> {
     /// arms above, which may accept more than one arity, e.g. `zeros`).
     fn builtin_arity_hint(&self, name: &str) -> usize {
         match name {
+            "json_set_str" => 3,
             "dot" | "cross" | "solve" | "json_get" | "json_get_str" | "json_get_i64" | "json_get_f64"
             | "json_get_bool" | "json_array_get" | "check_role" | "extract_claim" | "extract_claim_path"
             | "db_query" | "db_execute" | "validate_api_key" | "mq_connect" | "constant_time_str_eq" => 2,

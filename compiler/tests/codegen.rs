@@ -73,7 +73,7 @@ fn unique_suffix() -> u64 {
 
 #[test]
 fn hello_compiles_and_matches_interpreter() {
-    let src = include_str!("../examples/hello.nir");
+    let src = include_str!("../../examples/hello.nir");
     let (stdout, code) = compile_and_run(src);
     assert_eq!(stdout, "8\n");
     assert_eq!(code, 0);
@@ -82,7 +82,7 @@ fn hello_compiles_and_matches_interpreter() {
 
 #[test]
 fn factorial_compiles_and_matches_interpreter() {
-    let src = include_str!("../examples/factorial.nir");
+    let src = include_str!("../../examples/factorial.nir");
     let (stdout, code) = compile_and_run(src);
     assert_eq!(stdout, "3628800\n");
     assert_eq!(code, 0);
@@ -90,7 +90,7 @@ fn factorial_compiles_and_matches_interpreter() {
 
 #[test]
 fn loop_compiles_and_matches_interpreter() {
-    let src = include_str!("../examples/loop.nir");
+    let src = include_str!("../../examples/loop.nir");
     let (stdout, code) = compile_and_run(src);
     assert_eq!(stdout, "20\n19\n18\n17\n16\n11\n");
     assert_eq!(code, 0);
@@ -100,7 +100,7 @@ fn loop_compiles_and_matches_interpreter() {
 
 #[test]
 fn ownership_example_compiles_and_matches_interpreter() {
-    let src = include_str!("../examples/ownership.nir");
+    let src = include_str!("../../examples/ownership.nir");
     let (stdout, code) = compile_and_run(src);
     assert_eq!(code, 0);
     assert_eq!(stdout, capture_interpreted_stdout(src));
@@ -108,7 +108,7 @@ fn ownership_example_compiles_and_matches_interpreter() {
 
 #[test]
 fn borrow_example_compiles_and_matches_interpreter() {
-    let src = include_str!("../examples/borrow.nir");
+    let src = include_str!("../../examples/borrow.nir");
     let (stdout, code) = compile_and_run(src);
     assert_eq!(code, 0);
     assert_eq!(stdout, capture_interpreted_stdout(src));
@@ -116,7 +116,7 @@ fn borrow_example_compiles_and_matches_interpreter() {
 
 #[test]
 fn threads_example_is_rejected_by_codegen() {
-    let program = parse_checked(include_str!("../examples/threads.nir"));
+    let program = parse_checked(include_str!("../../examples/threads.nir"));
     let report = analyze(&program);
     let result = codegen::emit_llvm_ir(&program, &report);
     assert!(
@@ -127,7 +127,7 @@ fn threads_example_is_rejected_by_codegen() {
 
 #[test]
 fn channels_example_is_rejected_by_codegen() {
-    let program = parse_checked(include_str!("../examples/channels.nir"));
+    let program = parse_checked(include_str!("../../examples/channels.nir"));
     let report = analyze(&program);
     let result = codegen::emit_llvm_ir(&program, &report);
     assert!(
@@ -138,7 +138,7 @@ fn channels_example_is_rejected_by_codegen() {
 
 #[test]
 fn sandbox_example_is_rejected_by_codegen() {
-    let program = parse_checked(include_str!("../examples/sandbox.nir"));
+    let program = parse_checked(include_str!("../../examples/sandbox.nir"));
     let report = analyze(&program);
     let result = codegen::emit_llvm_ir(&program, &report);
     assert!(
@@ -149,7 +149,7 @@ fn sandbox_example_is_rejected_by_codegen() {
 
 #[test]
 fn sandbox_channels_example_is_rejected_by_codegen() {
-    let program = parse_checked(include_str!("../examples/sandbox_channels.nir"));
+    let program = parse_checked(include_str!("../../examples/sandbox_channels.nir"));
     let report = analyze(&program);
     let result = codegen::emit_llvm_ir(&program, &report);
     assert!(
@@ -162,7 +162,7 @@ fn sandbox_channels_example_is_rejected_by_codegen() {
 
 #[test]
 fn strings_example_compiles_and_matches_interpreter() {
-    let src = include_str!("../examples/strings.nir");
+    let src = include_str!("../../examples/strings.nir");
     let (stdout, code) = compile_and_run(src);
     // `1`/`0`, not `true`/`false` -- a pre-existing, documented cosmetic
     // difference from the interpreter's `render()` (a comparison result
@@ -256,7 +256,7 @@ fn tcp_client_example_compiles_now_that_tcp_codegen_landed() {
     // needs `python3 -m http.server 8000` running externally — a real
     // end-to-end round trip against a self-contained loopback server is
     // covered instead by the dedicated tests just above.
-    let program = parse_checked(include_str!("../examples/tcp_client.nir"));
+    let program = parse_checked(include_str!("../../examples/tcp_client.nir"));
     let report = analyze(&program);
     let result = codegen::emit_llvm_ir(&program, &report);
     assert!(result.is_ok(), "tcp/connect/send/recv/stop should all compile: {:?}", result.err());
@@ -740,9 +740,9 @@ fn optimized_and_unoptimized_builds_agree_on_every_example() {
     // same expected output is what would actually catch that, not
     // reading the code again.
     for (src, expected_stdout) in [
-        (include_str!("../examples/hello.nir"), "8\n"),
-        (include_str!("../examples/factorial.nir"), "3628800\n"),
-        (include_str!("../examples/loop.nir"), "20\n19\n18\n17\n16\n11\n"),
+        (include_str!("../../examples/hello.nir"), "8\n"),
+        (include_str!("../../examples/factorial.nir"), "3628800\n"),
+        (include_str!("../../examples/loop.nir"), "20\n19\n18\n17\n16\n11\n"),
     ] {
         let (o0_stdout, o0_code) = compile_and_run_opt(src, codegen::OptLevel::O0);
         let (o2_stdout, o2_code) = compile_and_run_opt(src, codegen::OptLevel::O2);
@@ -768,7 +768,7 @@ fn optimized_and_unoptimized_builds_agree_on_every_example() {
 
 #[test]
 fn floats_example_compiles_and_matches_interpreter() {
-    let src = include_str!("../examples/floats.nir");
+    let src = include_str!("../../examples/floats.nir");
     let (stdout, code) = compile_and_run(src);
     assert_eq!(code, 0);
     // `%f`'s default 6-decimal formatting (this backend) vs Rust's
@@ -966,7 +966,7 @@ fn matrices_example_is_rejected_by_codegen() {
     // `arg_ty.is_aggregate()` check), not by the early pre-pass -- so
     // this test now exercises the full `build` pipeline instead of
     // `check_supported` alone.
-    let program = parse_checked(include_str!("../examples/matrices.nir"));
+    let program = parse_checked(include_str!("../../examples/matrices.nir"));
     assert!(
         codegen::check_supported(&program).is_ok(),
         "every construct in this example except `print`-of-a-whole-aggregate is codegen-supported now"
@@ -991,7 +991,7 @@ fn linalg_example_is_rejected_by_codegen() {
     // (`cross`, `transpose`, `zeros`, `ones`, `identity`, `solve` are all
     // printed directly here) is still unsupported, caught by `call()`
     // during actual IR emission, not the early pre-pass.
-    let program = parse_checked(include_str!("../examples/linalg.nir"));
+    let program = parse_checked(include_str!("../../examples/linalg.nir"));
     assert!(
         codegen::check_supported(&program).is_ok(),
         "every construct in this example except `print`-of-a-whole-aggregate is codegen-supported now"
@@ -2780,7 +2780,7 @@ fn structs_enums_example_compiles_and_matches_the_interpreter_value() {
     // `Value::Float`. Both express the same underlying value, confirmed
     // against each other here the same way `floats_example_*` cross-
     // checks the `%f`-formatted stdout.
-    let src = include_str!("../examples/structs_enums.nir");
+    let src = include_str!("../../examples/structs_enums.nir");
     let (_stdout, code) = compile_and_run(src);
     // 29.56636 truncated toward zero (fptosi) is 29.
     assert_eq!(code, 29);

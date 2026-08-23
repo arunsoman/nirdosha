@@ -171,13 +171,29 @@ with a future increment, but is **not yet threaded into `on_entry`/
    `UPDATE ... WHERE consumed = 0` (TOCTOU-safe: two simultaneous
    requests can't both win). A match with no exhaustion runs the normal
    `advance` path.
-4. Every `on_entry`/`on_exit` action call gets a bounded, backoff retry —
-   the same shape `run_transact_write_slot` gives `transact`'s `commit`/
-   `compensate` (5 attempts, `20ms << attempt` backoff), treating a trap
-   *or* a `Result(_, _)`'s `Err` variant as failure. Exhausting the
-   budget **traps** `WorkflowActionPending { instance_id, state, action }`
-   — never a guessed outcome, matching `TransactCommitPending`'s own
-   "stuck and visible on purpose" precedent.
+4. Every `on_entry`/`on_exit` action call's callee and already-evaluated
+   arguments are durably recorded (`WorkflowLog::begin_pending_action`)
+   *before* it's dispatched — the same "log intent, then act" ordering
+   `transact_log.rs::begin_pending` gives `network`, so a crash between
+   that write and the call actually running is resumable, not lost. Each
+   call then gets a bounded, backoff retry — the same shape
+   `run_transact_write_slot` gives `transact`'s `commit`/`compensate` (5
+   attempts, `20ms << attempt` backoff), treating a trap *or* a
+   `Result(_, _)`'s `Err` variant as failure. Success marks the row
+   `done`. Exhausting the live budget **traps**
+   `WorkflowActionPending { instance_id, state, action }` — never a
+   guessed outcome, matching `TransactCommitPending`'s own "stuck and
+   visible on purpose" precedent — but the row stays durably `pending`,
+   picked up by `Interpreter::replay_pending_workflow_actions` (called
+   once at `nirdosha serve` startup, right alongside
+   `replay_pending_transactions`) the same way a crashed `transact` is.
+   Arguments round-trip through JSON via `serve::encode_value`/
+   `decode_value` — the same general struct/scalar codec the RPC layer
+   already uses, decoded back on replay via the callee's *current*
+   declared parameter types (no separate type information is stored) —
+   so a callee whose signature changed, or that was removed, between the
+   crash and the restart reports `WorkflowReplayOutcome::Stuck` with a
+   named reason rather than guessing.
 
 ## `send_email`/`send_sms`/`send_push`/`notify`
 
@@ -245,17 +261,6 @@ builtin).
 
 ## Deliberate non-goals (disclosed, not silently dropped)
 
-- **No crash-durable replay of individual `on_entry`/`on_exit` actions.**
-  Unlike `transact_log.rs` (which logs `network`'s intent *before*
-  running it, specifically so a crash mid-call is replayable),
-  `workflow_log.rs` does not yet log a pending row per action before
-  dispatch. A failed action retries in-process only; exhausting the
-  budget traps `WorkflowActionPending`, and the instance's `state` has
-  already durably moved by that point (for an `on_entry` failure) or
-  never moved at all (for an `on_exit` failure) — not lost, just stuck on
-  that one state's actions until the transition is retried. A future
-  increment can add the same `begin_pending`/replay shape `transact_log.rs`
-  already has, if this proves not to be enough in practice.
 - **This repository does not terminate WebSocket connections and adds no
   new transport.** `notify`'s real-time path is a Redis `PUBLISH` — an
   external WS gateway process is assumed, not built here.

@@ -36,7 +36,7 @@ fn is_parse_error(src: &str) -> bool {
 
 #[test]
 fn example_transact_runs_to_completion() {
-    let src = include_str!("../examples/transact.nir");
+    let src = include_str!("../../examples/transact.nir");
     assert_eq!(run(src), Ok(Value::Unit));
 }
 

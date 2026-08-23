@@ -72,7 +72,7 @@ cargo run -- serve <file.nil> --port 8080     # run as a real HTTP service
 | Where Nirdosha's std-lib design departs from the two earlier aspirational specs | `PROTOLANG_PORT.md` (itself responds to `protolang_reference_specification.md`/`protolang_std_io_specification.md`) |
 | LLM-agent-facing HTTP API spec (constrained gen, validation, sandboxed exec, provenance) — **spec only, server not built**, see `ROADMAP.md` Track C | `nirdosha-agent-api.md` |
 | Remaining UI-DSL doc debt | `compiler/UI_DSL_TODO.md` |
-| The trade-finance demo app's own module-by-module build tracker | `compiler/examples/trade-finance/todo.md` |
+| The trade-finance demo app's own module-by-module build tracker | `examples/trade-finance/todo.md` |
 | Browsable concatenation of every `.nir` example (generated locally, not in git) | `all_examples.md` |
 
 **Not this project's work, don't load for Nirdosha tasks**:

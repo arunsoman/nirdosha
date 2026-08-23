@@ -4,23 +4,20 @@
 //! durability, not batched" shape. Owns everything `WORKFLOW.md`'s
 //! desugared `__workflow_start`/`__workflow_advance`/`__workflow_link_advance`
 //! builtins (`interpreter.rs`) need at runtime: instance state, an
-//! append-only transition history, magic-link mint/consume, and the two
+//! append-only transition history, magic-link mint/consume, the two
 //! pieces of identity bookkeeping no builtin/route in this codebase kept
 //! before (`identity_directory` for `Recipient::ByRole`, `identity_presence`
-//! for `notify`'s online/offline branch).
-//!
-//! **Scope note, disclosed rather than silently dropped**: unlike
-//! `transact_log.rs`, this module does not (yet) durably log each
-//! individual `on_entry`/`on_exit` action call before dispatching it, so
-//! there is no `replay_pending_workflow_actions` startup pass. A failed
-//! action retries in-process (`Interpreter::run_workflow_action`, the same
-//! bounded-backoff shape `run_transact_write_slot` uses for `commit`/
-//! `compensate`) and, if the retry budget is exhausted, traps
-//! `WorkflowActionError::ActionPending` — the instance's `state` has
-//! already durably advanced by that point, so it is not lost, just stuck
-//! on that state's actions until an operator (or a future replay pass)
-//! retries the transition again. `WORKFLOW.md`'s "deliberate non-goals"
-//! section calls this out explicitly.
+//! for `notify`'s online/offline branch), and — same "log intent *before*
+//! running it" crash-safety boundary `transact_log.rs`'s own
+//! `begin_pending` gives `network` — a pending row per `on_entry`/
+//! `on_exit` action call, written before `Interpreter::run_workflow_actions`
+//! dispatches it, so `Interpreter::replay_pending_workflow_actions` (called
+//! once at `nirdosha serve` startup, right alongside
+//! `replay_pending_transactions`) can resume a crash mid-action-fan-out
+//! without needing the original `.nir` call site or environment — the row
+//! is self-contained (callee name + already-evaluated, JSON-encoded
+//! arguments, decoded back via the callee's own declared parameter types
+//! at replay time, `serve::decode_value`).
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -71,6 +68,20 @@ impl WorkflowLog {
             CREATE TABLE IF NOT EXISTS identity_presence (
                 subject TEXT PRIMARY KEY,
                 online INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS workflow_pending_action (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id INTEGER NOT NULL,
+                workflow_name TEXT NOT NULL,
+                state TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                action_index INTEGER NOT NULL,
+                action_fn TEXT NOT NULL,
+                args_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );",
         )
@@ -208,4 +219,104 @@ impl WorkflowLog {
             .map_err(io_err)?;
         Ok(online.unwrap_or(0) != 0)
     }
+
+    /// Durably records intent to run one `on_entry`/`on_exit` action call
+    /// — written *before* `Interpreter::run_workflow_actions` actually
+    /// dispatches it, the same "record the intent, then act" ordering
+    /// `transact_log.rs::begin_pending` gives `network`. `args_json` is a
+    /// JSON array of each already-evaluated argument (`serve::encode_value`,
+    /// the same general struct/scalar codec the RPC layer already uses —
+    /// not restricted to `Ty::is_transact_scalar` the way `transact`'s own
+    /// log is, since a workflow action's arguments are already limited to
+    /// `instance_id`/`data.<field>`/`link_<Event>`, never a live resource
+    /// handle). Returns the new row's id, used by `mark_action_done`/
+    /// `bump_action_attempts` to update this exact row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_pending_action(
+        &self,
+        instance_id: i64,
+        workflow_name: &str,
+        state: &str,
+        slot: &str,
+        action_index: i64,
+        action_fn: &str,
+        args_json: &str,
+        now: i64,
+    ) -> Result<i64, String> {
+        let conn = self.conn.lock().expect("workflow log mutex poisoned");
+        conn.execute(
+            "INSERT INTO workflow_pending_action \
+             (instance_id, workflow_name, state, slot, action_index, action_fn, args_json, status, attempts, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)",
+            params![instance_id, workflow_name, state, slot, action_index, action_fn, args_json, now, now],
+        )
+        .map_err(io_err)?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn mark_action_done(&self, id: i64, now: i64) -> Result<(), String> {
+        let conn = self.conn.lock().expect("workflow log mutex poisoned");
+        conn.execute("UPDATE workflow_pending_action SET status = 'done', updated_at = ? WHERE id = ?", params![now, id])
+            .map_err(io_err)?;
+        Ok(())
+    }
+
+    pub fn bump_action_attempts(&self, id: i64, now: i64) -> Result<(), String> {
+        let conn = self.conn.lock().expect("workflow log mutex poisoned");
+        conn.execute(
+            "UPDATE workflow_pending_action SET attempts = attempts + 1, updated_at = ? WHERE id = ?",
+            params![now, id],
+        )
+        .map_err(io_err)?;
+        Ok(())
+    }
+
+    /// Every not-yet-`done` action row, oldest first — `Interpreter::
+    /// replay_pending_workflow_actions` (`nirdosha serve` startup, once,
+    /// right alongside `replay_pending_transactions`) resumes each of
+    /// these independently.
+    pub fn list_pending_actions(&self) -> Result<Vec<PendingWorkflowAction>, String> {
+        let conn = self.conn.lock().expect("workflow log mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, instance_id, workflow_name, state, slot, action_index, action_fn, args_json, attempts \
+                 FROM workflow_pending_action WHERE status = 'pending' ORDER BY id ASC",
+            )
+            .map_err(io_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PendingWorkflowAction {
+                    id: row.get(0)?,
+                    instance_id: row.get(1)?,
+                    workflow_name: row.get(2)?,
+                    state: row.get(3)?,
+                    slot: row.get(4)?,
+                    action_index: row.get(5)?,
+                    action_fn: row.get(6)?,
+                    args_json: row.get(7)?,
+                    attempts: row.get(8)?,
+                })
+            })
+            .map_err(io_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(io_err)?);
+        }
+        Ok(out)
+    }
+}
+
+/// One `workflow_pending_action` row — see `WorkflowLog::begin_pending_action`'s
+/// doc comment for what each field means and when it's written.
+#[derive(Debug, Clone)]
+pub struct PendingWorkflowAction {
+    pub id: i64,
+    pub instance_id: i64,
+    pub workflow_name: String,
+    pub state: String,
+    pub slot: String,
+    pub action_index: i64,
+    pub action_fn: String,
+    pub args_json: String,
+    pub attempts: i64,
 }

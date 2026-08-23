@@ -272,7 +272,7 @@ pub struct Checker<'a> {
 /// `ast::BUILTIN_NAMES` is one for "is this name a builtin" at all.
 fn builtin_return_ty(name: &str) -> Option<Ty> {
     match name {
-        "json_parse" | "json_get" | "json_array_get" => Some(result_of(Ty::Json)),
+        "json_parse" | "json_get" | "json_array_get" | "json_set_str" => Some(result_of(Ty::Json)),
         "json_get_str" => Some(result_of(Ty::Str)),
         "json_get_i64" | "json_array_len" => Some(result_of(Ty::I64)),
         "json_get_f64" => Some(result_of(Ty::F64)),

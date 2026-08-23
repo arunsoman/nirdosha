@@ -1688,6 +1688,10 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "json_get_bool",
     "json_array_len",
     "json_array_get",
+    // `json_get_str`'s inverse -- see typeck.rs's `("json_set_str", 3)`
+    // arm for the exact shape/rationale (WORKFLOW.md needed at least this
+    // much JSON construction for `notify`/`send_email`'s `vars` payload).
+    "json_set_str",
     // HTTP (plain, client-only, layer 1 -- HTTPS/TLS is a real, deliberate
     // gap: PROTOLANG_PORT.md's std_io §12 already says TLS should be a
     // vetted library binding, not hand-rolled, and no such binding has

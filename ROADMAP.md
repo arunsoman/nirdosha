@@ -25,7 +25,7 @@ A, Track B, Track C below) — but the specs themselves stay put.
 
 ## Status tags
 
-Same discipline `compiler/examples/trade-finance/todo.md` already uses:
+Same discipline `examples/trade-finance/todo.md` already uses:
 checked off only once actually run/verified, not on "code written."
 
 - `[DONE]` — verified complete (tests pass, or run end-to-end).
@@ -131,10 +131,16 @@ messages.
   repo terminates no WebSocket connections itself (verified absent
   before building this, not assumed). `nirdosha build`/`emit-llvm`
   cleanly reject `workflow`-using programs via `check_supported`, same
-  as `transact`. Full design, runtime protocol, and disclosed non-goals
-  (no crash-durable per-action replay yet; `payload` not yet threaded
-  into action bindings) in `WORKFLOW.md`. 3 new end-to-end tests
-  (`tests/workflow.rs`); full existing suite (400+ tests) still green.
+  as `transact`. `on_entry`/`on_exit` actions are crash-durable
+  (`WorkflowLog::begin_pending_action`/`Interpreter::
+  replay_pending_workflow_actions`, replayed at `nirdosha serve` startup
+  alongside `transact`'s own replay) — added same-day after the first cut
+  shipped without it, closing the one gap that had been disclosed rather
+  than silently left. Full design, runtime protocol, and remaining
+  disclosed non-goals (`payload` not yet threaded into action bindings;
+  no real WebSocket termination, by design) in `WORKFLOW.md`. 6 new
+  end-to-end tests (`tests/workflow.rs`, including two dedicated replay
+  tests); full existing suite (400+ tests) still green.
 
 ---
 
@@ -212,6 +218,22 @@ of Track B has landed.*
   (2026-08-23) was a breaking language change shipped in one session —
   need a real policy before a deployed critical app can trust future
   changes won't silently break it.
+- `[OPEN]` **A6. `workflow`'s real-time presence gateway.** `notify()`
+  (`WORKFLOW.md`) publishes to `nirdosha:push:<subject>` (Redis) and
+  reads `identity_presence` — both real — but nothing in this repo
+  terminates a live browser WebSocket/SSE connection, and that's the
+  only thing that could ever legitimately call the two routes that
+  populate `identity_presence` (`_presence_connect`/`_presence_disconnect`)
+  or subscribe to those Redis channels. Net effect today: `identity_presence`
+  never has an "online" row, so `notify()` always silently takes the
+  offline (`send_email`) path — it doesn't error, it just never does the
+  "push it live" half of its job. Needs a small standalone service
+  (outside `compiler/`) that: terminates the real client connections,
+  calls `_presence_connect`/`_presence_disconnect` as they open/close
+  (bearer-token-authenticated via `--presence-token`), and subscribes to
+  each `nirdosha:push:<subject>` channel to relay to the right live
+  connection. `send_email`/`send_sms`/`send_push` and every other part
+  of `workflow` are unaffected and fully functional without this.
 
 ---
 

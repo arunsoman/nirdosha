@@ -52,7 +52,7 @@ use crate::effects::{self, EffectSet};
 use crate::observability;
 use crate::token::Span;
 use crate::transact_log::{PendingTxn, TransactLog};
-use crate::workflow_log::WorkflowLog;
+use crate::workflow_log::{PendingWorkflowAction, WorkflowLog};
 
 /// Renamed on import — this file's own `Value` enum would otherwise
 /// collide with `serde_json::Value`'s name at every use site.
@@ -2469,6 +2469,24 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
                 Err(e) => Ok(result_err(e)),
             }
         }
+        // `json_get_str`'s inverse — `typeck.rs`'s `("json_set_str", 3)`
+        // arm has the full rationale. `null` (what `json_parse("null")`
+        // and `json_parse("{}")`'s own inverse-of-empty-object give) is
+        // treated as "start a fresh object," not an error — the common
+        // "I have no object yet, just a value to set" case shouldn't need
+        // a separate object-construction builtin of its own.
+        "json_set_str" => {
+            let (Value::Json(doc), Value::Str(key), Value::Str(value)) = (&args[0], &args[1], &args[2]) else {
+                unreachable!("typeck.rs already proved these are json, str and str")
+            };
+            let mut obj = match doc.as_ref() {
+                JsonDoc::Object(m) => m.clone(),
+                JsonDoc::Null => serde_json::Map::new(),
+                other => return Ok(result_err(format!("json_set_str: expected a json object (or null), found {}", json_kind(other)))),
+            };
+            obj.insert(key.to_string(), JsonDoc::String(value.to_string()));
+            Ok(result_ok(Value::Json(Arc::new(JsonDoc::Object(obj)))))
+        }
         "json_array_len" => {
             let Value::Json(doc) = &args[0] else { unreachable!("typeck.rs already proved this is json") };
             match doc.as_array() {
@@ -3122,6 +3140,22 @@ pub enum ReplayOutcome {
     Stuck { txn_id: String, reason: String },
 }
 
+/// One `workflow_pending_action` row's outcome from
+/// `Interpreter::replay_pending_workflow_actions` — same three-way shape
+/// as `ReplayOutcome` above, for the same reasons.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkflowReplayOutcome {
+    /// The action's retry succeeded this replay pass — marked `done`.
+    Resolved { instance_id: i64, action: String },
+    /// Still failing, retry budget exhausted again — left `pending`,
+    /// eligible for the next replay.
+    StillPending { instance_id: i64, action: String },
+    /// Could not even be attempted (the callee no longer exists in this
+    /// program, or its durably-logged arguments no longer match its
+    /// current signature) — left exactly as it was, needs an operator.
+    Stuck { instance_id: i64, action: String, reason: String },
+}
+
 impl Interpreter {
     pub fn new(program: Arc<Program>, source: Arc<str>) -> Self {
         let fn_index = program.fns.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect();
@@ -3696,43 +3730,143 @@ impl Interpreter {
 
     /// Runs every action in `actions` in order, in `env` (already carrying
     /// `instance_id`/`data`/`link_<Event>` bindings — see
-    /// `workflow_start`/`workflow_advance`). Each action gets a bounded,
-    /// backoff retry (same shape `run_transact_write_slot` gives
-    /// `commit`/`compensate`) and traps `WorkflowActionPending` if the
-    /// budget is exhausted — see `workflow_log.rs`'s module doc for why
-    /// this retry is in-process only in this version, not crash-durable.
-    fn run_workflow_actions(&self, actions: &[TransactSlot], env: &mut Env, instance_id: i64, state: &str) -> SResult<()> {
-        const MAX_ATTEMPTS: u32 = 5;
-        for action in actions {
+    /// `workflow_start`/`workflow_advance`). Each action's callee and
+    /// already-evaluated arguments are durably recorded (`WorkflowLog::
+    /// begin_pending_action`) *before* it's dispatched — the same "log
+    /// intent, then act" ordering `transact_log.rs::begin_pending` gives
+    /// `network` — so `replay_pending_workflow_actions` can resume a crash
+    /// mid-fan-out at startup, not just retry in-process.
+    fn run_workflow_actions(
+        &self,
+        workflow_name: &str,
+        actions: &[TransactSlot],
+        env: &mut Env,
+        instance_id: i64,
+        state: &str,
+        slot: &str,
+    ) -> SResult<()> {
+        for (action_index, action) in actions.iter().enumerate() {
             let mut vals = Vec::with_capacity(action.args.len());
             for a in &action.args {
                 vals.push(self.eval_expr(a, env)?);
             }
-            let mut attempt = 0u32;
-            loop {
-                let outcome = self.call(&action.name, &vals, action.span);
-                let failed = match &outcome {
-                    Err(_) => true,
-                    Ok(v) => is_result_err(v),
-                };
-                if !failed {
-                    break;
-                }
-                attempt += 1;
-                if attempt >= MAX_ATTEMPTS {
-                    return Err(Signal::Err(RuntimeError {
-                        kind: ErrorKind::WorkflowActionPending {
-                            instance_id,
-                            state: state.to_string(),
-                            action: action.name.clone(),
-                        },
-                        span: action.span,
-                    }));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20u64 << attempt.min(10)));
-            }
+            let wlog = self.workflow_log(action.span).map_err(Signal::Err)?;
+            let args_json = self.encode_workflow_action_args(&vals, action.span)?;
+            let now = now_secs();
+            let row_id = wlog
+                .begin_pending_action(instance_id, workflow_name, state, slot, action_index as i64, &action.name, &args_json, now)
+                .map_err(|e| Signal::Err(self.workflow_log_err(e, action.span)))?;
+            self.run_one_workflow_action(&wlog, row_id, &action.name, &vals, instance_id, state, action.span)?;
         }
         Ok(())
+    }
+
+    /// `Vec<Value>` -> a JSON array text, via `serve::encode_value`'s
+    /// general struct/scalar codec (not `transact_log.rs`'s own narrower
+    /// scalar-only encoder — a workflow action's arguments can be a whole
+    /// `data`-derived struct or a `link_<Event>` token struct, not just
+    /// scalars). Decoded back on replay via the callee's own declared
+    /// parameter types (`replay_one_workflow_action`), so no type
+    /// information needs to be stored here at all.
+    fn encode_workflow_action_args(&self, vals: &[Value], span: Span) -> SResult<String> {
+        let mut arr = Vec::with_capacity(vals.len());
+        for v in vals {
+            arr.push(crate::serve::encode_value(v, &self.program).map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?);
+        }
+        Ok(serde_json::Value::Array(arr).to_string())
+    }
+
+    /// The actual dispatch-with-retry for one already-durably-logged
+    /// action row — shared by `run_workflow_actions` (the live path) and
+    /// `replay_one_workflow_action` (crash recovery), so both give exactly
+    /// the same bounded-backoff-then-trap behavior `run_transact_write_slot`
+    /// gives `transact`'s `commit`/`compensate`.
+    fn run_one_workflow_action(
+        &self,
+        wlog: &WorkflowLog,
+        row_id: i64,
+        action_fn: &str,
+        vals: &[Value],
+        instance_id: i64,
+        state: &str,
+        span: Span,
+    ) -> SResult<()> {
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut attempt = 0u32;
+        loop {
+            let outcome = self.call(action_fn, vals, span);
+            let failed = match &outcome {
+                Err(_) => true,
+                Ok(v) => is_result_err(v),
+            };
+            if !failed {
+                wlog.mark_action_done(row_id, now_secs()).map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
+                return Ok(());
+            }
+            attempt += 1;
+            let _ = wlog.bump_action_attempts(row_id, now_secs());
+            if attempt >= MAX_ATTEMPTS {
+                return Err(Signal::Err(RuntimeError {
+                    kind: ErrorKind::WorkflowActionPending { instance_id, state: state.to_string(), action: action_fn.to_string() },
+                    span,
+                }));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20u64 << attempt.min(10)));
+        }
+    }
+
+    /// `WORKFLOW.md`'s crash-replay pass — called once at `nirdosha serve`
+    /// startup, right alongside `replay_pending_transactions`, before the
+    /// server accepts any request. Every `workflow_pending_action` row
+    /// still `pending` (the action either never ran, or ran and exhausted
+    /// its live retry budget) gets one more bounded retry attempt here;
+    /// this never traps the whole startup — an action still failing after
+    /// replay stays durably `pending`, eligible for the next replay or an
+    /// operator's attention, reported in the returned outcome instead.
+    pub fn replay_pending_workflow_actions(&self) -> Result<Vec<WorkflowReplayOutcome>, RuntimeError> {
+        let span = Span { line: 0, col: 0 };
+        let wlog = self.workflow_log(span)?;
+        let pending = wlog.list_pending_actions().map_err(|e| self.workflow_log_err(e, span))?;
+        Ok(pending.into_iter().map(|p| self.replay_one_workflow_action(&wlog, p, span)).collect())
+    }
+
+    fn replay_one_workflow_action(&self, wlog: &WorkflowLog, p: PendingWorkflowAction, span: Span) -> WorkflowReplayOutcome {
+        let instance_id = p.instance_id;
+        let action = p.action_fn.clone();
+        let Some(f) = self.find_fn(&p.action_fn) else {
+            return WorkflowReplayOutcome::Stuck { instance_id, action, reason: "callee no longer exists in this program".to_string() };
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&p.args_json) {
+            Ok(v) => v,
+            Err(e) => return WorkflowReplayOutcome::Stuck { instance_id, action, reason: format!("corrupt args_json: {e}") },
+        };
+        let Some(arr) = parsed.as_array() else {
+            return WorkflowReplayOutcome::Stuck { instance_id, action, reason: "args_json is not a JSON array".to_string() };
+        };
+        if arr.len() != f.params.len() {
+            return WorkflowReplayOutcome::Stuck {
+                instance_id,
+                action,
+                reason: "argument count no longer matches the callee's current signature".to_string(),
+            };
+        }
+        let mut vals = Vec::with_capacity(arr.len());
+        for (j, param) in arr.iter().zip(f.params.iter()) {
+            match crate::serve::decode_value(j, &param.ty, &self.program, 0) {
+                Ok(v) => vals.push(v),
+                Err(e) => {
+                    return WorkflowReplayOutcome::Stuck {
+                        instance_id,
+                        action,
+                        reason: format!("failed to decode argument `{}`: {e}", param.name),
+                    }
+                }
+            }
+        }
+        match self.run_one_workflow_action(wlog, p.id, &p.action_fn, &vals, instance_id, &p.state, span) {
+            Ok(()) => WorkflowReplayOutcome::Resolved { instance_id, action },
+            Err(_) => WorkflowReplayOutcome::StillPending { instance_id, action },
+        }
     }
 
     /// Mints one fresh, not-yet-consumed token per `link`-marked outgoing
@@ -3789,7 +3923,7 @@ impl Interpreter {
         env.define("instance_id", Value::Int(instance_id), Ty::I64);
         env.define("data", data_val, data_ty);
         self.bind_link_tokens(&wlog, wf, initial, instance_id, &mut env, span)?;
-        self.run_workflow_actions(&initial.on_entry, &mut env, instance_id, &initial.name)?;
+        self.run_workflow_actions(workflow_name, &initial.on_entry, &mut env, instance_id, &initial.name, "entry")?;
         Ok(result_ok(Value::Int(instance_id)))
     }
 
@@ -3835,7 +3969,7 @@ impl Interpreter {
         let mut exit_env = Env::new();
         exit_env.define("instance_id", Value::Int(instance_id), Ty::I64);
         exit_env.define("data", data_val.clone(), data_ty.clone());
-        self.run_workflow_actions(&from_state.on_exit, &mut exit_env, instance_id, &from_state.name)?;
+        self.run_workflow_actions(workflow_name, &from_state.on_exit, &mut exit_env, instance_id, &from_state.name, "exit")?;
 
         let now = now_secs();
         wlog.record_transition(instance_id, &from_state.name, &transition.target, &event_tag, now)
@@ -3850,7 +3984,7 @@ impl Interpreter {
         entry_env.define("instance_id", Value::Int(instance_id), Ty::I64);
         entry_env.define("data", data_val, data_ty);
         self.bind_link_tokens(&wlog, wf, to_state, instance_id, &mut entry_env, span)?;
-        self.run_workflow_actions(&to_state.on_entry, &mut entry_env, instance_id, &to_state.name)?;
+        self.run_workflow_actions(workflow_name, &to_state.on_entry, &mut entry_env, instance_id, &to_state.name, "entry")?;
 
         Ok(result_ok(Value::Bool(true)))
     }

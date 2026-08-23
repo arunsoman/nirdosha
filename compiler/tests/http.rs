@@ -286,7 +286,7 @@ fn example_http_runs_to_completion() {
         listener,
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"message\": \"pong\"}",
     );
-    let src = include_str!("../examples/http.nir").replace("8977", &port.to_string());
+    let src = include_str!("../../examples/http.nir").replace("8977", &port.to_string());
     let program = parse_ok(&src);
     typecheck(&program).expect("should typecheck cleanly");
     match run(&src) {

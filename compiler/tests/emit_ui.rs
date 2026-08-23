@@ -26,7 +26,7 @@ fn emit_ui(src: &str) -> String {
 
 #[test]
 fn derives_a_screen_per_struct_with_a_convention_fn() {
-    let html = emit_ui(include_str!("../examples/ui_todo.nir"));
+    let html = emit_ui(include_str!("../../examples/ui_todo.nir"));
 
     // Nav entry + manifest entry for `Todo`.
     assert!(html.contains("\"name\":\"Todo\""), "manifest should carry the Todo screen");

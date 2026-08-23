@@ -36,7 +36,7 @@ fn mat_f64(vals: &[f64], rows: usize, cols: usize) -> Value {
 
 #[test]
 fn example_matrices_runs_to_completion() {
-    let src = include_str!("../examples/matrices.nir");
+    let src = include_str!("../../examples/matrices.nir");
     assert_eq!(run(src), Ok(Value::Unit));
 }
 

@@ -39,19 +39,19 @@ fn first_type_error(src: &str) -> TypeErrorKind {
 
 #[test]
 fn example_hello_runs_to_completion() {
-    let src = include_str!("../examples/hello.nir");
+    let src = include_str!("../../examples/hello.nir");
     assert_eq!(run(src), Ok(Value::Unit));
 }
 
 #[test]
 fn example_factorial_runs_to_completion() {
-    let src = include_str!("../examples/factorial.nir");
+    let src = include_str!("../../examples/factorial.nir");
     assert_eq!(run(src), Ok(Value::Unit));
 }
 
 #[test]
 fn example_loop_runs_to_completion() {
-    let src = include_str!("../examples/loop.nir");
+    let src = include_str!("../../examples/loop.nir");
     assert_eq!(run(src), Ok(Value::Unit));
 }
 
@@ -489,9 +489,9 @@ fn missing_main_is_caught_statically() {
 #[test]
 fn all_three_examples_pass_static_type_checking() {
     for src in [
-        include_str!("../examples/hello.nir"),
-        include_str!("../examples/factorial.nir"),
-        include_str!("../examples/loop.nir"),
+        include_str!("../../examples/hello.nir"),
+        include_str!("../../examples/factorial.nir"),
+        include_str!("../../examples/loop.nir"),
     ] {
         let program = parse_ok(src);
         assert_eq!(typecheck(&program), Ok(()));

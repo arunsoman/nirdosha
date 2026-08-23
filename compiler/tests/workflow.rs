@@ -150,7 +150,228 @@ fn link_transition_mints_a_single_use_token_that_advances_the_state() {
 /// typechecks cleanly end to end.
 #[test]
 fn kyc_onboarding_example_typechecks() {
-    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/kyc_onboarding.nir"))
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/kyc_onboarding.nir"))
         .expect("examples/kyc_onboarding.nir should exist and be readable");
     build_program(&src);
+}
+
+// ---- crash-durable action replay -------------------------------------
+//
+// `WorkflowLog::begin_pending_action` durably records an `on_entry`/
+// `on_exit` action's callee + arguments *before* `run_workflow_actions`
+// ever dispatches it (`workflow_log.rs`'s own doc comment) -- so a crash
+// between that write and the action actually running must still be
+// resumable by `Interpreter::replay_pending_workflow_actions` on the next
+// startup, from nothing but the durable row itself (no live `.nir` call
+// site, no environment). This constructs exactly that "recorded, never
+// dispatched" row by hand (`begin_pending_action` directly, bypassing
+// `run_workflow_actions`) -- the narrowest possible crash window, and the
+// same one `tests/transact_durability.rs`'s own replay tests target for
+// `transact`.
+
+const REPLAY_SRC: &str = r#"
+        fn mark_ran_inner(conn: db, instance_id: i64) -> bool {
+            let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS ran (instance_id INTEGER)") { Ok(n) => n, Err(e) => -1 }
+            let t2: i64 = match db_execute(conn, "INSERT INTO ran (instance_id) VALUES (?)", instance_id) { Ok(n) => n, Err(e) => -1 }
+            return true
+        }
+
+        fn mark_ran(instance_id: i64) -> bool {
+            return match db_connect("__OBSERVE_DB__") {
+                Ok(conn) => mark_ran_inner(conn, instance_id),
+                Err(e) => false,
+            }
+        }
+    "#;
+
+#[test]
+fn replay_resumes_an_action_that_was_logged_but_never_dispatched() {
+    let observe_db = temp_path("replay-observe");
+    let src = REPLAY_SRC.replace("__OBSERVE_DB__", observe_db.to_str().expect("temp path should be valid UTF-8"));
+    let program = build_program(&src);
+    let workflow_log_path = temp_path("replay-workflow-log");
+
+    // Simulate "crashed right after logging intent, before ever calling
+    // `mark_ran`" -- write the pending row directly, the same shape
+    // `Interpreter::run_workflow_actions` would have written.
+    {
+        let wlog = WorkflowLog::open(&workflow_log_path).expect("workflow log should open");
+        let args_json = serde_json::json!([99]).to_string();
+        wlog.begin_pending_action(1, "ReplayDemo", "SomeState", "entry", 0, "mark_ran", &args_json, 0)
+            .expect("begin_pending_action should succeed");
+    }
+
+    // Nothing should have run yet -- no fresh `Interpreter` has replayed
+    // this row, and `mark_ran` was never called live.
+    assert!(!observe_db.exists(), "mark_ran must not have run before replay");
+
+    let interp = Interpreter::new(Arc::new(program), Arc::from(src.as_str())).with_workflow_log_path(workflow_log_path.clone());
+    let outcomes = interp.replay_pending_workflow_actions().expect("replay should not trap");
+    assert_eq!(outcomes.len(), 1);
+    match &outcomes[0] {
+        nirdosha::interpreter::WorkflowReplayOutcome::Resolved { instance_id, action } => {
+            assert_eq!(*instance_id, 1);
+            assert_eq!(action, "mark_ran");
+        }
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+
+    // `mark_ran` really ran (a real, separate SQLite file it created) --
+    // and the pending row is gone, so a second replay finds nothing left.
+    assert!(observe_db.exists(), "replay should have actually dispatched mark_ran");
+    let wlog = WorkflowLog::open(&workflow_log_path).expect("workflow log should reopen");
+    assert!(wlog.list_pending_actions().expect("query should succeed").is_empty());
+}
+
+#[test]
+fn replay_reports_stuck_for_a_callee_that_no_longer_exists() {
+    // A minimal, unrelated program -- no `mark_ran` in it at all -- so
+    // replaying a row naming that callee can't possibly find it, the same
+    // way a program edited between a crash and a restart legitimately
+    // could leave a stale pending row behind.
+    let program = build_program("fn unrelated() -> bool { return true }");
+    let workflow_log_path = temp_path("replay-stuck");
+    {
+        let wlog = WorkflowLog::open(&workflow_log_path).expect("workflow log should open");
+        let args_json = serde_json::json!([1]).to_string();
+        wlog.begin_pending_action(2, "ReplayDemo", "SomeState", "entry", 0, "mark_ran", &args_json, 0)
+            .expect("begin_pending_action should succeed");
+    }
+    let interp =
+        Interpreter::new(Arc::new(program), Arc::from("")).with_workflow_log_path(workflow_log_path.clone());
+    let outcomes = interp.replay_pending_workflow_actions().expect("replay should not trap");
+    assert_eq!(outcomes.len(), 1);
+    match &outcomes[0] {
+        nirdosha::interpreter::WorkflowReplayOutcome::Stuck { instance_id, action, .. } => {
+            assert_eq!(*instance_id, 2);
+            assert_eq!(action, "mark_ran");
+        }
+        other => panic!("expected Stuck, got {other:?}"),
+    }
+    // Left exactly as it was -- still pending, not silently dropped.
+    let wlog = WorkflowLog::open(&workflow_log_path).expect("workflow log should reopen");
+    assert_eq!(wlog.list_pending_actions().expect("query should succeed").len(), 1);
+}
+
+// ---- on_entry/on_exit action calls are really type-checked ------------
+//
+// `check_workflow_decl` used to only check that `data.<field>`/
+// `link_<Event>` *names* existed, never that an action call's arguments
+// actually matched its callee's declared parameter types -- so a
+// `needs_i64(data.name)` where `name: str` typechecked cleanly and would
+// only have failed at runtime, inside `self.call`, far from the actual
+// mistake. Fixed by routing every action call through this checker's own
+// `infer`/`infer_call`, the same machinery an ordinary function body's
+// calls already go through.
+
+#[test]
+fn action_call_argument_type_mismatch_is_a_compile_error() {
+    let toks = Lexer::new(
+        r#"
+        fn needs_i64(x: i64) -> bool { return true }
+
+        workflow Demo {
+            data { name: str }
+            state Start {
+                on_entry {
+                    needs_i64(data.name)
+                }
+                on Go -> Done
+            }
+            state Done terminal {}
+        }
+    "#,
+    )
+    .tokenize()
+    .expect("lex should succeed");
+    let program = Parser::new(toks).parse_program().expect("parse should succeed");
+    let errors = typecheck_optional_main(&program).expect_err("a str passed where i64 is expected must be rejected");
+    assert!(
+        errors.iter().any(|e| matches!(&e.kind, nirdosha::typeck::TypeErrorKind::TypeMismatch { .. })),
+        "expected a TypeMismatch, got {errors:?}"
+    );
+}
+
+#[test]
+fn action_call_wrong_arity_is_a_compile_error() {
+    let toks = Lexer::new(
+        r#"
+        fn needs_one_arg(x: i64) -> bool { return true }
+
+        workflow Demo {
+            data { }
+            state Start {
+                on_entry {
+                    needs_one_arg(instance_id, instance_id)
+                }
+                on Go -> Done
+            }
+            state Done terminal {}
+        }
+    "#,
+    )
+    .tokenize()
+    .expect("lex should succeed");
+    let program = Parser::new(toks).parse_program().expect("parse should succeed");
+    let errors = typecheck_optional_main(&program).expect_err("calling a 1-arg fn with 2 args must be rejected");
+    assert!(
+        errors.iter().any(|e| matches!(&e.kind, nirdosha::typeck::TypeErrorKind::ArityMismatch { .. })),
+        "expected an ArityMismatch, got {errors:?}"
+    );
+}
+
+#[test]
+fn action_call_unknown_data_field_is_a_compile_error() {
+    let toks = Lexer::new(
+        r#"
+        fn noop(x: i64) -> bool { return true }
+
+        workflow Demo {
+            data { name: str }
+            state Start {
+                on_entry {
+                    noop(data.not_a_real_field)
+                }
+                on Go -> Done
+            }
+            state Done terminal {}
+        }
+    "#,
+    )
+    .tokenize()
+    .expect("lex should succeed");
+    let program = Parser::new(toks).parse_program().expect("parse should succeed");
+    typecheck_optional_main(&program).expect_err("an unknown `data` field must be rejected");
+}
+
+#[test]
+fn action_call_link_binding_out_of_scope_is_a_compile_error() {
+    // `link_Verify` only exists in the `on_entry` of a state that
+    // declares `on link Verify -> ...` as one of *its own* outgoing
+    // transitions -- referencing it from a state that doesn't must fail,
+    // the same as referencing any other undeclared variable.
+    let toks = Lexer::new(
+        r#"
+        fn noop(t: SomeLinkToken) -> bool { return true }
+
+        struct SomeLinkToken { value: str }
+
+        workflow Demo {
+            data { }
+            state Start {
+                on_entry {
+                    noop(link_Verify)
+                }
+                on Go -> Done
+            }
+            state Done terminal {
+                on link Verify -> Done
+            }
+        }
+    "#,
+    )
+    .tokenize()
+    .expect("lex should succeed");
+    let program = Parser::new(toks).parse_program().expect("parse should succeed");
+    typecheck_optional_main(&program).expect_err("a link binding from a different state must be out of scope");
 }

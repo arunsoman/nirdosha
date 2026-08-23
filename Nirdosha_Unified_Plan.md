@@ -138,7 +138,7 @@ New `TypeErrorKind::ShapeMismatch` for inner-dimension failures in matmul.
 
 #### 4.1.6 Verification
 - `cargo test` green.
-- `compiler/examples/matrices.nir` + `compiler/tests/matrices.rs` — end-to-end example and grouped tests, following the `strings.nir`/`tests/strings.rs` pattern.
+- `examples/matrices.nir` + `compiler/tests/matrices.rs` — end-to-end example and grouped tests, following the `strings.nir`/`tests/strings.rs` pattern.
 - Static-rejection tests for shape mismatch (`[1.0] + [1.0, 2.0]`), `Vector * Vector`, and out-of-bounds index.
 
 ---
@@ -188,7 +188,7 @@ Ship the resulting file (e.g., `compiler/nirdosha.gbnf`) and reference it from `
 
 #### 4.2.5 Verification
 - `cargo test` green.
-- `compiler/examples/linalg.nir` + matching tests — textbook examples with known-good numeric output.
+- `examples/linalg.nir` + matching tests — textbook examples with known-good numeric output.
 - Fragment validation tests: valid fragment accepted, invalid fragment returns structured `Diagnostic` JSON.
 - Exported grammar validated against a real constrained-decoding loader, **and** the accept/reject fidelity corpus from 4.2.3 step 3 passes for both the hand-written parser and the exported grammar.
 
@@ -238,7 +238,7 @@ New syntax: `audited "<justification>" { <block> }`
 - **Scope boundary:** The compiler enforces syntax and non-empty justification. Judging justification *content* or gating authorship is a CI/review-process rule, not compiler code.
 
 #### 4.3.5 Files Touched
-`compiler/src/interpreter.rs` (RNG state, geometry, KF, TCP server), `compiler/src/ast.rs`, `compiler/src/parser.rs`, `compiler/src/token.rs`, `compiler/src/typeck.rs` (audited justification check), `compiler/examples/sensor_fusion.nir`, `compiler/examples/wargame_agents.nir`.
+`compiler/src/interpreter.rs` (RNG state, geometry, KF, TCP server), `compiler/src/ast.rs`, `compiler/src/parser.rs`, `compiler/src/token.rs`, `compiler/src/typeck.rs` (audited justification check), `examples/sensor_fusion.nir`, `examples/wargame_agents.nir`.
 
 #### 4.3.6 Verification
 - `cargo test` green.
@@ -395,10 +395,10 @@ Phase 3 and Phase 4 each depend only on Phase 2, not on each other — the branc
 | `compiler/src/lib.rs` | 0.5, 2 | Unified `Diagnostic` enum, fragment validation entry point |
 | `grammar_check/` or `grammar_export/` | 2 | GBNF/decoder-format export |
 | `GRAMMAR.md` | 2 | Reference generated grammar artifact |
-| `compiler/examples/matrices.nir` | 1 | End-to-end matrix example |
-| `compiler/examples/linalg.nir` | 2 | End-to-end LA example |
-| `compiler/examples/sensor_fusion.nir` | 3 | KF example |
-| `compiler/examples/wargame_agents.nir` | 3 | Actor simulation example |
+| `examples/matrices.nir` | 1 | End-to-end matrix example |
+| `examples/linalg.nir` | 2 | End-to-end LA example |
+| `examples/sensor_fusion.nir` | 3 | KF example |
+| `examples/wargame_agents.nir` | 3 | Actor simulation example |
 | `compiler/tests/*.rs` | 1, 2, 3 | Unit tests per phase |
 | `bench/` | 5 | Benchmark corpus and harness |
 
@@ -409,7 +409,7 @@ Phase 3 and Phase 4 each depend only on Phase 2, not on each other — the branc
 Every phase must satisfy:
 
 1. **`cargo test` green** — existing suite plus new tests, no regressions.
-2. **Example execution** — each phase's `.nir` example runs end-to-end via `cargo run -- interpret compiler/examples/<name>.nir`.
+2. **Example execution** — each phase's `.nir` example runs end-to-end via `cargo run -- interpret examples/<name>.nir`.
 3. **Static rejection tests** — every illegal operation (shape mismatch, `Vector * Vector`, empty `audited` justification, etc.) has a test asserting the specific `TypeErrorKind`.
 4. **Determinism test** (Phase 3+) — same seed + same binary → byte-identical output.
 5. **Round-trip test** (Phase 0.5+) — `--format=json` diagnostics deserialize correctly.

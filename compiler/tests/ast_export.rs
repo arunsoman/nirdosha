@@ -20,7 +20,7 @@ fn parse_ok(src: &str) -> Program {
 
 #[test]
 fn a_whole_program_round_trips_through_json() {
-    let src = include_str!("../examples/matrices.nir");
+    let src = include_str!("../../examples/matrices.nir");
     let program = parse_ok(src);
     let json = serde_json::to_string(&program).expect("Program should serialize");
     let back: Program = serde_json::from_str(&json).expect("Program should deserialize");
@@ -41,7 +41,7 @@ fn every_example_program_round_trips_through_json() {
     // silently doesn't round-trip (e.g. a hand-written `impl` that
     // shadowed the derive incorrectly -- not the case here, but this is
     // the test that would catch it if it ever were).
-    for entry in std::fs::read_dir("examples").expect("examples/ should exist") {
+    for entry in std::fs::read_dir("../examples").expect("examples/ should exist") {
         let path = entry.expect("dir entry should read").path();
         if path.extension().and_then(|e| e.to_str()) != Some("nir") {
             continue;

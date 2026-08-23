@@ -28,7 +28,7 @@ fn first_type_error(src: &str) -> TypeErrorKind {
 
 #[test]
 fn example_strings_runs_to_completion() {
-    let src = include_str!("../examples/strings.nir");
+    let src = include_str!("../../examples/strings.nir");
     assert_eq!(run(src), Ok(Value::Unit));
 }
 

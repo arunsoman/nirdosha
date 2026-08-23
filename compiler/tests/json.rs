@@ -333,7 +333,75 @@ fn json_is_interpreter_only_rejected_by_codegen() {
 
 #[test]
 fn example_json_runs_to_completion() {
-    let program = parse_ok(include_str!("../examples/json.nir"));
+    let program = parse_ok(include_str!("../../examples/json.nir"));
     typecheck(&program).expect("should typecheck cleanly");
-    assert_eq!(run(include_str!("../examples/json.nir")), Ok(Value::Unit));
+    assert_eq!(run(include_str!("../../examples/json.nir")), Ok(Value::Unit));
+}
+
+// ---- json_set_str (json_get_str's inverse, WORKFLOW.md) --------------
+
+#[test]
+fn json_set_str_adds_a_field_to_an_empty_object() {
+    let src = r#"
+        struct Text {
+            value: str,
+        }
+        fn main() -> Text {
+            return match json_parse("{}") {
+                Ok(doc) => match json_set_str(doc, "link_token", "abc123") {
+                    Ok(updated) => match json_get_str(updated, "link_token") {
+                        Ok(s) => Text(s),
+                        Err(e) => Text(e),
+                    },
+                    Err(e) => Text(e),
+                },
+                Err(e) => Text(e),
+            }
+        }
+    "#;
+    let program = parse_ok(src);
+    typecheck(&program).expect("should typecheck cleanly");
+    assert_eq!(
+        run(src),
+        Ok(Value::Struct(std::sync::Arc::from("Text"), std::sync::Arc::from(vec![Value::Str(std::sync::Arc::from("abc123"))])))
+    );
+}
+
+#[test]
+fn json_set_str_preserves_existing_fields() {
+    let src = r#"
+        fn main() -> i64 {
+            return match json_parse("{\"a\": 1}") {
+                Ok(doc) => match json_set_str(doc, "b", "two") {
+                    Ok(updated) => match json_get_i64(updated, "a") {
+                        Ok(n) => n,
+                        Err(e) => -1,
+                    },
+                    Err(e) => -1,
+                },
+                Err(e) => -1,
+            }
+        }
+    "#;
+    let program = parse_ok(src);
+    typecheck(&program).expect("should typecheck cleanly");
+    assert_eq!(run(src), Ok(Value::Int(1)));
+}
+
+#[test]
+fn json_set_str_on_a_non_object_is_a_clean_err_not_a_trap() {
+    let src = r#"
+        fn main() -> bool {
+            return match json_parse("[1, 2]") {
+                Ok(doc) => match json_set_str(doc, "k", "v") {
+                    Ok(updated) => false,
+                    Err(e) => true,
+                },
+                Err(e) => false,
+            }
+        }
+    "#;
+    let program = parse_ok(src);
+    typecheck(&program).expect("should typecheck cleanly");
+    assert_eq!(run(src), Ok(Value::Bool(true)));
 }

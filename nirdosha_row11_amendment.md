@@ -9,7 +9,7 @@ checking, affinity propagation through struct/enum fields (including
 through a generic instantiation's own concrete type arguments), and the
 `Option(T)`/`Result(T, E)` prelude (layer 7) are real, tested
 (`compiler/tests/structs_enums.rs`, `compiler/tests/generics.rs`,
-`compiler/examples/structs_enums.nir`, `compiler/examples/generics.nir`),
+`examples/structs_enums.nir`, `examples/generics.nir`),
 interpreter-only per layer 8's own scoping
 (`compiler/src/codegen.rs::check_supported` rejects any program that
 actually constructs/matches a `struct`/`enum` — including a prelude

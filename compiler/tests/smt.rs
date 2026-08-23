@@ -219,7 +219,7 @@ fn factorial_multiplication_is_not_proven_in_range() {
     // branch is genuinely, trivially safe (1 always fits `i64`) and now
     // correctly gets proven. A real improvement surfacing an
     // accidentally-over-broad test, not a regression.
-    let program = parse(include_str!("../examples/factorial.nir"));
+    let program = parse(include_str!("../../examples/factorial.nir"));
     let report = analyze(&program);
     let factorial_fn = program.fns.iter().find(|f| f.name == "factorial").unwrap();
     let mul_return_span = {
@@ -273,22 +273,22 @@ fn arithmetic_on_a_loop_reassigned_variable_after_the_loop_is_not_proven() {
 #[test]
 fn analyze_does_not_panic_on_any_example() {
     for src in [
-        include_str!("../examples/hello.nir"),
-        include_str!("../examples/factorial.nir"),
-        include_str!("../examples/loop.nir"),
-        include_str!("../examples/ownership.nir"),
-        include_str!("../examples/borrow.nir"),
-        include_str!("../examples/threads.nir"),
-        include_str!("../examples/channels.nir"),
-        include_str!("../examples/sandbox.nir"),
-        include_str!("../examples/sandbox_channels.nir"),
-        include_str!("../examples/strings.nir"),
-        include_str!("../examples/tcp_client.nir"),
-        include_str!("../examples/floats.nir"),
-        include_str!("../examples/matrices.nir"),
-        include_str!("../examples/linalg.nir"),
-        include_str!("../examples/sensor_fusion.nir"),
-        include_str!("../examples/wargame_agents.nir"),
+        include_str!("../../examples/hello.nir"),
+        include_str!("../../examples/factorial.nir"),
+        include_str!("../../examples/loop.nir"),
+        include_str!("../../examples/ownership.nir"),
+        include_str!("../../examples/borrow.nir"),
+        include_str!("../../examples/threads.nir"),
+        include_str!("../../examples/channels.nir"),
+        include_str!("../../examples/sandbox.nir"),
+        include_str!("../../examples/sandbox_channels.nir"),
+        include_str!("../../examples/strings.nir"),
+        include_str!("../../examples/tcp_client.nir"),
+        include_str!("../../examples/floats.nir"),
+        include_str!("../../examples/matrices.nir"),
+        include_str!("../../examples/linalg.nir"),
+        include_str!("../../examples/sensor_fusion.nir"),
+        include_str!("../../examples/wargame_agents.nir"),
     ] {
         let program = parse(src);
         let _ = analyze(&program); // just must not panic or hang

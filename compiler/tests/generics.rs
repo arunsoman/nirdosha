@@ -421,10 +421,10 @@ fn option_of_option_nests_correctly() {
 
 #[test]
 fn example_generics_runs_to_completion() {
-    let program = parse_ok(include_str!("../examples/generics.nir"));
+    let program = parse_ok(include_str!("../../examples/generics.nir"));
     typecheck(&program).expect("should typecheck cleanly");
     check_ownership(&program).expect("should pass ownership checking");
-    match run(include_str!("../examples/generics.nir")) {
+    match run(include_str!("../../examples/generics.nir")) {
         Ok(Value::Int(n)) => assert_eq!(n, 8),
         other => panic!("expected Ok(Int(8)), got {other:?}"),
     }

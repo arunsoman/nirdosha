@@ -116,6 +116,17 @@ pub fn run_with_tracer_transact_and_workflow_log(
             Err(e) => return Err(format!("transact durability log error during crash replay: {e}")),
         }
     }
+    // Same textual pre-check gate, for `WORKFLOW.md`'s own replay pass.
+    if src.contains("workflow") {
+        match interp.replay_pending_workflow_actions() {
+            Ok(outcomes) => {
+                for o in &outcomes {
+                    eprintln!("workflow replay: {o:?}");
+                }
+            }
+            Err(e) => return Err(format!("workflow log error during crash replay: {e}")),
+        }
+    }
     interp.run_main_on_big_stack().map_err(|e| format!("runtime error: {e}"))
 }
 
@@ -221,6 +232,16 @@ pub fn run_diagnostic_with_tracer_transact_and_workflow_log(
             Ok(outcomes) => {
                 for o in &outcomes {
                     eprintln!("transact replay: {o:?}");
+                }
+            }
+            Err(e) => return Err(RunFailure::Diagnostics(vec![Diagnostic::Runtime(e)])),
+        }
+    }
+    if src.contains("workflow") {
+        match interp.replay_pending_workflow_actions() {
+            Ok(outcomes) => {
+                for o in &outcomes {
+                    eprintln!("workflow replay: {o:?}");
                 }
             }
             Err(e) => return Err(RunFailure::Diagnostics(vec![Diagnostic::Runtime(e)])),

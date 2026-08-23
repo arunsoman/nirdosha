@@ -757,13 +757,15 @@ every later pass, including `nirdosha serve`'s automatic
 `POST /api/<fn>` RPC exposure, sees only those, never `workflow` syntax
 itself. A program that declares no `workflow` is byte-for-byte unaffected.
 
-Two things this does **not** do, worth stating plainly since they're easy
-to assume: it does not add WebSocket support to this codebase (`notify`'s
+One thing this does **not** do, worth stating plainly since it's easy to
+assume: it does not add WebSocket support to this codebase (`notify`'s
 real-time path is a Redis `PUBLISH` an external gateway is expected to
-relay — see `WORKFLOW.md`), and it does not durably log individual
-`on_entry`/`on_exit` action calls the way `transact`'s `network` slot is
-logged before running (a failed action retries in-process only; see
-`WORKFLOW.md`'s "Deliberate non-goals").
+relay — see `WORKFLOW.md`). `on_entry`/`on_exit` actions *are*
+crash-durable, the same "log intent before running it, replay on
+restart" shape `transact`'s own `network` slot already has
+(`WorkflowLog::begin_pending_action`, `Interpreter::
+replay_pending_workflow_actions` — called at `nirdosha serve` startup
+right alongside `replay_pending_transactions`).
 
 Interpreter-only, the same way `transact`/`db`/`mq` already are (§10):
 `workflow`-desugared functions call builtins outside `codegen.rs`'s

@@ -119,7 +119,7 @@ below:
 **Status: shipped (21 Aug 2026).** `effect(...)` parses, and enforcement
 (declared ⊇ inferred, `TypeErrorKind::EffectNotDeclared`) is real and
 tested (`compiler/tests/effects.rs`, `compiler/src/effects.rs`) —
-`compiler/examples/effects.nir` is the worked example. Everything in
+`examples/effects.nir` is the worked example. Everything in
 "Rollout layers" below shipped as one slice rather than layer-by-layer
 (the design was small enough, and each layer needed the next to be
 testable at all): parsing alone has nothing to verify without inference,
@@ -257,7 +257,7 @@ layer before the next:
 **Status: Layer 1 shipped (21 Aug 2026).** `open`/`send`/`recv`/`stop` on
 `file` are real, tested (`compiler/tests/file_io.rs`), and interpreter-only
 per the layering below — `"r"`/`"w"`/`"a"` modes, no `mmap`, no
-directories, no `read_line()` yet. `compiler/examples/file_io.nir` is the
+directories, no `read_line()` yet. `examples/file_io.nir` is the
 worked example. Everything from "Rollout layers" layer 2 onward is still
 future work.
 
@@ -370,7 +370,7 @@ named here so it isn't lost.
 **Status: shipped (21 Aug 2026).** `Ty::Json`, `json_parse`, and the
 per-target-type accessors (`json_get`/`json_get_str`/`_i64`/`_f64`/
 `_bool`, `json_array_len`/`json_array_get`) are real, tested
-(`compiler/tests/json.rs`, `compiler/examples/json.nir`),
+(`compiler/tests/json.rs`, `examples/json.nir`),
 interpreter-only per the same discipline every other affine-handle
 feature here already follows.
 
@@ -450,7 +450,7 @@ existing Ident-only resolution couldn't do for a bare call — see
 **Status: shipped (21 Aug 2026), both plain and TLS, client-only.**
 `http_get`/`http_post`/`https_get`/`https_post` are real, tested
 (`compiler/tests/http.rs`, `compiler/tests/https.rs`,
-`compiler/examples/http.nir`, `compiler/examples/https.nir`),
+`examples/http.nir`, `examples/https.nir`),
 interpreter-only.
 
 ### What it brings to the table, and what changed from §5's original verdict
@@ -555,7 +555,7 @@ half-close signal at all, over either transport.
 
 **Status: shipped (21 Aug 2026), layer 1 (SQLite only).**
 `db_connect`/`db_query`/`db_execute` are real, tested
-(`compiler/tests/db.rs`, `compiler/examples/db.nir`), interpreter-only.
+(`compiler/tests/db.rs`, `examples/db.nir`), interpreter-only.
 
 ### What it brings to the table, and why "one driver per vendor, one uniform surface" instead of "one driver for everything"
 

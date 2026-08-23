@@ -43,7 +43,7 @@ fn first_ownership_error(src: &str) -> OwnershipErrorKind {
 
 #[test]
 fn example_channels_runs_to_completion() {
-    let src = include_str!("../examples/channels.nir");
+    let src = include_str!("../../examples/channels.nir");
     assert_eq!(run(src), Ok(Value::Unit));
 }
 

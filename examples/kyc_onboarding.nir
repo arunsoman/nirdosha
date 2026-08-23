@@ -41,18 +41,6 @@ struct EmailProviderConfig {
     from_address: str,
 }
 
-fn kyc_db() -> Result(db, str) {
-    return db_connect("kyc_onboarding.db")
-}
-
-// `notify`'s presence bridge — a real deployment points this at its own
-// Redis instance; loopback here is just this example's own placeholder,
-// the same way every other builtin example in this tree connects to
-// `127.0.0.1`.
-fn kyc_mq() -> Result(mq, str) {
-    return mq_connect("127.0.0.1", 6379)
-}
-
 // `send_email`/`notify` on_entry wrappers. Each is a real `fn` (a
 // `TransactSlot`-shaped `on_entry` action call is a bare `name(args)`),
 // opening its own `db`/`mq` handles internally — an on_entry action's
@@ -61,10 +49,20 @@ fn kyc_mq() -> Result(mq, str) {
 // `Ty::is_transact_scalar`-durable and aren't in scope there), so every
 // wrapper below re-derives what it needs itself, the same way
 // `trade_finance.nir`'s own `_inner` functions each open their own `conn`.
+// Calls `db_connect`/`mq_connect` directly rather than through a shared
+// helper — a `fn kyc_db() -> Result(db, str)` wrapper would itself be
+// rejected (`StrInFnSignature`: `Result(_, str)` still contains `str`,
+// and this fn-boundary ban applies to `program.fns` entries regardless
+// of how deep the `str` is nested).
+//
+// `notify`'s presence bridge — a real deployment points `mq_connect` at
+// its own Redis instance; loopback here is just this example's own
+// placeholder, the same way every other builtin example in this tree
+// connects to `127.0.0.1`.
 
 fn notify_applicant_submitted(instance_id: i64, applicant_subject: Text) -> bool {
-    match kyc_db() {
-        Ok(conn) => match kyc_mq() {
+    return match db_connect("kyc_onboarding.db") {
+        Ok(conn) => match mq_connect("127.0.0.1", 6379) {
             Ok(mq_conn) => match json_parse("{}") {
                 Ok(vars) => match notify(conn, mq_conn, BySubject(applicant_subject.value), "kyc_submitted", vars) {
                     Ok(sent) => sent,
@@ -83,22 +81,17 @@ fn notify_applicant_submitted(instance_id: i64, applicant_subject: Text) -> bool
 // runs) arrives here as an ordinary `KycOnboardingLinkToken` value, the
 // struct `workflow_lower.rs` synthesizes for this workflow.
 //
-// Honest gap this example surfaces: Nirdosha's `json` builtins today are
-// read-only (`json_parse`/`json_get_*`/`json_array_*` — no
-// `json_set_*`/object-construction builtin), and `str` has no
-// concatenation operator (typeck.rs's own `db_query` bind-params comment
-// notes the same limit), so `link_token.value` can't actually be woven
-// into a dynamic `vars` JSON body from `.nir` source yet. A real
-// deployment either adds a JSON-construction builtin, or has its email
-// template look the pending link up server-side by `instance_id` through
-// its own channel. `vars` here is deliberately just `{}` — this action's
-// job in this example is to demonstrate the `link_<Event>` binding
-// existing and type-checking, not to fully solve templating.
+// `json_set_str` (`json_get_str`'s inverse) is what makes this possible —
+// `vars` starts as `{}` and gets `link_token`'s value woven in, for the
+// real email template to embed in a verification URL.
 fn send_verification_email(instance_id: i64, applicant_subject: Text, link_token: KycOnboardingLinkToken) -> bool {
-    match kyc_db() {
+    return match db_connect("kyc_onboarding.db") {
         Ok(conn) => match json_parse("{}") {
-            Ok(vars) => match send_email(conn, BySubject(applicant_subject.value), "kyc_verify_email", vars) {
-                Ok(sent) => sent,
+            Ok(base_vars) => match json_set_str(base_vars, "link_token", link_token.value) {
+                Ok(vars) => match send_email(conn, BySubject(applicant_subject.value), "kyc_verify_email", vars) {
+                    Ok(sent) => sent,
+                    Err(e) => false,
+                },
                 Err(e) => false,
             },
             Err(e) => false,
@@ -108,8 +101,8 @@ fn send_verification_email(instance_id: i64, applicant_subject: Text, link_token
 }
 
 fn notify_compliance_review_needed(instance_id: i64) -> bool {
-    match kyc_db() {
-        Ok(conn) => match kyc_mq() {
+    return match db_connect("kyc_onboarding.db") {
+        Ok(conn) => match mq_connect("127.0.0.1", 6379) {
             Ok(mq_conn) => match json_parse("{}") {
                 Ok(vars) => match notify(conn, mq_conn, ByRole("compliance_officer"), "kyc_review_needed", vars) {
                     Ok(sent) => sent,
@@ -124,8 +117,8 @@ fn notify_compliance_review_needed(instance_id: i64) -> bool {
 }
 
 fn notify_applicant_decided(instance_id: i64, applicant_subject: Text, template: Text) -> bool {
-    match kyc_db() {
-        Ok(conn) => match kyc_mq() {
+    return match db_connect("kyc_onboarding.db") {
+        Ok(conn) => match mq_connect("127.0.0.1", 6379) {
             Ok(mq_conn) => match json_parse("{}") {
                 Ok(vars) => match notify(conn, mq_conn, BySubject(applicant_subject.value), template.value, vars) {
                     Ok(sent) => sent,
@@ -187,7 +180,7 @@ fn submit_kyc_application(applicant_subject: Text, risk_score: i64) -> Result(i6
 }
 
 fn review_kyc_application(instance_id: i64, decision: KycOnboardingEvent) -> Result(bool, WorkflowActionError) {
-    match json_parse("{}") {
+    return match json_parse("{}") {
         Ok(payload) => advance_kyc_onboarding(instance_id, decision, payload),
         Err(e) => Err(NoSuchTransition()),
     }

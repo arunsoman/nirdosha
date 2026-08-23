@@ -850,7 +850,7 @@ deciding (not roles — segregation-of-duties in this app is by identity,
   clean `git stash` of every change this session made).
 - Regenerate `all_examples.md` (repo root) after any `.nir` example
   edit — it's a plain concatenated dump (`find benchmarks/nirdosha
-  compiler/examples -name '*.nir' | sort`, then one `## <path>` heading
+  examples -name '*.nir' | sort`, then one `## <path>` heading
   + ```nir fenced block per file) with no build step of its own; it
   will silently go stale otherwise.
 

@@ -165,8 +165,9 @@ pub fn run(
     // durable log twice per request would be wasted work, and the whole
     // point is to resolve whatever crashed *before* new traffic arrives.
     {
-        let replay_interp =
-            Interpreter::new(Arc::clone(&program), Arc::from("")).with_transact_log_path((*transact_log_path).clone());
+        let replay_interp = Interpreter::new(Arc::clone(&program), Arc::from(""))
+            .with_transact_log_path((*transact_log_path).clone())
+            .with_workflow_log_path((*workflow_log_path).clone());
         match replay_interp.replay_pending_transactions() {
             Ok(outcomes) => {
                 for o in &outcomes {
@@ -174,6 +175,17 @@ pub fn run(
                 }
             }
             Err(e) => return Err(format!("transact durability log error during startup crash replay: {e}")),
+        }
+        // `WORKFLOW.md`'s own crash-replay pass, same "once, before the
+        // server accepts a request" timing as `transact`'s own replay
+        // just above.
+        match replay_interp.replay_pending_workflow_actions() {
+            Ok(outcomes) => {
+                for o in &outcomes {
+                    eprintln!("workflow replay: {o:?}");
+                }
+            }
+            Err(e) => return Err(format!("workflow log error during startup crash replay: {e}")),
         }
     }
 
