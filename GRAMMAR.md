@@ -102,7 +102,7 @@ parses as `return (x - y)` — one statement, a subtraction — never as
 ```ebnf
 program     ::= item*
 
-item        ::= fn_decl | struct_decl | enum_decl | screen_decl | dashboard_decl | module_decl
+item        ::= fn_decl | struct_decl | enum_decl | screen_decl | dashboard_decl | module_decl | workflow_decl
 
 fn_decl     ::= "fn" ident "(" params? ")" ("->" type)? block
 
@@ -178,6 +178,26 @@ dashboard_item ::= ("tile" | "chart") string "->" ident
 // file that never uses `module` renders exactly as it did before this
 // construct existed (nav stays flat, ungrouped).
 module_decl ::= "module" string "{" (fn_decl | struct_decl | enum_decl)* "}"
+
+// `WORKFLOW.md`'s durable state machine — desugared by `workflow_lower.rs`
+// (right after parsing, `Parser::parse_program`'s own tail call) into
+// ordinary `fn_decl`/`enum_decl`/`struct_decl`, the same "pure lowering,
+// zero new dispatch machinery" shape `module_decl` above already uses.
+// `workflow`/`state` are real reserved keywords; `data`/`on_entry`/
+// `on_exit`/`on`/`terminal`/`link` are contextual — matched by identifier
+// text only inside `parse_workflow_decl`/`parse_state_decl`, the same
+// treatment `transact`'s own slot names get (see `transact_expr` below).
+// `action_call` reuses `transact_expr`'s "parse a call, reject anything
+// else" restriction — a bare `name(args)`, never an arbitrary expression
+// — except a workflow action call *may* name a builtin (`send_email`
+// etc. are builtins), the opposite of `transact`'s own restriction.
+workflow_decl  ::= "workflow" ident "{" data_block? state_decl+ "}"
+data_block     ::= "data" "{" field ("," field)* ","? "}"
+state_decl     ::= "state" ident "terminal"? "{" on_entry_block? on_exit_block? transition* "}"
+on_entry_block ::= "on_entry" "{" action_call* "}"
+on_exit_block  ::= "on_exit" "{" action_call* "}"
+action_call    ::= ident "(" (expr ("," expr)*)? ")"
+transition     ::= "on" "link"? ident "->" ident
 
 // No trailing comma — `params`/`args` (below) both require a following
 // item after every comma, so `fn f(a: i64,)` and `f(1, 2,)` are both

@@ -1,0 +1,194 @@
+// A worked example for `workflow { ... }` (WORKFLOW.md): a minimal KYC
+// onboarding pipeline. Demonstrates:
+//   - a `data` block and `data.<field>` implicit bindings
+//   - `on_entry` notification actions (`notify`, `send_email`)
+//   - a `link`-marked transition (unauthenticated, single-use, email
+//     click-to-verify) and its implicit `link_<Event>` binding
+//   - the admin-editable provider-config struct ("communication
+//     control") `send_email`/`notify` read at send time
+//
+// Served via `nirdosha serve --db kyc_onboarding.db --workflow-log
+// kyc_onboarding.workflow.db kyc_onboarding.nir` — every function below
+// becomes a `POST /api/<fn>` endpoint automatically (`start_kyc_onboarding`,
+// `advance_kyc_onboarding`, `email_verified_via_link`, plus this file's
+// own `submit_kyc_application`/`review_kyc_application` wrappers). Not
+// runnable end-to-end without a real webhook endpoint behind
+// `EmailProviderConfig` and (for the online/push path) a Redis instance —
+// see WORKFLOW.md's "Deliberate non-goals" for exactly what's real today
+// versus what needs an operator's own infrastructure.
+
+// LANGUAGE.md §6b's carrier-struct convention: free text that has to
+// cross a function boundary (every wrapper `fn` below is a real
+// `program.fns` entry, so a bare `str` parameter is rejected).
+struct Text {
+    value: str,
+}
+
+// The "communication control" — an ordinary, admin-editable struct.
+// `nirdosha serve --db` migrates this into `email_provider_config`
+// automatically (LANGUAGE.md §13); an admin fills in `host`/`port`/
+// `path`/`api_key`/`from_address` through the free CRUD screen this
+// struct already gets (LANGUAGE.md §11) and flips `active` once real
+// values are in place. `send_email`/`notify` read the first `active = 1`
+// row of this exact table at send time (WORKFLOW.md).
+struct EmailProviderConfig {
+    id: i64,
+    active: bool,
+    host: str,
+    port: i64,
+    path: str,
+    api_key: str,
+    from_address: str,
+}
+
+fn kyc_db() -> Result(db, str) {
+    return db_connect("kyc_onboarding.db")
+}
+
+// `notify`'s presence bridge — a real deployment points this at its own
+// Redis instance; loopback here is just this example's own placeholder,
+// the same way every other builtin example in this tree connects to
+// `127.0.0.1`.
+fn kyc_mq() -> Result(mq, str) {
+    return mq_connect("127.0.0.1", 6379)
+}
+
+// `send_email`/`notify` on_entry wrappers. Each is a real `fn` (a
+// `TransactSlot`-shaped `on_entry` action call is a bare `name(args)`),
+// opening its own `db`/`mq` handles internally — an on_entry action's
+// *arguments* are restricted to `instance_id`/`data.<field>`/
+// `link_<Event>`, never a live resource handle (those aren't
+// `Ty::is_transact_scalar`-durable and aren't in scope there), so every
+// wrapper below re-derives what it needs itself, the same way
+// `trade_finance.nir`'s own `_inner` functions each open their own `conn`.
+
+fn notify_applicant_submitted(instance_id: i64, applicant_subject: Text) -> bool {
+    match kyc_db() {
+        Ok(conn) => match kyc_mq() {
+            Ok(mq_conn) => match json_parse("{}") {
+                Ok(vars) => match notify(conn, mq_conn, BySubject(applicant_subject.value), "kyc_submitted", vars) {
+                    Ok(sent) => sent,
+                    Err(e) => false,
+                },
+                Err(e) => false,
+            },
+            Err(e) => false,
+        },
+        Err(e) => false,
+    }
+}
+
+// The `link`-marked transition's own action: `link_EmailVerified` (minted
+// by `Interpreter::bind_link_tokens` right before this state's `on_entry`
+// runs) arrives here as an ordinary `KycOnboardingLinkToken` value, the
+// struct `workflow_lower.rs` synthesizes for this workflow.
+//
+// Honest gap this example surfaces: Nirdosha's `json` builtins today are
+// read-only (`json_parse`/`json_get_*`/`json_array_*` — no
+// `json_set_*`/object-construction builtin), and `str` has no
+// concatenation operator (typeck.rs's own `db_query` bind-params comment
+// notes the same limit), so `link_token.value` can't actually be woven
+// into a dynamic `vars` JSON body from `.nir` source yet. A real
+// deployment either adds a JSON-construction builtin, or has its email
+// template look the pending link up server-side by `instance_id` through
+// its own channel. `vars` here is deliberately just `{}` — this action's
+// job in this example is to demonstrate the `link_<Event>` binding
+// existing and type-checking, not to fully solve templating.
+fn send_verification_email(instance_id: i64, applicant_subject: Text, link_token: KycOnboardingLinkToken) -> bool {
+    match kyc_db() {
+        Ok(conn) => match json_parse("{}") {
+            Ok(vars) => match send_email(conn, BySubject(applicant_subject.value), "kyc_verify_email", vars) {
+                Ok(sent) => sent,
+                Err(e) => false,
+            },
+            Err(e) => false,
+        },
+        Err(e) => false,
+    }
+}
+
+fn notify_compliance_review_needed(instance_id: i64) -> bool {
+    match kyc_db() {
+        Ok(conn) => match kyc_mq() {
+            Ok(mq_conn) => match json_parse("{}") {
+                Ok(vars) => match notify(conn, mq_conn, ByRole("compliance_officer"), "kyc_review_needed", vars) {
+                    Ok(sent) => sent,
+                    Err(e) => false,
+                },
+                Err(e) => false,
+            },
+            Err(e) => false,
+        },
+        Err(e) => false,
+    }
+}
+
+fn notify_applicant_decided(instance_id: i64, applicant_subject: Text, template: Text) -> bool {
+    match kyc_db() {
+        Ok(conn) => match kyc_mq() {
+            Ok(mq_conn) => match json_parse("{}") {
+                Ok(vars) => match notify(conn, mq_conn, BySubject(applicant_subject.value), template.value, vars) {
+                    Ok(sent) => sent,
+                    Err(e) => false,
+                },
+                Err(e) => false,
+            },
+            Err(e) => false,
+        },
+        Err(e) => false,
+    }
+}
+
+workflow KycOnboarding {
+    data {
+        applicant_subject: str,
+        risk_score: i64,
+    }
+
+    // Entry point: mints and emails the verification link. Leaves via
+    // the `link`-marked `EmailVerified` transition only — no ordinary
+    // authenticated path in, matching "verify by clicking the email"
+    // being the actual gate here.
+    state Submitted {
+        on_entry {
+            send_verification_email(instance_id, Text(data.applicant_subject), link_EmailVerified)
+        }
+        on link EmailVerified -> UnderReview
+    }
+
+    state UnderReview {
+        on_entry {
+            notify_compliance_review_needed(instance_id)
+        }
+        on Approve -> Approved
+        on Reject -> Rejected
+    }
+
+    state Approved terminal {
+        on_entry {
+            notify_applicant_decided(instance_id, Text(data.applicant_subject), Text("kyc_approved"))
+        }
+    }
+
+    state Rejected terminal {
+        on_entry {
+            notify_applicant_decided(instance_id, Text(data.applicant_subject), Text("kyc_rejected"))
+        }
+    }
+}
+
+// Thin, `emit-ui`-friendly wrappers over the desugared `start_kyc_onboarding`/
+// `advance_kyc_onboarding` (`workflow_lower.rs`) — same reason
+// `trade_finance.nir`'s own approval flow layers a friendlier public `fn`
+// over its `_inner` helper: a caller shouldn't have to know the exact
+// synthesized name/shape to use this workflow.
+fn submit_kyc_application(applicant_subject: Text, risk_score: i64) -> Result(i64, WorkflowActionError) {
+    return start_kyc_onboarding(KycOnboardingData(applicant_subject.value, risk_score))
+}
+
+fn review_kyc_application(instance_id: i64, decision: KycOnboardingEvent) -> Result(bool, WorkflowActionError) {
+    match json_parse("{}") {
+        Ok(payload) => advance_kyc_onboarding(instance_id, decision, payload),
+        Err(e) => Err(NoSuchTransition()),
+    }
+}

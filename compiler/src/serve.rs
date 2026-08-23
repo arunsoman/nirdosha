@@ -112,6 +112,8 @@ pub fn run(
     auth: Option<AuthConfig>,
     identity_base: Option<&str>,
     transact_log_path: std::path::PathBuf,
+    workflow_log_path: std::path::PathBuf,
+    presence_token: Option<String>,
     db_path: Option<String>,
     theme: Option<&crate::ui_gen::Theme>,
 ) -> Result<(), String> {
@@ -120,6 +122,8 @@ pub fn run(
     let ui_html = crate::ui_gen::generate(&program, &effects, identity_base, db_path.is_some(), theme);
     let auth = Arc::new(auth);
     let transact_log_path = Arc::new(transact_log_path);
+    let workflow_log_path = Arc::new(workflow_log_path);
+    let presence_token = Arc::new(presence_token);
     // `--db <path>`: opens one shared connection, direct rusqlite (not
     // through the interpreter), backing the generic
     // `/_nirdosha/table/<snake>` pagination/sort/filter/search route
@@ -223,7 +227,7 @@ pub fn run(
                     .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("Authorization"))
                     .map(|h| h.value.as_str().to_string());
                 let (status, payload) = match &table_db {
-                    Some(db) => match resolve_identity(auth_header.as_deref(), auth.as_ref().as_ref()) {
+                    Some(db) => match resolve_identity(auth_header.as_deref(), auth.as_ref().as_ref(), &workflow_log_path) {
                         Ok(identity) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             dispatch_table_query(db, &table_catalog, table, &body, &program, identity.as_ref())
                         }))
@@ -232,6 +236,35 @@ pub fn run(
                     },
                     None => (404, json_err("no --db was passed to `nirdosha serve`; the generic table-query route is disabled")),
                 };
+                let mut resp = tiny_http::Response::from_string(payload)
+                    .with_status_code(status)
+                    .with_header(header("Content-Type", "application/json"));
+                for h in cors_headers() {
+                    resp.add_header(h);
+                }
+                let _ = request.respond(resp);
+                continue;
+            }
+            if url == "/api/_presence_connect" || url == "/api/_presence_disconnect" {
+                let online = url == "/api/_presence_connect";
+                let body = match read_limited_body(&mut request) {
+                    Ok(b) => b,
+                    Err(status_body) => {
+                        let mut resp = tiny_http::Response::from_string(status_body.1).with_status_code(status_body.0);
+                        for h in cors_headers() {
+                            resp.add_header(h);
+                        }
+                        let _ = request.respond(resp);
+                        continue;
+                    }
+                };
+                let auth_header = request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("Authorization"))
+                    .map(|h| h.value.as_str().to_string());
+                let (status, payload) =
+                    handle_presence(&body, auth_header.as_deref(), presence_token.as_ref().as_ref(), &workflow_log_path, online);
                 let mut resp = tiny_http::Response::from_string(payload)
                     .with_status_code(status)
                     .with_header(header("Content-Type", "application/json"));
@@ -281,6 +314,7 @@ pub fn run(
                         auth_header.as_deref(),
                         auth.as_ref().as_ref(),
                         &transact_log_path,
+                        &workflow_log_path,
                         table_db.as_deref(),
                     )
                 })) {
@@ -524,7 +558,11 @@ fn dispatch_table_query(
 /// for an ungated call); `Err` is a ready-to-return `(status, body)` for
 /// every case that should stop the request outright (missing config,
 /// malformed header, invalid or expired token).
-fn resolve_identity(auth_header: Option<&str>, auth: Option<&AuthConfig>) -> Result<Option<Value>, (u16, String)> {
+fn resolve_identity(
+    auth_header: Option<&str>,
+    auth: Option<&AuthConfig>,
+    workflow_log_path: &std::path::Path,
+) -> Result<Option<Value>, (u16, String)> {
     match (auth_header, auth) {
         (Some(h), Some(cfg)) => match h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("bearer ")) {
             Some(token) => match interpreter::validate_oidc_token(token, &cfg.issuer, &cfg.audience, &cfg.jwks_json) {
@@ -544,7 +582,10 @@ fn resolve_identity(auth_header: Option<&str>, auth: Option<&AuthConfig>) -> Res
                         .unwrap_or(i64::MAX);
                     match interpreter::identity_expires_at(&v) {
                         Ok(expires_at) if now > expires_at => Err((401, json_err("invalid token: token has expired"))),
-                        _ => Ok(Some(v)),
+                        _ => {
+                            upsert_identity_directory(&v, now, workflow_log_path);
+                            Ok(Some(v))
+                        }
                     }
                 }
                 Err(e) => Err((401, json_err(&format!("invalid token: {e}")))),
@@ -555,6 +596,70 @@ fn resolve_identity(auth_header: Option<&str>, auth: Option<&AuthConfig>) -> Res
             Err((500, json_err("this server has no --jwks-file/--issuer/--audience configured to validate a bearer token against")))
         }
         (None, _) => Ok(None),
+    }
+}
+
+/// `WORKFLOW.md`'s `identity_directory` — the piece that makes
+/// `Recipient::ByRole` resolvable, upserted on every successful auth
+/// (this is the only writer). Best-effort: a directory-write failure
+/// (disk full, a locked file) must never turn a successful auth into a
+/// failed request — `notify`/`send_email`'s own `ByRole` lookup, not this
+/// call, is where that kind of failure should surface, if it ever
+/// matters to a particular request at all.
+fn upsert_identity_directory(identity: &Value, now: i64, workflow_log_path: &std::path::Path) {
+    let Value::Struct(_, fields) = identity else { return };
+    let (Value::Str(subject), Value::Str(claims_json)) = (&fields[0], &fields[5]) else { return };
+    match crate::workflow_log::WorkflowLog::open(workflow_log_path) {
+        Ok(wlog) => {
+            if let Err(e) = wlog.upsert_identity(subject, claims_json, now) {
+                eprintln!("identity_directory upsert failed for `{subject}`: {e}");
+            }
+        }
+        Err(e) => eprintln!("identity_directory: failed to open workflow log: {e}"),
+    }
+}
+
+/// `POST /api/_presence_connect` / `_disconnect` — `WORKFLOW.md`'s
+/// presence bridge: a trusted external WS gateway (not an end user)
+/// reports "this subject just connected/disconnected its live browser
+/// session," authenticated with `--presence-token` (a service credential,
+/// compared constant-time — same discipline `trade_finance.nir:676`'s
+/// magic-link token compare already established) rather than a normal
+/// `Authorization: Bearer <identity-token>`. No `--presence-token`
+/// configured means these routes 404 outright — `notify()` still works,
+/// it just always takes the offline path (`TRANSACT.md`'s own "a program
+/// that never opts in pays nothing" framing, reused here).
+fn handle_presence(
+    body: &str,
+    auth_header: Option<&str>,
+    presence_token: Option<&String>,
+    workflow_log_path: &std::path::Path,
+    online: bool,
+) -> (u16, String) {
+    let Some(expected) = presence_token else {
+        return (404, json_err("presence routes are disabled: no --presence-token was passed to `nirdosha serve`"));
+    };
+    let presented = auth_header.and_then(|h| h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("bearer ")));
+    let Some(presented) = presented else {
+        return (401, json_err("Authorization header must be `Bearer <presence-token>`"));
+    };
+    if !interpreter::constant_time_eq(presented, expected) {
+        return (401, json_err("invalid presence token"));
+    }
+    let req: JsonVal = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return (400, json_err(&format!("invalid JSON body: {e}"))),
+    };
+    let Some(subject) = req.get("subject").and_then(JsonVal::as_str) else {
+        return (400, json_err("missing `subject` field"));
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    match crate::workflow_log::WorkflowLog::open(workflow_log_path) {
+        Ok(wlog) => match wlog.set_presence(subject, online, now) {
+            Ok(()) => (200, r#"{"ok":true}"#.to_string()),
+            Err(e) => (500, json_err(&format!("failed to update presence: {e}"))),
+        },
+        Err(e) => (500, json_err(&format!("failed to open workflow log: {e}"))),
     }
 }
 
@@ -636,6 +741,7 @@ fn dispatch(
     auth_header: Option<&str>,
     auth: Option<&AuthConfig>,
     transact_log_path: &std::path::Path,
+    workflow_log_path: &std::path::Path,
     table_db: Option<&std::sync::Mutex<rusqlite::Connection>>,
 ) -> (u16, String) {
     let Some(f) = program.fns.iter().find(|f| f.name == fn_name) else {
@@ -643,7 +749,7 @@ fn dispatch(
     };
 
     // Bearer token -> VerifiedIdentity, if present and valid.
-    let identity: Option<Value> = match resolve_identity(auth_header, auth) {
+    let identity: Option<Value> = match resolve_identity(auth_header, auth, workflow_log_path) {
         Ok(id) => id,
         Err(status_body) => return status_body,
     };
@@ -763,7 +869,9 @@ fn dispatch(
     }
 
     let program_arc = Arc::clone(program);
-    let interp = Interpreter::new(program_arc, Arc::from("")).with_transact_log_path(transact_log_path.to_path_buf());
+    let interp = Interpreter::new(program_arc, Arc::from(""))
+        .with_transact_log_path(transact_log_path.to_path_buf())
+        .with_workflow_log_path(workflow_log_path.to_path_buf());
     match interp.call_named_on_big_stack(fn_name, &args) {
         Ok(result) => match encode_value(&result, program) {
             Ok(mut json) => {
@@ -910,7 +1018,7 @@ fn decode_enum_value(json: &JsonVal, enum_name: &str, e: &crate::ast::EnumDecl) 
 /// cycle-safety reasoning `build_field` documents), and anything else
 /// (affine handles, `Fn`, a payload-carrying enum, deeper nesting) is a
 /// clear 400, never a silent misdecode.
-fn decode_value(json: &JsonVal, ty: &Ty, program: &Program, depth: u8) -> Result<Value, String> {
+pub(crate) fn decode_value(json: &JsonVal, ty: &Ty, program: &Program, depth: u8) -> Result<Value, String> {
     match ty {
         Ty::Str => json.as_str().map(|s| Value::Str(Arc::from(s))).ok_or_else(|| "expected a string".to_string()),
         Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::Usize => {
@@ -958,7 +1066,7 @@ fn decode_value(json: &JsonVal, ty: &Ty, program: &Program, depth: u8) -> Result
 /// unchanged — it's already a `serde_json::Value`. Affine handles
 /// (`box`/`thread`/`chan`/`sandbox`/`tcp`/`file`/`db`/`mq`), `Fn`, are
 /// refused with a clear error rather than a garbage encoding.
-fn encode_value(v: &Value, program: &Program) -> Result<JsonVal, String> {
+pub(crate) fn encode_value(v: &Value, program: &Program) -> Result<JsonVal, String> {
     match v {
         Value::Int(n) => Ok(JsonVal::from(*n)),
         Value::Float(f) => Ok(if f.is_finite() { JsonVal::from(*f) } else { JsonVal::Null }),

@@ -52,6 +52,7 @@ use crate::effects::{self, EffectSet};
 use crate::observability;
 use crate::token::Span;
 use crate::transact_log::{PendingTxn, TransactLog};
+use crate::workflow_log::WorkflowLog;
 
 /// Renamed on import — this file's own `Value` enum would otherwise
 /// collide with `serde_json::Value`'s name at every use site.
@@ -779,6 +780,24 @@ pub enum ErrorKind {
     /// ever the *final* error reported once `retry`'s attempt budget
     /// (default 1) is exhausted.
     TransactNetworkTimedOut { seconds: i64 },
+    /// `workflow_log.rs`'s durable store couldn't be opened/written to
+    /// (disk full, permissions, a locked file) — same "fatal to the whole
+    /// operation, never a silent no-durability downgrade" reasoning as
+    /// `TransactLogUnavailable`.
+    WorkflowLogUnavailable { message: String },
+    /// An `on_entry`/`on_exit` action call's bounded retry
+    /// (`Interpreter::run_workflow_action`, the same backoff shape
+    /// `run_transact_write_slot` uses for `commit`/`compensate`) was
+    /// exhausted — a deliberate trap, not a guessed outcome.
+    /// `Interpreter::eval_workflow_advance` runs the *old* state's
+    /// `on_exit` before moving `state`, so a trap here on `on_exit` means
+    /// the transition never happened (still the old state, safe to retry
+    /// the whole `advance_*` call again); a trap on the *new* state's
+    /// `on_entry` (which runs after the move) means the transition
+    /// already durably happened and only this state's own actions are
+    /// stuck — `state` names which case by naming the state whose
+    /// actions were running.
+    WorkflowActionPending { instance_id: i64, state: String, action: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -852,6 +871,14 @@ impl std::fmt::Display for RuntimeError {
             ErrorKind::TransactNetworkTimedOut { seconds } => {
                 write!(f, "{line}:{col}: `transact`'s `network` slot timed out after {seconds}s")
             }
+            ErrorKind::WorkflowLogUnavailable { message } => {
+                write!(f, "{line}:{col}: workflow log unavailable: {message}")
+            }
+            ErrorKind::WorkflowActionPending { instance_id, state, action } => write!(
+                f,
+                "{line}:{col}: workflow instance {instance_id}, state `{state}`: action `{action}` has not \
+                 succeeded (retries exhausted)"
+            ),
         }
     }
 }
@@ -929,6 +956,91 @@ fn result_err(message: impl Into<String>) -> Value {
 /// what counts as failure for any other return shape).
 fn is_result_err(v: &Value) -> bool {
     matches!(v, Value::Enum(name, variant, _) if name.as_ref() == "Result" && variant.as_ref() == "Err")
+}
+
+/// `Err(WorkflowActionError::<variant>(payload))` as a real Nirdosha
+/// `Result(_, WorkflowActionError)` value — every `send_email`/`send_sms`/
+/// `send_push`/`notify`/`__workflow_*` builtin's `.nir`-visible failure
+/// case (as opposed to a Rust-level trap, e.g. `WorkflowLogUnavailable`,
+/// for a condition that isn't the calling program's fault to recover
+/// from). Same "constructed directly, sound because the shape is fixed"
+/// reasoning as `result_ok`/`result_err`.
+fn workflow_err(variant: &str, payload: Vec<Value>) -> Value {
+    let err = Value::Enum(Arc::from("WorkflowActionError"), Arc::from(variant), Arc::from(payload));
+    Value::Enum(Arc::from("Result"), Arc::from("Err"), Arc::from(vec![err]))
+}
+
+/// A real wall-clock read, Rust-side only (never reachable from `.nir`
+/// source) — same documented, precedented exception to the determinism
+/// story `generate_txn_id`/`resolve_identity`'s `expires_at` check
+/// already make (see `WorkflowLog`'s own module doc, `WORKFLOW.md`).
+fn now_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn provider_table_name(channel: &str) -> &'static str {
+    match channel {
+        "email" => "email_provider_config",
+        "sms" => "sms_provider_config",
+        "push" => "push_provider_config",
+        _ => unreachable!("send_via_channel's own callers only ever pass one of these three"),
+    }
+}
+
+/// `send_email`/`send_sms`/`send_push`/`notify`'s offline-fallback
+/// transport: an authenticated HTTPS POST to an admin-configured
+/// webhook, carrying a small fixed JSON envelope. Deliberately not
+/// hardcoded to one vendor's exact schema (SendGrid's `/v3/mail/send`,
+/// Twilio's REST API, FCM's HTTP v1 API) — those can't be verified
+/// without live accounts; this ships correct, working delivery to
+/// whatever endpoint the admin-editable provider-config row names
+/// (`WORKFLOW.md`'s "deliberate non-goals").
+fn build_notify_request(host: &str, path: &str, api_key: &str, body: &str) -> Vec<u8> {
+    let path = if path.is_empty() || !path.starts_with('/') { format!("/{path}") } else { path.to_string() };
+    let body_bytes = body.as_bytes();
+    let header = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: nirdosha\r\n\
+         Accept: */*\r\nAuthorization: Bearer {api_key}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n",
+        body_bytes.len()
+    );
+    let mut out = header.into_bytes();
+    out.extend_from_slice(body_bytes);
+    out
+}
+
+/// Reuses `send_and_receive`'s existing connect/write/read/parse
+/// machinery (the same one `https_get`/`https_post` already share) —
+/// only the request-building step differs (an `Authorization` header
+/// `build_http_request` has no slot for).
+fn notify_https_post(host: &str, port: i64, path: &str, api_key: &str, body: &str) -> Result<(), String> {
+    let port = u16::try_from(port).map_err(|_| format!("port {port} is not a valid 0-65535 TCP port"))?;
+    let request = build_notify_request(host, path, api_key, body);
+    let tcp = std::net::TcpStream::connect((host, port)).map_err(|e| e.to_string())?;
+    let connector = native_tls::TlsConnector::new().map_err(|e| format!("failed to initialize TLS: {e}"))?;
+    let stream = connector.connect(host, tcp).map_err(|e| format!("TLS handshake failed: {e}"))?;
+    match send_and_receive(stream, &request) {
+        Value::Enum(name, variant, payload) if name.as_ref() == "Result" && variant.as_ref() == "Ok" => {
+            let Value::Struct(_, fields) = &payload[0] else {
+                return Err("malformed HTTP response".to_string());
+            };
+            let Value::Int(status) = &fields[0] else {
+                return Err("malformed HTTP response".to_string());
+            };
+            if (200..300).contains(status) {
+                Ok(())
+            } else {
+                Err(format!("provider returned HTTP {status}"))
+            }
+        }
+        Value::Enum(name, variant, payload) if name.as_ref() == "Result" && variant.as_ref() == "Err" => {
+            match &payload[0] {
+                Value::Str(msg) => Err(msg.to_string()),
+                _ => Err("provider request failed".to_string()),
+            }
+        }
+        _ => Err("unexpected response shape".to_string()),
+    }
 }
 
 /// A short, human-readable name for a JSON value's own dynamic shape --
@@ -1080,7 +1192,7 @@ fn hmac_sha256_base64url(key: &[u8], message: &[u8]) -> String {
 /// rejected up front (real signatures are always the same fixed
 /// length), which does leak a length comparison, not a content one —
 /// no `Ord`/short-circuit over the actual signature bytes either way.
-fn constant_time_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
         return false;
@@ -1332,6 +1444,19 @@ fn default_transact_log_path() -> std::path::PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!("nirdosha-transact-{}-{nanos}-{counter}.db", std::process::id()))
+}
+
+/// `Interpreter::workflow_log_path`'s default -- same "unique per-instance
+/// temp file" reasoning as `default_transact_log_path`, for the same
+/// parallel-test-safety reason.
+fn default_workflow_log_path() -> std::path::PathBuf {
+    static PATH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let counter = PATH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("nirdosha-workflow-{}-{nanos}-{counter}.db", std::process::id()))
 }
 
 fn generate_txn_id() -> String {
@@ -2864,6 +2989,12 @@ pub struct Interpreter {
     /// (this file) for why: only a program that actually contains a
     /// `transact` ever touches the filesystem for this at all.
     transact_log_cell: std::cell::OnceCell<Arc<TransactLog>>,
+    /// Same role as `transact_log_path`, for `WORKFLOW.md`'s durable
+    /// store -- default is a unique per-instance temp file
+    /// (`default_workflow_log_path`); `main.rs`'s `serve` command
+    /// overrides it via `with_workflow_log_path`/`--workflow-log <path>`.
+    workflow_log_path: std::path::PathBuf,
+    workflow_log_cell: std::cell::OnceCell<Arc<WorkflowLog>>,
 }
 
 /// Past this many nested `call()`s, fail cleanly instead of overflowing
@@ -3005,6 +3136,8 @@ impl Interpreter {
             call_depth: std::cell::Cell::new(0),
             transact_log_path: default_transact_log_path(),
             transact_log_cell: std::cell::OnceCell::new(),
+            workflow_log_path: default_workflow_log_path(),
+            workflow_log_cell: std::cell::OnceCell::new(),
         }
     }
 
@@ -3022,6 +3155,14 @@ impl Interpreter {
     /// `with_sandbox_exe`/`with_tracer`.
     pub fn with_transact_log_path(mut self, path: std::path::PathBuf) -> Self {
         self.transact_log_path = path;
+        self
+    }
+
+    /// Same role as `with_transact_log_path`, for `WORKFLOW.md`'s durable
+    /// store -- `main.rs`'s `serve` command uses this to point at
+    /// `<source-file>.workflow.db` (or an explicit `--workflow-log <path>`).
+    pub fn with_workflow_log_path(mut self, path: std::path::PathBuf) -> Self {
+        self.workflow_log_path = path;
         self
     }
 
@@ -3510,6 +3651,374 @@ impl Interpreter {
         RuntimeError { kind: ErrorKind::TransactLogUnavailable { message: e.to_string() }, span }
     }
 
+    /// Same "open once, lazily, only if a program actually needs it"
+    /// shape as `transact_log` -- see that method's doc comment.
+    fn workflow_log(&self, span: Span) -> Result<Arc<WorkflowLog>, RuntimeError> {
+        if let Some(log) = self.workflow_log_cell.get() {
+            return Ok(Arc::clone(log));
+        }
+        let log = Arc::new(
+            WorkflowLog::open(&self.workflow_log_path)
+                .map_err(|message| RuntimeError { kind: ErrorKind::WorkflowLogUnavailable { message }, span })?,
+        );
+        let _ = self.workflow_log_cell.set(Arc::clone(&log));
+        Ok(log)
+    }
+
+    fn workflow_log_err(&self, e: String, span: Span) -> RuntimeError {
+        RuntimeError { kind: ErrorKind::WorkflowLogUnavailable { message: e }, span }
+    }
+
+    fn find_workflow(&self, name: &str) -> Option<&WorkflowDecl> {
+        self.program.workflows.iter().find(|w| w.name == name)
+    }
+
+    /// Dispatches `send_email`/`send_sms`/`send_push`/`notify` and
+    /// `workflow_lower.rs`'s three shared internal builtins — `Some(_)`
+    /// when `name` is one of these seven (handled here, needs `self`/
+    /// durable-log access `eval_builtin`'s free-function shape can't
+    /// provide, the same reason `Expr::Transact` gets its own dedicated
+    /// evaluation instead of going through `eval_builtin`); `None` for
+    /// every other name, so `Expr::Call`'s normal dispatch falls through
+    /// to `eval_builtin` unchanged.
+    fn eval_workflow_builtin(&self, name: &str, args: &[Value], span: Span) -> SResult<Option<Value>> {
+        match name {
+            "__workflow_start" => self.workflow_start(args, span).map(Some),
+            "__workflow_advance" => self.workflow_advance(args, span).map(Some),
+            "__workflow_link_advance" => self.workflow_link_advance(args, span).map(Some),
+            "send_email" => self.dispatch_send(args, span, "email").map(Some),
+            "send_sms" => self.dispatch_send(args, span, "sms").map(Some),
+            "send_push" => self.dispatch_send(args, span, "push").map(Some),
+            "notify" => self.dispatch_notify(args, span).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// Runs every action in `actions` in order, in `env` (already carrying
+    /// `instance_id`/`data`/`link_<Event>` bindings — see
+    /// `workflow_start`/`workflow_advance`). Each action gets a bounded,
+    /// backoff retry (same shape `run_transact_write_slot` gives
+    /// `commit`/`compensate`) and traps `WorkflowActionPending` if the
+    /// budget is exhausted — see `workflow_log.rs`'s module doc for why
+    /// this retry is in-process only in this version, not crash-durable.
+    fn run_workflow_actions(&self, actions: &[TransactSlot], env: &mut Env, instance_id: i64, state: &str) -> SResult<()> {
+        const MAX_ATTEMPTS: u32 = 5;
+        for action in actions {
+            let mut vals = Vec::with_capacity(action.args.len());
+            for a in &action.args {
+                vals.push(self.eval_expr(a, env)?);
+            }
+            let mut attempt = 0u32;
+            loop {
+                let outcome = self.call(&action.name, &vals, action.span);
+                let failed = match &outcome {
+                    Err(_) => true,
+                    Ok(v) => is_result_err(v),
+                };
+                if !failed {
+                    break;
+                }
+                attempt += 1;
+                if attempt >= MAX_ATTEMPTS {
+                    return Err(Signal::Err(RuntimeError {
+                        kind: ErrorKind::WorkflowActionPending {
+                            instance_id,
+                            state: state.to_string(),
+                            action: action.name.clone(),
+                        },
+                        span: action.span,
+                    }));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20u64 << attempt.min(10)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Mints one fresh, not-yet-consumed token per `link`-marked outgoing
+    /// transition of `state`, durably records it, and binds it into `env`
+    /// as `link_<Event>` — only ever called right before that state's own
+    /// `on_entry` actions run, so the binding's lifetime matches
+    /// `WORKFLOW.md`'s "only in scope inside the `on_entry` of the state
+    /// that declares it" rule structurally (a fresh `Env` each time, never
+    /// carried into a different state's scope).
+    fn bind_link_tokens(
+        &self,
+        wlog: &WorkflowLog,
+        wf: &WorkflowDecl,
+        state: &StateDecl,
+        instance_id: i64,
+        env: &mut Env,
+        span: Span,
+    ) -> SResult<()> {
+        let link_token_ty_name = format!("{}LinkToken", wf.name);
+        for t in &state.transitions {
+            if !t.via_link {
+                continue;
+            }
+            let token = generate_txn_id();
+            wlog.mint_link(instance_id, &t.event, &token).map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
+            let binding = format!("link_{}", t.event);
+            env.define(
+                &binding,
+                Value::Struct(Arc::from(link_token_ty_name.as_str()), Arc::from(vec![Value::Str(Arc::from(token))])),
+                Ty::Named(link_token_ty_name.clone(), vec![]),
+            );
+        }
+        Ok(())
+    }
+
+    fn workflow_start(&self, args: &[Value], span: Span) -> SResult<Value> {
+        let Value::Str(workflow_name) = &args[0] else {
+            unreachable!("typeck.rs already proved this is a str")
+        };
+        let data_val = args[1].clone();
+        let wf = self
+            .find_workflow(workflow_name)
+            .unwrap_or_else(|| unreachable!("workflow_lower.rs only ever emits calls naming a real workflow"));
+        let initial = &wf.states[0];
+        let data_json = crate::serve::encode_value(&data_val, &self.program)
+            .map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
+        let now = now_secs();
+        let wlog = self.workflow_log(span).map_err(Signal::Err)?;
+        let instance_id = wlog
+            .create_instance(workflow_name, &initial.name, &data_json.to_string(), now)
+            .map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
+        let data_ty = Ty::Named(format!("{workflow_name}Data"), vec![]);
+        let mut env = Env::new();
+        env.define("instance_id", Value::Int(instance_id), Ty::I64);
+        env.define("data", data_val, data_ty);
+        self.bind_link_tokens(&wlog, wf, initial, instance_id, &mut env, span)?;
+        self.run_workflow_actions(&initial.on_entry, &mut env, instance_id, &initial.name)?;
+        Ok(result_ok(Value::Int(instance_id)))
+    }
+
+    /// `payload` (the last argument) is accepted for signature symmetry
+    /// with `advance_*`'s own future evolution but not yet threaded into
+    /// `on_entry`/`on_exit` bindings — a disclosed v1 gap, `WORKFLOW.md`'s
+    /// "deliberate non-goals" section names it.
+    fn workflow_advance(&self, args: &[Value], span: Span) -> SResult<Value> {
+        let Value::Str(workflow_name) = &args[0] else {
+            unreachable!("typeck.rs already proved this is a str")
+        };
+        let Value::Int(instance_id) = &args[1] else {
+            unreachable!("typeck.rs already proved this is an i64")
+        };
+        let instance_id = *instance_id;
+        let event_tag: Arc<str> = match &args[2] {
+            Value::Enum(_, variant, _) => Arc::clone(variant),
+            _ => unreachable!("typeck.rs already proved this is a workflow event enum value"),
+        };
+        let wf = self
+            .find_workflow(workflow_name)
+            .unwrap_or_else(|| unreachable!("workflow_lower.rs only ever emits calls naming a real workflow"));
+        let wlog = self.workflow_log(span).map_err(Signal::Err)?;
+        let Some((_, current_state, data_json)) =
+            wlog.get_instance(instance_id).map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?
+        else {
+            return Ok(workflow_err("InstanceNotFound", vec![]));
+        };
+        let Some(from_state) = wf.states.iter().find(|s| s.name == current_state) else {
+            return Ok(workflow_err("InstanceNotFound", vec![]));
+        };
+        let Some(transition) = from_state.transitions.iter().find(|t| t.event.as_str() == event_tag.as_ref()) else {
+            return Ok(workflow_err("NoSuchTransition", vec![]));
+        };
+        let data_ty = Ty::Named(format!("{workflow_name}Data"), vec![]);
+        let json_val: serde_json::Value = serde_json::from_str(&data_json).unwrap_or(serde_json::Value::Null);
+        let data_val = crate::serve::decode_value(&json_val, &data_ty, &self.program, 0)
+            .map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
+
+        // `on_exit` of the old state runs before the state actually
+        // moves -- a trap here (retries exhausted) leaves the instance in
+        // `from_state`, so `advance_*` is safe to call again.
+        let mut exit_env = Env::new();
+        exit_env.define("instance_id", Value::Int(instance_id), Ty::I64);
+        exit_env.define("data", data_val.clone(), data_ty.clone());
+        self.run_workflow_actions(&from_state.on_exit, &mut exit_env, instance_id, &from_state.name)?;
+
+        let now = now_secs();
+        wlog.record_transition(instance_id, &from_state.name, &transition.target, &event_tag, now)
+            .map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
+
+        let to_state = wf
+            .states
+            .iter()
+            .find(|s| s.name == transition.target)
+            .expect("workflow_lower.rs already proved every transition target is a declared state");
+        let mut entry_env = Env::new();
+        entry_env.define("instance_id", Value::Int(instance_id), Ty::I64);
+        entry_env.define("data", data_val, data_ty);
+        self.bind_link_tokens(&wlog, wf, to_state, instance_id, &mut entry_env, span)?;
+        self.run_workflow_actions(&to_state.on_entry, &mut entry_env, instance_id, &to_state.name)?;
+
+        Ok(result_ok(Value::Bool(true)))
+    }
+
+    fn workflow_link_advance(&self, args: &[Value], span: Span) -> SResult<Value> {
+        let Value::Int(instance_id) = &args[1] else {
+            unreachable!("typeck.rs already proved this is an i64")
+        };
+        let instance_id = *instance_id;
+        let event_tag: Arc<str> = match &args[2] {
+            Value::Enum(_, variant, _) => Arc::clone(variant),
+            _ => unreachable!("typeck.rs already proved this is a workflow event enum value"),
+        };
+        let Value::Struct(_, token_fields) = &args[3] else {
+            unreachable!("typeck.rs already proved this is a workflow link-token struct value")
+        };
+        let Value::Str(presented_token) = &token_fields[0] else {
+            unreachable!("workflow_lower.rs's synthesized LinkToken struct has exactly one `str` field")
+        };
+        let wlog = self.workflow_log(span).map_err(Signal::Err)?;
+        let found = wlog.find_unconsumed_link(instance_id, &event_tag).map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
+        let Some((row_id, stored_token)) = found else {
+            return Ok(workflow_err("LinkTokenMismatch", vec![]));
+        };
+        // Constant-time compare *before* touching the database again --
+        // the same timing-side-channel fix `trade_finance.nir:676`'s
+        // `constant_time_str_eq` already established for
+        // `decide_approval_via_link`.
+        if !constant_time_eq(&stored_token, presented_token) {
+            return Ok(workflow_err("LinkTokenMismatch", vec![]));
+        }
+        let consumed = wlog.consume_link_by_id(row_id).map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
+        if !consumed {
+            // Another request won the race between `find_unconsumed_link`
+            // and here -- already spent.
+            return Ok(workflow_err("LinkAlreadyConsumed", vec![]));
+        }
+        // Same transition/state-move/`on_entry` logic `workflow_advance`
+        // already implements -- the token isn't part of that, only its
+        // own verification above is.
+        self.workflow_advance(&[args[0].clone(), args[1].clone(), args[2].clone(), args[4].clone()], span)
+    }
+
+    /// `Recipient::BySubject(s)` is just `s`; `Recipient::ByRole(role)`
+    /// fans out via `identity_directory` (`workflow_log.rs`) -- the piece
+    /// no builtin/route in this codebase kept before.
+    fn resolve_recipients(&self, wlog: &WorkflowLog, to: &Value, span: Span) -> SResult<Vec<String>> {
+        let Value::Enum(_, variant, payload) = to else {
+            unreachable!("typeck.rs already proved this is a Recipient value")
+        };
+        let Value::Str(s) = &payload[0] else {
+            unreachable!("Recipient's variants are both a single str payload")
+        };
+        match variant.as_ref() {
+            "BySubject" => Ok(vec![s.to_string()]),
+            "ByRole" => wlog.subjects_with_role(s).map_err(|e| Signal::Err(self.workflow_log_err(e, span))),
+            _ => unreachable!("ast::prelude_enums' Recipient has exactly these two variants"),
+        }
+    }
+
+    /// `send_email`/`send_sms`/`send_push`'s (and `notify`'s offline
+    /// fallback's) real transport for one subject on one channel — looks
+    /// up the app's own admin-editable provider-config row (an ordinary
+    /// user `struct`, e.g. `EmailProviderConfig`, migrated by `nirdosha
+    /// serve --db` into `email_provider_config` like any other struct;
+    /// `WORKFLOW.md` documents the exact column convention this reads)
+    /// via `conn`, then a generic authenticated HTTPS POST
+    /// (`notify_https_post`). Returns the ready-to-return `.nir` `Err(..)`
+    /// value directly on failure, `Ok(())` on success — callers just
+    /// `return Ok(e)` on `Err`.
+    fn send_via_channel(&self, conn: &Value, channel: &str, subject: &str, template: &str, vars: &Value) -> Result<(), Value> {
+        let Value::Db(slot) = conn else { unreachable!("typeck.rs already proved this is db") };
+        let guard = slot.lock().unwrap();
+        let Some(sqlite) = guard.as_ref() else {
+            return Err(workflow_err("ProviderRequestFailed", vec![Value::Str(Arc::from("db connection is stopped"))]));
+        };
+        let table = provider_table_name(channel);
+        let row: rusqlite::Result<(String, i64, String, String, String)> = sqlite.query_row(
+            &format!("SELECT host, port, path, api_key, from_address FROM {table} WHERE active = 1 ORDER BY id DESC LIMIT 1"),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        );
+        let (host, port, path, api_key, from_address) = match row {
+            Ok(r) => r,
+            Err(_) => return Err(workflow_err("ProviderNotConfigured", vec![])),
+        };
+        let Value::Json(doc) = vars else { unreachable!("typeck.rs already proved this is json") };
+        let body = serde_json::json!({
+            "to": subject,
+            "from": from_address,
+            "template": template,
+            "vars": (**doc).clone(),
+        })
+        .to_string();
+        match notify_https_post(&host, port, &path, &api_key, &body) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(workflow_err("ProviderRequestFailed", vec![Value::Str(Arc::from(e))])),
+        }
+    }
+
+    fn dispatch_send(&self, args: &[Value], span: Span, channel: &str) -> SResult<Value> {
+        let conn = &args[0];
+        let to = &args[1];
+        let Value::Str(template) = &args[2] else { unreachable!("typeck.rs already proved this is a str") };
+        let vars = &args[3];
+        let wlog = self.workflow_log(span).map_err(Signal::Err)?;
+        let subjects = self.resolve_recipients(&wlog, to, span)?;
+        if subjects.is_empty() {
+            return Ok(workflow_err("NoRecipientsForRole", vec![]));
+        }
+        for subject in &subjects {
+            if let Err(e) = self.send_via_channel(conn, channel, subject, template, vars) {
+                return Ok(e);
+            }
+        }
+        Ok(result_ok(Value::Bool(true)))
+    }
+
+    /// Publishes to `nirdosha:push:<subject>` (Redis `PUBLISH`, a sibling
+    /// to the existing `LPUSH`/`BLPOP`-backed `mq_publish`/`mq_consume`,
+    /// same connection type) — the external WS gateway `WORKFLOW.md`
+    /// documents is expected to `SUBSCRIBE` and relay to that subject's
+    /// live browser connection. Fire-and-forget by design (`PUBLISH` has
+    /// no persistence if nobody's subscribed) — fine here specifically
+    /// because `dispatch_notify` only takes this path when
+    /// `identity_presence` says someone should be listening.
+    fn publish_push_event(&self, mq: &Value, subject: &str, template: &str, vars: &Value) -> Result<(), Value> {
+        let Value::Mq(slot) = mq else { unreachable!("typeck.rs already proved this is mq") };
+        let mut guard = slot.lock().unwrap();
+        let Some(conn) = guard.as_mut() else {
+            return Err(workflow_err("ProviderRequestFailed", vec![Value::Str(Arc::from("mq connection is stopped"))]));
+        };
+        let Value::Json(doc) = vars else { unreachable!("typeck.rs already proved this is json") };
+        let payload = serde_json::json!({
+            "template": template,
+            "vars": (**doc).clone(),
+            "sent_at": now_secs(),
+        })
+        .to_string();
+        let channel = format!("nirdosha:push:{subject}");
+        match redis::cmd("PUBLISH").arg(&channel).arg(&payload).query::<i64>(&mut conn.0) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(workflow_err("ProviderRequestFailed", vec![Value::Str(Arc::from(e.to_string()))])),
+        }
+    }
+
+    fn dispatch_notify(&self, args: &[Value], span: Span) -> SResult<Value> {
+        let conn = &args[0];
+        let mq = &args[1];
+        let to = &args[2];
+        let Value::Str(template) = &args[3] else { unreachable!("typeck.rs already proved this is a str") };
+        let vars = &args[4];
+        let wlog = self.workflow_log(span).map_err(Signal::Err)?;
+        let subjects = self.resolve_recipients(&wlog, to, span)?;
+        if subjects.is_empty() {
+            return Ok(workflow_err("NoRecipientsForRole", vec![]));
+        }
+        for subject in &subjects {
+            let online = wlog.is_online(subject).map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
+            let outcome =
+                if online { self.publish_push_event(mq, subject, template, vars) } else { self.send_via_channel(conn, "email", subject, template, vars) };
+            if let Err(e) = outcome {
+                return Ok(e);
+            }
+        }
+        Ok(result_ok(Value::Bool(true)))
+    }
+
     fn call(&self, name: &str, arg_vals: &[Value], span: Span) -> Result<Value, RuntimeError> {
         // `MAX_CALL_DEPTH` guard (see its own doc comment and
         // `call_depth`'s): checked and incremented before `run` even
@@ -3871,6 +4380,16 @@ impl Interpreter {
                     let mut vals = Vec::with_capacity(arg_exprs.len());
                     for a in arg_exprs {
                         vals.push(self.eval_expr(a, env)?);
+                    }
+                    // `send_email`/`send_sms`/`send_push`/`notify` and
+                    // `workflow_lower.rs`'s three internal builtins need
+                    // `self`/durable-log access `eval_builtin`'s
+                    // free-function shape can't provide — handled here,
+                    // ahead of the generic dispatch below, the same
+                    // reason `Expr::Transact` bypasses `eval_builtin`
+                    // entirely instead of being just another arm in it.
+                    if let Some(v) = self.eval_workflow_builtin(name, &vals, *span)? {
+                        return Ok(v);
                     }
                     // Observability layer 1's third and last hook point —
                     // one wrapping call at this single dispatch site (not

@@ -126,6 +126,8 @@ pub fn error_kind_name(kind: &crate::interpreter::ErrorKind) -> &'static str {
         TransactCommitPending { .. } => "TransactCommitPending",
         TransactCompensatePending { .. } => "TransactCompensatePending",
         TransactNetworkTimedOut { .. } => "TransactNetworkTimedOut",
+        WorkflowLogUnavailable { .. } => "WorkflowLogUnavailable",
+        WorkflowActionPending { .. } => "WorkflowActionPending",
     }
 }
 

@@ -64,6 +64,7 @@ cargo run -- serve <file.nil> --port 8080     # run as a real HTTP service
 | Design philosophy / the "rows" (no-GC, no-races, determinism, LLM-friendliness, ...) | `goal.md` |
 | Phase-by-phase build plan (0.5 → 5) | `Nirdosha_Unified_Plan.md` |
 | `transact` durability protocol (WAL, crash replay, `txn_id`, retry/timeout) | `TRANSACT.md` |
+| `workflow` state machines, `on_entry`/`on_exit` notification actions, presence bridge | `WORKFLOW.md` |
 | `sandbox`/`stop` process-isolation design | `SANDBOXING.md` |
 | Row 11 (`struct`/`enum`/generics/`match`) design rationale | `nirdosha_row11_amendment.md` |
 | Row 12 (identity/`VerifiedIdentity`/sessions/API keys) design | `nirdosha_row12_functions_identity.md` |

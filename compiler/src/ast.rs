@@ -592,6 +592,15 @@ pub struct EnumDecl {
     pub module: Option<String>,
 }
 
+/// `Recipient`/`WorkflowActionError` — `WORKFLOW.md`'s prelude enums for
+/// the `send_email`/`send_sms`/`send_push`/`notify` builtins. `str`
+/// payloads on these variants are the documented, precedented exemption
+/// (`LANGUAGE.md` §6b: "an enum variant may itself carry a `str` payload
+/// ... the check only inspects a `fn`'s own declared parameter/return
+/// type expression") — a bare `Ty::Named("Recipient", [])` has nothing
+/// for `Ty::contains_str` to recurse into, so this needs no `Text`
+/// wrapper the way a real `fn` boundary would.
+///
 /// `Option(T)`/`Result(T, E)` — Row 11 layer 7's prelude, injected into
 /// every `Program.enums` at parse time (`Parser::parse_program`) as if
 /// the user had written them, exactly the way `nirdosha_row11_amendment.md`
@@ -627,6 +636,39 @@ pub fn prelude_enums() -> Vec<EnumDecl> {
             variants: vec![
                 Variant { name: "Ok".to_string(), payload: vec![Ty::Named("T".to_string(), vec![])], span },
                 Variant { name: "Err".to_string(), payload: vec![Ty::Named("E".to_string(), vec![])], span },
+            ],
+            span,
+            module: None,
+        },
+        // WORKFLOW.md: `send_email`/`send_sms`/`send_push`/`notify`'s `to`
+        // parameter. `str` payloads are the documented enum-variant
+        // exemption from the fn-boundary str ban (LANGUAGE.md §6b) — see
+        // the doc comment just above `prelude_enums`.
+        EnumDecl {
+            name: "Recipient".to_string(),
+            type_params: vec![],
+            variants: vec![
+                Variant { name: "BySubject".to_string(), payload: vec![Ty::Str], span },
+                Variant { name: "ByRole".to_string(), payload: vec![Ty::Str], span },
+            ],
+            span,
+            module: None,
+        },
+        // WORKFLOW.md: the shared error type for every workflow-action
+        // builtin and every desugared `start_*`/`advance_*`/`*_via_link`
+        // function's `Result(_, WorkflowActionError)` return type.
+        EnumDecl {
+            name: "WorkflowActionError".to_string(),
+            type_params: vec![],
+            variants: vec![
+                Variant { name: "NoRecipientsForRole".to_string(), payload: vec![], span },
+                Variant { name: "ProviderNotConfigured".to_string(), payload: vec![], span },
+                Variant { name: "ProviderRequestFailed".to_string(), payload: vec![Ty::Str], span },
+                Variant { name: "NoSuchTransition".to_string(), payload: vec![], span },
+                Variant { name: "InstanceNotFound".to_string(), payload: vec![], span },
+                Variant { name: "LinkAlreadyConsumed".to_string(), payload: vec![], span },
+                Variant { name: "LinkTokenMismatch".to_string(), payload: vec![], span },
+                Variant { name: "ActionPending".to_string(), payload: vec![Ty::Str], span },
             ],
             span,
             module: None,
@@ -1225,6 +1267,14 @@ pub struct Program {
     /// At most one `dashboard { ... }` block — supplements (doesn't
     /// replace) `stat_`/`chart_` naming-convention inference.
     pub dashboard: Option<DashboardDecl>,
+    /// Declared `workflow Name { ... }` blocks (`WORKFLOW.md`), in
+    /// original source form. Consumed exactly once, by
+    /// `workflow_lower::lower` right after parsing — every later pass
+    /// (`typeck`, the interpreter, `serve.rs`'s automatic RPC exposure)
+    /// only ever sees the `FnDecl`s/`EnumDecl`s that pass synthesizes,
+    /// never this field. Left populated (not drained) after lowering so
+    /// diagnostics can still point at the original `workflow` syntax.
+    pub workflows: Vec<WorkflowDecl>,
 }
 
 /// One `key: value` slot inside a `screen`/`dashboard`/`field`/`action`
@@ -1289,6 +1339,51 @@ pub struct MetricRef {
 pub struct DashboardDecl {
     pub tiles: Vec<MetricRef>,
     pub charts: Vec<MetricRef>,
+    pub span: Span,
+}
+
+/// `on <Event> -> <Target>` / `on link <Event> -> <Target>` inside a
+/// `state` block (`WORKFLOW.md`) — one outgoing transition. `via_link`
+/// means `workflow_lower.rs` also synthesizes an unauthenticated
+/// `<event>_via_link` fn and a per-workflow link-token struct, the same
+/// mint/consume shape `trade_finance.nir:637-689`'s
+/// `decide_approval_via_link` already hand-writes once.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Transition {
+    pub event: String,
+    pub target: String,
+    pub via_link: bool,
+    pub span: Span,
+}
+
+/// `state Name [terminal] { on_entry { ... } on_exit { ... } <on>* }` —
+/// one state inside a `workflow` block. `on_entry`/`on_exit` reuse
+/// `TransactSlot` (bare-call-only action slots, same discipline
+/// `transact`'s own slots already enforce) rather than a new node type.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StateDecl {
+    pub name: String,
+    pub terminal: bool,
+    pub on_entry: Vec<TransactSlot>,
+    pub on_exit: Vec<TransactSlot>,
+    pub transitions: Vec<Transition>,
+    pub span: Span,
+}
+
+/// `workflow Name { data { ... } state ... }` — `WORKFLOW.md`'s durable
+/// state machine. Not a runtime primitive: `workflow_lower.rs` desugars
+/// every `WorkflowDecl` into ordinary `FnDecl`s/`EnumDecl`s right after
+/// parsing, before `typeck` — the same "pure lowering, zero new dispatch
+/// machinery" shape `module` already uses (`LANGUAGE.md` §12), just as a
+/// separate pass instead of parser-time flattening, since a workflow's
+/// lowering needs the full set of states/transitions gathered first.
+/// Kept on `Program` only so the lowering pass (and diagnostics that want
+/// to point at the original syntax) has the source form to read.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowDecl {
+    pub name: String,
+    pub data: Vec<Field>,
+    pub states: Vec<StateDecl>,
     pub span: Span,
 }
 
@@ -1434,6 +1529,15 @@ impl<'a> TypeRegistry<'a> {
 /// `JsonError` type invented in parallel.
 pub fn result_of(ok: Ty) -> Ty {
     Ty::Named("Result".to_string(), vec![ok, Ty::Str])
+}
+
+/// Same shape as `result_of`, `WorkflowActionError` instead of `str` as
+/// the fixed error type — every `send_email`/`send_sms`/`send_push`/
+/// `notify`/`__workflow_*` builtin's return type, and every
+/// `workflow_lower.rs`-synthesized `start_*`/`advance_*`/`*_via_link`
+/// function's declared return type (`WORKFLOW.md`).
+pub fn workflow_result_of(ok: Ty) -> Ty {
+    Ty::Named("Result".to_string(), vec![ok, Ty::Named("WorkflowActionError".to_string(), vec![])])
 }
 
 pub fn zip_type_params<'a, 'b>(type_params: &'a [String], args: &'b [Ty]) -> HashMap<&'a str, &'b Ty> {
@@ -1674,6 +1778,33 @@ pub const BUILTIN_NAMES: &[&str] = &[
     // mints tokens" -- see its own doc comment at the builtin's typeck
     // signature (`typeck.rs`) for why the `mock_` prefix is load-bearing.
     "mock_issue_token",
+    // WORKFLOW.md: notification actions. `to: Recipient` resolves via
+    // `workflow_log.rs`'s own `identity_directory`; `conn: db` looks up
+    // the app's own provider-config table (an ordinary user struct, e.g.
+    // `EmailProviderConfig`) at send time -- see `interpreter.rs`'s
+    // dispatch arm for the full transport (a generic authenticated HTTPS
+    // POST, deliberately not hardcoded to one vendor's exact schema).
+    "send_email",
+    "send_sms",
+    "send_push",
+    // `notify`'s `mq: Mq` is the presence/push-event bridge -- online
+    // (`identity_presence`, updated only by the `_presence_connect`/
+    // `_presence_disconnect` routes `serve.rs` exposes) publishes to a
+    // per-subject Redis channel for an external WS gateway to relay;
+    // offline falls back to `send_email`.
+    "notify",
+    // WORKFLOW.md's shared internal dispatch builtins -- every
+    // `workflow_lower.rs`-synthesized `start_*`/`advance_*`/`*_via_link`
+    // function's body is a one-line call into exactly one of these three,
+    // with its own workflow's name baked in as a literal `str`. Never
+    // written by hand in `.nir` source (nothing stops it syntactically,
+    // but `workflow_log.rs`'s durability bookkeeping assumes the shape
+    // only the desugarer produces) -- the leading `__` is the same
+    // "don't write this yourself" signal `Interpreter`'s own internal
+    // conventions use elsewhere.
+    "__workflow_start",
+    "__workflow_advance",
+    "__workflow_link_advance",
 ];
 
 pub fn is_builtin(name: &str) -> bool {

@@ -236,7 +236,7 @@ mod tests {
     }
 
     fn empty_program() -> Program {
-        Program { fns: vec![], structs: vec![], enums: vec![], screens: vec![], dashboard: None }
+        Program { fns: vec![], structs: vec![], enums: vec![], screens: vec![], dashboard: None, workflows: vec![] }
     }
 
     #[test]

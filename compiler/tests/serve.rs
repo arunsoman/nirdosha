@@ -60,8 +60,10 @@ fn start_server(auth: Option<AuthConfig>) -> u16 {
     let port = free_port();
     let program = Arc::new(build_program(SRC));
     let transact_log = std::env::temp_dir().join(format!("nirdosha-test-transact-{port}.db"));
+    let workflow_log = std::env::temp_dir().join(format!("nirdosha-test-workflow-{port}.db"));
     std::thread::spawn(move || {
-        nirdosha::serve::run(program, "127.0.0.1", port, auth, None, transact_log, None, None).expect("serve::run should not fail to bind");
+        nirdosha::serve::run(program, "127.0.0.1", port, auth, None, transact_log, workflow_log, None, None, None)
+            .expect("serve::run should not fail to bind");
     });
     for _ in 0..100 {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {

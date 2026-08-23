@@ -109,6 +109,21 @@ pub enum Tok {
     /// treatment) since no existing example uses "module" as an
     /// identifier.
     Module,
+    /// `workflow Name { data { ... } state ... }` — top-level durable
+    /// state-machine declaration (`WORKFLOW.md`). A real reserved keyword
+    /// like `Struct`/`Enum`/`Screen`/`Dashboard`/`Module` above; its body
+    /// keywords (`data`/`on_entry`/`on_exit`/`on`/`terminal`/`link`) stay
+    /// contextual-only (matched by identifier text inside
+    /// `parser.rs::parse_workflow_decl` only), same "keyword only within
+    /// one specific syntactic slot" treatment `transact`'s slot names and
+    /// `screen`/`dashboard`'s inner names already get.
+    Workflow,
+    /// `state Name { ... }` — one state inside a `workflow` block. Real
+    /// reserved keyword (unlike its own body's `on_entry`/`on_exit`/`on`,
+    /// which are contextual) since `state` isn't otherwise used as an
+    /// identifier anywhere in the existing examples, matching `Screen`'s
+    /// own reserved-vs-contextual reasoning.
+    State,
     /// `Vector`/`Matrix` in *type* position (`Vector(f64, 3)`) — deliberately
     /// capitalized, distinct from the lowercase `TypeName` scalars, matching
     /// the surface syntax the unified plan's architecture table already
@@ -372,6 +387,8 @@ impl<'a> Lexer<'a> {
                     "screen" => Tok::Screen,
                     "dashboard" => Tok::Dashboard,
                     "module" => Tok::Module,
+                    "workflow" => Tok::Workflow,
+                    "state" => Tok::State,
                     "Vector" => Tok::VectorKw,
                     "Matrix" => Tok::MatrixKw,
                     "true" => Tok::True,

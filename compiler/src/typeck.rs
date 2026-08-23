@@ -370,6 +370,38 @@ pub enum TypeErrorKind {
     /// must stay a plain `str` scalar for WAL durability
     /// (`Ty::is_transact_scalar`), so `check_fn` skips this check for it.
     StrInFnSignature { fn_name: String, param_name: Option<String> },
+    /// `__workflow_advance`/`__workflow_link_advance`'s `event` argument
+    /// wasn't a value of some declared `enum` type — every
+    /// `workflow_lower.rs`-synthesized `<Workflow>Event` is one, but this
+    /// isn't pinned to one fixed `Ty` (it's a different enum per
+    /// workflow), so `infer_builtin_call` checks the shape here instead.
+    WorkflowEventArgMustBeEnum { fn_name: String, found: Ty },
+    /// `__workflow_start`'s `data` argument, or `__workflow_link_advance`'s
+    /// `token` argument, wasn't a value of some declared `struct` type —
+    /// every `workflow_lower.rs`-synthesized `<Workflow>Data`/
+    /// `<Workflow>LinkToken` is one; same "not pinned to one fixed `Ty`"
+    /// reasoning as `WorkflowEventArgMustBeEnum`.
+    WorkflowStructArgMustBeStruct { fn_name: String, arg: String, found: Ty },
+    /// A `workflow` declares a non-`terminal` `state` with no outgoing
+    /// `on` transition at all — a dead end no `advance_*` call could ever
+    /// leave, almost certainly a missing `on ... -> ...` line rather than
+    /// an intentional trap (a genuine dead end should be `terminal`).
+    WorkflowStateHasNoTransitions { workflow: String, state: String },
+    /// A `workflow`'s `on <Event> -> <Target>` names a `<Target>` that
+    /// isn't one of that same workflow's own declared `state`s.
+    WorkflowUnknownTargetState { workflow: String, state: String, target: String },
+    /// Two `on` transitions out of the *same* `state` share an event
+    /// name — `advance_<workflow>` couldn't dispatch unambiguously.
+    WorkflowDuplicateEvent { workflow: String, state: String, event: String },
+    /// An `on_entry`/`on_exit` action referenced `data.<field>`, but the
+    /// enclosing `workflow`'s `data { ... }` block declares no field by
+    /// that name.
+    WorkflowUnknownDataField { workflow: String, field: String },
+    /// An `on_entry`/`on_exit` action referenced `link_<Event>`, but the
+    /// enclosing `state` declares no `link`-marked outgoing transition
+    /// named `<Event>` — the minted-token binding only exists for the
+    /// specific state whose `on_entry` mints it, right before running.
+    WorkflowUnknownLinkBinding { workflow: String, state: String, event: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -691,6 +723,39 @@ impl std::fmt::Display for TypeError {
                  `str` can't cross a function boundary; use an `enum` for categorical data or a \
                  carrier struct (e.g. `Text`) for free text"
             ),
+            TypeErrorKind::WorkflowEventArgMustBeEnum { fn_name, found } => write!(
+                f,
+                "{line}:{col}: `{fn_name}`'s `event` argument must be a workflow event enum value, found {found:?}"
+            ),
+            TypeErrorKind::WorkflowStructArgMustBeStruct { fn_name, arg, found } => write!(
+                f,
+                "{line}:{col}: `{fn_name}`'s `{arg}` argument must be a workflow-declared struct value, found {found:?}"
+            ),
+            TypeErrorKind::WorkflowStateHasNoTransitions { workflow, state } => write!(
+                f,
+                "{line}:{col}: `workflow {workflow}`'s state `{state}` is not `terminal` but declares no \
+                 outgoing `on` transition — either add one or mark it `terminal`"
+            ),
+            TypeErrorKind::WorkflowUnknownTargetState { workflow, state, target } => write!(
+                f,
+                "{line}:{col}: `workflow {workflow}`'s state `{state}` has a transition to `{target}`, \
+                 which is not a state declared in this workflow"
+            ),
+            TypeErrorKind::WorkflowDuplicateEvent { workflow, state, event } => write!(
+                f,
+                "{line}:{col}: `workflow {workflow}`'s state `{state}` declares the event `{event}` on \
+                 more than one outgoing transition"
+            ),
+            TypeErrorKind::WorkflowUnknownDataField { workflow, field } => write!(
+                f,
+                "{line}:{col}: `workflow {workflow}` has no `data` field named `{field}`"
+            ),
+            TypeErrorKind::WorkflowUnknownLinkBinding { workflow, state, event } => write!(
+                f,
+                "{line}:{col}: `workflow {workflow}`'s state `{state}` has no `link`-marked outgoing \
+                 transition named `{event}` — `link_{event}` is only in scope inside the `on_entry` of \
+                 the state that declares it"
+            ),
         }
     }
 }
@@ -915,6 +980,16 @@ fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeE
         c.check_fn(f);
     }
 
+    // `WorkflowDecl`'s own structural rules (WORKFLOW.md) — walked
+    // independently of `workflow_lower.rs`'s desugared `FnDecl`s/
+    // `EnumDecl`s (which get the exact same `check_fn`/enum-registration
+    // treatment as any other declaration, above): this is the one pass
+    // that still has the original `state`/`on_entry`/`on_exit` syntax to
+    // point diagnostics at.
+    for w in &program.workflows {
+        check_workflow_decl(w, &mut c.errors);
+    }
+
     // Effect enforcement runs only over an otherwise-clean program —
     // `effects::infer_effects` assumes every binding's declared type
     // actually resolves (a `let x: file = ...` with an unknown builtin
@@ -935,6 +1010,108 @@ fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeE
         Ok(())
     } else {
         Err(c.errors)
+    }
+}
+
+/// `WorkflowDecl`'s structural rules — every non-terminal `state` has a
+/// way out, every transition target exists, no ambiguous event dispatch,
+/// and every `data.<field>`/`link_<Event>` reference inside an action
+/// call resolves. Doesn't need `TypeRegistry`/`Checker`'s machinery (no
+/// type inference here, just name resolution against the workflow's own
+/// declared shape), so this stays a plain free function rather than
+/// another `Checker` method.
+fn check_workflow_decl(w: &WorkflowDecl, errors: &mut Vec<TypeError>) {
+    let state_names: std::collections::HashSet<&str> = w.states.iter().map(|s| s.name.as_str()).collect();
+    let data_fields: std::collections::HashSet<&str> = w.data.iter().map(|f| f.name.as_str()).collect();
+
+    for s in &w.states {
+        if !s.terminal && s.transitions.is_empty() {
+            errors.push(TypeError {
+                kind: TypeErrorKind::WorkflowStateHasNoTransitions { workflow: w.name.clone(), state: s.name.clone() },
+                span: s.span,
+            });
+        }
+
+        let mut seen_events: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut link_events: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for t in &s.transitions {
+            if !state_names.contains(t.target.as_str()) {
+                errors.push(TypeError {
+                    kind: TypeErrorKind::WorkflowUnknownTargetState {
+                        workflow: w.name.clone(),
+                        state: s.name.clone(),
+                        target: t.target.clone(),
+                    },
+                    span: t.span,
+                });
+            }
+            if !seen_events.insert(t.event.as_str()) {
+                errors.push(TypeError {
+                    kind: TypeErrorKind::WorkflowDuplicateEvent {
+                        workflow: w.name.clone(),
+                        state: s.name.clone(),
+                        event: t.event.clone(),
+                    },
+                    span: t.span,
+                });
+            }
+            if t.via_link {
+                link_events.insert(t.event.as_str());
+            }
+        }
+
+        for action in s.on_entry.iter().chain(s.on_exit.iter()) {
+            for arg in &action.args {
+                check_workflow_action_arg(arg, w, &data_fields, &link_events, &s.name, errors);
+            }
+        }
+    }
+}
+
+/// Walks one `on_entry`/`on_exit` action-call argument expression
+/// looking for `data.<field>`/`link_<Event>` references, recursively
+/// (an argument can itself be a nested call, e.g. `f(data.risk_score)`).
+fn check_workflow_action_arg(
+    e: &Expr,
+    w: &WorkflowDecl,
+    data_fields: &std::collections::HashSet<&str>,
+    link_events: &std::collections::HashSet<&str>,
+    state: &str,
+    errors: &mut Vec<TypeError>,
+) {
+    match e {
+        Expr::FieldAccess(base, field, span) => {
+            if let Expr::Ident(name, _) = base.as_ref() {
+                if name == "data" && !data_fields.contains(field.as_str()) {
+                    errors.push(TypeError {
+                        kind: TypeErrorKind::WorkflowUnknownDataField { workflow: w.name.clone(), field: field.clone() },
+                        span: *span,
+                    });
+                }
+            } else {
+                check_workflow_action_arg(base, w, data_fields, link_events, state, errors);
+            }
+        }
+        Expr::Ident(name, span) => {
+            if let Some(event) = name.strip_prefix("link_") {
+                if !link_events.contains(event) {
+                    errors.push(TypeError {
+                        kind: TypeErrorKind::WorkflowUnknownLinkBinding {
+                            workflow: w.name.clone(),
+                            state: state.to_string(),
+                            event: event.to_string(),
+                        },
+                        span: *span,
+                    });
+                }
+            }
+        }
+        Expr::Call(_, args, _) => {
+            for a in args {
+                check_workflow_action_arg(a, w, data_fields, link_events, state, errors);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2867,6 +3044,81 @@ impl<'a> Checker<'a> {
                 self.check(&args[6], &Ty::Str, expected_ret, scopes); // jwks_json
                 result_of(Ty::Str)
             }
+            // WORKFLOW.md: notification actions. `template`/`vars` are
+            // exempt from the fn-boundary `str` ban like every other
+            // builtin (LANGUAGE.md §6b — this arm is never a `program.fns`
+            // entry).
+            ("send_email", 4) | ("send_sms", 4) | ("send_push", 4) => {
+                self.check(&args[0], &Ty::Db, expected_ret, scopes); // conn
+                self.check(&args[1], &Ty::Named("Recipient".to_string(), vec![]), expected_ret, scopes); // to
+                self.check(&args[2], &Ty::Str, expected_ret, scopes); // template
+                self.check(&args[3], &Ty::Json, expected_ret, scopes); // vars
+                workflow_result_of(Ty::Bool)
+            }
+            ("notify", 5) => {
+                self.check(&args[0], &Ty::Db, expected_ret, scopes); // conn
+                self.check(&args[1], &Ty::Mq, expected_ret, scopes); // mq (presence/push bridge)
+                self.check(&args[2], &Ty::Named("Recipient".to_string(), vec![]), expected_ret, scopes); // to
+                self.check(&args[3], &Ty::Str, expected_ret, scopes); // template
+                self.check(&args[4], &Ty::Json, expected_ret, scopes); // vars
+                workflow_result_of(Ty::Bool)
+            }
+            // `workflow_lower.rs`'s shared internal dispatch builtins —
+            // `event`/`token`'s type isn't pinned to one fixed `Ty` here
+            // (a different compiler-synthesized enum/struct per
+            // workflow); see `WorkflowEventArgMustBeEnum`'s doc comment.
+            ("__workflow_start", 2) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes); // workflow_name
+                let data_ty = self.infer(&args[1], expected_ret, scopes);
+                if data_ty != Ty::Error && !matches!(&data_ty, Ty::Named(n, _) if self.registry.is_struct(n)) {
+                    self.error(
+                        TypeErrorKind::WorkflowStructArgMustBeStruct {
+                            fn_name: name.to_string(),
+                            arg: "data".to_string(),
+                            found: data_ty,
+                        },
+                        args[1].span(),
+                    );
+                }
+                workflow_result_of(Ty::I64)
+            }
+            ("__workflow_advance", 4) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes); // workflow_name
+                self.check(&args[1], &Ty::I64, expected_ret, scopes); // instance_id
+                let event_ty = self.infer(&args[2], expected_ret, scopes);
+                if event_ty != Ty::Error && !matches!(&event_ty, Ty::Named(n, _) if self.registry.is_enum(n)) {
+                    self.error(
+                        TypeErrorKind::WorkflowEventArgMustBeEnum { fn_name: name.to_string(), found: event_ty },
+                        args[2].span(),
+                    );
+                }
+                self.check(&args[3], &Ty::Json, expected_ret, scopes); // payload
+                workflow_result_of(Ty::Bool)
+            }
+            ("__workflow_link_advance", 5) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes); // workflow_name
+                self.check(&args[1], &Ty::I64, expected_ret, scopes); // instance_id
+                let event_ty = self.infer(&args[2], expected_ret, scopes);
+                if event_ty != Ty::Error && !matches!(&event_ty, Ty::Named(n, _) if self.registry.is_enum(n)) {
+                    self.error(
+                        TypeErrorKind::WorkflowEventArgMustBeEnum { fn_name: name.to_string(), found: event_ty },
+                        args[2].span(),
+                    );
+                }
+                let token_ty = self.infer(&args[3], expected_ret, scopes);
+                if token_ty != Ty::Error && !matches!(&token_ty, Ty::Named(n, _) if self.registry.is_struct(n)) {
+                    self.error(
+                        TypeErrorKind::WorkflowStructArgMustBeStruct {
+                            fn_name: name.to_string(),
+                            arg: "token".to_string(),
+                            found: token_ty,
+                        },
+                        args[3].span(),
+                    );
+                }
+                self.check(&args[4], &Ty::Json, expected_ret, scopes); // payload
+                workflow_result_of(Ty::Bool)
+            }
             _ => {
                 for a in args {
                     self.infer(a, expected_ret, scopes);
@@ -2890,8 +3142,11 @@ impl<'a> Checker<'a> {
             | "json_get_bool" | "json_array_get" | "check_role" | "extract_claim" | "extract_claim_path"
             | "db_query" | "db_execute" | "validate_api_key" | "mq_connect" | "constant_time_str_eq" => 2,
             "http_get" | "https_get" | "exchange_refresh_token" | "mq_publish" | "mq_consume" | "check_role_path" => 3,
-            "http_post" | "https_post" | "oidc_validate_token" => 4,
+            "http_post" | "https_post" | "oidc_validate_token" | "send_email" | "send_sms" | "send_push"
+            | "__workflow_advance" => 4,
             "mock_issue_token" => 7,
+            "notify" | "__workflow_link_advance" => 5,
+            "__workflow_start" => 2,
             _ => 1,
         }
     }

@@ -99,9 +99,11 @@ fn start_server(db_path: &str) -> u16 {
     let program = Arc::new(build_program(&widget_src(db_path)));
     let auth = AuthConfig { jwks_json: JWKS.to_string(), issuer: ISSUER.to_string(), audience: AUDIENCE.to_string() };
     let transact_log = std::env::temp_dir().join(format!("nirdosha-field-rbac-transact-{port}.db"));
+    let workflow_log = std::env::temp_dir().join(format!("nirdosha-field-rbac-workflow-{port}.db"));
     let db_path = db_path.to_string();
     std::thread::spawn(move || {
-        nirdosha::serve::run(program, "127.0.0.1", port, Some(auth), None, transact_log, Some(db_path), None).expect("serve::run should not fail to bind");
+        nirdosha::serve::run(program, "127.0.0.1", port, Some(auth), None, transact_log, workflow_log, None, Some(db_path), None)
+            .expect("serve::run should not fail to bind");
     });
     for _ in 0..100 {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {

@@ -41,9 +41,19 @@ fn main() -> ExitCode {
     // file at all, e.g. `nirdosha::run(src: &str)`).
     let transact_log_path: Option<String> =
         raw.iter().find_map(|a| a.strip_prefix("--transact-log=").map(String::from));
-    let mut args = raw
-        .into_iter()
-        .filter(|a| a != "--format=json" && a != "--otel-console" && !a.starts_with("--transact-log="));
+    // `--workflow-log=<path>` (`workflow { ... }`'s durable store,
+    // `WORKFLOW.md`) — same up-front, interpret-only scan as
+    // `--transact-log=<path>`, for the same reason: `cmd_interpret`'s
+    // default when omitted is `<source-file>.workflow.db`, a stable,
+    // program-derived path.
+    let workflow_log_path: Option<String> =
+        raw.iter().find_map(|a| a.strip_prefix("--workflow-log=").map(String::from));
+    let mut args = raw.into_iter().filter(|a| {
+        a != "--format=json"
+            && a != "--otel-console"
+            && !a.starts_with("--transact-log=")
+            && !a.starts_with("--workflow-log=")
+    });
     let first = match args.next() {
         Some(a) => a,
         None => {
@@ -57,14 +67,14 @@ fn main() -> ExitCode {
         "emit-llvm" => cmd_emit_llvm(args),
         "emit-ast" => cmd_emit_ast(args),
         "emit-ui" => cmd_emit_ui(args),
-        "serve" => cmd_serve(args, transact_log_path),
+        "serve" => cmd_serve(args, transact_log_path, workflow_log_path),
         // Not a user-facing subcommand — the *only* caller is a `sandbox`
         // handle's own `Expr::SpawnSandbox` (see interpreter.rs), which
         // execs this exact binary with this exact flag to become the
         // separate OS process a sandbox handle actually points at.
         // Deliberately absent from `print_usage()` for the same reason.
         "--sandbox-worker" => cmd_sandbox_worker(args),
-        path => cmd_interpret(path, format_json, otel_console, transact_log_path),
+        path => cmd_interpret(path, format_json, otel_console, transact_log_path, workflow_log_path),
     }
 }
 
@@ -124,7 +134,13 @@ fn print_value(v: &Value) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_interpret(path: &str, format_json: bool, otel_console: bool, transact_log_path: Option<String>) -> ExitCode {
+fn cmd_interpret(
+    path: &str,
+    format_json: bool,
+    otel_console: bool,
+    transact_log_path: Option<String>,
+    workflow_log_path: Option<String>,
+) -> ExitCode {
     let src = match read_source(path) {
         Ok(s) => s,
         Err(code) => return code,
@@ -140,8 +156,16 @@ fn cmd_interpret(path: &str, format_json: bool, otel_console: bool, transact_log
     // default so a restart's crash replay finds the previous run's
     // pending rows without the caller having to remember a flag.
     let transact_log = std::path::PathBuf::from(transact_log_path.unwrap_or_else(|| format!("{path}.transact.db")));
+    // `workflow { ... }`'s durable store: same default-path convention as
+    // `transact_log` above (`WORKFLOW.md`).
+    let workflow_log = std::path::PathBuf::from(workflow_log_path.unwrap_or_else(|| format!("{path}.workflow.db")));
     if format_json {
-        return match nirdosha::run_diagnostic_with_tracer_and_transact_log(&src, tracer, Some(transact_log)) {
+        return match nirdosha::run_diagnostic_with_tracer_transact_and_workflow_log(
+            &src,
+            tracer,
+            Some(transact_log),
+            Some(workflow_log),
+        ) {
             Ok(v) => print_value(&v),
             // Lex/parse errors aren't part of `Diagnostic` yet (see
             // `lib.rs`'s doc comment) — they stay plain text even under
@@ -158,7 +182,7 @@ fn cmd_interpret(path: &str, format_json: bool, otel_console: bool, transact_log
             }
         };
     }
-    match nirdosha::run_with_tracer_and_transact_log(&src, tracer, Some(transact_log)) {
+    match nirdosha::run_with_tracer_transact_and_workflow_log(&src, tracer, Some(transact_log), Some(workflow_log)) {
         Ok(v) => print_value(&v),
         Err(msg) => {
             eprintln!("{msg}");
@@ -413,7 +437,11 @@ fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
 /// than silently accepted or silently ignored, and any `requires`-gated
 /// handler is simply unreachable (every caller gets 401) — an honest
 /// failure mode, not a security hole disguised as "it just worked."
-fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<String>) -> ExitCode {
+fn cmd_serve(
+    mut args: impl Iterator<Item = String>,
+    transact_log_path: Option<String>,
+    workflow_log_path: Option<String>,
+) -> ExitCode {
     let mut input: Option<String> = None;
     let mut host: String = "127.0.0.1".to_string();
     let mut port: u16 = 8080;
@@ -423,6 +451,7 @@ fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<S
     let mut identity_base: Option<String> = None;
     let mut db_path: Option<String> = None;
     let mut theme_path: Option<String> = None;
+    let mut presence_token: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--host" => host = args.next().unwrap_or(host),
@@ -433,12 +462,21 @@ fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<S
             "--audience" => audience = args.next(),
             "--identity-base" => identity_base = args.next(),
             "--db" => db_path = args.next(),
+            // `WORKFLOW.md`'s presence bridge: the service token an
+            // external WS gateway presents to `_presence_connect`/
+            // `_presence_disconnect` (machine-to-machine, distinct from a
+            // normal user's `Authorization: Bearer` identity token).
+            // Omitted entirely means those two routes always 404 —
+            // `notify()` still works, just always taking the offline
+            // path, the same "a feature you don't opt into costs nothing"
+            // degradation `--db`-gated routes already follow.
+            "--presence-token" => presence_token = args.next(),
             other => input = Some(other.to_string()),
         }
     }
     let Some(path) = input else {
         eprintln!(
-            "usage: nirdosha serve <file.nir> [--host 127.0.0.1] [--port 8080] [--jwks-file P --issuer S --audience S] [--identity-base URL] [--db PATH] [--theme theme.json]"
+            "usage: nirdosha serve <file.nir> [--host 127.0.0.1] [--port 8080] [--jwks-file P --issuer S --audience S] [--identity-base URL] [--db PATH] [--theme theme.json] [--presence-token TOKEN]"
         );
         return ExitCode::FAILURE;
     };
@@ -481,7 +519,21 @@ fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<S
     // scatter a durable transaction's rows across files nothing ever
     // replays together, and would leak one file per request forever.
     let transact_log = std::path::PathBuf::from(transact_log_path.unwrap_or_else(|| format!("{path}.transact.db")));
-    match nirdosha::serve::run(std::sync::Arc::new(program), &host, port, auth, identity_base.as_deref(), transact_log, db_path, theme.as_ref()) {
+    // `workflow { ... }`'s durable store: same one-stable-path-for-the-
+    // server's-lifetime reasoning as `transact_log` above.
+    let workflow_log = std::path::PathBuf::from(workflow_log_path.unwrap_or_else(|| format!("{path}.workflow.db")));
+    match nirdosha::serve::run(
+        std::sync::Arc::new(program),
+        &host,
+        port,
+        auth,
+        identity_base.as_deref(),
+        transact_log,
+        workflow_log,
+        presence_token,
+        db_path,
+        theme.as_ref(),
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("{msg}");

@@ -271,11 +271,13 @@ impl Parser {
         let mut enums = prelude_enums();
         let mut screens = Vec::new();
         let mut dashboard = None;
+        let mut workflows = Vec::new();
         while self.peek().tok != Tok::Eof {
             match self.peek().tok {
                 Tok::Struct => structs.push(self.parse_struct_decl()?),
                 Tok::Enum => enums.push(self.parse_enum_decl()?),
                 Tok::Screen => screens.push(self.parse_screen_decl()?),
+                Tok::Workflow => workflows.push(self.parse_workflow_decl()?),
                 Tok::Dashboard => {
                     let d = self.parse_dashboard_decl()?;
                     if dashboard.is_some() {
@@ -295,7 +297,9 @@ impl Parser {
                 _ => fns.push(self.parse_fn_decl()?),
             }
         }
-        Ok(Program { fns, structs, enums, screens, dashboard })
+        let mut program = Program { fns, structs, enums, screens, dashboard, workflows };
+        crate::workflow_lower::lower(&mut program)?;
+        Ok(program)
     }
 
     /// `module_decl ::= "module" STRING "{" (fn_decl | struct_decl |
@@ -489,6 +493,166 @@ impl Parser {
         }
         self.expect(&Tok::RBrace, "`}`")?;
         Ok(DashboardDecl { tiles, charts, span })
+    }
+
+    /// `workflow_decl ::= "workflow" IDENT "{" data_block? state_decl+ "}"`
+    /// (`GRAMMAR.md`, `WORKFLOW.md`) — parsed into source-form
+    /// `ast::WorkflowDecl`, later desugared by `workflow_lower.rs` into
+    /// ordinary `FnDecl`s/`EnumDecl`s. `data`/`state` bodies dispatch on
+    /// leading-token identifier text exactly like `screen`'s own body
+    /// does (see `parse_screen_decl`'s doc comment) — no second-token
+    /// lookahead anywhere.
+    fn parse_workflow_decl(&mut self) -> PResult<WorkflowDecl> {
+        let span = self.span();
+        self.expect(&Tok::Workflow, "`workflow`")?;
+        let name = self.expect_ident()?;
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut data = Vec::new();
+        if matches!(&self.peek().tok, Tok::Ident(s) if s == "data") {
+            data = self.parse_workflow_data_block()?;
+        }
+        let mut states = Vec::new();
+        while self.peek().tok != Tok::RBrace {
+            match self.peek().tok {
+                Tok::State => states.push(self.parse_state_decl()?),
+                Tok::Eof => {
+                    return Err(ParseError {
+                        message: "unterminated `workflow` block, expected `}`".to_string(),
+                        span: self.span(),
+                    });
+                }
+                ref other => {
+                    return Err(ParseError {
+                        message: format!("expected `state` inside `workflow {name}`, found {other:?}"),
+                        span: self.span(),
+                    });
+                }
+            }
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        if states.is_empty() {
+            return Err(ParseError { message: format!("`workflow {name}` declares no `state`s"), span });
+        }
+        Ok(WorkflowDecl { name, data, states, span })
+    }
+
+    // data_block ::= "data" "{" field ("," field)* ","? "}"
+    fn parse_workflow_data_block(&mut self) -> PResult<Vec<Field>> {
+        self.bump(); // "data" (identifier-matched, not a Tok keyword)
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut fields = Vec::new();
+        if self.peek().tok != Tok::RBrace {
+            loop {
+                let fname = self.expect_ident()?;
+                self.expect(&Tok::Colon, "`:`")?;
+                let fty = self.expect_type()?;
+                fields.push(Field { name: fname, ty: fty });
+                if self.peek().tok == Tok::Comma {
+                    self.bump();
+                    if self.peek().tok == Tok::RBrace {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(fields)
+    }
+
+    /// `state_decl ::= "state" IDENT "terminal"? "{" on_entry_block?
+    /// on_exit_block? transition* "}"` — `terminal` is matched by
+    /// identifier text right after the state name (same "keyword only in
+    /// this one slot" treatment as everywhere else in this grammar), not
+    /// a reserved `Tok`.
+    fn parse_state_decl(&mut self) -> PResult<StateDecl> {
+        let span = self.span();
+        self.expect(&Tok::State, "`state`")?;
+        let name = self.expect_ident()?;
+        let terminal = if matches!(&self.peek().tok, Tok::Ident(s) if s == "terminal") {
+            self.bump();
+            true
+        } else {
+            false
+        };
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut on_entry = Vec::new();
+        let mut on_exit = Vec::new();
+        let mut transitions = Vec::new();
+        while self.peek().tok != Tok::RBrace {
+            match &self.peek().tok {
+                Tok::Ident(s) if s == "on_entry" => {
+                    self.bump();
+                    on_entry = self.parse_action_block()?;
+                }
+                Tok::Ident(s) if s == "on_exit" => {
+                    self.bump();
+                    on_exit = self.parse_action_block()?;
+                }
+                Tok::Ident(s) if s == "on" => transitions.push(self.parse_transition()?),
+                Tok::Eof => {
+                    return Err(ParseError {
+                        message: format!("unterminated `state {name}` block, expected `}}`"),
+                        span: self.span(),
+                    });
+                }
+                other => {
+                    return Err(ParseError {
+                        message: format!(
+                            "expected `on_entry`, `on_exit`, or `on` inside `state {name}`, found {other:?}"
+                        ),
+                        span: self.span(),
+                    });
+                }
+            }
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(StateDecl { name, terminal, on_entry, on_exit, transitions, span })
+    }
+
+    // action_block ::= "{" action_call* "}"
+    fn parse_action_block(&mut self) -> PResult<Vec<TransactSlot>> {
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut actions = Vec::new();
+        while self.peek().tok != Tok::RBrace {
+            actions.push(self.parse_action_call()?);
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(actions)
+    }
+
+    // One bare `name(args)` inside an `on_entry`/`on_exit` block. Same
+    // "must parse as a plain call" restriction `parse_transact_slot`
+    // enforces, reusing `TransactSlot` as the node — see `WorkflowDecl`'s
+    // doc comment for why on_entry/on_exit reuse that type.
+    fn parse_action_call(&mut self) -> PResult<TransactSlot> {
+        let span = self.span();
+        let call = self.parse_call()?;
+        match call {
+            Expr::Call(name, args, call_span) => Ok(TransactSlot { name, args, span: call_span }),
+            _ => Err(ParseError {
+                message: "an `on_entry`/`on_exit` action must be a plain function call, e.g. `send_email(...)`"
+                    .to_string(),
+                span,
+            }),
+        }
+    }
+
+    // transition ::= "on" "link"? IDENT "->" IDENT
+    fn parse_transition(&mut self) -> PResult<Transition> {
+        let span = self.span();
+        self.bump(); // "on"
+        let via_link = if matches!(&self.peek().tok, Tok::Ident(s) if s == "link") {
+            self.bump();
+            true
+        } else {
+            false
+        };
+        let event = self.expect_ident()?;
+        self.expect(&Tok::Arrow, "`->`")?;
+        let target = self.expect_ident()?;
+        Ok(Transition { event, target, via_link, span })
     }
 
     // A `struct`/`enum` declaration's optional type-parameter list --

@@ -112,6 +112,29 @@ messages.
   Known risks deferred to future Track-A work: sandbox Unix-socket peer
   authentication, CORS defaults, and table-route function-level auth
   alignment.
+- **2026-08-24 — `workflow { ... }`: durable state machines with
+  notification actions.** New top-level construct (`workflow`/`state`
+  reserved keywords), desugared by `workflow_lower.rs` into ordinary
+  `fn`/`enum`/`struct` declarations right after parsing — every existing
+  pass (typeck, interpreter, `serve.rs`'s automatic RPC exposure) handles
+  the result unchanged. New durable store (`workflow_log.rs`, modeled on
+  `transact_log.rs`): instance state, append-only history, single-use
+  magic-link tokens (constant-time compared), `identity_directory`
+  (`Recipient::ByRole` resolution — the first reverse role→subjects
+  lookup in this codebase), `identity_presence`. New builtins
+  `send_email`/`send_sms`/`send_push`/`notify` — a generic authenticated-
+  HTTPS-POST transport reading an admin-editable provider-config `struct`
+  (the "communication control," an ordinary CRUD screen, no new UI work);
+  `notify`'s online path is a Redis `PUBLISH` bridge (`nirdosha:push:
+  <subject>`) for an external WS gateway, gated behind new
+  `--presence-token`/`POST /api/_presence_connect`/`_disconnect` — this
+  repo terminates no WebSocket connections itself (verified absent
+  before building this, not assumed). `nirdosha build`/`emit-llvm`
+  cleanly reject `workflow`-using programs via `check_supported`, same
+  as `transact`. Full design, runtime protocol, and disclosed non-goals
+  (no crash-durable per-action replay yet; `payload` not yet threaded
+  into action bindings) in `WORKFLOW.md`. 3 new end-to-end tests
+  (`tests/workflow.rs`); full existing suite (400+ tests) still green.
 
 ---
 

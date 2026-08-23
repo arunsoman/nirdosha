@@ -530,6 +530,10 @@ never silently mis-compiled):
   every builtin not in `codegen.rs`'s `PHASE4_BUILTINS`/
   `PHASE5_BUILTINS`/`STR_CRYPTO_BUILTINS`/`RAND_BUILTINS` lists.
 - `transact`.
+- `workflow` (§14, `WORKFLOW.md`) — its desugared functions call
+  `send_email`/`send_sms`/`send_push`/`notify`/`__workflow_*`, none of
+  which are in `codegen.rs`'s builtin allowlists, so `check_supported`
+  rejects them the same clean, named way it already rejects `transact`.
 - `fn(..)->..`/`acquire`/`requires(...)` — first-class and privileged
   functions (§6a), joining the affine-field `struct`/`enum`/`match` entry
   above on this list.
@@ -731,3 +735,38 @@ records `(filename, applied_at, sql)` for a DB inspected on its own.
 Omitting `--db` leaves an app exactly as it always behaved — this
 feature, like the `/_nirdosha/table/<name>` route it shares its
 `--db`-gating with, only exists at all once that flag is passed.
+
+---
+
+## 14. `workflow` — durable state machines with notification actions
+
+Full design in `WORKFLOW.md` (locked grammar, runtime protocol, deliberate
+non-goals) — this section is the short version.
+
+`workflow Name { data { ... } state ... }` is a durable, named state
+machine: `state`s, `on <Event> -> <Target>` transitions (optionally
+`link`-marked for an unauthenticated, single-use magic-link trigger), and
+`on_entry`/`on_exit` action calls that can reach the new notification
+builtins (`send_email`/`send_sms`/`send_push`/`notify`). Like `module`
+(§12), it's **pure desugaring, not a new runtime primitive**:
+`workflow_lower.rs` turns every `workflow` block into ordinary `fn`/
+`enum`/`struct` declarations (a `start_*`, an `advance_*`, one
+`<event>_via_link` per `link`-marked transition, plus a synthesized
+`<Workflow>Event` enum and `<Workflow>Data` struct) right after parsing —
+every later pass, including `nirdosha serve`'s automatic
+`POST /api/<fn>` RPC exposure, sees only those, never `workflow` syntax
+itself. A program that declares no `workflow` is byte-for-byte unaffected.
+
+Two things this does **not** do, worth stating plainly since they're easy
+to assume: it does not add WebSocket support to this codebase (`notify`'s
+real-time path is a Redis `PUBLISH` an external gateway is expected to
+relay — see `WORKFLOW.md`), and it does not durably log individual
+`on_entry`/`on_exit` action calls the way `transact`'s `network` slot is
+logged before running (a failed action retries in-process only; see
+`WORKFLOW.md`'s "Deliberate non-goals").
+
+Interpreter-only, the same way `transact`/`db`/`mq` already are (§10):
+`workflow`-desugared functions call builtins outside `codegen.rs`'s
+`PHASE4_BUILTINS`/`PHASE5_BUILTINS`/... allowlists, so `nirdosha build`/
+`emit-llvm` cleanly rejects a program using `workflow`, naming the
+specific unsupported builtin — never a silent mis-compile.

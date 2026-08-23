@@ -13,6 +13,8 @@ pub mod token;
 pub mod transact_log;
 pub mod typeck;
 pub mod ui_gen;
+pub mod workflow_lower;
+pub mod workflow_log;
 
 use interpreter::{Interpreter, Value};
 use parser::Parser;
@@ -57,6 +59,20 @@ pub fn run_with_tracer_and_transact_log(
     tracer: Option<std::sync::Arc<observability::Tracer>>,
     transact_log_path: Option<std::path::PathBuf>,
 ) -> Result<Value, String> {
+    run_with_tracer_transact_and_workflow_log(src, tracer, transact_log_path, None)
+}
+
+/// Same as `run_with_tracer_and_transact_log`, plus a caller-chosen,
+/// stable `workflow_log_path` (`Interpreter::with_workflow_log_path`) —
+/// `main.rs`'s `run`/`serve` commands use this instead, for the same
+/// "a restart can find the previous run's state again" reason
+/// `transact_log_path` already gets.
+pub fn run_with_tracer_transact_and_workflow_log(
+    src: &str,
+    tracer: Option<std::sync::Arc<observability::Tracer>>,
+    transact_log_path: Option<std::path::PathBuf>,
+    workflow_log_path: Option<std::path::PathBuf>,
+) -> Result<Value, String> {
     let toks = Lexer::new(src)
         .tokenize()
         .map_err(|e| format!("lex error at {}:{}: {}", e.span.line, e.span.col, e.message))?;
@@ -77,6 +93,9 @@ pub fn run_with_tracer_and_transact_log(
     }
     if let Some(p) = transact_log_path {
         interp = interp.with_transact_log_path(p);
+    }
+    if let Some(p) = workflow_log_path {
+        interp = interp.with_workflow_log_path(p);
     }
     // Crash replay (`TRANSACT.md`'s Layer 4) before `main` ever runs --
     // gated on a cheap textual pre-check (the keyword has to appear in
@@ -164,6 +183,17 @@ pub fn run_diagnostic_with_tracer_and_transact_log(
     tracer: Option<std::sync::Arc<observability::Tracer>>,
     transact_log_path: Option<std::path::PathBuf>,
 ) -> Result<Value, RunFailure> {
+    run_diagnostic_with_tracer_transact_and_workflow_log(src, tracer, transact_log_path, None)
+}
+
+/// Same as `run_diagnostic_with_tracer_and_transact_log`, plus
+/// `run_with_tracer_transact_and_workflow_log`'s own `workflow_log_path`.
+pub fn run_diagnostic_with_tracer_transact_and_workflow_log(
+    src: &str,
+    tracer: Option<std::sync::Arc<observability::Tracer>>,
+    transact_log_path: Option<std::path::PathBuf>,
+    workflow_log_path: Option<std::path::PathBuf>,
+) -> Result<Value, RunFailure> {
     let toks = Lexer::new(src).tokenize().map_err(|e| {
         RunFailure::Lex(format!("lex error at {}:{}: {}", e.span.line, e.span.col, e.message))
     })?;
@@ -182,6 +212,9 @@ pub fn run_diagnostic_with_tracer_and_transact_log(
     }
     if let Some(p) = transact_log_path {
         interp = interp.with_transact_log_path(p);
+    }
+    if let Some(p) = workflow_log_path {
+        interp = interp.with_workflow_log_path(p);
     }
     if src.contains("transact") {
         match interp.replay_pending_transactions() {
