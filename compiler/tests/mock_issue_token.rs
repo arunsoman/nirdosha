@@ -22,21 +22,27 @@ const JWKS: &str = r#"{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc
 fn minted_token_round_trips_through_real_validation() {
     let src = format!(
         r#"
-        fn main() -> str {{
+        struct Text {{
+            value: str,
+        }}
+        fn main() -> Text {{
             let jwks: str = "{JWKS}"
             return match mock_issue_token("alice", "https://mock-idp.local", "store-app", 1700000000, 3600, "{{\"roles\":[\"admin\"]}}", jwks) {{
                 Ok(token) => match oidc_validate_token(token, "https://mock-idp.local", "store-app", jwks) {{
-                    Ok(identity) => identity.subject,
-                    Err(e) => e,
+                    Ok(identity) => Text(identity.subject),
+                    Err(e) => Text(e),
                 }},
-                Err(e) => e,
+                Err(e) => Text(e),
             }}
         }}
     "#
     );
     match run(&src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "alice"),
-        other => panic!("expected Ok(Str(\"alice\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "alice"),
+            other => panic!("expected Text(Str(\"alice\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"alice\")), got {other:?}"),
     }
 }
 
@@ -44,24 +50,30 @@ fn minted_token_round_trips_through_real_validation() {
 fn embedded_claims_survive_the_round_trip_for_check_role() {
     let src = format!(
         r#"
-        fn main() -> str {{
+        struct Text {{
+            value: str,
+        }}
+        fn main() -> Text {{
             let jwks: str = "{JWKS}"
             return match mock_issue_token("bob", "https://mock-idp.local", "store-app", 1700000000, 3600, "{{\"roles\":[\"admin\"]}}", jwks) {{
                 Ok(token) => match oidc_validate_token(token, "https://mock-idp.local", "store-app", jwks) {{
                     Ok(identity) => match check_role(identity, "admin") {{
-                        Ok(proof) => proof.role,
-                        Err(e) => e,
+                        Ok(proof) => Text(proof.role),
+                        Err(e) => Text(e),
                     }},
-                    Err(e) => e,
+                    Err(e) => Text(e),
                 }},
-                Err(e) => e,
+                Err(e) => Text(e),
             }}
         }}
     "#
     );
     match run(&src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "admin"),
-        other => panic!("expected Ok(Str(\"admin\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "admin"),
+            other => panic!("expected Text(Str(\"admin\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"admin\")), got {other:?}"),
     }
 }
 

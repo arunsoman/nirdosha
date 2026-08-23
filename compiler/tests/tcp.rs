@@ -53,18 +53,24 @@ fn a_connected_client_can_send_and_receive_real_bytes() {
 
     let src = format!(
         r#"
-        fn main() -> str {{
+        struct Text {{
+            value: str,
+        }}
+        fn main() -> Text {{
             let conn: tcp = connect("127.0.0.1", {port})
             send(conn, "ping")
             let reply: str = recv(conn)
             stop conn
-            return reply
+            return Text(reply)
         }}
     "#
     );
     match run(&src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "pong"),
-        other => panic!("expected Ok(Str(\"pong\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "pong"),
+            other => panic!("expected Text(Str(\"pong\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"pong\")), got {other:?}"),
     }
     server.join().unwrap();
 }

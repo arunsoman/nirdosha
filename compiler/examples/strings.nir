@@ -3,7 +3,18 @@
 // slicing -- just enough to name things (a hostname, an image, a
 // message) that couldn't be spelled any other way. See tcp_client.nir
 // for what strings are actually *for* right now.
-fn greet(name: str) -> str {
+//
+// `str` can no longer be, or be part of, a function's parameter or
+// return type (the "enum favoring" rule -- `TypeErrorKind::
+// StrInFnSignature`, typeck.rs::check_fn) -- so `greet` takes/returns
+// `Text`, a one-field carrier struct, instead of bare `str`. `str`
+// itself is untouched everywhere else: it's still a completely ordinary
+// struct field type, local variable type, and literal.
+struct Text {
+    value: str,
+}
+
+fn greet(name: Text) -> Text {
     return name
 }
 
@@ -14,8 +25,8 @@ fn main() {
     let escaped: str = "line one\nline two\ttabbed"
     print(escaped)
 
-    let g: str = greet("world")
-    print(g)
+    let g: Text = greet(Text("world"))
+    print(g.value)
 
     let a: str = "same"
     let b: str = "same"

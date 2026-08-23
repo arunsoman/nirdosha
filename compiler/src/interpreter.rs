@@ -1438,6 +1438,15 @@ fn sql_bind_params(args: &[Value]) -> Result<Vec<rusqlite::types::Value>, String
             Value::Float(f) => Ok(rusqlite::types::Value::Real(*f)),
             Value::Str(s) => Ok(rusqlite::types::Value::Text(s.to_string())),
             Value::Bool(b) => Ok(rusqlite::types::Value::Integer(if *b { 1 } else { 0 })),
+            // A zero-payload ("unit") enum variant -- e.g. a categorical
+            // `enum RiskRating { Low, Medium, High }` field -- binds as
+            // its own variant name, TEXT. A payload-carrying variant
+            // can't sensibly occupy one SQL column (it has more than one
+            // value to store), so it still falls through to the error
+            // below, unchanged.
+            Value::Enum(_, variant, payload) if payload.is_empty() => {
+                Ok(rusqlite::types::Value::Text(variant.to_string()))
+            }
             other => Err(format!("db bind value must be str/i64/f64/bool, got {}", other.ty_name())),
         })
         .collect()
@@ -1452,7 +1461,7 @@ fn sql_bind_params(args: &[Value]) -> Result<Vec<rusqlite::types::Value>, String
 /// column is still *readable*, just not round-trippable back into SQL from
 /// Nirdosha yet — a real, narrow, named limitation, not silently assumed
 /// away.
-fn db_row_to_json(row: &rusqlite::Row, column_names: &[String]) -> rusqlite::Result<JsonDoc> {
+pub(crate) fn db_row_to_json(row: &rusqlite::Row, column_names: &[String]) -> rusqlite::Result<JsonDoc> {
     let mut map = serde_json::Map::with_capacity(column_names.len());
     for (i, name) in column_names.iter().enumerate() {
         let value: rusqlite::types::Value = row.get(i)?;
@@ -4891,6 +4900,28 @@ impl Interpreter {
                     span,
                 ),
             },
+            // `typeck.rs`'s `unify_operands` permits `==`/`!=` generically
+            // for any pair of matching types, `Ty::Named` (struct/enum)
+            // included -- same gap `Value::Str`'s comment above already
+            // documents for `str`, found the same way (by testing code
+            // that typechecks, not by re-reading either file): a
+            // `struct`/`enum` value already has a correct `PartialEq`
+            // impl just above (`an == bn && af == bf` /
+            // `an == bn && av == bv && af == bf`), it just had no arm
+            // here to reach it. Surfaced by the "enum favoring" str-ban
+            // work — code migrating off `if status_str == "PENDING"` onto
+            // a real `enum` naturally reaches for `==` next, so this
+            // needs to actually work now, not just typecheck.
+            (l @ Value::Struct(_, _), r @ Value::Struct(_, _)) | (l @ Value::Enum(_, _, _), r @ Value::Enum(_, _, _)) => {
+                match op {
+                    BinOp::Eq => Ok(Value::Bool(l == r)),
+                    BinOp::NotEq => Ok(Value::Bool(l != r)),
+                    _ => err(
+                        ErrorKind::TypeMismatch { expected: "int".to_string(), found: l.ty_name().to_string() },
+                        span,
+                    ),
+                }
+            }
             // Elementwise `+`/`-`/`.*`/`./`, plus structural `==`/`!=` --
             // `typeck.rs` already proved the two operands have exactly
             // the same shape (a `Vector(T, n)` and a `Vector(T, m)` are

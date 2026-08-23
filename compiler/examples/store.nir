@@ -28,6 +28,19 @@
 // *real* computed total is what actually gets persisted to `orders`,
 // via a parameterized query, not passed through the HTTP call.
 
+// The "enum favoring" ban's error-channel replacement for this file's
+// old, universal `Result(_, str)` convention: `DbError(str)` is the
+// escape hatch for a builtin's own dynamic message (`db_connect`/
+// `db_execute`/`db_query` failing) -- carrying that real message forward
+// instead of collapsing it to a generic tag, the same way a `str` struct
+// field already carries free text; `PaymentDeclined`/`InvalidCheckout`
+// are this file's own two static, closed-vocabulary application errors.
+enum ErrorCode {
+    DbError(str),
+    PaymentDeclined,
+    InvalidCheckout,
+}
+
 struct Product {
     id: i64,
     name: str,
@@ -44,71 +57,83 @@ struct Order {
 
 // ---- catalog: plain CRUD, SQLite-backed --------------------------------
 
-fn list_product_inner(conn: db) -> Result(json, str) {
+fn list_product_inner(conn: db) -> Result(json, ErrorCode) {
     let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price_cents INTEGER, stock INTEGER)") {
         Ok(n) => n,
         Err(e) => -1,
     }
-    let rows: Result(json, str) = db_query(conn, "SELECT id, name, price_cents, stock FROM products ORDER BY id")
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, name, price_cents, stock FROM products ORDER BY id") {
+        Ok(r) => Ok(r),
+        Err(e) => Err(DbError(e)),
+    }
     stop conn
     return rows
 }
 
-fn list_product() -> Result(json, str) {
+fn list_product() -> Result(json, ErrorCode) {
     return match db_connect("store.db") {
         Ok(conn) => list_product_inner(conn),
-        Err(e) => Err(e),
+        Err(e) => Err(DbError(e)),
     }
 }
 
-fn create_product_inner(conn: db, p: Product) -> Result(i64, str) {
+fn create_product_inner(conn: db, p: Product) -> Result(i64, ErrorCode) {
     let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price_cents INTEGER, stock INTEGER)") {
         Ok(n) => n,
         Err(e) => -1,
     }
-    let result: Result(i64, str) = db_execute(conn, "INSERT INTO products (name, price_cents, stock) VALUES (?, ?, ?)", p.name, p.price_cents, p.stock)
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO products (name, price_cents, stock) VALUES (?, ?, ?)", p.name, p.price_cents, p.stock) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
     stop conn
     return result
 }
 
-fn create_product(p: Product) -> Result(i64, str) requires(role: "admin") {
+fn create_product(p: Product) -> Result(i64, ErrorCode) requires(role: "admin") {
     return match db_connect("store.db") {
         Ok(conn) => create_product_inner(conn, p),
-        Err(e) => Err(e),
+        Err(e) => Err(DbError(e)),
     }
 }
 
-fn update_product_inner(conn: db, p: Product) -> Result(i64, str) {
+fn update_product_inner(conn: db, p: Product) -> Result(i64, ErrorCode) {
     let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price_cents INTEGER, stock INTEGER)") {
         Ok(n) => n,
         Err(e) => -1,
     }
-    let result: Result(i64, str) = db_execute(conn, "UPDATE products SET name = ?, price_cents = ?, stock = ? WHERE id = ?", p.name, p.price_cents, p.stock, p.id)
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE products SET name = ?, price_cents = ?, stock = ? WHERE id = ?", p.name, p.price_cents, p.stock, p.id) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
     stop conn
     return result
 }
 
-fn update_product(p: Product) -> Result(i64, str) requires(role: "admin") {
+fn update_product(p: Product) -> Result(i64, ErrorCode) requires(role: "admin") {
     return match db_connect("store.db") {
         Ok(conn) => update_product_inner(conn, p),
-        Err(e) => Err(e),
+        Err(e) => Err(DbError(e)),
     }
 }
 
-fn delete_product_inner(conn: db, id: i64) -> Result(i64, str) {
+fn delete_product_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
     let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price_cents INTEGER, stock INTEGER)") {
         Ok(n) => n,
         Err(e) => -1,
     }
-    let result: Result(i64, str) = db_execute(conn, "DELETE FROM products WHERE id = ?", id)
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "DELETE FROM products WHERE id = ?", id) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
     stop conn
     return result
 }
 
-fn delete_product(id: i64) -> Result(i64, str) requires(role: "admin") {
+fn delete_product(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
     return match db_connect("store.db") {
         Ok(conn) => delete_product_inner(conn, id),
-        Err(e) => Err(e),
+        Err(e) => Err(DbError(e)),
     }
 }
 
@@ -117,20 +142,23 @@ fn delete_product(id: i64) -> Result(i64, str) requires(role: "admin") {
 // custom action's client-side handler currently sends only the row's id
 // (mirrors `delete_product`'s own single-param call), the same v1 limit
 // `compiler/UI_DSL_TODO.md` tracks for a future multi-param action form.
-fn restock_product_inner(conn: db, id: i64) -> Result(i64, str) {
+fn restock_product_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
     let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price_cents INTEGER, stock INTEGER)") {
         Ok(n) => n,
         Err(e) => -1,
     }
-    let result: Result(i64, str) = db_execute(conn, "UPDATE products SET stock = stock + 10 WHERE id = ?", id)
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE products SET stock = stock + 10 WHERE id = ?", id) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
     stop conn
     return result
 }
 
-fn restock_product(id: i64) -> Result(i64, str) requires(role: "admin") {
+fn restock_product(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
     return match db_connect("store.db") {
         Ok(conn) => restock_product_inner(conn, id),
-        Err(e) => Err(e),
+        Err(e) => Err(DbError(e)),
     }
 }
 
@@ -153,20 +181,23 @@ screen Product {
 
 // ---- admin: view all orders --------------------------------------------
 
-fn list_order_inner(conn: db) -> Result(json, str) {
+fn list_order_inner(conn: db) -> Result(json, ErrorCode) {
     let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, customer_subject TEXT, total_cents INTEGER, status TEXT)") {
         Ok(n) => n,
         Err(e) => -1,
     }
-    let rows: Result(json, str) = db_query(conn, "SELECT id, customer_subject, total_cents, status FROM orders ORDER BY id DESC")
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, customer_subject, total_cents, status FROM orders ORDER BY id DESC") {
+        Ok(r) => Ok(r),
+        Err(e) => Err(DbError(e)),
+    }
     stop conn
     return rows
 }
 
-fn list_order() -> Result(json, str) requires(role: "admin") {
+fn list_order() -> Result(json, ErrorCode) requires(role: "admin") {
     return match db_connect("store.db") {
         Ok(conn) => list_order_inner(conn),
-        Err(e) => Err(e),
+        Err(e) => Err(DbError(e)),
     }
 }
 
@@ -184,7 +215,7 @@ fn publish_order_created(mqconn: mq) -> i64 {
     return published
 }
 
-fn checkout_inner(conn: db, identity: VerifiedIdentity, product_id: i64, qty: i64) -> Result(Order, str) {
+fn checkout_inner(conn: db, identity: VerifiedIdentity, product_id: i64, qty: i64) -> Result(Order, ErrorCode) {
     let t1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price_cents INTEGER, stock INTEGER)") {
         Ok(n) => n,
         Err(e) => -1,
@@ -277,17 +308,17 @@ fn checkout_inner(conn: db, identity: VerifiedIdentity, product_id: i64, qty: i6
         Ok(Order(order_id, subject, total_cents, "paid"))
     } else {
         if valid {
-            Err("payment gateway declined the charge")
+            Err(PaymentDeclined())
         } else {
-            Err("checkout failed: unknown product, non-positive qty, or insufficient stock")
+            Err(InvalidCheckout())
         }
     }
 }
 
-fn checkout(identity: VerifiedIdentity, product_id: i64, qty: i64) -> Result(Order, str) {
+fn checkout(identity: VerifiedIdentity, product_id: i64, qty: i64) -> Result(Order, ErrorCode) {
     return match db_connect("store.db") {
         Ok(conn) => checkout_inner(conn, identity, product_id, qty),
-        Err(e) => Err(e),
+        Err(e) => Err(DbError(e)),
     }
 }
 

@@ -5,17 +5,18 @@
 // already-parsed serde_json tree directly, never materializing a
 // Nirdosha-level Vector/Matrix for it.
 
-fn describe_user(doc: json) -> str {
-    return match json_get_str(doc, "name") {
-        Ok(name) => name,
-        Err(msg) => msg,
-    }
+struct Text {
+    value: str,
 }
 
-fn main() -> str {
+fn main() {
     let text: str = "{\"name\": \"nirdosha\", \"version\": 1, \"stable\": false, \"tags\": [\"lang\", \"compiler\"]}"
-    return match json_parse(text) {
-        Ok(doc) => describe_user(doc),
-        Err(msg) => msg,
+    let described: Text = match json_parse(text) {
+        Ok(doc) => match json_get_str(doc, "name") {
+            Ok(name) => Text(name),
+            Err(msg) => Text(msg),
+        },
+        Err(msg) => Text(msg),
     }
+    print(described.value)
 }

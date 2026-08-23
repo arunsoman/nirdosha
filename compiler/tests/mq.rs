@@ -24,23 +24,29 @@ fn publish_then_consume_round_trips_the_message() {
     let queue = unique_queue("roundtrip");
     let src = format!(
         r#"
-        fn main() -> str {{
+        struct Text {{
+            value: str,
+        }}
+        fn main() -> Text {{
             return match mq_connect("127.0.0.1", 6379) {{
                 Ok(conn) => match mq_publish(conn, "{queue}", "hello from nirdosha") {{
                     Ok(u) => match mq_consume(conn, "{queue}", 5) {{
-                        Ok(msg) => msg,
-                        Err(e) => e,
+                        Ok(msg) => Text(msg),
+                        Err(e) => Text(e),
                     }},
-                    Err(e) => e,
+                    Err(e) => Text(e),
                 }},
-                Err(e) => e,
+                Err(e) => Text(e),
             }}
         }}
     "#
     );
     match run(&src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "hello from nirdosha"),
-        other => panic!("expected Ok(Str(\"hello from nirdosha\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "hello from nirdosha"),
+            other => panic!("expected Text(Str(\"hello from nirdosha\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"hello from nirdosha\")), got {other:?}"),
     }
 }
 
@@ -49,20 +55,26 @@ fn consume_on_an_empty_queue_times_out_as_err_not_a_hang() {
     let queue = unique_queue("empty");
     let src = format!(
         r#"
-        fn main() -> str {{
+        struct Text {{
+            value: str,
+        }}
+        fn main() -> Text {{
             return match mq_connect("127.0.0.1", 6379) {{
                 Ok(conn) => match mq_consume(conn, "{queue}", 1) {{
-                    Ok(msg) => msg,
-                    Err(e) => e,
+                    Ok(msg) => Text(msg),
+                    Err(e) => Text(e),
                 }},
-                Err(e) => e,
+                Err(e) => Text(e),
             }}
         }}
     "#
     );
     match run(&src) {
-        Ok(Value::Str(s)) => assert!(s.contains("no message"), "expected a timeout error, got {s:?}"),
-        other => panic!("expected Ok(Str(..timeout message..)), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert!(s.contains("no message"), "expected a timeout error, got {s:?}"),
+            other => panic!("expected Text(Str(..timeout message..)), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(..timeout message..)), got {other:?}"),
     }
 }
 
@@ -79,17 +91,20 @@ fn using_a_connection_after_stop_is_an_ownership_error() {
     let queue = unique_queue("afterstop");
     let src = format!(
         r#"
-        fn after_stop(conn: mq) -> str {{
+        struct Text {{
+            value: str,
+        }}
+        fn after_stop(conn: mq) -> Text {{
             stop conn
             return match mq_publish(conn, "{queue}", "too late") {{
-                Ok(u) => "should not reach here",
-                Err(e) => e,
+                Ok(u) => Text("should not reach here"),
+                Err(e) => Text(e),
             }}
         }}
-        fn main() -> str {{
+        fn main() -> Text {{
             return match mq_connect("127.0.0.1", 6379) {{
                 Ok(c) => after_stop(c),
-                Err(e) => e,
+                Err(e) => Text(e),
             }}
         }}
     "#

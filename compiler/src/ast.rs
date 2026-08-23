@@ -391,6 +391,26 @@ impl Ty {
         self.is_numeric() || matches!(self, Ty::Bool | Ty::Str)
     }
 
+    /// True if `Ty::Str` appears anywhere inside this type, including
+    /// nested inside a generic argument (`Result(T, str)`, `Option(str)`),
+    /// a `box`/`&`/`thread`/`chan` payload, a `Vector`/`Matrix` element
+    /// type, or a `fn(...) -> ...` type's own params/return. Used by
+    /// `typeck.rs::check_fn` to enforce that no user `fn`'s parameter or
+    /// return type can be, or contain, `str` — see that call site for why
+    /// (the "enum favoring" rule: `str` may still live in a `struct`
+    /// field, since construction is a call to a name in `callable_names`,
+    /// never a `program.fns` entry this check walks).
+    pub fn contains_str(&self) -> bool {
+        match self {
+            Ty::Str => true,
+            Ty::Named(_, args) => args.iter().any(Ty::contains_str),
+            Ty::Box(inner) | Ty::Ref(inner) | Ty::Thread(inner) | Ty::Channel(inner) => inner.contains_str(),
+            Ty::Vector(inner, _) | Ty::Matrix(inner, _, _) => inner.contains_str(),
+            Ty::Fn(params, ret) => params.iter().any(Ty::contains_str) || ret.contains_str(),
+            _ => false,
+        }
+    }
+
     /// The property that makes ownership meaningful: an affine value has
     /// exactly one owner at a time, and using it (other than reading
     /// *through* it — see `Expr::Deref`) transfers that ownership rather
@@ -532,6 +552,15 @@ pub struct StructDecl {
     pub type_params: Vec<String>,
     pub fields: Vec<Field>,
     pub span: Span,
+    /// `Some("Display Name")` when declared inside a `module "Display
+    /// Name" { ... }` block, `None` for every top-level (or prelude)
+    /// declaration — the common case, and the only case before this
+    /// field existed, so every pre-existing `.nir` file is unaffected.
+    /// Purely descriptive: consumed only by `ui_gen.rs` to group nav
+    /// screens, never by `typeck.rs` — there is still exactly one flat
+    /// global namespace, `module` adds no scoping at all. See
+    /// `parser.rs::parse_module_decl`'s doc comment for the full design.
+    pub module: Option<String>,
 }
 
 /// One `enum` variant — `Some(T)`, `None`, `Circle(f64)`. `payload` is
@@ -559,6 +588,8 @@ pub struct EnumDecl {
     pub type_params: Vec<String>,
     pub variants: Vec<Variant>,
     pub span: Span,
+    /// Same meaning as `StructDecl::module` — see its doc comment.
+    pub module: Option<String>,
 }
 
 /// `Option(T)`/`Result(T, E)` — Row 11 layer 7's prelude, injected into
@@ -588,6 +619,7 @@ pub fn prelude_enums() -> Vec<EnumDecl> {
                 Variant { name: "None".to_string(), payload: vec![], span },
             ],
             span,
+            module: None,
         },
         EnumDecl {
             name: "Result".to_string(),
@@ -597,6 +629,7 @@ pub fn prelude_enums() -> Vec<EnumDecl> {
                 Variant { name: "Err".to_string(), payload: vec![Ty::Named("E".to_string(), vec![])], span },
             ],
             span,
+            module: None,
         },
     ]
 }
@@ -620,6 +653,7 @@ pub fn prelude_structs() -> Vec<StructDecl> {
                 Field { name: "body".to_string(), ty: Ty::Str },
             ],
             span,
+            module: None,
         },
         // Row 12: first-class identity consumption. VerifiedIdentity is the
         // common abstraction produced by protocol adapters; it is freely
@@ -637,18 +671,21 @@ pub fn prelude_structs() -> Vec<StructDecl> {
                 Field { name: "claims_json".to_string(), ty: Ty::Str },
             ],
             span,
+            module: None,
         },
         StructDecl {
             name: "RoleView".to_string(),
             type_params: vec![],
             fields: vec![Field { name: "role".to_string(), ty: Ty::Str }],
             span,
+            module: None,
         },
         StructDecl {
             name: "ClaimView".to_string(),
             type_params: vec![],
             fields: vec![Field { name: "value".to_string(), ty: Ty::Str }],
             span,
+            module: None,
         },
         // Row 12 continued: application session and refresh-token lifecycle.
         // ApplicationSession is separate from VerifiedIdentity and manages
@@ -665,6 +702,7 @@ pub fn prelude_structs() -> Vec<StructDecl> {
                 Field { name: "last_accessed_at".to_string(), ty: Ty::I64 },
             ],
             span,
+            module: None,
         },
         // RefreshTokenHandle is affine (box i64 field) — represents a
         // runtime-managed refresh token slot.
@@ -676,6 +714,7 @@ pub fn prelude_structs() -> Vec<StructDecl> {
                 Field { name: "expires_at".to_string(), ty: Ty::I64 },
             ],
             span,
+            module: None,
         },
         // Generic pair for returning two values together (used by refresh
         // token exchange).
@@ -687,6 +726,7 @@ pub fn prelude_structs() -> Vec<StructDecl> {
                 Field { name: "second".to_string(), ty: Ty::Named("B".to_string(), vec![]) },
             ],
             span,
+            module: None,
         },
     ]
 }
@@ -769,6 +809,8 @@ pub struct FnDecl {
     /// presenting a matching `RoleView`/`ClaimView` proof. See
     /// `Requirement`'s own doc comment.
     pub requires: Option<Requirement>,
+    /// Same meaning as `StructDecl::module` — see its doc comment.
+    pub module: Option<String>,
 }
 
 /// What `acquire` (`Expr::Acquire`) demands proof of before a `requires`-

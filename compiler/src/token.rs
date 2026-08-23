@@ -99,6 +99,16 @@ pub enum Tok {
     /// inference; see `Screen`'s doc comment for the same reserved-vs-
     /// contextual reasoning.
     Dashboard,
+    /// `module "Display Name" { fn ... struct ... enum ... }` — pure
+    /// nav-grouping sugar for `ui_gen.rs` (`GRAMMAR.md`'s `module_decl`),
+    /// not a real scoping/namespace construct: every declaration inside
+    /// still registers into the exact same flat global namespace as a
+    /// top-level one, just tagged with this module's display name. A
+    /// real reserved keyword (like `Struct`/`Enum`/`Screen`/`Dashboard`
+    /// above, unlike `field`/`action`/`paginate`'s contextual-only
+    /// treatment) since no existing example uses "module" as an
+    /// identifier.
+    Module,
     /// `Vector`/`Matrix` in *type* position (`Vector(f64, 3)`) — deliberately
     /// capitalized, distinct from the lowercase `TypeName` scalars, matching
     /// the surface syntax the unified plan's architecture table already
@@ -361,6 +371,7 @@ impl<'a> Lexer<'a> {
                     "match" => Tok::Match,
                     "screen" => Tok::Screen,
                     "dashboard" => Tok::Dashboard,
+                    "module" => Tok::Module,
                     "Vector" => Tok::VectorKw,
                     "Matrix" => Tok::MatrixKw,
                     "true" => Tok::True,

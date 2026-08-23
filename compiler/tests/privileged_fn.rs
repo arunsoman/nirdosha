@@ -36,13 +36,6 @@ fn expect_int(v: Value, want: i64) {
     }
 }
 
-fn expect_str(v: Value, want: &str) {
-    match v {
-        Value::Str(s) => assert_eq!(s.as_ref(), want),
-        other => panic!("expected Str({want:?}), got {other:?}"),
-    }
-}
-
 // ---- plain (ungated) first-class functions -----------------------------
 
 #[test]
@@ -225,47 +218,22 @@ fn acquire_with_correct_role_end_to_end() {
 fn acquire_with_correct_claim_end_to_end() {
     let src = format!(
         r#"
-        fn read_chart(patient_id: str) -> str requires(claim: "department", "cardiology") {{
+        struct Text {{
+            value: str,
+        }}
+        fn read_chart(patient_id: Text) -> Text requires(claim: "department", "cardiology") {{
             return patient_id
         }}
-        fn main() -> str {{
+        fn main() -> Text {{
             return match oidc_validate_token("{token}", "{issuer}", "{audience}", "{jwks}") {{
                 Ok(identity) => match extract_claim(identity, "department") {{
                     Ok(proof) => match acquire read_chart(proof) {{
-                        Ok(f) => f("patient-42"),
-                        Err(e) => e,
+                        Ok(f) => f(Text("patient-42")),
+                        Err(e) => Text(e),
                     }},
-                    Err(e) => e,
+                    Err(e) => Text(e),
                 }},
-                Err(e) => e,
-            }}
-        }}
-    "#,
-        token = TOKEN,
-        issuer = ISSUER,
-        audience = AUDIENCE,
-        jwks = escape_nir_str(JWKS),
-    );
-    expect_str(run_ok(&src), "patient-42");
-}
-
-#[test]
-fn acquire_with_wrong_claim_value_yields_err() {
-    let src = format!(
-        r#"
-        fn read_chart(patient_id: str) -> str requires(claim: "department", "oncology") {{
-            return patient_id
-        }}
-        fn main() -> str {{
-            return match oidc_validate_token("{token}", "{issuer}", "{audience}", "{jwks}") {{
-                Ok(identity) => match extract_claim(identity, "department") {{
-                    Ok(proof) => match acquire read_chart(proof) {{
-                        Ok(f) => f("patient-42"),
-                        Err(e) => e,
-                    }},
-                    Err(e) => e,
-                }},
-                Err(e) => e,
+                Err(e) => Text(e),
             }}
         }}
     "#,
@@ -275,8 +243,48 @@ fn acquire_with_wrong_claim_value_yields_err() {
         jwks = escape_nir_str(JWKS),
     );
     match run_ok(&src) {
-        Value::Str(s) => assert!(s.contains("insufficient privilege"), "unexpected message: {s}"),
-        other => panic!("expected Str, got {other:?}"),
+        Value::Struct(name, fields) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(s.as_ref(), "patient-42"),
+            other => panic!("expected Text(Str(\"patient-42\")), got Text({other:?})"),
+        },
+        other => panic!("expected Text(\"patient-42\"), got {other:?}"),
+    }
+}
+
+#[test]
+fn acquire_with_wrong_claim_value_yields_err() {
+    let src = format!(
+        r#"
+        struct Text {{
+            value: str,
+        }}
+        fn read_chart(patient_id: Text) -> Text requires(claim: "department", "oncology") {{
+            return patient_id
+        }}
+        fn main() -> Text {{
+            return match oidc_validate_token("{token}", "{issuer}", "{audience}", "{jwks}") {{
+                Ok(identity) => match extract_claim(identity, "department") {{
+                    Ok(proof) => match acquire read_chart(proof) {{
+                        Ok(f) => f(Text("patient-42")),
+                        Err(e) => Text(e),
+                    }},
+                    Err(e) => Text(e),
+                }},
+                Err(e) => Text(e),
+            }}
+        }}
+    "#,
+        token = TOKEN,
+        issuer = ISSUER,
+        audience = AUDIENCE,
+        jwks = escape_nir_str(JWKS),
+    );
+    match run_ok(&src) {
+        Value::Struct(name, fields) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert!(s.contains("insufficient privilege"), "unexpected message: {s}"),
+            other => panic!("expected Text(Str(_)), got Text({other:?})"),
+        },
+        other => panic!("expected Text, got {other:?}"),
     }
 }
 

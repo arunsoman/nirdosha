@@ -20,28 +20,31 @@ fn escape_nir_str(s: &str) -> String {
 fn run_with_token(token: &str) -> Value {
     let src = format!(
         r#"
-fn handle_identity(identity: VerifiedIdentity) -> str {{
+struct Text {{
+    value: str,
+}}
+fn handle_identity(identity: VerifiedIdentity) -> Text {{
     if check_revocation(identity) {{
-        return "token revoked"
+        return Text("token revoked")
     }}
     if identity_expired(identity, 1800000000) {{
-        return "token expired"
+        return Text("token expired")
     }}
     return match check_role(identity, "physician") {{
         Ok(role_view) => match extract_claim(identity, "department") {{
-            Ok(claim_view) => claim_view.value,
-            Err(e) => e,
+            Ok(claim_view) => Text(claim_view.value),
+            Err(e) => Text(e),
         }},
-        Err(e) => e,
+        Err(e) => Text(e),
     }}
 }}
 
-fn main() -> str {{
+fn main() -> Text {{
     let token: str = "{token}"
     let jwks: str = "{jwks}"
     return match oidc_validate_token(token, "{issuer}", "{audience}", jwks) {{
         Ok(identity) => handle_identity(identity),
-        Err(e) => e,
+        Err(e) => Text(e),
     }}
 }}
 "#,
@@ -55,8 +58,11 @@ fn main() -> str {{
 
 fn expect_str(v: Value, want: &str) {
     match v {
-        Value::Str(s) => assert_eq!(&*s, want, "unexpected string result"),
-        other => panic!("expected Str({want:?}), got {other:?}"),
+        Value::Struct(name, fields) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, want, "unexpected string result"),
+            other => panic!("expected Text(Str({want:?})), got Text({other:?})"),
+        },
+        other => panic!("expected Text({want:?}), got {other:?}"),
     }
 }
 
@@ -123,10 +129,13 @@ fn revoked_token_is_rejected() {
     // even called `check_revocation` at all).
     let mint_src = format!(
         r#"
-fn main() -> str {{
+struct Text {{
+    value: str,
+}}
+fn main() -> Text {{
     return match mock_issue_token("alice", "{issuer}", "{audience}", 1700000000, 300000000, "{{\"roles\":[\"physician\"],\"department\":\"cardiology\",\"revoked\":true}}", "{jwks}") {{
-        Ok(token) => token,
-        Err(e) => e,
+        Ok(token) => Text(token),
+        Err(e) => Text(e),
     }}
 }}
 "#,
@@ -135,7 +144,10 @@ fn main() -> str {{
         jwks = escape_nir_str(JWKS),
     );
     let token = match run(&mint_src) {
-        Ok(Value::Str(s)) => s.to_string(),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => s.to_string(),
+            other => panic!("expected Text(Str(_)), got Text({other:?})"),
+        },
         other => panic!("expected a minted token, got {other:?}"),
     };
     expect_str(run_with_token(&token), "token revoked");
@@ -148,15 +160,18 @@ fn run_raw(src: &str) -> Value {
 #[test]
 fn api_key_with_valid_hash_succeeds() {
     let src = r#"
-fn main() -> str {
+struct Text {
+    value: str,
+}
+fn main() -> Text {
     let api_key: str = "my-secret-api-key"
     let expected_hash: str = "325ededd6c3b9988f623c7f964abb9b016b76b0f8b3474df0f7d7c23b941381f"
     return match validate_api_key(api_key, expected_hash) {
         Ok(identity) => match extract_claim(identity, "department") {
-            Ok(claim_view) => claim_view.value,
-            Err(e) => e,
+            Ok(claim_view) => Text(claim_view.value),
+            Err(e) => Text(e),
         },
-        Err(e) => e,
+        Err(e) => Text(e),
     }
 }
 "#;
@@ -166,10 +181,13 @@ fn main() -> str {
 #[test]
 fn api_key_with_invalid_hash_is_rejected() {
     let src = r#"
-fn main() -> str {
+struct Text {
+    value: str,
+}
+fn main() -> Text {
     return match validate_api_key("wrong-key", "325ededd6c3b9988f623c7f964abb9b016b76b0f8b3474df0f7d7c23b941381f") {
-        Ok(_) => "should not succeed",
-        Err(e) => e,
+        Ok(_) => Text("should not succeed"),
+        Err(e) => Text(e),
     }
 }
 "#;
@@ -179,18 +197,21 @@ fn main() -> str {
 #[test]
 fn refresh_token_exchange_succeeds_when_not_expired() {
     let src = r#"
-fn main() -> str {
+struct Text {
+    value: str,
+}
+fn main() -> Text {
     let token: str = "eyJhbGciOiAiSFMyNTYiLCAia2lkIjogImtleTEifQ.eyJzdWIiOiAiYWxpY2UiLCAiaXNzIjogImh0dHBzOi8vZXhhbXBsZS5jb20iLCAiYXVkIjogIm15LWFwcCIsICJleHAiOiAyMDAwMDAwMDAwLCAiaWF0IjogMTcwMDAwMDAwMCwgInJvbGVzIjogWyJwaHlzaWNpYW4iXSwgImRlcGFydG1lbnQiOiAiY2FyZGlvbG9neSJ9.nrFdeqNDwXWLeGzud6X9Q4ITzCXULzZBBK8y51LGYXs"
     let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
     return match oidc_validate_token(token, "https://example.com", "my-app", jwks) {
         Ok(identity) => match exchange_refresh_token(identity, new_refresh_token(2000000000), 1700000000) {
             Ok(refreshed) => match extract_claim(refreshed, "department") {
-                Ok(claim_view) => claim_view.value,
-                Err(e) => e,
+                Ok(claim_view) => Text(claim_view.value),
+                Err(e) => Text(e),
             },
-            Err(e) => e,
+            Err(e) => Text(e),
         },
-        Err(e) => e,
+        Err(e) => Text(e),
     }
 }
 "#;
@@ -200,15 +221,18 @@ fn main() -> str {
 #[test]
 fn refresh_token_exchange_fails_when_expired() {
     let src = r#"
-fn main() -> str {
+struct Text {
+    value: str,
+}
+fn main() -> Text {
     let token: str = "eyJhbGciOiAiSFMyNTYiLCAia2lkIjogImtleTEifQ.eyJzdWIiOiAiYWxpY2UiLCAiaXNzIjogImh0dHBzOi8vZXhhbXBsZS5jb20iLCAiYXVkIjogIm15LWFwcCIsICJleHAiOiAyMDAwMDAwMDAwLCAiaWF0IjogMTcwMDAwMDAwMCwgInJvbGVzIjogWyJwaHlzaWNpYW4iXSwgImRlcGFydG1lbnQiOiAiY2FyZGlvbG9neSJ9.nrFdeqNDwXWLeGzud6X9Q4ITzCXULzZBBK8y51LGYXs"
     let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
     return match oidc_validate_token(token, "https://example.com", "my-app", jwks) {
         Ok(identity) => match exchange_refresh_token(identity, new_refresh_token(1600000000), 1700000000) {
-            Ok(_) => "should not succeed",
-            Err(e) => e,
+            Ok(_) => Text("should not succeed"),
+            Err(e) => Text(e),
         },
-        Err(e) => e,
+        Err(e) => Text(e),
     }
 }
 "#;
@@ -218,30 +242,33 @@ fn main() -> str {
 #[test]
 fn application_session_cookie_is_generated() {
     let src = r#"
-fn main() -> str {
+struct Text {
+    value: str,
+}
+fn main() -> Text {
     let token: str = "eyJhbGciOiAiSFMyNTYiLCAia2lkIjogImtleTEifQ.eyJzdWIiOiAiYWxpY2UiLCAiaXNzIjogImh0dHBzOi8vZXhhbXBsZS5jb20iLCAiYXVkIjogIm15LWFwcCIsICJleHAiOiAyMDAwMDAwMDAwLCAiaWF0IjogMTcwMDAwMDAwMCwgInJvbGVzIjogWyJwaHlzaWNpYW4iXSwgImRlcGFydG1lbnQiOiAiY2FyZGlvbG9neSJ9.nrFdeqNDwXWLeGzud6X9Q4ITzCXULzZBBK8y51LGYXs"
     let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
     return match oidc_validate_token(token, "https://example.com", "my-app", jwks) {
-        Ok(identity) => session_cookie(create_application_session(identity)),
-        Err(e) => e,
+        Ok(identity) => Text(session_cookie(create_application_session(identity))),
+        Err(e) => Text(e),
     }
 }
 "#;
     match run_raw(src) {
-        Value::Str(s) => {
-            assert!(s.starts_with("session=example.com_alice_"), "unexpected cookie prefix: {s}");
-            assert!(s.contains("HttpOnly"), "cookie missing HttpOnly: {s}");
-            assert!(s.contains("Secure"), "cookie missing Secure: {s}");
-            assert!(s.contains("SameSite=Strict"), "cookie missing SameSite: {s}");
-        }
-        other => panic!("expected Str(cookie), got {other:?}"),
+        Value::Struct(name, fields) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => {
+                assert!(s.starts_with("session=example.com_alice_"), "unexpected cookie prefix: {s}");
+                assert!(s.contains("HttpOnly"), "cookie missing HttpOnly: {s}");
+                assert!(s.contains("Secure"), "cookie missing Secure: {s}");
+                assert!(s.contains("SameSite=Strict"), "cookie missing SameSite: {s}");
+            }
+            other => panic!("expected Text(Str(cookie)), got Text({other:?})"),
+        },
+        other => panic!("expected Text(cookie), got {other:?}"),
     }
 }
 
 #[test]
 fn example_runs_to_completion() {
-    match run(include_str!("../examples/row12_identity.nir")) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "done"),
-        other => panic!("expected Ok(Str(\"done\")), got {other:?}"),
-    }
+    assert_eq!(run(include_str!("../examples/row12_identity.nir")), Ok(Value::Unit));
 }

@@ -2,6 +2,7 @@ pub mod ast;
 pub mod codegen;
 pub mod effects;
 pub mod interpreter;
+pub mod migrate;
 pub mod observability;
 pub mod ownership;
 pub mod parser;

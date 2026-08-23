@@ -10,22 +10,27 @@ struct Todo {
     done: bool,
 }
 
-fn list_todo() -> str {
-    return "[]"
+enum ErrorCode {
+    MalformedListing,
 }
 
-fn create_todo(t: Todo) -> str {
-    return t.title
+fn list_todo() -> Result(json, ErrorCode) {
+    return match json_parse("[]") {
+        Ok(doc) => Ok(doc),
+        Err(e) => Err(MalformedListing()),
+    }
 }
 
-fn update_todo(t: Todo) -> str {
-    return t.title
+fn create_todo(t: Todo) -> i64 {
+    return t.id
+}
+
+fn update_todo(t: Todo) -> i64 {
+    return t.id
 }
 
 fn delete_todo(identity: VerifiedIdentity, id: i64) -> i64 requires(role: "admin") {
     return id
 }
 
-fn main() -> str {
-    return list_todo()
-}
+fn main() {}

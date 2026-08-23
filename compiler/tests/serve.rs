@@ -29,8 +29,8 @@ const SRC: &str = r#"
         name: str,
     }
 
-    fn list_widget() -> str {
-        return "[]"
+    fn list_widget() -> i64 {
+        return 0
     }
 
     fn admin_only(identity: VerifiedIdentity, x: i64) -> i64 requires(role: "admin") {
@@ -61,7 +61,7 @@ fn start_server(auth: Option<AuthConfig>) -> u16 {
     let program = Arc::new(build_program(SRC));
     let transact_log = std::env::temp_dir().join(format!("nirdosha-test-transact-{port}.db"));
     std::thread::spawn(move || {
-        nirdosha::serve::run(program, port, auth, None, transact_log).expect("serve::run should not fail to bind");
+        nirdosha::serve::run(program, port, auth, None, transact_log, None).expect("serve::run should not fail to bind");
     });
     for _ in 0..100 {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -112,7 +112,7 @@ fn post_api_calls_a_plain_function_and_encodes_its_result() {
     let port = start_server(None);
     let (status, body) = http_request(port, "POST", "/api/list_widget", "{}", None);
     assert_eq!(status, 200);
-    assert_eq!(body, "\"[]\"", "a str-returning fn should encode as a plain JSON string");
+    assert_eq!(body, "0", "a plain scalar-returning fn should encode directly, not wrapped in {{\"ok\":...}}");
 }
 
 #[test]
@@ -163,17 +163,23 @@ fn mint_token(roles_json: &str) -> String {
         .as_secs() as i64;
     let src = format!(
         r#"
-        fn main() -> str {{
+        struct Text {{
+            value: str,
+        }}
+        fn main() -> Text {{
             return match mock_issue_token("alice", "{ISSUER}", "{AUDIENCE}", {issued_at}, 3600, "{{\"roles\":{roles_json}}}", "{jwks}") {{
-                Ok(token) => token,
-                Err(e) => e,
+                Ok(token) => Text(token),
+                Err(e) => Text(e),
             }}
         }}
     "#,
         jwks = JWKS.replace('"', "\\\"")
     );
     match nirdosha::run(&src) {
-        Ok(nirdosha::interpreter::Value::Str(s)) => s.to_string(),
+        Ok(nirdosha::interpreter::Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            nirdosha::interpreter::Value::Str(s) => s.to_string(),
+            other => panic!("expected Text(Str(_)), got Text({other:?})"),
+        },
         other => panic!("expected a minted token, got {other:?}"),
     }
 }
@@ -202,17 +208,23 @@ fn requires_gated_fn_with_an_expired_token_is_401_not_accepted_forever() {
     // tokens used elsewhere in this file.
     let src = format!(
         r#"
-        fn main() -> str {{
+        struct Text {{
+            value: str,
+        }}
+        fn main() -> Text {{
             return match mock_issue_token("alice", "{ISSUER}", "{AUDIENCE}", 1600000000, 3600, "{{\"roles\":[\"admin\"]}}", "{jwks}") {{
-                Ok(token) => token,
-                Err(e) => e,
+                Ok(token) => Text(token),
+                Err(e) => Text(e),
             }}
         }}
     "#,
         jwks = JWKS.replace('"', "\\\"")
     );
     let token = match nirdosha::run(&src) {
-        Ok(nirdosha::interpreter::Value::Str(s)) => s.to_string(),
+        Ok(nirdosha::interpreter::Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            nirdosha::interpreter::Value::Str(s) => s.to_string(),
+            other => panic!("expected Text(Str(_)), got Text({other:?})"),
+        },
         other => panic!("expected a minted token, got {other:?}"),
     };
     let port = start_server(Some(auth_config()));

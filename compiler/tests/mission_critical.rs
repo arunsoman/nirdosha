@@ -267,7 +267,10 @@ fn a_client_can_talk_to_a_listening_server() {
             stop(l)
         }
 
-        fn main() -> str {
+        struct Text {
+            value: str,
+        }
+        fn main() -> Text {
             let ready: chan i64 = chan
             let t: thread unit = spawn server(19213, ready)
             let go: i64 = recv(ready)
@@ -276,11 +279,14 @@ fn a_client_can_talk_to_a_listening_server() {
             let reply: str = recv(c)
             stop(c)
             join(t)
-            return reply
+            return Text(reply)
         }
     "#;
     match run(src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "hello over tcp"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "hello over tcp"),
+            other => panic!("expected Text(Str(\"hello over tcp\")), got Text({other:?})"),
+        },
         other => panic!("expected the echoed string, got {other:?}"),
     }
 }

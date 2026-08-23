@@ -7,19 +7,20 @@
 // TcpListener on a fresh port and substitutes it in before running this
 // exact file, so this isn't a real, externally-reachable address.
 
-fn extract_message(doc: json) -> str {
-    return match json_get_str(doc, "message") {
-        Ok(msg) => msg,
-        Err(e) => e,
-    }
+struct Text {
+    value: str,
 }
 
-fn main() -> str {
-    return match http_get("127.0.0.1", 8977, "/ping") {
+fn main() {
+    let described: Text = match http_get("127.0.0.1", 8977, "/ping") {
         Ok(resp) => match json_parse(resp.body) {
-            Ok(doc) => extract_message(doc),
-            Err(e) => e,
+            Ok(doc) => match json_get_str(doc, "message") {
+                Ok(msg) => Text(msg),
+                Err(e) => Text(e),
+            },
+            Err(e) => Text(e),
         },
-        Err(e) => e,
+        Err(e) => Text(e),
     }
+    print(described.value)
 }

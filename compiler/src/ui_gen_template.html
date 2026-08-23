@@ -104,10 +104,23 @@
   .btn-outlined { background: transparent; color: var(--md-primary); border: 1px solid var(--md-outline); }
   .btn-text { background: transparent; color: var(--md-primary); }
   .btn-danger { background: var(--md-error); color: var(--md-on-error); }
+  /* Wraps every generated table -- a table wider than `main`'s own
+     max-width scrolls inside this box instead of overflowing the page. */
+  .table-scroll { overflow-x: auto; max-width: 100%; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
   th { text-align: left; font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
-       color: var(--md-on-surface-variant); font-weight: 500; padding: 8px 12px; border-bottom: 1px solid var(--md-outline); }
-  td { padding: 12px; border-bottom: 1px solid var(--md-surface-variant); }
+       color: var(--md-on-surface-variant); font-weight: 500; padding: 8px 12px; border-bottom: 1px solid var(--md-outline);
+       white-space: nowrap; }
+  td { padding: 12px; border-bottom: 1px solid var(--md-surface-variant); white-space: nowrap; }
+  .pager { display: flex; align-items: center; gap: 12px; margin-top: 12px; font-size: 13px; color: var(--md-on-surface-variant); }
+  .search-box {
+    font-family: inherit; font-size: 14px; padding: 10px 14px; border-radius: var(--md-radius-sm);
+    border: 1px solid var(--md-outline); background: transparent; color: var(--md-on-surface);
+    width: 100%; max-width: 320px; margin-bottom: 12px; display: block;
+  }
+  .col-filter { font-family: inherit; font-size: 12px; padding: 4px 6px; border-radius: 6px; border: 1px solid var(--md-outline); }
+  .nav-item-secondary { padding-left: 32px; font-size: 13px; }
+  .date-lock { margin-left: 6px; cursor: help; font-size: 12px; opacity: .7; }
   .empty-state { color: var(--md-on-surface-variant); font-size: 14px; padding: 32px; text-align: center; }
   .badge {
     display: inline-block; font-size: 11px; font-weight: 500; padding: 2px 8px; border-radius: 8px;
@@ -146,6 +159,14 @@ const CHARTS = __NIRDOSHA_CHARTS__;
 const API_BASE = window.NIRDOSHA_API_BASE || "/api";
 const IDENTITY_BASE = __NIRDOSHA_IDENTITY_BASE__;
 const IDENTITY_KEY = "nirdosha_identity";
+// Whether `nirdosha serve --db <path>` exposes the generic
+// `/_nirdosha/table/<snake>` pagination/sort/filter/search route
+// (`serve.rs`). `false` (the default, and always the case for `nirdosha
+// emit-ui`'s static-file mode) means every table renders exactly as it
+// always has -- one unpaginated fetch, no pagination/sort/search UI at
+// all -- see `ui_gen.rs::generate`'s own doc comment for why this is a
+// deliberate degradation, not a missing feature.
+const SERVER_TABLE_API = __NIRDOSHA_SERVER_TABLE_API__;
 
 // ---- identity ----
 // With no IDENTITY_BASE (the default), this is a pure client-side STUB:
@@ -189,6 +210,45 @@ function canRun(action) {
   return true;
 }
 
+// `screen <Struct> { field <name> { view: role(...)/claim(...) } }` --
+// any-of role match (a field can name more than one role, unlike
+// `canRun`'s single `requiredRole`), or the one claim pair. Cosmetic
+// only, same disclosed nature as every other client-side gate here --
+// `serve.rs` independently redacts the same field server-side (to
+// `null`) regardless of what this function decides, so a tampered
+// client can hide/show this box however it likes without exposing
+// anything this check didn't already let through.
+function canViewField(f) {
+  const roles = f.requiredViewRoles || [];
+  if (!roles.length && !f.requiredViewClaim) return true;
+  const id = getIdentity();
+  if (!id) return false;
+  if (roles.some((r) => (id.roles || []).includes(r))) return true;
+  if (f.requiredViewClaim) {
+    const [key, val] = f.requiredViewClaim;
+    if ((id.claims || {})[key] === val) return true;
+  }
+  return false;
+}
+
+// Same shape as `canViewField`, for `{ edit: ... }` -- whether the
+// current identity may change this field's value, not whether it's
+// shown at all. `serve.rs` independently rejects an unauthorized change
+// to this field on submit regardless of whether the input was actually
+// left enabled here.
+function canEditField(f) {
+  const roles = f.requiredEditRoles || [];
+  if (!roles.length && !f.requiredEditClaim) return true;
+  const id = getIdentity();
+  if (!id) return false;
+  if (roles.some((r) => (id.roles || []).includes(r))) return true;
+  if (f.requiredEditClaim) {
+    const [key, val] = f.requiredEditClaim;
+    if ((id.claims || {})[key] === val) return true;
+  }
+  return false;
+}
+
 // ---- snackbar ----
 let snackbarTimer = null;
 function showSnackbar(msg, isError) {
@@ -223,6 +283,31 @@ async function callFn(fnName, params) {
   }
 }
 
+// ---- generic table-query fetch, only used when SERVER_TABLE_API ----
+// Hits `/_nirdosha/table/<table>` (`serve.rs`'s `dispatch_table_query`)
+// directly -- a different response shape than `callFn`'s Result(T,E)
+// convention (`{rows, total, page, page_size}` or `{err}`), so it's its
+// own small fetch wrapper rather than a `callFn` variant.
+async function fetchTablePage(table, body) {
+  try {
+    const headers = { "Content-Type": "application/json" };
+    const id = getIdentity();
+    if (id && id.token) headers["Authorization"] = `Bearer ${id.token}`;
+    const res = await fetch(`/_nirdosha/table/${table}`, { method: "POST", headers, body: JSON.stringify(body || {}) });
+    const data = await res.json();
+    if (data && data.err) { showSnackbar(String(data.err), true); return null; }
+    return data;
+  } catch (e) {
+    showSnackbar(`${table}: ${e.message}`, true);
+    return null;
+  }
+}
+
+function debounce(fn, ms) {
+  let t = null;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
 // ---- generic element builder (no innerHTML -- avoids reflecting any
 // program-derived string back as markup) ----
 function el(tag, attrs, children) {
@@ -245,12 +330,39 @@ function fieldLabel(f) {
 
 // ---- generic field -> control, recursive (one level of struct nesting
 // per build_field's own depth cap on the Rust side) ----
-function buildFieldControl(f, value) {
+// `isEdit` (true only for an *update* form, never create) hides a field
+// literally named `id` from rendering -- a primary key is never
+// meaningfully user-editable -- while still carrying its value through
+// to `getValue()`'s output, read directly out of the row `value` object
+// rather than any input's DOM value (a genuinely `disabled` input would
+// be silently excluded from what `getValue` could otherwise read here,
+// so this is not a cosmetic choice). A `view`-gated field the current
+// identity can't see gets the exact same "hidden but passed through
+// unchanged" treatment -- `serve.rs` independently substitutes the
+// stored value server-side for one of these if it's omitted/`null`
+// (`dispatch`'s own view-gated pass-through-on-omit step), so `value`
+// here (already redacted to `null` by the server on the way in, for
+// anyone unauthorized) round-trips correctly either way; this is purely
+// about not rendering an input box for a value this viewer never saw.
+function buildFieldControl(f, value, isEdit) {
+  // `edit`-gated: never blocks a *create* (only an update form passes
+  // `isEdit === true`) -- see `serve.rs::check_edit_gates`'s own doc
+  // comment for why. Disables the input rather than hiding it (the
+  // field is still visible, just not changeable by this identity) --
+  // `serve.rs` independently rejects a changed value on submit
+  // regardless of whether this was left enabled.
+  const editLocked = isEdit && !canEditField(f);
   if (f.control === "struct") {
-    const children = f.nested.map((nf) => buildFieldControl(nf, value ? value[nf.name] : undefined));
+    const passthrough = f.nested.filter((nf) => (isEdit && nf.name === "id") || !canViewField(nf));
+    const visible = f.nested.filter((nf) => !passthrough.includes(nf));
+    const children = visible.map((nf) => buildFieldControl(nf, value ? value[nf.name] : undefined, isEdit));
     const wrap = el("fieldset", { class: "field", style: "border:1px solid var(--md-outline);border-radius:var(--md-radius-sm);padding:12px;" },
       [el("legend", { text: fieldLabel(f) + (f.required ? " *" : "") }), ...children.map((c) => c.el)]);
-    return { el: wrap, getValue: () => Object.fromEntries(f.nested.map((nf, i) => [nf.name, children[i].getValue()])) };
+    return { el: wrap, getValue: () => {
+      const out = Object.fromEntries(visible.map((nf, i) => [nf.name, children[i].getValue()]));
+      for (const pf of passthrough) out[pf.name] = value ? value[pf.name] : undefined;
+      return out;
+    }};
   }
   if (f.control === "readonly") {
     const shown = value !== undefined && value !== null ? (typeof value === "object" ? JSON.stringify(value) : String(value)) : `(${f.label}, not editable here)`;
@@ -260,24 +372,69 @@ function buildFieldControl(f, value) {
   if (f.control === "checkbox") {
     const input = el("input", { type: "checkbox" });
     input.checked = !!value;
+    if (editLocked) input.setAttribute("disabled", "");
     const wrap = el("div", { class: "field checkbox" }, [input, el("label", { text: fieldLabel(f) })]);
     return { el: wrap, getValue: () => input.checked };
   }
+  if (f.control === "select") {
+    // A categorical/ordinal field (a zero-payload-only enum,
+    // `ui_gen.rs::build_field`'s doc comment) -- `f.options` is every
+    // variant name in declaration order. A native `<input list=...>` +
+    // `<datalist>` pair is a real, searchable dropdown with zero JS
+    // dependency, matching this template's no-build-step ethos.
+    const listId = `dl-${f.name}-${Math.random().toString(36).slice(2, 8)}`;
+    const input = el("input", { type: "text", list: listId, value: value !== undefined && value !== null ? value : "" });
+    if (f.required) input.setAttribute("required", "");
+    if (editLocked) input.setAttribute("disabled", "");
+    const datalist = el("datalist", { id: listId }, f.options.map((o) => el("option", { value: o })));
+    const wrap = el("div", { class: "field" }, [el("label", { text: fieldLabel(f) + (f.required ? " *" : "") }), input, datalist]);
+    return { el: wrap, getValue: () => input.value };
+  }
+  if (f.control === "date") {
+    // A `date`/`time`-named str field (a naming-convention heuristic,
+    // not a new language type -- `ui_gen.rs::is_date_like_field_name`'s
+    // doc comment). The lock is decorative only: "human-supplied, not an
+    // automatic clock-stamp" -- Nirdosha has no wall-clock builtin at
+    // all (LANGUAGE.md SS9), by deliberate design; the field stays a
+    // plain, fully editable string underneath.
+    const input = el("input", { type: "date", value: value !== undefined && value !== null ? value : "" });
+    if (f.required) input.setAttribute("required", "");
+    if (editLocked) input.setAttribute("disabled", "");
+    const labelRow = el("div", { style: "display:flex;align-items:center;" }, [
+      el("label", { text: fieldLabel(f) + (f.required ? " *" : "") }),
+      el("span", { class: "date-lock", title: "Human-supplied date -- not an automatic clock-stamp.", text: "\u{1F512}" }),
+    ]);
+    const wrap = el("div", { class: "field" }, [labelRow, input]);
+    return { el: wrap, getValue: () => input.value };
+  }
   const input = el("input", { type: f.control, value: value !== undefined && value !== null ? value : "" });
   if (f.required) input.setAttribute("required", "");
+  if (editLocked) input.setAttribute("disabled", "");
   const wrap = el("div", { class: "field" }, [el("label", { text: fieldLabel(f) + (f.required ? " *" : "") }), input]);
   return { el: wrap, getValue: () => (f.control === "number" ? Number(input.value) : input.value) };
 }
 
 // ---- generic field-list -> form ----
-function buildForm(fields, values, onSubmit, submitLabel, disabled, disabledReason) {
-  const controls = fields.map((f) => ({ f, c: buildFieldControl(f, values ? values[f.name] : undefined) }));
+// `isEdit` (see `buildFieldControl` above): a top-level field literally
+// named `id` (a `delete_<S>(id: i64)`-shaped param, rather than the more
+// common whole-struct `update_<S>(s: S)` shape `buildFieldControl`'s own
+// "struct" branch already handles) gets the same treatment here, for
+// symmetry -- hidden from the rendered form, its value still read
+// directly from `values` (never a DOM input) into the submitted payload.
+// A top-level `view`-gated field the identity can't see gets the same
+// pass-through treatment (see `buildFieldControl`'s own doc comment for
+// why this has to be a pass-through, not a plain omission).
+function buildForm(fields, values, onSubmit, submitLabel, disabled, disabledReason, isEdit) {
+  const passthrough = fields.filter((f) => (isEdit && f.name === "id") || !canViewField(f));
+  const visible = fields.filter((f) => !passthrough.includes(f));
+  const controls = visible.map((f) => ({ f, c: buildFieldControl(f, values ? values[f.name] : undefined, isEdit) }));
   const submitBtn = el("button", { type: "submit", class: "btn btn-filled", text: submitLabel }, []);
   if (disabled) submitBtn.setAttribute("disabled", "");
   const form = el("form", { class: "card", onsubmit: (e) => {
     e.preventDefault();
     const out = {};
     for (const { f, c } of controls) out[f.name] = c.getValue();
+    for (const pf of passthrough) out[pf.name] = values ? values[pf.name] : undefined;
     onSubmit(out);
   }}, controls.map(({ c }) => c.el));
   form.appendChild(submitBtn);
@@ -305,6 +462,17 @@ function updateValuesFromRow(updateAction, row) {
   return values;
 }
 
+// A `checkbox`-controlled (i.e. `bool`-typed) cell reads "True"/"False"
+// instead of the raw stored value (`true`/`false`, or `1`/`0` coming
+// back through the generic table-query route, which encodes SQLite's
+// own boolean-as-integer storage) -- deterministic, no per-field-name
+// guessing ("Active"/"Inactive" and the like).
+function cellText(f, row) {
+  const v = row && row[f.name] !== undefined ? row[f.name] : "";
+  if (f.control === "checkbox") return v === true || v === 1 || v === "1" || v === "true" ? "True" : "False";
+  return v !== null && v !== undefined ? String(v) : "";
+}
+
 async function renderListScreen(screen, root) {
   const listAction = screen.actions.find((a) => a.kind === "list");
   const createAction = screen.actions.find((a) => a.kind === "create");
@@ -325,6 +493,30 @@ async function renderListScreen(screen, root) {
     ));
   }
 
+  // Pagination/sort/search/filter state -- only ever exercised when
+  // `SERVER_TABLE_API` is true (`nirdosha serve --db <path>`); with it
+  // false (the default), `load()` below takes the exact same
+  // `callFn(listAction.fn, {})` path this screen always has, and none of
+  // this state is ever read. See `serve.rs::dispatch_table_query`'s doc
+  // comment for the real limitation this implies (a hand-written
+  // `list_<struct>` doing a join or computed column is invisible to the
+  // generic route -- this is a deliberate, disclosed degradation, not a
+  // missing feature).
+  const usePagination = SERVER_TABLE_API && !!listAction;
+  let page = 1;
+  const pageSize = 25;
+  let sortField = screen.fields.length ? screen.fields[0].name : null;
+  let sortDir = "asc";
+  let searchQuery = "";
+  const filters = {};
+
+  let searchBox = null;
+  if (usePagination) {
+    searchBox = el("input", { type: "text", class: "search-box", placeholder: "Search…" });
+    searchBox.addEventListener("input", debounce(() => { searchQuery = searchBox.value; page = 1; load(); }, 300));
+    root.appendChild(searchBox);
+  }
+
   const tableWrap = el("div", { class: "card" }, []);
   root.appendChild(tableWrap);
 
@@ -333,20 +525,82 @@ async function renderListScreen(screen, root) {
     if (!listAction) { tableWrap.appendChild(el("div", { class: "empty-state", text: "No list action defined for " + screen.title + "." })); return; }
     if (!canRun(listAction)) { tableWrap.appendChild(el("div", { class: "empty-state", text: gateReason(listAction) })); return; }
     tableWrap.appendChild(el("div", { class: "empty-state", text: "Loading…" }));
-    const rows = await callFn(listAction.fn, {});
+
+    let list, total = null;
+    if (usePagination) {
+      const body = { page, page_size: pageSize, sort_field: sortField, sort_dir: sortDir };
+      if (searchQuery) body.search = searchQuery;
+      if (Object.keys(filters).length) body.filters = filters;
+      const data = await fetchTablePage(screen.table, body);
+      if (data === null) { tableWrap.textContent = ""; tableWrap.appendChild(el("div", { class: "empty-state", text: "Could not load records." })); return; }
+      list = Array.isArray(data.rows) ? data.rows : [];
+      total = typeof data.total === "number" ? data.total : list.length;
+    } else {
+      const rows = await callFn(listAction.fn, {});
+      list = Array.isArray(rows) ? rows : [];
+    }
+
     tableWrap.textContent = "";
-    const list = Array.isArray(rows) ? rows : [];
     if (list.length === 0) { tableWrap.appendChild(el("div", { class: "empty-state", text: "No records yet." })); return; }
+
+    // `view`-gated columns the current identity can't see are omitted
+    // from the table entirely (cosmetic -- `serve.rs` already redacted
+    // their values to `null` server-side regardless of this), recomputed
+    // every `load()` so a re-login mid-session is reflected immediately.
+    const visibleFields = screen.fields.filter(canViewField);
+
     const table = el("table", {}, []);
-    const thead = el("tr", {}, screen.fields.map((f) => el("th", { text: fieldLabel(f) })));
+    const thead = el("tr", {}, visibleFields.map((f) => {
+      let text = fieldLabel(f);
+      if (usePagination && sortField === f.name) text += sortDir === "asc" ? " ▲" : " ▼";
+      const th = el("th", { text });
+      if (usePagination) {
+        th.style.cursor = "pointer";
+        th.addEventListener("click", () => {
+          if (sortField === f.name) sortDir = sortDir === "asc" ? "desc" : "asc";
+          else { sortField = f.name; sortDir = "asc"; }
+          load();
+        });
+      }
+      return th;
+    }));
     if (updateAction) thead.appendChild(el("th", { text: "" }));
     if (deleteAction) thead.appendChild(el("th", { text: "" }));
     for (const _ of customActions) thead.appendChild(el("th", { text: "" }));
-    table.appendChild(el("thead", {}, [thead]));
+    const theadRows = [thead];
+
+    // A filter row under the header, one `<select>` per enum-backed
+    // ("select" control) column, populated from that field's own known
+    // `options` -- no separate "distinct values" query needed, since the
+    // full option set is already static per the enum's declaration.
+    // Every other column type has no per-column filter control here
+    // (the free-text search box above already covers them).
+    if (usePagination && visibleFields.some((f) => f.control === "select")) {
+      const filterCells = visibleFields.map((f) => {
+        if (f.control !== "select") return el("th", { text: "" });
+        const sel = el("select", { class: "col-filter" }, [
+          el("option", { value: "", text: "(any)" }),
+          ...f.options.map((o) => el("option", { value: o, text: o })),
+        ]);
+        sel.value = filters[f.name] || "";
+        sel.addEventListener("change", () => {
+          if (sel.value) filters[f.name] = sel.value; else delete filters[f.name];
+          page = 1; load();
+        });
+        return el("th", {}, [sel]);
+      });
+      const filterRow = el("tr", {}, filterCells);
+      if (updateAction) filterRow.appendChild(el("th", { text: "" }));
+      if (deleteAction) filterRow.appendChild(el("th", { text: "" }));
+      for (const _ of customActions) filterRow.appendChild(el("th", { text: "" }));
+      theadRows.push(filterRow);
+    }
+    table.appendChild(el("thead", {}, theadRows));
+
     const tbody = el("tbody", {}, []);
     for (const row of list) {
-      const tds = screen.fields.map((f) => el("td", { text: row && row[f.name] !== undefined ? String(row[f.name]) : "" }));
-      const colspan = screen.fields.length + (updateAction ? 1 : 0) + (deleteAction ? 1 : 0) + customActions.length;
+      const tds = visibleFields.map((f) => el("td", { text: cellText(f, row) }));
+      const colspan = visibleFields.length + (updateAction ? 1 : 0) + (deleteAction ? 1 : 0) + customActions.length;
       let tr, editRow = null;
       if (updateAction) {
         const btn = el("button", { class: "btn btn-outlined", text: "Edit" }, []);
@@ -356,7 +610,7 @@ async function renderListScreen(screen, root) {
           const form = buildForm(
             updateAction.params, updateValuesFromRow(updateAction, row),
             async (values) => { const r = await callFn(updateAction.fn, values); if (r !== null) { showSnackbar(`${screen.title} updated.`); load(); } },
-            "Save", !canRun(updateAction), gateReason(updateAction),
+            "Save", !canRun(updateAction), gateReason(updateAction), true,
           );
           editRow = el("tr", {}, [el("td", { colspan: String(colspan) }, [form])]);
           tr.after(editRow);
@@ -390,7 +644,16 @@ async function renderListScreen(screen, root) {
       tbody.appendChild(tr);
     }
     table.appendChild(tbody);
-    tableWrap.appendChild(table);
+    tableWrap.appendChild(el("div", { class: "table-scroll" }, [table]));
+
+    if (usePagination && total !== null) {
+      const totalPages = Math.max(1, Math.ceil(total / pageSize));
+      const prev = el("button", { class: "btn btn-outlined", text: "Prev", onclick: () => { if (page > 1) { page--; load(); } } });
+      const next = el("button", { class: "btn btn-outlined", text: "Next", onclick: () => { if (page < totalPages) { page++; load(); } } });
+      if (page <= 1) prev.setAttribute("disabled", "");
+      if (page >= totalPages) next.setAttribute("disabled", "");
+      tableWrap.appendChild(el("div", { class: "pager" }, [prev, el("span", { text: `Page ${page} of ${totalPages} (${total} total)` }), next]));
+    }
   }
   load();
 }
@@ -406,7 +669,7 @@ async function renderSingularScreen(screen, root) {
     wrap.appendChild(buildForm(
       updateAction.params, current,
       async (values) => { const r = await callFn(updateAction.fn, values); if (r !== null) showSnackbar(`${screen.title} saved.`); },
-      "Save", !canRun(updateAction), gateReason(updateAction),
+      "Save", !canRun(updateAction), gateReason(updateAction), true,
     ));
   } else {
     wrap.appendChild(el("div", { class: "empty-state", text: "No update action defined for " + screen.title + "." }));
@@ -525,6 +788,29 @@ function renderScreen(screen) {
 }
 
 // ---- login (stub) screen ----
+// Called right after a successful sign-in. `route()` alone would just
+// re-render the login screen again -- the hash is still `#/login` at
+// that point, and `route()` reads the hash, not "did we just log in" --
+// so a successful sign-in used to leave the user staring at the sign-in
+// form a second time instead of landing in the app. Navigate to the
+// dashboard (or the first screen the newly-signed-in identity can
+// actually see, honoring the same role-based nav visibility `renderNav`
+// itself applies) whenever sign-in happened *from* the login screen;
+// leave the hash alone if sign-in happened via the nav-rail "Sign in"
+// while already looking at a screen (rare, but don't yank them away).
+function postLoginRedirect() {
+  renderNav();
+  const hash = (location.hash || "").replace(/^#\//, "");
+  if (hash !== "login" && hash !== "") { route(); return; }
+  if (HAS_DASHBOARD) {
+    location.hash = "#/dashboard";
+  } else {
+    const first = MANIFEST.find((s) => { const gate = screenReadGate(s); return !gate || canRun(gate); });
+    if (first) location.hash = "#/" + first.snake;
+  }
+  route();
+}
+
 function renderLogin() {
   const content = document.getElementById("content");
   content.textContent = "";
@@ -548,7 +834,7 @@ function renderLogin() {
         const claims = decodeJwtPayload(token);
         setIdentity({ subject: claims.sub || subject.value, roles: claims.roles || [], claims, token });
         showSnackbar("Signed in.");
-        renderNav(); route();
+        postLoginRedirect();
       } catch (err) { showSnackbar(`login: ${err.message}`, true); }
     }}, [
       el("div", { class: "field" }, [el("label", { text: "subject" }), subject]),
@@ -571,7 +857,7 @@ function renderLogin() {
     }
     setIdentity({ subject: subject.value || "user", roles: roles.value.split(",").map((s) => s.trim()).filter(Boolean), claims: claimPairs });
     showSnackbar("Signed in.");
-    renderNav(); route();
+    postLoginRedirect();
   }}, [
     el("div", { class: "field" }, [el("label", { text: "subject" }), subject]),
     el("div", { class: "field" }, [el("label", { text: "roles (comma-separated)" }), roles]),
@@ -584,16 +870,76 @@ function renderLogin() {
 // ---- nav + routing ----
 const HAS_DASHBOARD = STATS.length > 0 || CHARTS.length > 0;
 
-function navButton(route, label) {
-  return el("button", { class: "nav-item", text: label, "data-route": route, onclick: () => { location.hash = "#/" + route; } }, []);
+function navButton(route, label, secondary) {
+  return el("button", { class: secondary ? "nav-item nav-item-secondary" : "nav-item", text: label, "data-route": route, onclick: () => { location.hash = "#/" + route; } }, []);
 }
 
+// A screen's own read gate -- `list` for a table screen, else `get`,
+// else `update` for a singular one (`is_singular`'s own definition:
+// no `list`, but a `get` or `update` exists) -- the same action
+// `renderListScreen`/`renderSingularScreen` themselves already check via
+// `canRun` before fetching anything. Used only to decide whether this
+// screen's *nav entry* should render at all for the current identity;
+// the real, server-side enforcement (`serve.rs`) is unaffected either
+// way -- this is a nav-visibility convenience, not a security boundary,
+// same disclosed nature as every other client-side `canRun` gate.
+function screenReadGate(screen) {
+  return screen.actions.find((a) => a.kind === "list") || screen.actions.find((a) => a.kind === "get") || screen.actions.find((a) => a.kind === "update");
+}
+
+// Primary/secondary nav: screens sharing a `module` (`module "Name" {
+// ... }`, LANGUAGE.md SS12) group under one collapsible header, in
+// first-seen order; a screen with no `module` tag renders flat, exactly
+// as every screen did before `module` existed. Only the group holding
+// the *current* screen defaults expanded -- recomputed on every call
+// (including on every navigation, see the `hashchange` listener below),
+// so it always reflects wherever the user actually is; a manual toggle
+// (click) persists only until the next navigation, not saved state.
+// No identity at all -> no menu at all, not even Dashboard: the nav
+// rail stays empty and `route()` (below) forces every hash to `#/login`
+// until a sign-in succeeds. This is a UX gate, same disclosed nature as
+// every other client-side check here (`canRun` etc.) -- the real
+// security boundary is still `serve.rs`'s independent server-side
+// `requires(...)` enforcement, unchanged by this; a screen with no
+// `requires` on its read action was always a real, intentionally public
+// read per this app's own governance model (the doc's "view X = none"
+// rows), this just stops the *client* from previewing that data pre-
+// login rather than gating access to it that wasn't gated to begin with.
 function renderNav() {
   const nav = document.getElementById("nav");
   nav.textContent = "";
-  if (HAS_DASHBOARD) nav.appendChild(navButton("dashboard", "Dashboard"));
-  for (const screen of MANIFEST) nav.appendChild(navButton(screen.snake, screen.title));
   const id = getIdentity();
+
+  if (id) {
+    if (HAS_DASHBOARD) nav.appendChild(navButton("dashboard", "Dashboard"));
+
+    const currentHash = (location.hash || "").replace(/^#\//, "");
+    const groups = [];
+    for (const screen of MANIFEST) {
+      const gate = screenReadGate(screen);
+      if (gate && !canRun(gate)) continue; // role-based nav visibility
+      let group = groups.find((g) => g.module === screen.module);
+      if (!group) { group = { module: screen.module, screens: [] }; groups.push(group); }
+      group.screens.push(screen);
+    }
+    for (const group of groups) {
+      if (group.module == null) {
+        for (const screen of group.screens) nav.appendChild(navButton(screen.snake, screen.title));
+        continue;
+      }
+      const isActive = group.screens.some((s) => s.snake === currentHash);
+      const body = el("div", { style: isActive ? "" : "display:none;" }, group.screens.map((s) => navButton(s.snake, s.title, true)));
+      const chevron = () => (body.style.display === "none" ? "▶ " : "▼ ");
+      const header = el("button", { class: "nav-item", text: chevron() + group.module });
+      header.addEventListener("click", () => {
+        body.style.display = body.style.display === "none" ? "" : "none";
+        header.textContent = chevron() + group.module;
+      });
+      nav.appendChild(header);
+      nav.appendChild(body);
+    }
+  }
+
   const slot = document.getElementById("identity-slot");
   slot.textContent = "";
   if (id) {
@@ -607,6 +953,7 @@ function renderNav() {
 function route() {
   const hash = (location.hash || "").replace(/^#\//, "");
   document.querySelectorAll(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.route === hash));
+  if (!getIdentity() && hash !== "login") { location.hash = "#/login"; return; }
   if (hash === "login") { renderLogin(); return; }
   if (hash === "dashboard") { renderDashboard(); return; }
   const screen = MANIFEST.find((s) => s.snake === hash) || MANIFEST[0];
@@ -622,7 +969,11 @@ function route() {
   else renderScreen(screen);
 }
 
-window.addEventListener("hashchange", route);
+// `renderNav`, not just `route`, on every navigation -- module-grouped
+// nav (above) recomputes "which group is active" from the current hash,
+// so it needs to re-run on every hash change too, not just at login/
+// logout/initial load.
+window.addEventListener("hashchange", () => { renderNav(); route(); });
 renderNav();
 route();
 </script>

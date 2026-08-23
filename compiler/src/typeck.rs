@@ -356,6 +356,20 @@ pub enum TypeErrorKind {
     /// A `dashboard` `tile`/`chart` target that doesn't resolve to a real
     /// user-defined function.
     UnknownDashboardFn { metric_kind: String, fn_name: String },
+    /// A user `fn`'s parameter or return type is (or contains) `str` —
+    /// the "enum favoring" rule: `str` may not cross a user function's
+    /// call boundary, so categorical string data belongs in a real
+    /// `enum` and free text belongs in a carrier struct (e.g. `Text`)
+    /// instead. Builtins (`http_*`/`db_*`/`json_*`/...) and struct/enum
+    /// constructors are unaffected — this only fires for `program.fns`
+    /// entries (`check_fn`'s own loop), which is what makes those two
+    /// exempt without any special-casing. `param_name` is `None` when
+    /// the offending position is the return type rather than a
+    /// parameter. The one structural exception is a parameter literally
+    /// named `txn_id`: `transact`'s synthesized idempotency-key binding
+    /// must stay a plain `str` scalar for WAL durability
+    /// (`Ty::is_transact_scalar`), so `check_fn` skips this check for it.
+    StrInFnSignature { fn_name: String, param_name: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -664,6 +678,18 @@ impl std::fmt::Display for TypeError {
             TypeErrorKind::UnknownDashboardFn { metric_kind, fn_name } => write!(
                 f,
                 "{line}:{col}: `{metric_kind} ... -> {fn_name}` — no function named `{fn_name}` is declared"
+            ),
+            TypeErrorKind::StrInFnSignature { fn_name, param_name: Some(param_name) } => write!(
+                f,
+                "{line}:{col}: `fn {fn_name}`'s parameter `{param_name}` is (or contains) `str` — \
+                 `str` can't cross a function boundary; use an `enum` for categorical data or a \
+                 carrier struct (e.g. `Text`) for free text"
+            ),
+            TypeErrorKind::StrInFnSignature { fn_name, param_name: None } => write!(
+                f,
+                "{line}:{col}: `fn {fn_name}`'s return type is (or contains) `str` — \
+                 `str` can't cross a function boundary; use an `enum` for categorical data or a \
+                 carrier struct (e.g. `Text`) for free text"
             ),
         }
     }
@@ -1072,6 +1098,24 @@ impl<'a> Checker<'a> {
     }
 
     fn check_fn(&mut self, f: &FnDecl) {
+        // "Enum favoring": `str` may not be, or contain, a parameter or
+        // return type of a user-defined function — see
+        // `TypeErrorKind::StrInFnSignature`'s doc comment for the full
+        // rule and its rationale. `txn_id` is the one structural
+        // exception (`transact`'s synthesized idempotency key must stay
+        // a plain `str` scalar for WAL durability, `Ty::is_transact_scalar`).
+        for p in &f.params {
+            if p.name != "txn_id" && p.ty.contains_str() {
+                self.error(
+                    TypeErrorKind::StrInFnSignature { fn_name: f.name.clone(), param_name: Some(p.name.clone()) },
+                    f.span,
+                );
+            }
+        }
+        if f.ret.contains_str() {
+            self.error(TypeErrorKind::StrInFnSignature { fn_name: f.name.clone(), param_name: None }, f.span);
+        }
+
         let mut scopes = Scopes::new();
         for p in &f.params {
             scopes.define(&p.name, p.ty.clone());

@@ -31,31 +31,37 @@ fn first_type_error(src: &str) -> TypeErrorKind {
 #[test]
 fn connect_create_insert_and_query_round_trip() {
     let src = r#"
-        fn main() -> str {
+        struct Text {
+            value: str,
+        }
+        fn main() -> Text {
             return match db_connect(":memory:") {
                 Ok(conn) => match db_execute(conn, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)") {
                     Ok(n) => match db_execute(conn, "INSERT INTO users (name) VALUES ('ada')") {
                         Ok(m) => match db_query(conn, "SELECT name FROM users") {
                             Ok(rows) => match json_array_get(rows, 0) {
                                 Ok(row) => match json_get_str(row, "name") {
-                                    Ok(name) => name,
-                                    Err(e) => e,
+                                    Ok(name) => Text(name),
+                                    Err(e) => Text(e),
                                 },
-                                Err(e) => e,
+                                Err(e) => Text(e),
                             },
-                            Err(e) => e,
+                            Err(e) => Text(e),
                         },
-                        Err(e) => e,
+                        Err(e) => Text(e),
                     },
-                    Err(e) => e,
+                    Err(e) => Text(e),
                 },
-                Err(e) => e,
+                Err(e) => Text(e),
             }
         }
     "#;
     match run(src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "ada"),
-        other => panic!("expected Ok(Str(\"ada\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "ada"),
+            other => panic!("expected Text(Str(\"ada\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"ada\")), got {other:?}"),
     }
 }
 
@@ -380,10 +386,7 @@ fn example_db_runs_to_completion() {
     let program = parse_ok(include_str!("../examples/db.nir"));
     typecheck(&program).expect("should typecheck cleanly");
     check_ownership(&program).expect("should pass ownership checking");
-    match run(include_str!("../examples/db.nir")) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "ada"),
-        other => panic!("expected Ok(Str(\"ada\")), got {other:?}"),
-    }
+    assert_eq!(run(include_str!("../examples/db.nir")), Ok(Value::Unit));
 }
 
 // ---- parameterized queries: the only way to embed runtime data into SQL,
@@ -392,13 +395,10 @@ fn example_db_runs_to_completion() {
 #[test]
 fn parameterized_execute_and_query_round_trip_runtime_values() {
     let src = r#"
-        fn extract_name(row: json) -> str {
-            return match json_get_str(row, "name") {
-                Ok(name) => name,
-                Err(e) => e,
-            }
+        struct Text {
+            value: str,
         }
-        fn run_all(conn: db) -> str {
+        fn run_all(conn: db) -> Text {
             let created: i64 = match db_execute(conn, "CREATE TABLE items (name TEXT, price INTEGER)") {
                 Ok(n) => n,
                 Err(e) => -1,
@@ -409,25 +409,31 @@ fn parameterized_execute_and_query_round_trip_runtime_values() {
                 Ok(n) => n,
                 Err(e) => -1,
             }
-            let found: str = match db_query(conn, "SELECT name FROM items WHERE price = ?", price) {
+            let found: Text = match db_query(conn, "SELECT name FROM items WHERE price = ?", price) {
                 Ok(rows) => match json_array_get(rows, 0) {
-                    Ok(row) => extract_name(row),
-                    Err(e) => e,
+                    Ok(row) => match json_get_str(row, "name") {
+                        Ok(n) => Text(n),
+                        Err(e) => Text(e),
+                    },
+                    Err(e) => Text(e),
                 },
-                Err(e) => e,
+                Err(e) => Text(e),
             }
             stop conn
             return found
         }
-        fn main() -> str {
+        fn main() -> Text {
             return match db_connect(":memory:") {
                 Ok(conn) => run_all(conn),
-                Err(e) => e,
+                Err(e) => Text(e),
             }
         }
     "#;
     match run(src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "widget"),
-        other => panic!("expected Ok(Str(\"widget\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "widget"),
+            other => panic!("expected Text(Str(\"widget\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"widget\")), got {other:?}"),
     }
 }

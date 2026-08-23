@@ -21,7 +21,7 @@ fn emit_ui(src: &str) -> String {
     check_ownership(&program).expect("ownership check should succeed");
     let registry = TypeRegistry::build(&program);
     let effects = infer_effects(&program, &registry);
-    generate(&program, &effects, None)
+    generate(&program, &effects, None, false)
 }
 
 #[test]
@@ -96,16 +96,21 @@ fn singular_screen_has_no_list_action() {
 #[test]
 fn option_field_is_optional_but_keeps_its_inner_control() {
     let src = r#"
+        struct Text {
+            value: str,
+        }
         struct Note {
             body: str,
             reminder: Option(i64),
         }
-        fn list_note() -> str { return "[]" }
-        fn create_note(n: Note) -> str { return n.body }
-        fn main() -> str { return list_note() }
+        fn list_note() -> Text { return Text("[]") }
+        fn create_note(n: Note) -> Text { return Text(n.body) }
+        fn main() -> Text { return list_note() }
     "#;
     let html = emit_ui(src);
-    assert!(html.contains(r#""control":"number","displayLabel":null,"label":"i64","name":"reminder","nested":[],"required":false"#));
+    assert!(html.contains(
+        r#""control":"number","displayLabel":null,"label":"i64","name":"reminder","nested":[],"options":[],"required":false"#
+    ));
 }
 
 #[test]
@@ -117,16 +122,25 @@ fn stat_and_chart_functions_are_derived_as_dashboard_metrics() {
         fn stat_total_leakage_cents() -> i64 requires(role: "analyst") {
             return 12345
         }
-        fn chart_leakage_by_service() -> Result(json, str) {
-            return json_parse("[]")
+        enum ErrorCode {
+            ParseError,
+        }
+        fn chart_leakage_by_service() -> Result(json, ErrorCode) {
+            return match json_parse("[]") {
+                Ok(v) => Ok(v),
+                Err(e) => Err(ParseError()),
+            }
         }
         // Not a metric: takes a param.
         fn stat_ignored(x: i64) -> i64 {
             return x
         }
+        struct Text {
+            value: str,
+        }
         // Not a metric: wrong return type.
-        fn stat_also_ignored() -> str {
-            return "nope"
+        fn stat_also_ignored() -> Text {
+            return Text("nope")
         }
         fn main() {}
     "#;
@@ -158,13 +172,16 @@ fn list_screen_wires_up_inline_edit_when_an_update_action_exists() {
     // Edit path wired up (the gap this session fixed: update was
     // previously only reachable on singular screens).
     let src = r#"
+        struct Text {
+            value: str,
+        }
         struct Ledger {
             id: i64,
             note: str,
         }
-        fn list_ledger() -> str { return "[]" }
-        fn update_ledger(l: Ledger) -> str { return l.note }
-        fn main() -> str { return list_ledger() }
+        fn list_ledger() -> Text { return Text("[]") }
+        fn update_ledger(l: Ledger) -> Text { return Text(l.note) }
+        fn main() -> Text { return list_ledger() }
     "#;
     let html = emit_ui(src);
     assert!(html.contains("\"singular\":false"));
@@ -183,12 +200,15 @@ fn list_screen_wires_up_inline_edit_when_an_update_action_exists() {
 #[test]
 fn declared_screen_title_and_field_label_override_inference() {
     let src = r#"
+        struct Text {
+            value: str,
+        }
         struct Product {
             id: i64,
             name: str,
         }
-        fn list_product() -> str { return "[]" }
-        fn create_product(p: Product) -> str { return p.name }
+        fn list_product() -> Text { return Text("[]") }
+        fn create_product(p: Product) -> Text { return Text(p.name) }
 
         screen Product {
             title: "Catalog"
@@ -196,7 +216,7 @@ fn declared_screen_title_and_field_label_override_inference() {
                 label: "Product Name"
             }
         }
-        fn main() -> str { return list_product() }
+        fn main() -> Text { return list_product() }
     "#;
     let html = emit_ui(src);
     assert!(html.contains(r#""title":"Catalog""#), "declared title should override the struct name as the screen's display title");
@@ -211,11 +231,14 @@ fn declared_screen_title_and_field_label_override_inference() {
 #[test]
 fn declared_custom_action_carries_its_label_style_and_confirm() {
     let src = r#"
+        struct Text {
+            value: str,
+        }
         struct Product {
             id: i64,
             name: str,
         }
-        fn list_product() -> str { return "[]" }
+        fn list_product() -> Text { return Text("[]") }
         fn restock_product(id: i64) -> i64 { return id }
 
         screen Product {
@@ -224,7 +247,7 @@ fn declared_custom_action_carries_its_label_style_and_confirm() {
                 confirm: "Restock this product?"
             }
         }
-        fn main() -> str { return list_product() }
+        fn main() -> Text { return list_product() }
     "#;
     let html = emit_ui(src);
     assert!(html.contains(r#""fn":"restock_product","kind":"custom""#));
@@ -239,15 +262,18 @@ fn screen_declared_crud_target_overrides_the_inferred_fn_name() {
     // convention at all -- proves the override actually replaces the
     // inferred name rather than merely supplementing it.
     let src = r#"
+        struct Text {
+            value: str,
+        }
         struct Product {
             id: i64,
         }
-        fn fetch_all_products() -> str { return "[]" }
+        fn fetch_all_products() -> Text { return Text("[]") }
 
         screen Product {
             list: fetch_all_products
         }
-        fn main() -> str { return fetch_all_products() }
+        fn main() -> Text { return fetch_all_products() }
     "#;
     let html = emit_ui(src);
     assert!(html.contains(r#""fn":"fetch_all_products","kind":"list""#));
@@ -259,10 +285,13 @@ fn struct_with_no_screen_block_is_unaffected_by_the_dsl_existing() {
     // struct in the same program having a `screen` block must not change
     // anything about a struct that doesn't.
     let src = r#"
+        struct Text {
+            value: str,
+        }
         struct Product {
             id: i64,
         }
-        fn list_product() -> str { return "[]" }
+        fn list_product() -> Text { return Text("[]") }
         screen Product {
             title: "Catalog"
         }
@@ -270,10 +299,13 @@ fn struct_with_no_screen_block_is_unaffected_by_the_dsl_existing() {
         struct Plain {
             id: i64,
         }
-        fn list_plain() -> str { return "[]" }
+        fn list_plain() -> Text { return Text("[]") }
 
-        fn main() -> str { return list_product() }
+        fn main() -> Text { return list_product() }
     "#;
     let html = emit_ui(src);
-    assert!(html.contains(r#""name":"Plain","singular":false,"snake":"plain","title":"Plain""#), "a struct with no screen block should get its own name as the title, unaffected by Product's block");
+    assert!(
+        html.contains(r#""name":"Plain","singular":false,"snake":"plain","table":"plain","title":"Plain""#),
+        "a struct with no screen block should get its own name as the title, unaffected by Product's block"
+    );
 }

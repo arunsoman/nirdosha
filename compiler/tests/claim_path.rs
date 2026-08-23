@@ -20,19 +20,23 @@ const JWKS: &str = r#"{"keys":[{"kid":"key1","kty":"oct","k":"bXktc2VjcmV0LWtleQ
 fn run_with_claims(claims_json: &str, body: &str) -> Value {
     let src = format!(
         r#"
-fn handle_identity(identity: VerifiedIdentity) -> str {{
+struct Text {{
+    value: str,
+}}
+
+fn handle_identity(identity: VerifiedIdentity) -> Text {{
     {body}
 }}
 
-fn main() -> str {{
+fn main() -> Text {{
     let claims_json: str = "{claims_json}"
     let jwks: str = "{jwks}"
     return match mock_issue_token("alice", "https://example.com", "my-app", 1700000000, 999999999, claims_json, jwks) {{
         Ok(token) => match oidc_validate_token(token, "https://example.com", "my-app", jwks) {{
             Ok(identity) => handle_identity(identity),
-            Err(e) => e,
+            Err(e) => Text(e),
         }},
-        Err(e) => e,
+        Err(e) => Text(e),
     }}
 }}
 "#,
@@ -45,8 +49,11 @@ fn main() -> str {{
 
 fn expect_str(v: Value, want: &str) {
     match v {
-        Value::Str(s) => assert_eq!(&*s, want, "unexpected string result"),
-        other => panic!("expected Str({want:?}), got {other:?}"),
+        Value::Struct(name, fields) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, want, "unexpected string result"),
+            other => panic!("expected Text(Str({want:?})), got Text({other:?})"),
+        },
+        other => panic!("expected Text({want:?}), got {other:?}"),
     }
 }
 
@@ -55,8 +62,8 @@ fn check_role_path_finds_a_role_nested_under_an_object() {
     let v = run_with_claims(
         r#"{"realm_access":{"roles":["admin","viewer"]}}"#,
         r#"return match check_role_path(identity, "realm_access.roles", "admin") {
-            Ok(view) => view.role,
-            Err(e) => e,
+            Ok(view) => Text(view.role),
+            Err(e) => Text(e),
         }"#,
     );
     expect_str(v, "admin");
@@ -67,8 +74,8 @@ fn check_role_path_rejects_a_role_not_in_the_nested_array() {
     let v = run_with_claims(
         r#"{"realm_access":{"roles":["viewer"]}}"#,
         r#"return match check_role_path(identity, "realm_access.roles", "admin") {
-            Ok(view) => view.role,
-            Err(e) => e,
+            Ok(view) => Text(view.role),
+            Err(e) => Text(e),
         }"#,
     );
     expect_str(v, "insufficient role: `admin`");
@@ -79,8 +86,8 @@ fn extract_claim_path_reads_a_nested_string_claim() {
     let v = run_with_claims(
         r#"{"profile":{"department":"cardiology"}}"#,
         r#"return match extract_claim_path(identity, "profile.department") {
-            Ok(view) => view.value,
-            Err(e) => e,
+            Ok(view) => Text(view.value),
+            Err(e) => Text(e),
         }"#,
     );
     expect_str(v, "cardiology");
@@ -91,8 +98,8 @@ fn extract_claim_path_on_a_missing_segment_is_a_clean_error_not_a_panic() {
     let v = run_with_claims(
         r#"{"profile":{"department":"cardiology"}}"#,
         r#"return match extract_claim_path(identity, "profile.title") {
-            Ok(view) => view.value,
-            Err(e) => e,
+            Ok(view) => Text(view.value),
+            Err(e) => Text(e),
         }"#,
     );
     expect_str(v, "no field `title`");
@@ -108,10 +115,10 @@ fn plain_check_role_and_extract_claim_are_unaffected_by_the_new_builtins() {
         r#"{"roles":["admin"],"department":"radiology"}"#,
         r#"return match check_role(identity, "admin") {
             Ok(_) => match extract_claim(identity, "department") {
-                Ok(view) => view.value,
-                Err(e) => e,
+                Ok(view) => Text(view.value),
+                Err(e) => Text(e),
             },
-            Err(e) => e,
+            Err(e) => Text(e),
         }"#,
     );
     expect_str(v, "radiology");

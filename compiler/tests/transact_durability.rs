@@ -185,27 +185,31 @@ fn commit_returning_result_err_is_retried_not_silently_accepted() {
     let counter_db_str = counter_db.to_string_lossy().replace('\\', "\\\\");
     let src = format!(
         r#"
+        enum ErrorCode {{
+            NotYet,
+            BuiltinError,
+        }}
         fn call_api(txn_id: str, amount: i64) -> i64 {{ return amount }}
         fn check(resp: i64) -> bool {{ return resp > 0 }}
-        fn commit_result_flaky(amount: i64) -> Result(i64, str) {{
+        fn commit_result_flaky(amount: i64) -> Result(i64, ErrorCode) {{
             return match db_connect("{counter_db_str}") {{
                 Ok(conn) => match db_execute(conn, "CREATE TABLE IF NOT EXISTS counter (id INTEGER PRIMARY KEY, n INTEGER)") {{
                     Ok(created) => match db_execute(conn, "INSERT INTO counter (id, n) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET n = n + 1") {{
                         Ok(upserted) => match db_query(conn, "SELECT n FROM counter WHERE id = 1") {{
                             Ok(rows) => match json_array_get(rows, 0) {{
                                 Ok(row) => match json_get_i64(row, "n") {{
-                                    Ok(n) => if n < 3 {{ Err("not yet") }} else {{ Ok(amount) }},
-                                    Err(e) => Err(e),
+                                    Ok(n) => if n < 3 {{ Err(NotYet()) }} else {{ Ok(amount) }},
+                                    Err(e) => Err(BuiltinError()),
                                 }},
-                                Err(e) => Err(e),
+                                Err(e) => Err(BuiltinError()),
                             }},
-                            Err(e) => Err(e),
+                            Err(e) => Err(BuiltinError()),
                         }},
-                        Err(e) => Err(e),
+                        Err(e) => Err(BuiltinError()),
                     }},
-                    Err(e) => Err(e),
+                    Err(e) => Err(BuiltinError()),
                 }},
-                Err(e) => Err(e),
+                Err(e) => Err(BuiltinError()),
             }}
         }}
         fn main() -> bool {{

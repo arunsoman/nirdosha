@@ -10,14 +10,11 @@
 // across smaller helpers the way `first_user_name` alone might suggest
 // is possible -- a real, general limitation shared by every affine
 // handle in this language today, not specific to `db`.
-fn extract_name(row: json) -> str {
-    return match json_get_str(row, "name") {
-        Ok(name) => name,
-        Err(e) => e,
-    }
+struct Text {
+    value: str,
 }
 
-fn run_all(conn: db) -> str {
+fn run_all(conn: db) -> Text {
     let created: i64 = match db_execute(conn, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)") {
         Ok(n) => n,
         Err(e) => -1,
@@ -26,20 +23,24 @@ fn run_all(conn: db) -> str {
         Ok(n) => n,
         Err(e) => -1,
     }
-    let name: str = match db_query(conn, "SELECT name FROM users ORDER BY id") {
+    let name: Text = match db_query(conn, "SELECT name FROM users ORDER BY id") {
         Ok(rows) => match json_array_get(rows, 0) {
-            Ok(row) => extract_name(row),
-            Err(e) => e,
+            Ok(row) => match json_get_str(row, "name") {
+                Ok(n) => Text(n),
+                Err(e) => Text(e),
+            },
+            Err(e) => Text(e),
         },
-        Err(e) => e,
+        Err(e) => Text(e),
     }
     stop conn
     return name
 }
 
-fn main() -> str {
-    return match db_connect(":memory:") {
+fn main() {
+    let name: Text = match db_connect(":memory:") {
         Ok(conn) => run_all(conn),
-        Err(e) => e,
+        Err(e) => Text(e),
     }
+    print(name.value)
 }

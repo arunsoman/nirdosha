@@ -26,19 +26,25 @@ fn first_type_error(src: &str) -> TypeErrorKind {
 #[test]
 fn parsing_and_reading_a_string_field_round_trips() {
     let src = r#"
-        fn main() -> str {
+        struct Text {
+            value: str,
+        }
+        fn main() -> Text {
             return match json_parse("{\"name\": \"nirdosha\"}") {
                 Ok(doc) => match json_get_str(doc, "name") {
-                    Ok(s) => s,
-                    Err(e) => e,
+                    Ok(s) => Text(s),
+                    Err(e) => Text(e),
                 },
-                Err(e) => e,
+                Err(e) => Text(e),
             }
         }
     "#;
     match run(src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "nirdosha"),
-        other => panic!("expected Ok(Str(\"nirdosha\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "nirdosha"),
+            other => panic!("expected Text(Str(\"nirdosha\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"nirdosha\")), got {other:?}"),
     }
 }
 
@@ -92,22 +98,28 @@ fn a_float_field_round_trips() {
 #[test]
 fn a_missing_field_is_a_recoverable_err_not_a_trap() {
     let src = r#"
-        fn describe(doc: json) -> str {
+        struct Text {
+            value: str,
+        }
+        fn describe(doc: json) -> Text {
             return match json_get_str(doc, "missing") {
-                Ok(s) => s,
-                Err(e) => "missing!",
+                Ok(s) => Text(s),
+                Err(e) => Text("missing!"),
             }
         }
-        fn main() -> str {
+        fn main() -> Text {
             return match json_parse("{\"name\": \"x\"}") {
                 Ok(doc) => describe(doc),
-                Err(e) => "parse failed",
+                Err(e) => Text("parse failed"),
             }
         }
     "#;
     match run(src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "missing!"),
-        other => panic!("expected Ok(Str(\"missing!\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "missing!"),
+            other => panic!("expected Text(Str(\"missing!\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"missing!\")), got {other:?}"),
     }
 }
 
@@ -190,22 +202,28 @@ fn an_out_of_bounds_array_index_is_a_recoverable_err() {
 #[test]
 fn nested_objects_navigate_with_plain_json_get() {
     let src = r#"
-        fn main() -> str {
+        struct Text {
+            value: str,
+        }
+        fn main() -> Text {
             return match json_parse("{\"user\": {\"name\": \"ada\"}}") {
                 Ok(doc) => match json_get(doc, "user") {
                     Ok(user) => match json_get_str(user, "name") {
-                        Ok(s) => s,
-                        Err(e) => e,
+                        Ok(s) => Text(s),
+                        Err(e) => Text(e),
                     },
-                    Err(e) => e,
+                    Err(e) => Text(e),
                 },
-                Err(e) => e,
+                Err(e) => Text(e),
             }
         }
     "#;
     match run(src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "ada"),
-        other => panic!("expected Ok(Str(\"ada\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "ada"),
+            other => panic!("expected Text(Str(\"ada\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"ada\")), got {other:?}"),
     }
 }
 
@@ -259,13 +277,19 @@ fn matching_directly_on_a_builtin_call_result_resolves_generic_args_precisely() 
 #[test]
 fn matching_directly_on_a_user_function_call_result_resolves_generic_args_precisely() {
     let src = r#"
-        fn find(doc: json) -> Result(str, str) {
-            return json_get_str(doc, "name")
+        struct Text {
+            value: str,
+        }
+        fn find(doc: json) -> Result(Text, Text) {
+            return match json_get_str(doc, "name") {
+                Ok(s) => Ok(Text(s)),
+                Err(e) => Err(Text(e)),
+            }
         }
         fn main() -> bool {
             return match json_parse("{\"name\": \"x\"}") {
                 Ok(doc) => match find(doc) {
-                    Ok(s) => s == "x",
+                    Ok(s) => s.value == "x",
                     Err(e) => match find(doc) {
                         Ok(s2) => false,
                         Err(e2) => false,
@@ -311,8 +335,5 @@ fn json_is_interpreter_only_rejected_by_codegen() {
 fn example_json_runs_to_completion() {
     let program = parse_ok(include_str!("../examples/json.nir"));
     typecheck(&program).expect("should typecheck cleanly");
-    match run(include_str!("../examples/json.nir")) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "nirdosha"),
-        other => panic!("expected Ok(Str(\"nirdosha\")), got {other:?}"),
-    }
+    assert_eq!(run(include_str!("../examples/json.nir")), Ok(Value::Unit));
 }

@@ -84,7 +84,7 @@ fn print_usage() {
     eprintln!("  nirdosha emit-ui <file.nir> [-o out.html]");
     eprintln!("                                      derive a Material-styled web UI from struct/fn conventions");
     eprintln!("  nirdosha serve <file.nir> [--port 8080] [--jwks-file P --issuer S --audience S]");
-    eprintln!("                             [--identity-base URL]");
+    eprintln!("                             [--identity-base URL] [--db PATH]");
     eprintln!("                                      run the program as a real HTTP service (UI at GET /,");
     eprintln!("                                      API at POST /api/<fn>) -- see src/serve.rs");
 }
@@ -343,7 +343,7 @@ fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
     };
     let registry = nirdosha::ast::TypeRegistry::build(&program);
     let effects = nirdosha::effects::infer_effects(&program, &registry);
-    let html = nirdosha::ui_gen::generate(&program, &effects, None);
+    let html = nirdosha::ui_gen::generate(&program, &effects, None, false);
     match output {
         Some(out) => match std::fs::write(&out, html) {
             Ok(()) => {
@@ -363,11 +363,16 @@ fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
 }
 
 /// `nirdosha serve <file.nir> [--port 8080] [--jwks-file P --issuer S
-/// --audience S] [--identity-base URL]` — runs the program as a real
-/// HTTP service via `serve::run` (`tiny_http`; see `src/serve.rs`'s
-/// module doc for the request-handling design and, importantly, the
-/// authz gate it adds on top of `Interpreter::call_named`, which by
-/// itself does not enforce `requires(role: ...)`). `--jwks-file`/
+/// --audience S] [--identity-base URL] [--db PATH]` — runs the program
+/// as a real HTTP service via `serve::run` (`tiny_http`; see
+/// `src/serve.rs`'s module doc for the request-handling design and,
+/// importantly, the authz gate it adds on top of
+/// `Interpreter::call_named`, which by itself does not enforce
+/// `requires(role: ...)`). `--db PATH` additionally exposes the generic
+/// `/_nirdosha/table/<snake>` pagination/sort/filter/search route
+/// (`serve.rs`'s own doc comment on `dispatch_table_query`) against the
+/// SQLite file at `PATH`; omitted, every table renders exactly as it
+/// always has (one unpaginated fetch). `--jwks-file`/
 /// `--issuer`/`--audience` are all-or-nothing: without them, any
 /// `Authorization: Bearer` header is rejected with a clear 500 rather
 /// than silently accepted or silently ignored, and any `requires`-gated
@@ -380,6 +385,7 @@ fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<S
     let mut issuer: Option<String> = None;
     let mut audience: Option<String> = None;
     let mut identity_base: Option<String> = None;
+    let mut db_path: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--port" => port = args.next().and_then(|s| s.parse().ok()).unwrap_or(port),
@@ -387,11 +393,14 @@ fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<S
             "--issuer" => issuer = args.next(),
             "--audience" => audience = args.next(),
             "--identity-base" => identity_base = args.next(),
+            "--db" => db_path = args.next(),
             other => input = Some(other.to_string()),
         }
     }
     let Some(path) = input else {
-        eprintln!("usage: nirdosha serve <file.nir> [--port 8080] [--jwks-file P --issuer S --audience S] [--identity-base URL]");
+        eprintln!(
+            "usage: nirdosha serve <file.nir> [--port 8080] [--jwks-file P --issuer S --audience S] [--identity-base URL] [--db PATH]"
+        );
         return ExitCode::FAILURE;
     };
     let src = match read_source(&path) {
@@ -426,7 +435,7 @@ fn cmd_serve(mut args: impl Iterator<Item = String>, transact_log_path: Option<S
     // scatter a durable transaction's rows across files nothing ever
     // replays together, and would leak one file per request forever.
     let transact_log = std::path::PathBuf::from(transact_log_path.unwrap_or_else(|| format!("{path}.transact.db")));
-    match nirdosha::serve::run(std::sync::Arc::new(program), port, auth, identity_base.as_deref(), transact_log) {
+    match nirdosha::serve::run(std::sync::Arc::new(program), port, auth, identity_base.as_deref(), transact_log, db_path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("{msg}");

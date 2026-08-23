@@ -56,17 +56,23 @@ fn http_get_returns_the_status_and_body() {
 
     let src = format!(
         r#"
-        fn main() -> str {{
+        struct Text {{
+            value: str,
+        }}
+        fn main() -> Text {{
             return match http_get("127.0.0.1", {port}, "/greet") {{
-                Ok(resp) => resp.body,
-                Err(e) => e,
+                Ok(resp) => Text(resp.body),
+                Err(e) => Text(e),
             }}
         }}
     "#
     );
     match run(&src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "hello from server"),
-        other => panic!("expected Ok(Str(\"hello from server\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "hello from server"),
+            other => panic!("expected Text(Str(\"hello from server\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"hello from server\")), got {other:?}"),
     }
     let request = server.join().unwrap();
     let request = String::from_utf8(request).unwrap();
@@ -134,23 +140,29 @@ fn a_response_body_composes_directly_with_json_get_str() {
 
     let src = format!(
         r#"
-        fn main() -> str {{
+        struct Text {{
+            value: str,
+        }}
+        fn main() -> Text {{
             return match http_get("127.0.0.1", {port}, "/ping") {{
                 Ok(resp) => match json_parse(resp.body) {{
                     Ok(doc) => match json_get_str(doc, "message") {{
-                        Ok(msg) => msg,
-                        Err(e) => e,
+                        Ok(msg) => Text(msg),
+                        Err(e) => Text(e),
                     }},
-                    Err(e) => e,
+                    Err(e) => Text(e),
                 }},
-                Err(e) => e,
+                Err(e) => Text(e),
             }}
         }}
     "#
     );
     match run(&src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "pong"),
-        other => panic!("expected Ok(Str(\"pong\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "pong"),
+            other => panic!("expected Text(Str(\"pong\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"pong\")), got {other:?}"),
     }
     server.join().unwrap();
 }
@@ -278,8 +290,8 @@ fn example_http_runs_to_completion() {
     let program = parse_ok(&src);
     typecheck(&program).expect("should typecheck cleanly");
     match run(&src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "pong"),
-        other => panic!("expected Ok(Str(\"pong\")), got {other:?}"),
+        Ok(Value::Unit) => {}
+        other => panic!("expected Ok(Unit), got {other:?}"),
     }
     server.join().unwrap();
 }

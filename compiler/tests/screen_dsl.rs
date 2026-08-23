@@ -23,20 +23,24 @@ fn first_type_error(src: &str) -> TypeErrorKind {
 }
 
 const WELL_FORMED: &str = r#"
+    struct Text {
+        value: str,
+    }
+
     struct Product {
         id: i64,
         name: str,
         price: i64,
     }
 
-    fn list_product() -> str { return "[]" }
-    fn create_product(p: Product) -> str { return p.name }
-    fn update_product(p: Product) -> str { return p.name }
+    fn list_product() -> Text { return Text("[]") }
+    fn create_product(p: Product) -> Text { return Text(p.name) }
+    fn update_product(p: Product) -> Text { return Text(p.name) }
     fn delete_product(id: i64) -> i64 { return id }
     fn restock_product(id: i64) -> i64 { return id }
 
     fn stat_product_count() -> i64 { return 0 }
-    fn chart_products_by_price() -> str { return "[]" }
+    fn chart_products_by_price() -> Text { return Text("[]") }
 
     screen Product {
         title: "Catalog"
@@ -240,8 +244,8 @@ fn struct_with_no_screen_block_is_completely_unaffected() {
         struct Plain {
             id: i64,
         }
-        fn list_plain() -> str { return "[]" }
-        fn main() -> str { return list_plain() }
+        fn list_plain() -> i64 { return 0 }
+        fn main() -> i64 { return list_plain() }
     "#;
     let program = parse_ok(src);
     assert!(program.screens.is_empty());

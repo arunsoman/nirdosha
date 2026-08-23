@@ -7,8 +7,15 @@
 // "obviously not production" spirit `examples/identity_mock.nir` takes
 // for identity.
 
-fn charge() -> str {
-    return "{\"charge_id\":\"ch_mock_001\",\"status\":\"succeeded\"}"
+enum ErrorCode {
+    MalformedResponse,
+}
+
+fn charge() -> Result(json, ErrorCode) {
+    return match json_parse("{\"charge_id\":\"ch_mock_001\",\"status\":\"succeeded\"}") {
+        Ok(doc) => Ok(doc),
+        Err(e) => Err(MalformedResponse()),
+    }
 }
 
 fn main() {}

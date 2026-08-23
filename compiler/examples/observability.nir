@@ -12,7 +12,7 @@ fn double(n: i64) -> i64 {
     return n * 2
 }
 
-fn main() -> str {
+fn main() {
     let h: thread i64 = spawn double(21)
 
     let out: file = open("/tmp/nirdosha_observability_example.txt", "w")
@@ -26,5 +26,4 @@ fn main() -> str {
     let doubled: i64 = join h
     print(doubled) // 42
     print(content)
-    return content
 }

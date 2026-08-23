@@ -39,7 +39,10 @@ fn writing_then_reading_a_real_file_round_trips() {
     let path = temp_path("roundtrip.txt");
     let src = format!(
         r#"
-        fn main() -> str {{
+        struct Text {{
+            value: str,
+        }}
+        fn main() -> Text {{
             let out: file = open("{path}", "w")
             send(out, "hello from nirdosha")
             stop out
@@ -47,13 +50,16 @@ fn writing_then_reading_a_real_file_round_trips() {
             let inp: file = open("{path}", "r")
             let content: str = recv(inp)
             stop inp
-            return content
+            return Text(content)
         }}
     "#
     );
     match run(&src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "hello from nirdosha"),
-        other => panic!("expected Ok(Str(\"hello from nirdosha\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "hello from nirdosha"),
+            other => panic!("expected Text(Str(\"hello from nirdosha\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"hello from nirdosha\")), got {other:?}"),
     }
     let _ = std::fs::remove_file(&path);
 }
@@ -63,7 +69,10 @@ fn appending_to_an_existing_file_does_not_truncate_it() {
     let path = temp_path("append.txt");
     let src = format!(
         r#"
-        fn main() -> str {{
+        struct Text {{
+            value: str,
+        }}
+        fn main() -> Text {{
             let first: file = open("{path}", "w")
             send(first, "one-")
             stop first
@@ -75,13 +84,16 @@ fn appending_to_an_existing_file_does_not_truncate_it() {
             let inp: file = open("{path}", "r")
             let content: str = recv(inp)
             stop inp
-            return content
+            return Text(content)
         }}
     "#
     );
     match run(&src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "one-two"),
-        other => panic!("expected Ok(Str(\"one-two\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "one-two"),
+            other => panic!("expected Text(Str(\"one-two\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"one-two\")), got {other:?}"),
     }
     let _ = std::fs::remove_file(&path);
 }
@@ -94,7 +106,10 @@ fn reading_past_eof_returns_an_empty_string_not_an_error() {
     let path = temp_path("eof.txt");
     let src = format!(
         r#"
-        fn main() -> str {{
+        struct Text {{
+            value: str,
+        }}
+        fn main() -> Text {{
             let out: file = open("{path}", "w")
             send(out, "x")
             stop out
@@ -103,13 +118,16 @@ fn reading_past_eof_returns_an_empty_string_not_an_error() {
             let first: str = recv(inp)
             let second: str = recv(inp)
             stop inp
-            return second
+            return Text(second)
         }}
     "#
     );
     match run(&src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, ""),
-        other => panic!("expected Ok(Str(\"\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, ""),
+            other => panic!("expected Text(Str(\"\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"\")), got {other:?}"),
     }
     let _ = std::fs::remove_file(&path);
 }

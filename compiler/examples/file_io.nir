@@ -4,7 +4,7 @@
 // the way `tcp` itself reused them from `chan` -- no new I/O keywords,
 // only one new type-former (`file`) and one new expression (`open`).
 
-fn main() -> str {
+fn main() {
     let out: file = open("/tmp/nirdosha_file_io_example.txt", "w")
     send(out, "hello from nirdosha")
     stop out
@@ -14,5 +14,4 @@ fn main() -> str {
     stop inp
 
     print(content)
-    return content
 }

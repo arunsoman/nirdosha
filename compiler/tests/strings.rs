@@ -37,25 +37,37 @@ fn example_strings_runs_to_completion() {
 #[test]
 fn a_plain_string_literal_round_trips() {
     let src = r#"
-        fn main() -> str {
-            return "hello"
+        struct Text {
+            value: str,
+        }
+        fn main() -> Text {
+            return Text("hello")
         }
     "#;
     match run(src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "hello"),
-        other => panic!("expected Ok(Str(\"hello\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "hello"),
+            other => panic!("expected Text(Str(\"hello\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"hello\")), got {other:?}"),
     }
 }
 
 #[test]
 fn escape_sequences_are_interpreted_correctly() {
     let src = r#"
-        fn main() -> str {
-            return "a\nb\tc\\d\"e\rf"
+        struct Text {
+            value: str,
+        }
+        fn main() -> Text {
+            return Text("a\nb\tc\\d\"e\rf")
         }
     "#;
     match run(src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "a\nb\tc\\d\"e\rf"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "a\nb\tc\\d\"e\rf"),
+            other => panic!("expected Text(Str(escaped)), got Text({other:?})"),
+        },
         other => panic!("expected the escaped string, got {other:?}"),
     }
 }
@@ -74,19 +86,32 @@ fn an_unterminated_string_is_a_lex_error() {
 
 // ---- passing strings through functions ------------------------------------
 
+// A bare `str` can no longer be a function's parameter or return type at
+// all (the "enum favoring" rule — `TypeErrorKind::StrInFnSignature`,
+// `typeck.rs::check_fn`), so this no longer tests passing a bare `str`
+// through a function boundary; it tests the sanctioned replacement —
+// wrapping free text in a carrier struct (`Text`) — still passes through
+// a function boundary with its value unchanged, not silently corrupted
+// or truncated in transit.
 #[test]
-fn strings_pass_through_function_parameters_and_returns_unchanged() {
+fn text_passes_through_function_parameters_and_returns_unchanged() {
     let src = r#"
-        fn pass_through(s: str) -> str {
+        struct Text {
+            value: str,
+        }
+        fn pass_through(s: Text) -> Text {
             return s
         }
-        fn main() -> str {
-            return pass_through("passed through")
+        fn main() -> Text {
+            return pass_through(Text("passed through"))
         }
     "#;
     match run(src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "passed through"),
-        other => panic!("expected the passed-through string, got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "passed through"),
+            other => panic!("expected Text(Str(\"passed through\")), got Text({other:?})"),
+        },
+        other => panic!("expected the passed-through Text, got {other:?}"),
     }
 }
 
@@ -140,10 +165,11 @@ fn ordering_strings_is_rejected_statically_not_at_runtime() {
 fn arithmetic_on_strings_is_rejected_statically() {
     let kind = first_type_error(
         r#"
-        fn main() -> str {
+        fn main() -> bool {
             let a: str = "a"
             let b: str = "b"
-            return a + b
+            let c: i64 = a + b
+            return true
         }
     "#,
     );

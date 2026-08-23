@@ -286,10 +286,78 @@ impl Parser {
                     }
                     dashboard = Some(d);
                 }
+                Tok::Module => {
+                    let (mut mfns, mut mstructs, mut menums) = self.parse_module_decl()?;
+                    fns.append(&mut mfns);
+                    structs.append(&mut mstructs);
+                    enums.append(&mut menums);
+                }
                 _ => fns.push(self.parse_fn_decl()?),
             }
         }
         Ok(Program { fns, structs, enums, screens, dashboard })
+    }
+
+    /// `module_decl ::= "module" STRING "{" (fn_decl | struct_decl |
+    /// enum_decl)* "}"` (`GRAMMAR.md`) — pure nav-grouping sugar, not a
+    /// real scoping construct. Every declaration inside is parsed by the
+    /// exact same `parse_fn_decl`/`parse_struct_decl`/`parse_enum_decl`
+    /// the top-level loop itself calls (each self-consumes its own
+    /// leading keyword, so they work standalone here unchanged), then
+    /// tagged with this module's display name and returned for the
+    /// caller to fold into its own flat `fns`/`structs`/`enums` — there
+    /// is no separate `Program`-shaped nested item list anywhere, no new
+    /// namespace, nothing else in the checker even knows this block
+    /// existed. Single-level only: nesting a `module` inside a `module`,
+    /// or a `screen`/`dashboard` inside one, is a parse error, matching
+    /// this grammar's existing fixed-arity/no-arbitrary-nesting
+    /// discipline elsewhere (e.g. `transact` slots never nest either).
+    fn parse_module_decl(&mut self) -> PResult<(Vec<FnDecl>, Vec<StructDecl>, Vec<EnumDecl>)> {
+        self.expect(&Tok::Module, "`module`")?;
+        let name = self.expect_str_lit("a module display name")?;
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut fns = Vec::new();
+        let mut structs = Vec::new();
+        let mut enums = Vec::new();
+        while self.peek().tok != Tok::RBrace {
+            match self.peek().tok {
+                Tok::Struct => {
+                    let mut s = self.parse_struct_decl()?;
+                    s.module = Some(name.clone());
+                    structs.push(s);
+                }
+                Tok::Enum => {
+                    let mut e = self.parse_enum_decl()?;
+                    e.module = Some(name.clone());
+                    enums.push(e);
+                }
+                Tok::Module => {
+                    return Err(ParseError {
+                        message: "`module` blocks cannot be nested".to_string(),
+                        span: self.span(),
+                    });
+                }
+                Tok::Screen | Tok::Dashboard => {
+                    return Err(ParseError {
+                        message: "`screen`/`dashboard` blocks must be declared at top level, outside any `module`".to_string(),
+                        span: self.span(),
+                    });
+                }
+                Tok::Eof => {
+                    return Err(ParseError {
+                        message: "unterminated `module` block, expected `}`".to_string(),
+                        span: self.span(),
+                    });
+                }
+                _ => {
+                    let mut f = self.parse_fn_decl()?;
+                    f.module = Some(name.clone());
+                    fns.push(f);
+                }
+            }
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok((fns, structs, enums))
     }
 
     /// One `key: value` slot shared by `screen`/`field`/`action`/
@@ -474,7 +542,7 @@ impl Parser {
             }
         }
         self.expect(&Tok::RBrace, "`}`")?;
-        Ok(StructDecl { name, type_params, fields, span })
+        Ok(StructDecl { name, type_params, fields, span, module: None })
     }
 
     // enum_decl ::= "enum" ident ("(" ident ("," ident)* ")")?
@@ -518,7 +586,7 @@ impl Parser {
             }
         }
         self.expect(&Tok::RBrace, "`}`")?;
-        Ok(EnumDecl { name, type_params, variants, span })
+        Ok(EnumDecl { name, type_params, variants, span, module: None })
     }
 
     // fn_decl ::= "fn" ident "(" params? ")" ("->" type)? block
@@ -551,7 +619,7 @@ impl Parser {
         let declared_effects = self.parse_effect_annotation()?;
         let requires = self.parse_requires_annotation()?;
         let body = self.parse_block()?;
-        Ok(FnDecl { name, params, ret, body, span, declared_effects, requires })
+        Ok(FnDecl { name, params, ret, body, span, declared_effects, requires, module: None })
     }
 
     /// `effect(pure)` / `effect(io, network)` / ... — `None` if there's no

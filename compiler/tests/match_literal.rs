@@ -27,37 +27,52 @@ fn first_type_error(src: &str) -> TypeErrorKind {
 #[test]
 fn str_match_replaces_a_nested_if_else_chain() {
     let src = r#"
-        fn role_to_claims(role: str) -> str {
-            return match role {
-                "admin" => "{\"roles\":[\"admin\"]}",
-                "analyst" => "{\"roles\":[\"analyst\"]}",
-                _ => "{\"roles\":[\"customer\"]}",
+        struct Text {
+            value: str,
+        }
+        struct Role {
+            value: str,
+        }
+        fn role_to_claims(role: Role) -> Text {
+            return match role.value {
+                "admin" => Text("{\"roles\":[\"admin\"]}"),
+                "analyst" => Text("{\"roles\":[\"analyst\"]}"),
+                _ => Text("{\"roles\":[\"customer\"]}"),
             }
         }
-        fn main() -> str {
-            return role_to_claims("analyst")
+        fn main() -> Text {
+            return role_to_claims(Role("analyst"))
         }
     "#;
     match run(src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "{\"roles\":[\"analyst\"]}"),
-        other => panic!("expected Ok(Str(..)), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "{\"roles\":[\"analyst\"]}"),
+            other => panic!("expected Text(Str(..)), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(..)), got {other:?}"),
     }
 }
 
 #[test]
 fn str_match_falls_through_to_wildcard_for_an_unlisted_value() {
     let src = r#"
-        fn main() -> str {
+        struct Text {
+            value: str,
+        }
+        fn main() -> Text {
             return match "nobody" {
-                "admin" => "a",
-                "analyst" => "b",
-                _ => "customer",
+                "admin" => Text("a"),
+                "analyst" => Text("b"),
+                _ => Text("customer"),
             }
         }
     "#;
     match run(src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "customer"),
-        other => panic!("expected Ok(Str(\"customer\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "customer"),
+            other => panic!("expected Text(Str(\"customer\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"customer\")), got {other:?}"),
     }
 }
 
@@ -82,17 +97,23 @@ fn int_match_dispatches_on_the_right_literal() {
 #[test]
 fn bool_match_dispatches_on_the_right_literal() {
     let src = r#"
-        fn main() -> str {
+        struct Text {
+            value: str,
+        }
+        fn main() -> Text {
             return match true {
-                true => "yes",
-                false => "no",
-                _ => "unreachable",
+                true => Text("yes"),
+                false => Text("no"),
+                _ => Text("unreachable"),
             }
         }
     "#;
     match run(src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "yes"),
-        other => panic!("expected Ok(Str(\"yes\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "yes"),
+            other => panic!("expected Text(Str(\"yes\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"yes\")), got {other:?}"),
     }
 }
 

@@ -56,19 +56,19 @@ fn two_different_instantiations_are_structurally_distinct_types() {
             first: A,
             second: B,
         }
-        fn takes_int_str(p: Duo(i64, str)) -> i64 {
+        fn takes_int_unit(p: Duo(i64, unit)) -> i64 {
             return p.first
         }
         fn main() -> i64 {
             let p: Duo(f64, bool) = Duo(1.0, true)
-            return takes_int_str(p)
+            return takes_int_unit(p)
         }
     "#,
     );
     assert_eq!(
         kind,
         TypeErrorKind::TypeMismatch {
-            expected: Ty::Named("Duo".to_string(), vec![Ty::I64, Ty::Str]),
+            expected: Ty::Named("Duo".to_string(), vec![Ty::I64, Ty::Unit]),
             found: Ty::Named("Duo".to_string(), vec![Ty::F64, Ty::Bool]),
         }
     );
@@ -177,24 +177,30 @@ fn nested_generic_field_access_resolves_the_correct_concrete_type() {
 #[test]
 fn generic_enum_construction_and_match_round_trip() {
     let src = r#"
+        struct Text {
+            value: str,
+        }
         enum Either(A, B) {
             Left(A),
             Right(B),
         }
-        fn describe(e: Either(i64, str)) -> str {
+        fn describe(e: Either(i64, Text)) -> Text {
             return match e {
-                Left(n) => "left",
+                Left(n) => Text("left"),
                 Right(s) => s,
             }
         }
-        fn main() -> str {
-            let e: Either(i64, str) = Right("hi")
+        fn main() -> Text {
+            let e: Either(i64, Text) = Right(Text("hi"))
             return describe(e)
         }
     "#;
     match run(src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "hi"),
-        other => panic!("expected Ok(Str(\"hi\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "hi"),
+            other => panic!("expected Text(Str(\"hi\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"hi\")), got {other:?}"),
     }
 }
 
@@ -326,20 +332,26 @@ fn option_match_is_exhaustive_and_rejects_a_missing_arm() {
 #[test]
 fn result_ok_and_err_round_trip_through_match() {
     let src = r#"
-        fn describe(r: Result(i64, str)) -> str {
+        struct Text {
+            value: str,
+        }
+        fn describe(r: Result(i64, Text)) -> Text {
             return match r {
-                Ok(n) => "ok",
+                Ok(n) => Text("ok"),
                 Err(msg) => msg,
             }
         }
-        fn main() -> str {
-            let bad: Result(i64, str) = Err("boom")
+        fn main() -> Text {
+            let bad: Result(i64, Text) = Err(Text("boom"))
             return describe(bad)
         }
     "#;
     match run(src) {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "boom"),
-        other => panic!("expected Ok(Str(\"boom\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "boom"),
+            other => panic!("expected Text(Str(\"boom\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"boom\")), got {other:?}"),
     }
 }
 

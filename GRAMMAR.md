@@ -102,7 +102,7 @@ parses as `return (x - y)` — one statement, a subtraction — never as
 ```ebnf
 program     ::= item*
 
-item        ::= fn_decl | struct_decl | enum_decl | screen_decl | dashboard_decl
+item        ::= fn_decl | struct_decl | enum_decl | screen_decl | dashboard_decl | module_decl
 
 fn_decl     ::= "fn" ident "(" params? ")" ("->" type)? block
 
@@ -164,6 +164,20 @@ kv_entry       ::= ident ":" expr
 
 dashboard_decl ::= "dashboard" "{" dashboard_item* "}"
 dashboard_item ::= ("tile" | "chart") string "->" ident
+
+// Pure nav-grouping sugar for `ui_gen.rs`, not a scoping/namespace
+// construct: every `fn`/`struct`/`enum` inside still registers into the
+// exact same flat global namespace a top-level declaration would --
+// `typeck.rs` never even looks at `module`, only `ui_gen.rs` does, to
+// group nav screens by it. `module` is a real reserved keyword (like
+// `struct`/`enum`/`screen`/`dashboard` above), since no existing example
+// uses "module" as an identifier. Single-level only: a `module` nested
+// inside a `module`, or a `screen`/`dashboard` inside one, is a parse
+// error (`parser.rs::parse_module_decl`) -- the same fixed-arity/
+// no-arbitrary-nesting discipline `transact` slots already have. A `.nir`
+// file that never uses `module` renders exactly as it did before this
+// construct existed (nav stays flat, ungrouped).
+module_decl ::= "module" string "{" (fn_decl | struct_decl | enum_decl)* "}"
 
 // No trailing comma — `params`/`args` (below) both require a following
 // item after every comma, so `fn f(a: i64,)` and `f(1, 2,)` are both

@@ -55,7 +55,10 @@ fn file_io_and_spawn_join_emit_spans_with_the_right_effect_tags() {
             return n * 2
         }}
 
-        fn main() -> str {{
+        struct Text {{
+            value: str,
+        }}
+        fn main() -> Text {{
             let h: thread i64 = spawn double(21)
 
             let out: file = open("{path}", "w")
@@ -68,7 +71,7 @@ fn file_io_and_spawn_join_emit_spans_with_the_right_effect_tags() {
 
             let doubled: i64 = join h
             print(doubled)
-            return content
+            return Text(content)
         }}
     "#,
         path = file_path.to_str().unwrap()
@@ -79,8 +82,11 @@ fn file_io_and_spawn_join_emit_spans_with_the_right_effect_tags() {
     let interp = Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src.as_str()))
         .with_tracer(std::sync::Arc::clone(&tracer));
     match interp.run_main() {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "hello from nirdosha"),
-        other => panic!("expected Ok(Str(\"hello from nirdosha\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "hello from nirdosha"),
+            other => panic!("expected Text(Str(\"hello from nirdosha\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"hello from nirdosha\")), got {other:?}"),
     }
     let _ = std::fs::remove_file(&file_path);
 
@@ -150,11 +156,14 @@ fn no_tracer_means_no_spans_at_all() {
     let file_path = temp_path("no_tracer.txt");
     let src = format!(
         r#"
-        fn main() -> str {{
+        struct Text {{
+            value: str,
+        }}
+        fn main() -> Text {{
             let out: file = open("{path}", "w")
             send(out, "x")
             stop out
-            return "done"
+            return Text("done")
         }}
     "#,
         path = file_path.to_str().unwrap()
@@ -165,8 +174,11 @@ fn no_tracer_means_no_spans_at_all() {
     // (`Interpreter::new`).
     let interp = Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src.as_str()));
     match interp.run_main() {
-        Ok(Value::Str(s)) => assert_eq!(&*s, "done"),
-        other => panic!("expected Ok(Str(\"done\")), got {other:?}"),
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(&**s, "done"),
+            other => panic!("expected Text(Str(\"done\")), got Text({other:?})"),
+        },
+        other => panic!("expected Ok(Text(\"done\")), got {other:?}"),
     }
     let _ = std::fs::remove_file(&file_path);
     // Nothing to assert on the interpreter side beyond "it ran to

@@ -174,14 +174,18 @@ fn strings_example_compiles_and_matches_interpreter() {
     assert_eq!(nirdosha::run(src), Ok(nirdosha::interpreter::Value::Unit));
 }
 
-// ---- Phase 1: `main() -> str` compiles directly (used to be rejected,
-// forcing a `print`-then-return-`unit` workaround) ----------------------
+// ---- `main() -> str` (and any `fn`'s `str` param/return) is rejected by
+// the "enum favoring" rule (`typeck.rs::check_fn`'s `StrInFnSignature`) --
+// the sanctioned replacement is `print`-then-return-`unit`, and for a
+// value that must cross a function boundary, the `Text { value: str }`
+// carrier struct (unaffected by the rule -- constructing it is a call to
+// a name in `callable_names`, never a `program.fns` entry). ------------
 
 #[test]
-fn main_returning_str_directly_compiles_and_prints_it() {
+fn main_printing_a_str_directly_compiles_and_prints_it() {
     let src = r#"
-        fn main() -> str {
-            return "hello from main"
+        fn main() -> unit {
+            print("hello from main")
         }
     "#;
     let (stdout, code) = compile_and_run(src);
@@ -190,24 +194,29 @@ fn main_returning_str_directly_compiles_and_prints_it() {
 }
 
 #[test]
-fn main_returning_a_computed_str_directly_compiles_and_matches_interpreter() {
+fn a_computed_str_carried_through_a_function_boundary_via_text_compiles_and_matches_interpreter() {
     let src = r#"
-        fn greet(name: str) -> str {
-            if name == "world" {
-                return "hello world"
+        struct Text {
+            value: str,
+        }
+
+        fn greet(name: Text) -> Text {
+            if name.value == "world" {
+                return Text("hello world")
             } else {
                 return name
             }
         }
 
-        fn main() -> str {
-            return greet("world")
+        fn main() -> unit {
+            let g: Text = greet(Text("world"))
+            print(g.value)
         }
     "#;
     let (stdout, code) = compile_and_run(src);
     assert_eq!(stdout, "hello world\n");
     assert_eq!(code, 0);
-    assert_eq!(nirdosha::run(src), Ok(nirdosha::interpreter::Value::Str("hello world".into())));
+    assert_eq!(nirdosha::run(src), Ok(nirdosha::interpreter::Value::Unit));
 }
 
 #[test]
@@ -2662,15 +2671,23 @@ fn option_some_none_round_trip_through_match() {
 #[test]
 fn result_ok_err_round_trip_through_match() {
     let src = r#"
-        fn classify(r: Result(i64, str)) -> str {
+        enum ErrorCode {
+            Nope,
+        }
+        struct Text {
+            value: str,
+        }
+        fn classify(r: Result(i64, ErrorCode)) -> Text {
             return match r {
-                Ok(v) => "ok",
-                Err(e) => e,
+                Ok(v) => Text("ok"),
+                Err(e) => Text("nope"),
             }
         }
         fn main() {
-            print(classify(Ok(7)))
-            print(classify(Err("nope")))
+            let a: Text = classify(Ok(7))
+            let b: Text = classify(Err(Nope()))
+            print(a.value)
+            print(b.value)
         }
     "#;
     let (stdout, code) = compile_and_run(src);
@@ -2725,17 +2742,23 @@ fn literal_match_over_bool_compiles() {
 #[test]
 fn literal_match_over_str_compiles() {
     let src = r#"
-        fn greet(role: str) -> str {
-            return match role {
-                "admin" => "hi admin",
-                "user" => "hi user",
-                _ => "unknown",
+        struct Text {
+            value: str,
+        }
+        fn greet(role: Text) -> Text {
+            return match role.value {
+                "admin" => Text("hi admin"),
+                "user" => Text("hi user"),
+                _ => Text("unknown"),
             }
         }
         fn main() {
-            print(greet("admin"))
-            print(greet("user"))
-            print(greet("zzz"))
+            let a: Text = greet(Text("admin"))
+            let b: Text = greet(Text("user"))
+            let c: Text = greet(Text("zzz"))
+            print(a.value)
+            print(b.value)
+            print(c.value)
         }
     "#;
     // `str` has no native switch — the lowering is a sequential
@@ -2845,17 +2868,23 @@ fn match_as_return_value_in_a_typed_function() {
             Neg,
             Zero,
         }
-        fn label(s: Sign) -> str {
+        struct Text {
+            value: str,
+        }
+        fn label(s: Sign) -> Text {
             return match s {
-                Pos => "p",
-                Neg => "n",
-                Zero => "z",
+                Pos => Text("p"),
+                Neg => Text("n"),
+                Zero => Text("z"),
             }
         }
         fn main() {
-            print(label(Pos()))
-            print(label(Neg()))
-            print(label(Zero()))
+            let a: Text = label(Pos())
+            let b: Text = label(Neg())
+            let c: Text = label(Zero())
+            print(a.value)
+            print(b.value)
+            print(c.value)
         }
     "#;
     let (stdout, code) = compile_and_run(src);
@@ -2870,8 +2899,9 @@ fn if_returns_a_vector_from_both_branches() {
     let src = r#"
         fn main() -> i64 {
             let c: bool = true
-            let v: Vector(i64, 3) = if c { Vector(1, 2, 3) } else { Vector(4, 5, 6) }
-            return v[0]
+            let v: Vector(i64, 3) = if c { [1, 2, 3] } else { [4, 5, 6] }
+            print(v[0])
+            return 0
         }
     "#;
     let (stdout, code) = compile_and_run(src);
@@ -2889,7 +2919,8 @@ fn if_returns_a_struct_from_both_branches() {
         fn main() -> f64 {
             let c: bool = false
             let p: Point = if c { Point(1.0, 2.0) } else { Point(3.0, 4.0) }
-            return p.x
+            print(p.x)
+            return 0.0
         }
     "#;
     let (stdout, code) = compile_and_run(src);
@@ -2908,7 +2939,8 @@ fn nested_aggregate_if_compiles() {
             let a: bool = true
             let b: bool = false
             let p: Point = if a { if b { Point(1.0, 1.0) } else { Point(2.0, 2.0) } } else { Point(3.0, 3.0) }
-            return p.y
+            print(p.y)
+            return 0.0
         }
     "#;
     let (stdout, code) = compile_and_run(src);
@@ -2922,11 +2954,12 @@ fn match_returns_a_vector_from_literal_arms() {
         fn main() -> i64 {
             let n: i64 = 2
             let v: Vector(i64, 2) = match n {
-                1 => Vector(10, 11),
-                2 => Vector(20, 21),
-                _ => Vector(30, 31),
+                1 => [10, 11],
+                2 => [20, 21],
+                _ => [30, 31],
             }
-            return v[1]
+            print(v[1])
+            return 0
         }
     "#;
     let (stdout, code) = compile_and_run(src);
@@ -2953,7 +2986,8 @@ fn match_returns_a_struct_from_enum_arms() {
         }
         fn main() -> f64 {
             let p: Point = pick(Rect(5.0, 7.0))
-            return p.y
+            print(p.y)
+            return 0.0
         }
     "#;
     let (stdout, code) = compile_and_run(src);
@@ -2974,7 +3008,8 @@ fn box_field_struct_round_trips_through_param_and_return() {
         }
         fn main() -> i64 {
             let w: Wrapper = Wrapper(box 42)
-            return get_value(w)
+            print(get_value(w))
+            return 0
         }
     "#;
     let (stdout, code) = compile_and_run(src);
@@ -2999,7 +3034,8 @@ fn box_field_struct_freed_in_a_tight_loop() {
                 sum = sum + *w.b
                 i = i + 1
             }
-            return sum
+            print(sum)
+            return 0
         }
     "#;
     let (stdout, code) = compile_and_run(src);
@@ -3017,7 +3053,8 @@ fn extracting_an_affine_field_moves_the_whole_struct() {
         fn main() -> i64 {
             let w: Wrapper = Wrapper(box 7)
             let b: box i64 = w.b
-            return *b
+            print(*b)
+            return 0
         }
     "#;
     let (stdout, code) = compile_and_run(src);
@@ -3027,20 +3064,26 @@ fn extracting_an_affine_field_moves_the_whole_struct() {
 
 #[test]
 fn enum_with_box_payload_compiles_and_frees() {
+    // `Present`/`Absent`, not `Some`/`None` -- the prelude's own `Option`
+    // enum (`ast::prelude_enums`) already registers `Some`/`None` in the
+    // flat variant-name namespace every enum shares, so reusing those
+    // names for a second, unrelated enum is a genuine
+    // `DuplicateConstructor` typecheck error, not a codegen concern.
     let src = r#"
         enum OptBox {
-            Some(box i64),
-            None,
+            Present(box i64),
+            Absent,
         }
         fn get_or_zero(o: OptBox) -> i64 {
             return match o {
-                Some(v) => *v,
-                None => 0,
+                Present(v) => *v,
+                Absent => 0,
             }
         }
         fn main() -> i64 {
-            let o: OptBox = Some(box 9)
-            return get_or_zero(o)
+            let o: OptBox = Present(box 9)
+            print(get_or_zero(o))
+            return 0
         }
     "#;
     let (stdout, code) = compile_and_run(src);
@@ -3052,19 +3095,17 @@ fn enum_with_box_payload_compiles_and_frees() {
 fn match_arm_with_unused_box_payload_frees_it() {
     let src = r#"
         enum OptBox {
-            Some(box i64),
-            None,
+            Present(box i64),
+            Absent,
         }
         fn main() -> i64 {
-            let o: OptBox = Some(box 123)
-            match o {
-                Some(v) => {
-                    return 1
-                }
-                None => {
-                    return 0
-                }
+            let o: OptBox = Present(box 123)
+            let r: i64 = match o {
+                Present(v) => 1,
+                Absent => 0,
             }
+            print(r)
+            return 0
         }
     "#;
     let (stdout, code) = compile_and_run(src);
@@ -3080,8 +3121,9 @@ fn nested_box_inside_struct_field_frees_both_layers() {
         }
         fn main() -> i64 {
             let x: box i64 = box 5
-            let o: Outer = Outer(x)
-            return **o.inner
+            let o: Outer = Outer(box x)
+            print(**o.inner)
+            return 0
         }
     "#;
     let (stdout, code) = compile_and_run(src);
@@ -3154,4 +3196,3 @@ fn main_returning_a_struct_is_rejected_cleanly() {
         .expect_err("`main` returning a struct should be rejected (no sensible exit code)");
     assert!(err.to_string().contains("struct"), "got: {err}");
 }
-...

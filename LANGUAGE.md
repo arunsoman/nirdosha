@@ -41,7 +41,7 @@ nirdosha emit-ast <file.nir>          # print the parsed AST as JSON
 | Float | `f64` | no | IEEE 754 double. One width — no `f32`, no literal-widening story. Saturates (`inf`/`NaN`), never traps. |
 | Boolean | `bool` | no | |
 | Unit | `unit` | no | No literal syntax — only reachable as a function's implicit return. |
-| String | `str` | no | UTF-8, `Arc<str>`-backed. Literal + escapes (`\"` `\\` `\n` `\t` `\r`) only — no concatenation, slicing, or indexing. |
+| String | `str` | no | UTF-8, `Arc<str>`-backed. Literal + escapes (`\"` `\\` `\n` `\t` `\r`) only — no concatenation, slicing, or indexing. May not be, or be part of, a user `fn`'s parameter or return type — see §6b. |
 | Heap cell | `box T` | **yes** | Single-owner heap allocation. `*expr` dereferences. |
 | Shared reference | `&T` | no | Read-only borrow of a plain identifier only (`&x`, not `&(x+1)`). No `&mut`. |
 | Thread handle | `thread T` | **yes** | A spawned computation's real-OS-thread handle; `join` consumes it once. |
@@ -202,7 +202,7 @@ audited "non-empty justification" { ... }   // suppresses codegen's Tier-1/2 gua
 
 ```
 fn transfer_funds(amount: i64) -> i64 requires(role: "admin") { ... }
-fn read_chart(id: str) -> str requires(claim: "department", "cardiology") { ... }
+fn read_chart(id: Text) -> Text requires(claim: "department", "cardiology") { ... }
 
 acquire transfer_funds(proof)   // proof: RoleView/ClaimView -> Result(fn(...)->..., str)
 ```
@@ -235,6 +235,86 @@ acquisition, not smeared across (or missing from) every call site.
 Interpreter-only for now, like every construct past §10's compiled
 subset — `nirdosha build` rejects `fn(..)->..`/`acquire` with a specific
 reason, never silently mis-compiles one.
+
+### 6b. `str` at function boundaries ("enum favoring")
+
+A user-defined `fn`'s parameter or return type may not be, or contain,
+`str` — checked recursively through `Result`/`Option`/generics, `box`/
+`&`/`thread`/`chan`, `Vector`/`Matrix`, and `fn(...) -> ...` types
+(`TypeErrorKind::StrInFnSignature`, `typeck.rs::check_fn`). The point is
+to push stringly-typed control flow (`if status == "PENDING"`,
+`match currency { "USD" => ..., "EUR" => ... }`) toward real `enum`s —
+which already get exhaustive `match` and already render as searchable
+dropdowns in `emit-ui` (§11) with zero extra work — instead of `==`/
+literal-`match` over `str`.
+
+`str` itself is completely unrestricted everywhere else: an ordinary
+`struct` field type, a local `let` binding's type, a literal. Two
+conventions carry what a bare `str` parameter/return used to:
+
+- **A closed, categorical vocabulary** (a status, a currency code, a
+  decision) becomes a small zero-payload `enum`.
+- **Genuine free text** that still needs to cross a function boundary
+  (a justification, a note, a reference, an identity subject) gets
+  wrapped in a one-field carrier struct, conventionally named `Text`:
+  ```
+  struct Text {
+      value: str,
+  }
+  ```
+  Struct construction is an ordinary call to a name registered as a
+  constructor (§3.1), never a `fn_decl` — so `Text("free text")` at a
+  call site, and a function taking/returning `Text` instead of bare
+  `str`, are both unaffected by the ban. A function that needs the raw
+  string (to hand to a builtin like `db_execute`) reads `.value`.
+  `Text` round-trips through JSON automatically wherever `nirdosha
+  serve` decodes/encodes request/response bodies (`serve.rs`'s
+  `decode_value`/`encode_value` are already generic over structs), and
+  `emit-ui` renders it as a plain text input, not a nested group
+  (`ui_gen.rs::build_field`'s one-field-`Text`-struct special case).
+
+  Comparing two `struct`/`enum` values with `==`/`!=` — the natural next
+  reach once a status/currency-style field is a real enum instead of a
+  string — typechecked already (`unify_operands` permits `==`/`!=`
+  generically for any matching type) but had no arm in the interpreter's
+  binary-operator dispatch to actually evaluate it, so it trapped at
+  runtime with a confusing `TypeMismatch` despite typechecking cleanly —
+  the same kind of typeck/interpreter gap `str`'s own `==` once had
+  (found the same way — by testing code that typechecks, not by
+  re-reading either file; see `interpreter.rs`'s `Value::Str` binop
+  arm). Fixed alongside this migration
+  (`interpreter.rs::eval_binary`'s `Value::Struct`/`Value::Enum` arm,
+  delegating to `Value`'s own already-correct `PartialEq`), since
+  pushing code toward enums is pointless if comparing them then traps.
+
+The ban applies only to entries in a program's own `fns` list. Three
+things are exempt **by construction**, not by special-casing:
+- **Builtins** (`http_get`/`db_query`/`json_get_str`/`oidc_validate_token`/
+  `mock_issue_token`/`print`/... — §5) are resolved by name in
+  `Expr::Call`, never appearing as `fn_decl`s — the language's actual
+  external-I/O boundary (an HTTP body, SQL text, a JWT, a JSON document)
+  is irreducibly `str` and stays that way.
+- **Struct/enum constructors** are calls to a registered type name, also
+  never `fn_decl`s — a struct can freely keep a `str` field.
+- **`transact`'s synthesized `txn_id` parameter** (TRANSACT.md) is the
+  one narrow, name-based exemption: `network`'s call must pass `txn_id`
+  as a real `str` argument, and it must stay a plain scalar for WAL
+  durability (`Ty::is_transact_scalar`) — it can't be wrapped in `Text`.
+  A parameter literally named `txn_id` is skipped by `check_fn`'s scan.
+
+An enum variant may itself carry a `str` payload (`enum ErrorCode {
+NotFound, External(str) }`) without tripping this rule — the check only
+inspects a `fn`'s own declared parameter/return *type expression*
+(`Ty::contains_str`), which for a bare `Ty::Named("ErrorCode", [])` has
+no argument to recurse into; the `str` lives inside the enum's own
+declaration, not the signature. This is the same "a payload type is not
+a signature type" reasoning that already exempts struct fields, applied
+to enums — a legitimate, precedented pattern for a shared error type
+that needs to both enumerate known application-level cases (`NotFound`)
+and forward an unpredictable builtin failure message (`External(str)`)
+uniformly through one `Result(_, ErrorCode)`, not a loophole around the
+rule's intent (nothing compares an `External` payload with `==`/
+literal-`match`).
 
 ---
 
@@ -555,3 +635,99 @@ UI**: `paginate { page_size, total }`, `field { searchable, sortable }`,
 server-side enforces it yet), form insert-vs-update auto-hide-primary-key
 behavior. Tracked, with the reason each is still open, in
 `compiler/UI_DSL_TODO.md`.
+
+## 12. `module "Name" { ... }` — nav grouping, not scoping
+
+`emit-ui`'s nav is one flat list of screens by default. A `module "Display
+Name" { ... }` block wrapping `fn`/`struct`/`enum` declarations tags each
+one with that display name — `ui_gen.rs` groups nav screens by it into
+collapsible primary-menu sections; `Dashboard` always stays outside every
+group, first. That is the *only* thing `module` does: it is **pure
+syntactic sugar**, not a namespace. Everything inside a `module` block
+still registers into the exact same single flat global namespace a
+top-level declaration would (`typeck.rs` never even inspects `module` —
+only `ui_gen.rs` does), so two functions in different `module` blocks can
+call each other exactly as freely as two top-level ones always could, and
+a program that never uses `module` at all renders exactly as it did
+before this construct existed (flat, ungrouped nav).
+
+```nirdosha
+module "Billing" {
+    struct Invoice { id: i64, amount_cents: i64, status: str }
+    fn list_invoice() -> Result(json, str) { ... }
+    fn create_invoice(inv: Invoice) -> Result(i64, str) { ... }
+}
+
+module "Shipping" {
+    struct Shipment { id: i64, invoice_id: i64, carrier: str }
+    fn list_shipment() -> Result(json, str) { ... }
+}
+```
+
+**Grammar** (`GRAMMAR.md`'s `module_decl`): `module` is a real reserved
+keyword, dispatched like `struct`/`enum`/`screen`/`dashboard`, followed by
+a string display name (not an `ident` — needs to hold spaces/punctuation
+like `"B2B Trade Payments & Commission Engine"`), then a brace-delimited
+list of `fn`/`struct`/`enum` declarations — each parsed by the exact same
+`parse_fn_decl`/`parse_struct_decl`/`parse_enum_decl` the top level itself
+uses. Single-level only: a `module` nested inside a `module`, or a
+`screen`/`dashboard` inside one, is a parse error — the same fixed-arity,
+no-arbitrary-nesting discipline `transact` slots already have (`screen`/
+`dashboard` stay top-level-only declarations, since they're UI-specific
+authoring, not business-organizational).
+
+## 13. Auto-generated DB schema migrations (`nirdosha serve --db`)
+
+Before this, every table was created by a hand-written, literal
+`db_execute(conn, "CREATE TABLE IF NOT EXISTS ...")` inside individual
+`.nir` functions — duplicated per function, never derived from the
+`struct` itself, and never updated when a struct gained a field. `nirdosha
+serve --db <path>` now derives schema from `struct` field declarations
+directly and keeps it current automatically, once at every startup — no
+new syntax, no new flag, just behavior layered on the `--db` flag that
+already existed.
+
+**What runs at startup, only when `--db` is given:** for every top-level
+`struct` (skipping the built-in prelude structs), the declared fields are
+diffed against the live SQLite schema:
+
+- table doesn't exist yet → `CREATE TABLE IF NOT EXISTS <table> (<cols>)`
+- table exists but is missing a column for some field → one `ALTER TABLE
+  <table> ADD COLUMN ...` per missing field
+- nothing missing → nothing happens (the common case on every
+  steady-state restart)
+
+Field type → SQL column type: `I8/16/32/64`/`U8/16/32/64`/`Usize` →
+`INTEGER`; `F64` → `REAL`; `Bool` → `INTEGER` (0/1, matching
+`db_execute`'s own existing encoding); `Str` → `TEXT`; `Option(T)` → same
+type as `T` (SQLite columns are nullable by default, so this needs no
+distinct shape); a zero-payload enum → `TEXT` (the variant name — same
+round-trip `sql_bind_params`/`decode_enum_value` already give a plain
+`db_execute`/`db_query` call). A field named literally `id` of type `i64`
+becomes `INTEGER PRIMARY KEY AUTOINCREMENT`, the convention every
+hand-written schema in this codebase already follows.
+
+**Deliberately additive-only.** A struct field whose type has no
+single-column SQL shape (a nested struct, `Vector`/`Matrix`, a
+payload-carrying enum, an affine handle like `db`/`tcp`/`box`) causes that
+struct's table to be skipped *entirely* — never a partial table — logged
+as a warning naming the struct and field. A column whose type changed, or
+whose field was removed from the struct, is **not** touched automatically
+(SQLite can't safely change a column's type without a full table rebuild,
+and dropping a column automatically at an unattended startup is a real
+data-loss risk) — also just a warning, never attempted. A table with no
+backing `struct` at all (hand-written SQL with no matching declaration) is
+completely untouched, exactly as before this feature existed.
+
+**Every applied change is written to disk first**, at
+`<sibling-of---db-path>/migrations/NNNN_<slug>.sql` (`create_<table>` /
+`alter_<table>_add_<col>...`, sequential across a single startup's run) —
+a reviewable, commit-to-git audit trail, not a rollback-capable ledger:
+there are no down-migrations, and these files are a generated record of
+what ran, not something meant to be hand-authored or edited. A small
+`_nirdosha_migrations` table inside the database itself separately
+records `(filename, applied_at, sql)` for a DB inspected on its own.
+
+Omitting `--db` leaves an app exactly as it always behaved — this
+feature, like the `/_nirdosha/table/<name>` route it shares its
+`--db`-gating with, only exists at all once that flag is passed.
