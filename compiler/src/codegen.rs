@@ -4031,45 +4031,235 @@ impl Codegen<'_> {
         r
     }
 
-    /// Structural `==`/`!=` on `Vector`/`Matrix` — unrolled element-by-
-    /// element comparison chained with `and` into one final `i1`,
-    /// matching `interpreter.rs::eval_binary`'s `Value`-level structural
-    /// equality (`Vector`: elementwise `PartialEq` on the whole slice;
-    /// `Matrix`: shape-then-elements — shape is already guaranteed equal
-    /// here since typeck makes differently-shaped Vectors/Matrices
-    /// different `Ty`s, so there's no shape check left to emit).
-    /// Produces a scalar `bool`, so this is reached from `binary()`
-    /// (`expr()`'s path), not `expr_ptr()`.
+    /// Recursively emit a structural equality comparison for two values
+    /// of the same type `ty`, pointed to by `l_ptr` and `r_ptr`. Returns an
+    /// `i1` SSA register that is true iff the values are equal. Mirrors
+    /// `Value::PartialEq` in the interpreter: content equality for `box`/
+    /// `&`, field-by-field for structs, tag-then-payload for enums, and
+    /// elementwise for `Vector`/`Matrix`.
+    fn emit_deep_eq(&mut self, l_ptr: &str, r_ptr: &str, ty: &Ty, span: Span) -> Result<String, CodegenError> {
+        match ty {
+            Ty::Unit => {
+                let one = self.fresh_reg("unit_eq");
+                writeln!(self.out, "  {one} = add i1 0, 1").unwrap();
+                Ok(one)
+            }
+            Ty::Bool | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::Usize => {
+                let llty = self.llvm_ty(ty)?;
+                let l = self.fresh_reg("l");
+                let r = self.fresh_reg("r");
+                writeln!(self.out, "  {l} = load {llty}, ptr {l_ptr}").unwrap();
+                writeln!(self.out, "  {r} = load {llty}, ptr {r_ptr}").unwrap();
+                self.icmp("eq", &llty, &l, &r)
+            }
+            Ty::F64 => {
+                let l = self.fresh_reg("l");
+                let r = self.fresh_reg("r");
+                writeln!(self.out, "  {l} = load double, ptr {l_ptr}").unwrap();
+                writeln!(self.out, "  {r} = load double, ptr {r_ptr}").unwrap();
+                self.fcmp("oeq", &l, &r)
+            }
+            Ty::Str => {
+                let l_ptr_reg = self.fresh_reg("str_l_ptr");
+                let l_len = self.fresh_reg("str_l_len");
+                let r_ptr_reg = self.fresh_reg("str_r_ptr");
+                let r_len = self.fresh_reg("str_r_len");
+                writeln!(self.out, "  {l_ptr_reg} = load ptr, ptr {l_ptr}").unwrap();
+                writeln!(self.out, "  {l_len} = load i64, ptr getelementptr ({{ptr, i64}}, ptr {l_ptr}, i32 0, i32 1)").unwrap();
+                writeln!(self.out, "  {r_ptr_reg} = load ptr, ptr {r_ptr}").unwrap();
+                writeln!(self.out, "  {r_len} = load i64, ptr getelementptr ({{ptr, i64}}, ptr {r_ptr}, i32 0, i32 1)").unwrap();
+                let raw = self.fresh_reg("str_eq_raw");
+                writeln!(
+                    self.out,
+                    "  {raw} = call i32 @nir_str_eq(ptr {l_ptr_reg}, i64 {l_len}, ptr {r_ptr_reg}, i64 {r_len})"
+                )
+                .unwrap();
+                self.icmp("ne", "i32", &raw, "0")
+            }
+            Ty::Box(inner) | Ty::Ref(inner) => {
+                let l = self.fresh_reg("box_l");
+                let r = self.fresh_reg("box_r");
+                writeln!(self.out, "  {l} = load ptr, ptr {l_ptr}").unwrap();
+                writeln!(self.out, "  {r} = load ptr, ptr {r_ptr}").unwrap();
+                self.emit_deep_eq(&l, &r, inner, span)
+            }
+            Ty::Vector(elem, n) | Ty::Matrix(elem, _, n) => {
+                let len = if matches!(ty, Ty::Vector(..)) { *n } else { n * n };
+                let elem_llty = self.llvm_ty(elem)?;
+                let mut acc: Option<String> = None;
+                for i in 0..len {
+                    let l_elem = self.agg_elem_ptr(l_ptr, &elem_llty, i);
+                    let r_elem = self.agg_elem_ptr(r_ptr, &elem_llty, i);
+                    let eq = self.emit_deep_eq(&l_elem, &r_elem, elem, span)?;
+                    acc = Some(match acc {
+                        None => eq,
+                        Some(prev) => {
+                            let out = self.fresh_reg("agg_eq_and");
+                            writeln!(self.out, "  {out} = and i1 {prev}, {eq}").unwrap();
+                            out
+                        }
+                    });
+                }
+                let all_eq = acc.unwrap_or_else(|| {
+                    let one = self.fresh_reg("empty_agg_eq");
+                    writeln!(self.out, "  {one} = add i1 0, 1").unwrap();
+                    one
+                });
+                Ok(all_eq)
+            }
+            Ty::Named(name, args) => {
+                if let Some(fields) = self.registry.struct_fields(name) {
+                    let type_params = self.registry.struct_type_params(name).unwrap_or(&[]);
+                    let subst = zip_type_params(type_params, args);
+                    let struct_ty = Ty::Named(name.to_string(), args.to_vec());
+                    let struct_llty = self.llvm_ty(&struct_ty)?;
+                    let mut acc: Option<String> = None;
+                    for (i, f) in fields.iter().enumerate() {
+                        let field_ty = substitute_ty(&f.ty, &subst);
+                        let l_field = self.fresh_reg("l_field");
+                        let r_field = self.fresh_reg("r_field");
+                        writeln!(self.out, "  {l_field} = getelementptr inbounds {struct_llty}, ptr {l_ptr}, i32 0, i32 {i}").unwrap();
+                        writeln!(self.out, "  {r_field} = getelementptr inbounds {struct_llty}, ptr {r_ptr}, i32 0, i32 {i}").unwrap();
+                        let eq = self.emit_deep_eq(&l_field, &r_field, &field_ty, span)?;
+                        acc = Some(match acc {
+                            None => eq,
+                            Some(prev) => {
+                                let out = self.fresh_reg("struct_eq_and");
+                                writeln!(self.out, "  {out} = and i1 {prev}, {eq}").unwrap();
+                                out
+                            }
+                        });
+                    }
+                    let all_eq = acc.unwrap_or_else(|| {
+                        let one = self.fresh_reg("empty_struct_eq");
+                        writeln!(self.out, "  {one} = add i1 0, 1").unwrap();
+                        one
+                    });
+                    Ok(all_eq)
+                } else if let Some(variants) = self.registry.enum_variants(name) {
+                    let type_params = self.registry.enum_type_params(name).unwrap_or(&[]);
+                    let subst = zip_type_params(type_params, args);
+                    let enum_ty = Ty::Named(name.to_string(), args.to_vec());
+                    let enum_llty = self.llvm_ty(&enum_ty)?;
+
+                    let l_tag_ptr = self.fresh_reg("l_tag_addr");
+                    let r_tag_ptr = self.fresh_reg("r_tag_addr");
+                    writeln!(self.out, "  {l_tag_ptr} = getelementptr inbounds {enum_llty}, ptr {l_ptr}, i32 0, i32 0").unwrap();
+                    writeln!(self.out, "  {r_tag_ptr} = getelementptr inbounds {enum_llty}, ptr {r_ptr}, i32 0, i32 0").unwrap();
+                    let l_tag = self.fresh_reg("l_tag");
+                    let r_tag = self.fresh_reg("r_tag");
+                    writeln!(self.out, "  {l_tag} = load i64, ptr {l_tag_ptr}").unwrap();
+                    writeln!(self.out, "  {r_tag} = load i64, ptr {r_tag_ptr}").unwrap();
+                    let tag_eq = self.icmp("eq", "i64", &l_tag, &r_tag)?;
+
+                    let neq_label = self.fresh_label("enum_eq_neq");
+                    let cmp_label = self.fresh_label("enum_eq_cmp");
+                    let merge_label = self.fresh_label("enum_eq_merge");
+                    writeln!(self.out, "  br i1 {tag_eq}, label %{cmp_label}, label %{neq_label}").unwrap();
+                    self.terminated = true;
+
+                    writeln!(self.out, "{neq_label}:").unwrap();
+                    self.terminated = false;
+                    writeln!(self.out, "  br label %{merge_label}").unwrap();
+                    self.terminated = true;
+
+                    writeln!(self.out, "{cmp_label}:").unwrap();
+                    self.terminated = false;
+                    let l_payload = self.fresh_reg("l_payload");
+                    let r_payload = self.fresh_reg("r_payload");
+                    writeln!(self.out, "  {l_payload} = getelementptr inbounds {enum_llty}, ptr {l_ptr}, i32 0, i32 1").unwrap();
+                    writeln!(self.out, "  {r_payload} = getelementptr inbounds {enum_llty}, ptr {r_ptr}, i32 0, i32 1").unwrap();
+
+                    let default_label = self.fresh_label("enum_eq_default");
+                    let mut case_labels: Vec<String> = Vec::new();
+                    let mut phi_entries: Vec<(String, String)> = Vec::new();
+                    for (vidx, _v) in variants.iter().enumerate() {
+                        let label = self.fresh_label(&format!("enum_eq_v{vidx}"));
+                        case_labels.push(label.clone());
+                        writeln!(self.out, "    i64 {vidx}, label %{label}").unwrap();
+                    }
+                    writeln!(self.out, "  switch i64 {l_tag}, label %{default_label} [").unwrap();
+                    // case labels were already emitted above to keep switch syntax valid
+                    for (vidx, _v) in variants.iter().enumerate() {
+                        writeln!(self.out, "    i64 {vidx}, label %{}", case_labels[vidx]).unwrap();
+                    }
+                    writeln!(self.out, "  ]").unwrap();
+                    self.terminated = true;
+
+                    writeln!(self.out, "{default_label}:").unwrap();
+                    self.terminated = false;
+                    writeln!(self.out, "  unreachable").unwrap();
+                    self.terminated = true;
+
+                    for (vidx, v) in variants.iter().enumerate() {
+                        let label = &case_labels[vidx];
+                        writeln!(self.out, "{label}:").unwrap();
+                        self.terminated = false;
+                        let mut acc: Option<String> = None;
+                        let mut word_off: u64 = 0;
+                        for decl_ty in &v.payload {
+                            let field_ty = substitute_ty(decl_ty, &subst);
+                            let l_field = self.fresh_reg("l_field");
+                            let r_field = self.fresh_reg("r_field");
+                            writeln!(self.out, "  {l_field} = getelementptr inbounds i64, ptr {l_payload}, i64 {word_off}").unwrap();
+                            writeln!(self.out, "  {r_field} = getelementptr inbounds i64, ptr {r_payload}, i64 {word_off}").unwrap();
+                            let eq = self.emit_deep_eq(&l_field, &r_field, &field_ty, span)?;
+                            acc = Some(match acc {
+                                None => eq,
+                                Some(prev) => {
+                                    let out = self.fresh_reg("enum_field_and");
+                                    writeln!(self.out, "  {out} = and i1 {prev}, {eq}").unwrap();
+                                    out
+                                }
+                            });
+                            word_off += conservative_word_count(&field_ty, &self.registry);
+                        }
+                        let variant_eq = acc.unwrap_or_else(|| {
+                            let one = self.fresh_reg("empty_variant_eq");
+                            writeln!(self.out, "  {one} = add i1 0, 1").unwrap();
+                            one
+                        });
+                        writeln!(self.out, "  br label %{merge_label}").unwrap();
+                        self.terminated = true;
+                        phi_entries.push((variant_eq, label.clone()));
+                    }
+
+                    writeln!(self.out, "{merge_label}:").unwrap();
+                    self.terminated = false;
+                    let result = self.fresh_reg("enum_eq");
+                    let mut phi = format!("  {result} = phi i1 [ 0, %{neq_label} ]");
+                    for (val, label) in &phi_entries {
+                        phi.push_str(&format!(", [ {val}, %{label} ]"));
+                    }
+                    writeln!(self.out, "{phi}").unwrap();
+                    Ok(result)
+                } else {
+                    Err(CodegenError {
+                        message: format!("equality not supported for named type `{name}` in compiled code"),
+                        span,
+                    })
+                }
+            }
+            _ => Err(CodegenError {
+                message: format!("equality not supported for `{ty}` in compiled code"),
+                span,
+            }),
+        }
+    }
+
+    /// Structural `==`/`!=` on aggregate values (`Vector`/`Matrix`/
+    /// `struct`/`enum`) — delegates to `emit_deep_eq` for the recursive,
+    /// type-driven comparison. Produces a scalar `bool`, so this is reached
+    /// from `binary()` (`expr()`'s path), not `expr_ptr()`.
     fn agg_eq(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, ty: &Ty, scopes: &mut Scopes) -> Result<String, CodegenError> {
         let l_ptr = self.expr_ptr(lhs, scopes)?;
         let r_ptr = self.expr_ptr(rhs, scopes)?;
-        let (elem, len) = agg_elem_and_len(ty);
-        let elem_llty = self.llvm_ty(elem)?;
-        let is_float = *elem == Ty::F64;
-
-        let mut acc: Option<String> = None;
-        for i in 0..len {
-            let l = self.agg_load_elem(&l_ptr, &elem_llty, elem, i);
-            let r = self.agg_load_elem(&r_ptr, &elem_llty, elem, i);
-            let eq = if is_float { self.fcmp("oeq", &l, &r)? } else { self.icmp("eq", "i64", &l, &r)? };
-            acc = Some(match acc {
-                None => eq,
-                Some(prev) => {
-                    let out = self.fresh_reg("agg_eq_and");
-                    writeln!(self.out, "  {out} = and i1 {prev}, {eq}").unwrap();
-                    out
-                }
-            });
-        }
-        // Only reachable for a non-empty Vector/Matrix -- `Vector(_, 0)`
-        // has no literal/builtin construction path in this language, so
-        // `acc` is always `Some` by the time the loop above finishes.
-        let all_eq = acc.expect("Vector/Matrix length is always > 0 for any constructible value");
+        let eq = self.emit_deep_eq(&l_ptr, &r_ptr, ty, lhs.span())?;
         if op == BinOp::Eq {
-            Ok(all_eq)
+            Ok(eq)
         } else {
             let out = self.fresh_reg("agg_neq");
-            writeln!(self.out, "  {out} = xor i1 {all_eq}, true").unwrap();
+            writeln!(self.out, "  {out} = xor i1 {eq}, true").unwrap();
             Ok(out)
         }
     }
