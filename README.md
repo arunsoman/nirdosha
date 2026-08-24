@@ -10,6 +10,15 @@ crate (`compiler/`); many safety properties are *proven* today and some are
 *aspirational* (called out honestly below). Source files use the `.nir`
 extension.
 
+![nirdosha serve deriving a role-gated CRUD catalog from a struct + fn naming convention, then creating a product that persists to real SQLite](./demo.gif)
+
+*Zero UI code. `nirdosha serve examples/store.nir` derives the whole screen
+above — including the `requires(role: "admin")` gate and the custom
+"Restock +10" action — from `struct Product` and its `list_/create_/
+update_/delete_product` functions. Login goes through a real mock IdP
+(`examples/identity_mock.nir`), and the create call really persists to
+SQLite (not simulated for this recording — see §5, §8).*
+
 ---
 
 ## Table of contents
