@@ -11,3 +11,6 @@
 
 # Runtime database artifacts
 *.db
+
+# Launch marketing drafts (not project documentation)
+/announcements
