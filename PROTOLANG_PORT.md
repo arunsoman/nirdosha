@@ -553,9 +553,10 @@ half-close signal at all, over either transport.
 
 ## Locked design 5: DB
 
-**Status: shipped (21 Aug 2026), layer 1 (SQLite only).**
-`db_connect`/`db_query`/`db_execute` are real, tested
-(`compiler/tests/db.rs`, `examples/db.nir`), interpreter-only.
+**Status: layer 1 shipped (21 Aug 2026, SQLite), layer 2 shipped (24 Aug
+2026, Postgres).** `db_connect`/`db_query`/`db_execute` are real, tested
+(`compiler/tests/db.rs` for SQLite, `compiler/tests/postgres.rs` for
+Postgres, `examples/db.nir`), interpreter-only.
 
 ### What it brings to the table, and why "one driver per vendor, one uniform surface" instead of "one driver for everything"
 
@@ -573,10 +574,40 @@ document already committed to for TLS. Layer 1 wires up exactly one
 backend, SQLite, via `rusqlite` ("bundled": SQLite compiled from source
 and statically linked, no system `libsqlite3` dependency — the same
 "fully self-contained, no external service" property this project's own
-test discipline already requires everywhere else). Adding Postgres later
-(named as layer 2, not attempted here) means wiring up `tokio-postgres`
-behind the same four function names — a small, isolated addition, never
-a rearchitecture, because the Nirdosha-facing shape doesn't change.
+test discipline already requires everywhere else). Layer 2
+(`compiler/src/dbconn.rs`) adds Postgres behind the same four function
+names, exactly as small and isolated as this section originally
+predicted — no rearchitecture, because the Nirdosha-facing shape doesn't
+change: `db_connect`'s connection string is inspected for a `postgres://`/
+`postgresql://` prefix and dispatched to the `postgres` crate (the sync
+wrapper over `tokio-postgres` — chosen over driving `tokio-postgres`
+directly so a `db` handle stays a plain blocking call from Nirdosha's
+side, matching `rusqlite`'s own synchronous shape and needing no runtime
+threading of its own through the interpreter); anything else is
+unchanged layer-1 SQLite behavior, `:memory:` included. TLS is opt-in,
+read from the connection string's own `sslmode=require`/`verify-ca`/
+`verify-full` (reusing the `native-tls` dependency already pulled in for
+`https_get`/`https_post`, via `postgres-native-tls`, rather than adding a
+second TLS stack); no `sslmode`, or `disable`/`prefer`/`allow`, connects
+in plaintext. `db_query`/`db_execute`'s SQLite-era `?` placeholder
+convention (see layer 3 below) is rewritten to Postgres's numbered
+`$1, $2, ...` scheme internally (`dbconn::rewrite_placeholders`, skipping
+`?` characters inside `'...'` string literals) so the exact same call
+site works unchanged against either backend — a caller never writes
+backend-specific SQL depending on which connection string it was handed.
+Postgres's own strong wire-level typing (unlike SQLite's dynamic typing)
+means a column declared narrower than the value Nirdosha binds (e.g. a
+Postgres `integer`/`int4` column against an `i64` bind value, which binds
+as `bigint`/`int8`) is a real, named limitation surfaced as a clear
+`Err(message)` from the driver, not a silent misbind — schema columns
+meant to hold Nirdosha `i64`/`f64`/`bool`/`str` values should be declared
+`BIGINT`/`DOUBLE PRECISION`/`BOOLEAN`/`TEXT` respectively. `nirdosha serve
+--db`'s auto-generated table routes and `migrate.rs`'s schema-diff
+migrations (§13 of `LANGUAGE.md`) are a separate, still-SQLite-only piece
+of work, deliberately out of scope here — a materially larger effort (a
+second SQL dialect and a second schema-introspection mechanism
+throughout both) than extending the language-level `db` handle itself
+was.
 
 `db_query` is for row-returning statements (`SELECT`); `db_execute` is
 for everything else (`INSERT`/`UPDATE`/`DELETE`/DDL), returning the
@@ -616,21 +647,32 @@ attempted here.
 
 1. **Shipped.** `db_connect`/`db_query`/`db_execute`, SQLite only
    (`rusqlite`, "bundled"), results always `Ty::Json`.
-2. **Not shipped, named explicitly.** Postgres (`tokio-postgres`) — the
-   most common real backend for services, but its own tests would need a
-   real running server (Docker or similar), a real gap in this project's
-   self-contained-test discipline that SQLite's embedded nature happens
-   to sidestep for free.
-3. **Not shipped, named explicitly.** Prepared-statement parameter
-   binding (`db_query(conn, "SELECT * FROM t WHERE id = ?", [id])`-
-   shaped) — today's `sql` is one opaque string per call, so a caller has
-   to format values into it themselves (a real SQL-injection footgun for
-   any untrusted input, worth naming honestly rather than glossing over).
+2. **Shipped.** Prepared-statement bind values — `db_query`/`db_execute`
+   accept up to 8 trailing scalar arguments (`db_query(conn, "SELECT *
+   FROM t WHERE id = ?", id)`, variadic, not the array-argument shape
+   this section originally sketched), the one way to parameterize a
+   query at all given `str` has no concatenation (`LANGUAGE.md` §2) —
+   closing what would otherwise be a real SQL-injection footgun for any
+   untrusted input.
+3. **Shipped (24 Aug 2026).** Postgres (`postgres`, the synchronous
+   wrapper over `tokio-postgres`) — `compiler/src/dbconn.rs`. Its own
+   tests (`compiler/tests/postgres.rs`) need a real running server, the
+   exact gap this entry originally named as the reason to defer; resolved
+   by shipping them `#[ignore]`d by default (opt-in via `cargo test --
+   --ignored` against a real server, `NIRDOSHA_TEST_POSTGRES_URL`) rather
+   than either skipping the tests or breaking this project's
+   self-contained-by-default test discipline for every other suite.
 4. **Not shipped, named explicitly.** Document/graph backends (MongoDB,
    Neo4j) — each would be its own real driver-crate integration and its
    own connection-string scheme, not a generalization of the relational
    layer above.
-5. **Compiled backend is out of scope until the interpreter version is
+5. **Not shipped, named explicitly.** `nirdosha serve --db`'s
+   auto-generated table routes and `migrate.rs`'s schema-diff migrations
+   (`LANGUAGE.md` §13) stay SQLite-only — a second SQL dialect and a
+   second schema-introspection mechanism throughout both, materially
+   larger than layer 3's language-level `db` handle addition, and not
+   attempted here.
+6. **Compiled backend is out of scope until the interpreter version is
    proven** — `db_connect`/`db_query`/`db_execute` join the existing
    interpreter-only list, not an exception to it.
 

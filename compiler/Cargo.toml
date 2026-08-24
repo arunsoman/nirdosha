@@ -14,3 +14,5 @@ sha2 = "0.10"
 rusqlite = { version = "0.31", features = ["bundled"] }
 redis = "0.27"
 tiny_http = "0.12"
+postgres = "0.19"
+postgres-native-tls = "0.5"

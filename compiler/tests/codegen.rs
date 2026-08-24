@@ -1471,6 +1471,108 @@ fn vector_and_matrix_equality_true_and_false_cases() {
 }
 
 #[test]
+fn bool_vector_equality_compiles_and_matches_interpreter() {
+    let src = r#"
+        fn main() {
+            let a: Vector(bool, 3) = [true, false, true]
+            let b: Vector(bool, 3) = [true, false, true]
+            let c: Vector(bool, 3) = [true, true, true]
+            print(a == b)
+            print(a == c)
+            print(a != c)
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n0\n1\n");
+    assert_eq!(nirdosha::run(src), Ok(nirdosha::interpreter::Value::Unit));
+}
+
+#[test]
+fn struct_equality_compiles_and_matches_interpreter() {
+    let src = r#"
+        struct IntPair {
+            x: i64,
+            y: i64,
+        }
+
+        fn main() {
+            let a: IntPair = IntPair(1, 2)
+            let b: IntPair = IntPair(1, 2)
+            let c: IntPair = IntPair(1, 99)
+            print(a == b)
+            print(a == c)
+            print(a != c)
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n0\n1\n");
+    assert_eq!(nirdosha::run(src), Ok(nirdosha::interpreter::Value::Unit));
+}
+
+#[test]
+fn enum_equality_compiles_and_matches_interpreter() {
+    let src = r#"
+        enum MyColor {
+            Red(),
+            Green(i64),
+            Blue(i64, i64),
+        }
+
+        fn main() {
+            let a: MyColor = Red()
+            let b: MyColor = Red()
+            let g1: MyColor = Green(7)
+            let g2: MyColor = Green(7)
+            let g3: MyColor = Green(8)
+            let bl1: MyColor = Blue(1, 2)
+            let bl2: MyColor = Blue(1, 2)
+            let bl3: MyColor = Blue(1, 3)
+            print(a == b)
+            print(a == g1)
+            print(g1 == g2)
+            print(g1 == g3)
+            print(bl1 == bl2)
+            print(bl1 == bl3)
+            print(bl1 != bl3)
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n0\n1\n0\n1\n0\n1\n");
+    assert_eq!(nirdosha::run(src), Ok(nirdosha::interpreter::Value::Unit));
+}
+
+#[test]
+fn nested_struct_enum_equality_compiles_and_matches_interpreter() {
+    let src = r#"
+        struct MyInner {
+            n: i64,
+        }
+
+        enum MyOuter {
+            A(MyInner),
+            B(),
+        }
+
+        fn main() {
+            let o1: MyOuter = A(MyInner(5))
+            let o2: MyOuter = A(MyInner(5))
+            let o3: MyOuter = A(MyInner(6))
+            let o4: MyOuter = B()
+            print(o1 == o2)
+            print(o1 == o3)
+            print(o1 == o4)
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n0\n0\n");
+    assert_eq!(nirdosha::run(src), Ok(nirdosha::interpreter::Value::Unit));
+}
+
+#[test]
 fn integer_element_vector_elementwise_ops_match_interpreter() {
     let src = r#"
         fn main() {

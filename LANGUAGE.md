@@ -145,6 +145,16 @@ to write them with). All require `f64` elements unless noted.
 - `kf_predict_state(x, P, F, Q) -> Vector` / `kf_predict_cov(x, P, F, Q) -> Matrix` — linear Kalman filter predict step (split in two — no tuple/struct return type exists).
 - `kf_update_state(x, P, z, H, R) -> Vector` / `kf_update_cov(...) -> Matrix` — update step.
 
+**Database** (`Ty::Db`, interpreter-only — `PROTOLANG_PORT.md`'s "Locked design 5: DB")
+- `db_connect(conn_str: str) -> Result(db, str)` — a bare path or `:memory:` opens a local SQLite database (`rusqlite`, bundled); a `postgres://`/`postgresql://` connection string instead connects to a real Postgres server (`postgres`/`postgres-native-tls` — `compiler/src/dbconn.rs`). Same four-function surface either way; only `db_connect`'s own argument decides the backend, chosen once and fixed for that handle's lifetime.
+- `db_query(conn: db, sql: str, ...up to 8 bind values) -> Result(json, str)` — row-returning statements (`SELECT`). Bind values are `i64`/`f64`/`str`/`bool` (or a zero-payload `enum` variant, bound as its name), the only way to parameterize a query since `str` has no concatenation (§2). `?` placeholders (SQLite's own positional style) are rewritten to Postgres's `$1, $2, ...` automatically when the handle is a Postgres connection, so the same `sql` string and call site work against either backend. Every row comes back as one JSON object (column name → value); the whole result set is a JSON array, navigated with `json_array_len`/`json_array_get`/`json_get_*` like any other JSON document.
+- `db_execute(conn: db, sql: str, ...up to 8 bind values) -> Result(i64, str)` — everything else (`INSERT`/`UPDATE`/`DELETE`/DDL); returns the affected-row count.
+- `stop(conn)` — closes the connection (reuses `tcp`/`file`'s keyword).
+- A connection failure, SQL syntax error, or constraint violation is `Err(message)`, never a trap — the database engine's own error message passed straight through.
+- Postgres is strongly typed at the wire level (unlike SQLite): a schema column meant to hold a Nirdosha `i64`/`f64`/`bool`/`str` value should be declared `BIGINT`/`DOUBLE PRECISION`/`BOOLEAN`/`TEXT` — a narrower column type (e.g. `integer`) is a clear `Err` from the driver, not a silent misbind.
+- TLS to Postgres is opt-in, read from the connection string's own `sslmode=require`/`verify-ca`/`verify-full`; no `sslmode` (or `disable`/`prefer`/`allow`) connects in plaintext.
+- `nirdosha serve --db <path>`'s auto-generated table routes and automatic schema migrations (§13) are a separate mechanism, still SQLite-only.
+
 **Identity / relying party** (Row 12)
 - `oidc_validate_token(token: str, expected_issuer: str, expected_audience: str, jwks_json: str) -> Result(VerifiedIdentity, str)` — validates a mock OIDC/JWT ID token against the supplied JWKS JSON (HMAC-SHA256). Checks issuer, audience, and signature. Returns a `VerifiedIdentity` on success. The runtime never mints tokens; it only consumes externally-issued ones.
 - `check_role(identity: VerifiedIdentity, role: str) -> Result(RoleView, str)` — succeeds if `identity.claims_json` contains a `roles` array with the requested role.

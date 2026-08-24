@@ -1,7 +1,13 @@
-// db_connect/db_query/db_execute -- layer 1: SQLite only (rusqlite,
-// "bundled" -- statically linked, no system libsqlite3). One connection
-// handle, stop-able like tcp/file/sandbox; results always read back as
-// json, composing directly with json_get_*/json_array_*.
+// db_connect/db_query/db_execute -- layer 1: SQLite (rusqlite, "bundled"
+// -- statically linked, no system libsqlite3), the backend below since
+// ":memory:" isn't a postgres://... URL. Layer 2 (compiler/src/dbconn.rs)
+// adds Postgres: pass db_connect a "postgres://user@host/dbname"
+// connection string instead and the exact same db_query/db_execute/stop
+// calls below run against a real Postgres server, no other change to
+// this file needed -- PROTOLANG_PORT.md's "Locked design 5: DB" has the
+// full design, compiler/tests/postgres.rs the (opt-in, real-server)
+// tests. One connection handle, stop-able like tcp/file/sandbox; results
+// always read back as json, composing directly with json_get_*/json_array_*.
 
 // A `db` handle is affine (like `tcp`/`file`) and, like them, has no
 // borrowing story yet -- passing it to more than one helper function

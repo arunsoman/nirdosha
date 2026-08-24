@@ -184,12 +184,17 @@ pub enum Ty {
     /// `libsqlite3` dependency): embedded, no server process, so every
     /// test that needs one can be fully self-contained, the same
     /// discipline every other affine-handle feature's tests already
-    /// follow. A different backend (Postgres, named explicitly as a
-    /// future layer) would be a new `db_connect`-recognized connection
-    /// *string* scheme, not a new `Ty` — the Nirdosha-facing surface
+    /// follow. Layer 2 (`compiler/src/dbconn.rs`) adds Postgres exactly
+    /// the way this doc comment originally anticipated: a new
+    /// `db_connect`-recognized connection *string* scheme (`postgres://`/
+    /// `postgresql://`), not a new `Ty` — the Nirdosha-facing surface
     /// (`db_connect`/`db_query`/`db_execute`/`stop`, results always
     /// `Ty::Json`) stays the same regardless of which real driver crate
-    /// answers it underneath.
+    /// answers it underneath. `nirdosha serve --db`'s auto-generated
+    /// table routes and `migrate.rs`'s schema-diff migrations are a
+    /// separate, still-SQLite-only piece (`ROADMAP.md`) — this layer only
+    /// covers the language-level `db_connect`/`db_query`/`db_execute`
+    /// handle.
     Db,
     /// A handle to a real, open message-queue connection (`mq_connect(host,
     /// port)` — see `Expr::Call`'s `"mq_connect"` arm). Affine, same

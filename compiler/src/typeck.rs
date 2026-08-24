@@ -2951,19 +2951,26 @@ impl<'a> Checker<'a> {
                 self.check(&args[1], &Ty::Str, expected_ret, scopes);
                 Ty::Bool
             }
-            // DB, layer 1 (`Ty::Db`'s doc comment).
+            // DB, layer 1 + layer 2 (`Ty::Db`'s doc comment) -- `path` is
+            // really "connection string": a bare file path or `:memory:`
+            // still means SQLite, `postgres://`/`postgresql://` selects
+            // Postgres (`dbconn.rs`), but the checked type is `str` either
+            // way, so nothing here changed when Postgres was added.
             ("db_connect", 1) => {
-                self.check(&args[0], &Ty::Str, expected_ret, scopes); // path
+                self.check(&args[0], &Ty::Str, expected_ret, scopes); // connection string
                 result_of(Ty::Db)
             }
             // `db_query`/`db_execute` accept up to 8 trailing bind-value
-            // arguments (`?` placeholders in `sql`, SQLite-positional) --
-            // the *only* route to a parameterized query, since `str` has
-            // no concatenation (LANGUAGE.md §2): there's no way to build
-            // a dynamic SQL string in Nirdosha source at all otherwise.
-            // Each bind value's own type isn't constrained here (`infer`
-            // only, not `check` against one fixed `Ty`) -- it can be
-            // `str`/`i64`/`f64`/`bool`, whichever a caller's data
+            // arguments (`?` placeholders in `sql`, SQLite-positional --
+            // `dbconn.rs::rewrite_placeholders` rewrites them to Postgres's
+            // `$1, $2, ...` when the handle underneath is a Postgres
+            // connection, so this same `?` syntax works against either
+            // backend) -- the *only* route to a parameterized query, since
+            // `str` has no concatenation (LANGUAGE.md §2): there's no way
+            // to build a dynamic SQL string in Nirdosha source at all
+            // otherwise. Each bind value's own type isn't constrained here
+            // (`infer` only, not `check` against one fixed `Ty`) -- it can
+            // be `str`/`i64`/`f64`/`bool`, whichever a caller's data
             // actually is; `interpreter.rs`'s `sql_bind_params` is the
             // real (runtime) gate on that, same "some proven away
             // statically, some at runtime" split every Tier-2 check here

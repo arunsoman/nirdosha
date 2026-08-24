@@ -203,7 +203,10 @@ linalg feature set is modeled on Julia and now **compiled** (see §6).
 ### I/O & networking
 `print`, `file` handles (`open`/`read`/`write`/`stop`), `tcp` client
 (`connect`), `tcp_listener` (`listen`/`accept`/`stop`), JSON, a `db`
-builtin (rusqlite), `transact` semantics (see [`TRANSACT.md`](./TRANSACT.md))
+builtin (SQLite via rusqlite, or Postgres via `postgres`/
+`postgres-native-tls` — picked by `db_connect`'s own connection-string
+scheme, see [`PROTOLANG_PORT.md`](./PROTOLANG_PORT.md)'s "Locked design
+5: DB"), `transact` semantics (see [`TRANSACT.md`](./TRANSACT.md))
 including cross-process transactions, and a `redis`-backed message queue.
 
 ### Structured diagnostics (row 9)

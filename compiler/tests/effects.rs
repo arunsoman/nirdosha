@@ -146,6 +146,77 @@ fn file_io_is_the_io_effect_not_network() {
 }
 
 #[test]
+fn db_connect_with_a_literal_sqlite_path_is_the_io_effect_only() {
+    let program = parse_ok(
+        r#"
+        fn main() -> unit {
+            match db_connect(":memory:") {
+                Ok(conn) => stop conn,
+                Err(e) => print(e),
+            }
+        }
+    "#,
+    );
+    typecheck(&program).expect("should typecheck cleanly");
+    let effects = infer_effects(&program, &TypeRegistry::build(&program));
+    assert_eq!(effects["main"].inferred, [Effect::Io].into_iter().collect());
+}
+
+#[test]
+fn db_connect_with_a_literal_postgres_url_is_also_the_network_effect() {
+    let program = parse_ok(
+        r#"
+        fn main() -> unit {
+            match db_connect("postgres://user@host/db") {
+                Ok(conn) => stop conn,
+                Err(e) => print(e),
+            }
+        }
+    "#,
+    );
+    typecheck(&program).expect("should typecheck cleanly");
+    let effects = infer_effects(&program, &TypeRegistry::build(&program));
+    assert_eq!(effects["main"].inferred, [Effect::Io, Effect::Network].into_iter().collect());
+}
+
+#[test]
+fn db_connect_with_a_non_literal_connection_string_conservatively_needs_network_too() {
+    // The connection string isn't a literal *at the call site* (it's a
+    // local binding), so `db_connect_effect` can't rule out Postgres at
+    // compile time and has to assume the worse case rather than silently
+    // under-report -- same reasoning as the call-through-value case above.
+    let program = parse_ok(
+        r#"
+        fn main() -> unit {
+            let conn_str: str = ":memory:"
+            match db_connect(conn_str) {
+                Ok(conn) => stop conn,
+                Err(e) => print(e),
+            }
+        }
+    "#,
+    );
+    typecheck(&program).expect("should typecheck cleanly");
+    let effects = infer_effects(&program, &TypeRegistry::build(&program));
+    assert_eq!(effects["main"].inferred, [Effect::Io, Effect::Network].into_iter().collect());
+}
+
+#[test]
+fn declaring_only_io_for_a_literal_postgres_db_connect_is_a_type_error() {
+    let kind = first_type_error(
+        r#"
+        fn main() -> unit effect(io) {
+            match db_connect("postgres://user@host/db") {
+                Ok(conn) => stop conn,
+                Err(e) => print(e),
+            }
+        }
+    "#,
+    );
+    assert_eq!(kind, TypeErrorKind::EffectNotDeclared { fn_name: "main".to_string(), missing: Effect::Network });
+}
+
+#[test]
 fn mutual_recursion_still_converges_to_the_right_effect_set() {
     // Neither function directly performs an effect on its own base case,
     // but `is_odd` calls `is_even` (io) and vice versa — the fixpoint

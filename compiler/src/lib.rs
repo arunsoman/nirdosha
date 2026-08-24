@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod codegen;
+pub mod dbconn;
 pub mod effects;
 pub mod interpreter;
 pub mod migrate;

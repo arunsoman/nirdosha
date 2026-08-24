@@ -21,9 +21,13 @@
 //! |---|---|
 //! | `pure` (the empty set) | everything not listed below |
 //! | `rng` | `rand_seed`/`rand_f64`/`rand_gaussian` |
-//! | `io` | `print`; `file`'s `open`/`send`/`recv`/`stop` |
+//! | `io` | `print`; `file`'s `open`/`send`/`recv`/`stop`; `db_connect`/
+//! `db_query`/`db_execute` (SQLite) |
 //! | `concurrent` | `spawn`/`join`; `chan`'s `send`/`recv`; `sandbox`/`stop` |
-//! | `network` | `connect`/`listen`/`accept`; `tcp`'s `send`/`recv`/`stop` |
+//! | `network` | `connect`/`listen`/`accept`; `tcp`'s `send`/`recv`/`stop`;
+//! `mq_connect`/`mq_publish`/`mq_consume`; `db_connect` when its
+//! connection-string argument is (or might be, per `db_connect_effect`)
+//! Postgres |
 //!
 //! `spawn`/`sandbox` also inherit whatever the spawned function's own
 //! effect set is (transitively) — the *caller* triggered that work, even
@@ -202,8 +206,25 @@ pub(crate) fn builtin_effect(name: &str) -> EffectSet {
         "json_parse" | "json_get" | "json_get_str" | "json_get_i64" | "json_get_f64" | "json_get_bool"
         | "json_array_len" | "json_array_get" | "json_set_str" => {}
         // Same effect `file`'s `open`/`send`/`recv`/`stop` already get --
-        // SQLite (layer 1's only backend -- `Ty::Db`'s doc comment) is a
-        // local file, not a network service.
+        // right for SQLite (a local file). `db_connect`'s base tag is
+        // still `Io` here (this table is also `observability.rs::
+        // traced_builtin`'s only source for "does this call get traced,
+        // and as what" -- it needs *some* answer for every builtin name
+        // alone, with no access to a call's actual arguments); `walk_expr`
+        // additionally calls `db_connect_effect`, which starts from this
+        // same `Io` tag and adds `Network` on top for a connection string
+        // that's visibly `postgres://`/`postgresql://` (`dbconn.rs`'s
+        // module doc) -- the one place in this pass that *does* have the
+        // call's literal argument available. `db_query`/`db_execute` stay
+        // `Io`-only regardless of backend: unlike `db_connect`'s own
+        // literal connection-string argument, a `Ty::Db`-typed variable at
+        // a `db_query`/`db_execute` call site carries no static trace of
+        // which backend actually opened it -- real points-to tracking this
+        // pass doesn't do (see the call-through-value fix above for the
+        // identical limitation). A disclosed, narrow gap: a function
+        // declaring only `effect(io)` that calls `db_query`/`db_execute`
+        // on a handle from a Postgres `db_connect` elsewhere still
+        // typechecks clean today.
         "db_connect" | "db_query" | "db_execute" => {
             s.insert(Effect::Io);
         }
@@ -214,6 +235,32 @@ pub(crate) fn builtin_effect(name: &str) -> EffectSet {
             s.insert(Effect::Network);
         }
         _ => {}
+    }
+    s
+}
+
+/// `db_connect`'s own effect set -- `builtin_effect`'s plain by-name
+/// table can't express this, since it's the one builtin whose effect
+/// genuinely depends on an argument, not just its name: a
+/// `postgres://`/`postgresql://` connection string is a real network
+/// service, unlike SQLite's local-file `Effect::Io` (`dbconn.rs`'s module
+/// doc, `Ty::Db`'s doc comment). A literal string argument is checked
+/// directly for that prefix; anything else -- a variable, a fn param, a
+/// concatenation this language doesn't even have (`str` has none, so in
+/// practice this is always either a literal or a passed-through param) --
+/// can't be ruled out at compile time, so it conservatively gets
+/// `Network` too. Same "coarser than real flow analysis, but never
+/// under-reports" stance the call-through-value case just below already
+/// takes for the identical kind of gap.
+fn db_connect_effect(args: &[Expr]) -> EffectSet {
+    let mut s = builtin_effect("db_connect");
+    let is_definitely_sqlite = matches!(
+        args.first(),
+        Some(Expr::Str(literal, _))
+            if !literal.starts_with("postgres://") && !literal.starts_with("postgresql://")
+    );
+    if !is_definitely_sqlite {
+        s.insert(Effect::Network);
     }
     s
 }
@@ -233,7 +280,9 @@ fn walk_expr(e: &Expr, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, 
             for a in args {
                 walk_expr(a, scopes, known, registry, acc);
             }
-            if is_builtin(name) {
+            if name == "db_connect" {
+                acc.extend(db_connect_effect(args));
+            } else if is_builtin(name) {
                 acc.extend(builtin_effect(name));
             } else if let Some(callee) = known.get(name) {
                 acc.extend(callee.iter().copied());

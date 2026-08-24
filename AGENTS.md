@@ -66,6 +66,7 @@ cargo run -- serve <file.nil> --port 8080     # run as a real HTTP service
 | `transact` durability protocol (WAL, crash replay, `txn_id`, retry/timeout) | `TRANSACT.md` |
 | `workflow` state machines, `on_entry`/`on_exit` notification actions, presence bridge | `WORKFLOW.md` |
 | `sandbox`/`stop` process-isolation design | `SANDBOXING.md` |
+| Native iOS/Android app generation (manifest-driven codegen, Standard/Rich profiles) — **design only, not built**, see `ROADMAP.md` Track D | `MOBILE.md` |
 | Row 11 (`struct`/`enum`/generics/`match`) design rationale | `nirdosha_row11_amendment.md` |
 | Row 12 (identity/`VerifiedIdentity`/sessions/API keys) design | `nirdosha_row12_functions_identity.md` |
 | Historical build journal (early phases, numbered "updates") | `PHASE0.md` |

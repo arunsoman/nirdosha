@@ -4176,10 +4176,9 @@ impl Codegen<'_> {
                     for (vidx, _v) in variants.iter().enumerate() {
                         let label = self.fresh_label(&format!("enum_eq_v{vidx}"));
                         case_labels.push(label.clone());
-                        writeln!(self.out, "    i64 {vidx}, label %{label}").unwrap();
                     }
                     writeln!(self.out, "  switch i64 {l_tag}, label %{default_label} [").unwrap();
-                    // case labels were already emitted above to keep switch syntax valid
+                    // case labels are emitted below, inside the switch brackets
                     for (vidx, _v) in variants.iter().enumerate() {
                         writeln!(self.out, "    i64 {vidx}, label %{}", case_labels[vidx]).unwrap();
                     }

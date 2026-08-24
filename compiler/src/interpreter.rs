@@ -201,9 +201,11 @@ pub enum Value {
     /// see `Ty::Db`'s doc comment). `Mutex<Option<..>>`, same shape and
     /// reason as `Value::Tcp`/`Value::File`: `stop` needs to `.take()` the
     /// connection out exactly once. No custom `Drop` is needed — a
-    /// `rusqlite::Connection` closes its own database handle on drop with
-    /// no help required, the same as every other affine handle here.
-    Db(Arc<Mutex<Option<rusqlite::Connection>>>),
+    /// `rusqlite::Connection`/`postgres::Client` (`dbconn::DbConn`, chosen
+    /// by `db_connect`'s connection-string scheme — `dbconn.rs`'s module
+    /// doc) each close their own connection on drop with no help required,
+    /// the same as every other affine handle here.
+    Db(Arc<Mutex<Option<crate::dbconn::DbConn>>>),
     /// A handle to a real, open message-queue connection (`mq_connect(host,
     /// port)` — see `Ty::Mq`'s doc comment). Same `Mutex<Option<..>>` shape
     /// and reason as `Value::Db`. Backed by Redis (`redis` crate); no
@@ -1522,47 +1524,25 @@ fn sha256_hex_chain(parts: &[&str]) -> String {
     result.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-// ---- DB, layer 1: SQLite (`Ty::Db`'s doc comment) --------------------------
-
-/// `db_query`'s implementation — runs a row-returning statement (`SELECT`)
-/// and returns every row as one JSON object (column name → value), the
-/// whole result set as a JSON array. Reusing `Ty::Json` here rather than
-/// inventing a `Ty::Row`/table type is the same move JSON's own design
-/// already made for arrays/objects: no growable Nirdosha-level collection
-/// type exists (`Vector`/`Matrix` are fixed-size), so a query's row count —
-/// which is a runtime value, not a compile-time-known dimension — has
-/// nowhere else to live. The caller navigates it with the same
-/// `json_array_len`/`json_array_get`/`json_get_*` builtins any other JSON
-/// document uses.
-fn db_query(conn: &rusqlite::Connection, sql: &str, params: &[rusqlite::types::Value]) -> Value {
-    let result: rusqlite::Result<JsonDoc> = (|| {
-        let mut stmt = conn.prepare(sql)?;
-        let column_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
-        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| db_row_to_json(row, &column_names))?;
-        let rows: rusqlite::Result<Vec<JsonDoc>> = rows.collect();
-        Ok(JsonDoc::Array(rows?))
-    })();
-    match result {
-        Ok(doc) => result_ok(Value::Json(Arc::new(doc))),
-        Err(e) => result_err(e.to_string()),
-    }
-}
+// ---- DB, layer 1 + layer 2: SQLite + Postgres (`Ty::Db`'s doc comment,
+// `dbconn.rs`'s module doc) -----------------------------------------------
 
 /// Converts `db_query`/`db_execute`'s trailing bind-value arguments
-/// (`typeck.rs`'s arity-ranged `(2..=10)` signature) into rusqlite's own
-/// bind-value type. Scalars only — `Int`/`Float`/`Str`/`Bool` map
-/// directly (`Bool` as SQLite's usual 0/1 integer convention);
-/// anything else (struct, handle, ...) is a clear runtime error rather
-/// than a silent misbind. See `typeck.rs`'s doc comment on why these
-/// args aren't type-constrained ahead of time — this is the actual
-/// (runtime) gate.
-fn sql_bind_params(args: &[Value]) -> Result<Vec<rusqlite::types::Value>, String> {
+/// (`typeck.rs`'s arity-ranged `(2..=10)` signature) into `dbconn::Param`
+/// -- backend-neutral, since a given `Value::Db` handle might be either
+/// driver underneath. Scalars only — `Int`/`Float`/`Str`/`Bool` map
+/// directly (`dbconn.rs`'s `pg_bind`/`sqlite_bind` decide, per backend,
+/// how `Bool` actually gets bound); anything else (struct, handle, ...)
+/// is a clear runtime error rather than a silent misbind. See
+/// `typeck.rs`'s doc comment on why these args aren't type-constrained
+/// ahead of time — this is the actual (runtime) gate.
+fn sql_bind_params(args: &[Value]) -> Result<Vec<crate::dbconn::Param>, String> {
     args.iter()
         .map(|v| match v {
-            Value::Int(n) => Ok(rusqlite::types::Value::Integer(*n)),
-            Value::Float(f) => Ok(rusqlite::types::Value::Real(*f)),
-            Value::Str(s) => Ok(rusqlite::types::Value::Text(s.to_string())),
-            Value::Bool(b) => Ok(rusqlite::types::Value::Integer(if *b { 1 } else { 0 })),
+            Value::Int(n) => Ok(crate::dbconn::Param::Int(*n)),
+            Value::Float(f) => Ok(crate::dbconn::Param::Float(*f)),
+            Value::Str(s) => Ok(crate::dbconn::Param::Text(s.to_string())),
+            Value::Bool(b) => Ok(crate::dbconn::Param::Bool(*b)),
             // A zero-payload ("unit") enum variant -- e.g. a categorical
             // `enum RiskRating { Low, Medium, High }` field -- binds as
             // its own variant name, TEXT. A payload-carrying variant
@@ -1570,7 +1550,7 @@ fn sql_bind_params(args: &[Value]) -> Result<Vec<rusqlite::types::Value>, String
             // value to store), so it still falls through to the error
             // below, unchanged.
             Value::Enum(_, variant, payload) if payload.is_empty() => {
-                Ok(rusqlite::types::Value::Text(variant.to_string()))
+                Ok(crate::dbconn::Param::Text(variant.to_string()))
             }
             other => Err(format!("db bind value must be str/i64/f64/bool, got {}", other.ty_name())),
         })
@@ -2707,23 +2687,27 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
             };
             Ok(Value::Bool(constant_time_eq(a, b)))
         }
-        // DB, layer 1 (`Ty::Db`'s doc comment).
+        // DB, layer 1 + layer 2 (`Ty::Db`'s doc comment; `dbconn.rs`'s
+        // module doc for the SQLite-vs-Postgres dispatch).
         "db_connect" => {
-            let Value::Str(path) = &args[0] else { unreachable!("typeck.rs already proved this is a str") };
-            match rusqlite::Connection::open(path.as_ref()) {
+            let Value::Str(conn_str) = &args[0] else { unreachable!("typeck.rs already proved this is a str") };
+            match crate::dbconn::connect(conn_str.as_ref()) {
                 Ok(conn) => Ok(result_ok(Value::Db(Arc::new(Mutex::new(Some(conn)))))),
-                Err(e) => Ok(result_err(e.to_string())),
+                Err(e) => Ok(result_err(e)),
             }
         }
         "db_query" => {
             let (Value::Db(slot), Value::Str(sql)) = (&args[0], &args[1]) else {
                 unreachable!("typeck.rs already proved these are db and str")
             };
-            let guard = slot.lock().unwrap();
-            match guard.as_ref() {
+            let mut guard = slot.lock().unwrap();
+            match guard.as_mut() {
                 None => Ok(result_err("this db connection was already stopped")),
                 Some(conn) => match sql_bind_params(&args[2..]) {
-                    Ok(params) => Ok(db_query(conn, sql, &params)),
+                    Ok(params) => match crate::dbconn::query(conn, sql, &params) {
+                        Ok(doc) => Ok(result_ok(Value::Json(Arc::new(doc)))),
+                        Err(e) => Ok(result_err(e)),
+                    },
                     Err(e) => Ok(result_err(e)),
                 },
             }
@@ -2732,13 +2716,13 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
             let (Value::Db(slot), Value::Str(sql)) = (&args[0], &args[1]) else {
                 unreachable!("typeck.rs already proved these are db and str")
             };
-            let guard = slot.lock().unwrap();
-            match guard.as_ref() {
+            let mut guard = slot.lock().unwrap();
+            match guard.as_mut() {
                 None => Ok(result_err("this db connection was already stopped")),
                 Some(conn) => match sql_bind_params(&args[2..]) {
-                    Ok(params) => match conn.execute(sql, rusqlite::params_from_iter(&params)) {
-                        Ok(affected) => Ok(result_ok(Value::Int(affected as i64))),
-                        Err(e) => Ok(result_err(e.to_string())),
+                    Ok(params) => match crate::dbconn::execute(conn, sql, &params) {
+                        Ok(affected) => Ok(result_ok(Value::Int(affected))),
+                        Err(e) => Ok(result_err(e)),
                     },
                     Err(e) => Ok(result_err(e)),
                 },
@@ -4057,19 +4041,32 @@ impl Interpreter {
     /// `return Ok(e)` on `Err`.
     fn send_via_channel(&self, conn: &Value, channel: &str, subject: &str, template: &str, vars: &Value) -> Result<(), Value> {
         let Value::Db(slot) = conn else { unreachable!("typeck.rs already proved this is db") };
-        let guard = slot.lock().unwrap();
-        let Some(sqlite) = guard.as_ref() else {
+        let mut guard = slot.lock().unwrap();
+        let Some(db) = guard.as_mut() else {
             return Err(workflow_err("ProviderRequestFailed", vec![Value::Str(Arc::from("db connection is stopped"))]));
         };
         let table = provider_table_name(channel);
-        let row: rusqlite::Result<(String, i64, String, String, String)> = sqlite.query_row(
-            &format!("SELECT host, port, path, api_key, from_address FROM {table} WHERE active = 1 ORDER BY id DESC LIMIT 1"),
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        let sql = format!(
+            "SELECT host, port, path, api_key, from_address FROM {table} WHERE active = 1 ORDER BY id DESC LIMIT 1"
         );
-        let (host, port, path, api_key, from_address) = match row {
-            Ok(r) => r,
-            Err(_) => return Err(workflow_err("ProviderNotConfigured", vec![])),
+        // Goes through `dbconn::query`, not a raw rusqlite row extractor,
+        // so the provider-config lookup works the same whether `conn`
+        // came from a SQLite or a Postgres `db_connect` string (`Ty::Db`'s
+        // doc comment, `dbconn.rs`'s module doc).
+        let first_row = match crate::dbconn::query(db, &sql, &[]) {
+            Ok(JsonDoc::Array(rows)) => rows.into_iter().next(),
+            _ => None,
+        };
+        let Some((host, port, path, api_key, from_address)) = first_row.and_then(|row| {
+            let s = |k: &str| row.get(k)?.as_str().map(str::to_string);
+            let host = s("host")?;
+            let port = row.get("port")?.as_i64()?;
+            let path = s("path")?;
+            let api_key = s("api_key")?;
+            let from_address = s("from_address")?;
+            Some((host, port, path, api_key, from_address))
+        }) else {
+            return Err(workflow_err("ProviderNotConfigured", vec![]));
         };
         let Value::Json(doc) = vars else { unreachable!("typeck.rs already proved this is json") };
         let body = serde_json::json!({
@@ -5271,8 +5268,9 @@ impl Interpreter {
                     ),
                     // Same "just drop it, double-stop is Unit not an
                     // error" treatment as `Value::Tcp`/`Value::File` above
-                    // — a `rusqlite::Connection` closes its own database
-                    // handle on drop with no help required. Not part of
+                    // — a `dbconn::DbConn` (SQLite or Postgres, chosen by
+                    // `db_connect`'s connection string) closes its own
+                    // connection on drop with no help required. Not part of
                     // `effects.rs`'s own `local_ty`/`StopSandbox` mapping
                     // (a pre-existing, documented gap there — `Ty::Db`
                     // isn't one of its matched cases), but `Effect::Io`

@@ -6,8 +6,8 @@ across the whole project, in one place.
 **Why the other planning/spec docs (`Nirdosha_Unified_Plan.md`,
 `goal.md`, `TRANSACT.md`, `SANDBOXING.md`, `PROTOLANG_PORT.md`,
 `nirdosha_row11_amendment.md`, `nirdosha_row12_functions_identity.md`,
-`nirdosha-agent-api.md`, `PHASE0.md`, ...) are not folded in here and
-deleted:** they're technical *specifications* (grammar, semantics,
+`nirdosha-agent-api.md`, `PHASE0.md`, `MOBILE.md`, ...) are not folded
+in here and deleted:** they're technical *specifications* (grammar, semantics,
 protocol detail, API request/response shapes), not status trackers —
 this file only summarizes their status, it doesn't replace their
 content. They're also load-bearing: checked this session,
@@ -74,8 +74,9 @@ messages.
   foundation everything from Row 12 onward builds on.
 - **JSON, HTTP/HTTPS builtins** (interpreter-only) — `json_*`,
   `http_get`/`http_post`/`https_get`/`https_post`.
-- **DB connectivity** — `db_connect`/`db_query`/`db_execute`, SQLite
-  layer 1 (interpreter-only).
+- **DB connectivity** — `db_connect`/`db_query`/`db_execute`
+  (interpreter-only): SQLite layer 1, Postgres layer 2 (dispatched by
+  connection-string scheme, `dbconn.rs`).
 - **Row 12 — identity, DB/MQ-backed apps, the UI engine** —
   `VerifiedIdentity`/`RoleView`/`ClaimView`, mock OIDC validation,
   sessions/refresh/revocation, `mq` (Redis), `nirdosha emit-ui`/
@@ -141,6 +142,59 @@ messages.
   no real WebSocket termination, by design) in `WORKFLOW.md`. 6 new
   end-to-end tests (`tests/workflow.rs`, including two dedicated replay
   tests); full existing suite (400+ tests) still green.
+- **2026-08-24 — Systematic correctness-gap sweep (Track A1).**
+  Added compiled structural `==`/`!=` for `struct`, `enum`,
+  `Vector`/`Matrix` of `bool`, and recursive `box`/`&` payloads in
+  `codegen.rs::emit_deep_eq`; fixed duplicate switch-case emission in the
+  enum branch. Four new `compiler/tests/codegen.rs` tests cover `bool`
+  vectors, struct, enum, and nested struct-in-enum equality against the
+  interpreter. Full `cargo test` (400+ tests) green.
+- **2026-08-24 — DB layer 2: Postgres, alongside SQLite.**
+  `db_connect`/`db_query`/`db_execute`'s Nirdosha-facing surface is
+  unchanged (`Ty::Db`'s doc comment already named this as the intended
+  shape); new `compiler/src/dbconn.rs` dispatches purely off
+  `db_connect`'s connection-string scheme — `postgres://`/`postgresql://`
+  selects Postgres (`postgres`/`postgres-native-tls` crates, TLS opt-in
+  via `sslmode`), anything else (a bare path, `:memory:`) is unchanged
+  SQLite behavior, so no existing `.nir` program's behavior moves. The
+  SQLite-era `?` bind-placeholder convention is rewritten to Postgres's
+  `$1, $2, ...` internally, so the same call site and the same `sql`
+  string work against either backend. Closed a real soundness gap this
+  otherwise would have opened: `effects.rs`'s static classification
+  tagged all of `db_connect`/`db_query`/`db_execute` as `Effect::Io`
+  (right when SQLite, a local file, was the only backend) — a function
+  declaring only `effect(io)` could now silently reach the network via a
+  `postgres://` `db_connect`. Fixed for `db_connect` itself
+  (`effects::db_connect_effect` inspects the call's literal connection-
+  string argument, conservatively assuming `Network` too when it isn't a
+  literal); `db_query`/`db_execute` on an already-open handle are a
+  disclosed, narrower gap (no points-to tracking to trace a `Ty::Db`
+  variable back to which `db_connect` opened it — named in `effects.rs`
+  next to the identical pre-existing call-through-value limitation, not
+  fixed here). Verified against a real, locally-run Postgres server (not
+  just unit tests) before landing; `compiler/tests/postgres.rs` covers
+  the same ground as an `#[ignore]`d integration suite (opt-in via
+  `NIRDOSHA_TEST_POSTGRES_URL` + `cargo test -- --ignored`, since a real
+  server can't be part of this project's self-contained-by-default test
+  discipline the way SQLite's embedded `:memory:` can). Explicitly out of
+  scope, named rather than silently gapped: `nirdosha serve --db`'s
+  auto-generated table routes and `migrate.rs`'s schema-diff migrations
+  stay SQLite-only — a second SQL dialect and schema-introspection
+  mechanism throughout both, materially larger than this addition.
+  5 new `compiler/tests/effects.rs` tests plus the 4 `#[ignore]`d
+  Postgres integration tests; full non-ignored `cargo test` (660+ tests)
+  green. Full design writeup: `PROTOLANG_PORT.md`'s "Locked design 5: DB".
+- **2026-08-24 — Noted, not yet designed: data-dictionary-driven
+  categorical detection.** User request: automatically treat a `str`
+  column/field as enum-like (categorical) rather than free text, without
+  re-querying `DISTINCT` values on every access — instead backed by an
+  explicit data-dictionary table (temporal/ordinal/categorical/... per
+  field), optionally Redis-cached for lookup speed. Touches (at least)
+  `migrate.rs` schema diffing, `db_query` result shaping, and `ui_gen.rs`
+  form/table rendering. Scoped as `[OPEN]`, deliberately not started this
+  session — real schema design (the data-dictionary table shape, cache
+  invalidation story) needed first, not something to bolt onto the
+  Postgres work above.
 
 ---
 
@@ -181,6 +235,9 @@ done or already tracked inside their own file):
   design-only.
 - `compiler/UI_DSL_TODO.md` — `[OPEN]`: a documented, non-silent doc
   debt (GRAMMAR/LANGUAGE rewrite owed).
+- `MOBILE.md` — `[OPEN]`, design only: nothing in it is built. Written
+  2026-08-24, before Track D's first item, on purpose — see that doc's
+  own status line.
 
 **Explicitly out of scope, not tracked here**: `llm-ops-api-spec.md`/
 `llm-ops-api-spec-v2.md` are generic multi-backend LLM training/
@@ -200,25 +257,20 @@ soon — independent of Track B, since the interpreter path
 (`nirdosha serve`) is what will run those apps regardless of how much
 of Track B has landed.*
 
-- `[OPEN]` **A1. Systematic correctness-gap sweep.** The pattern found
-  this session — `enum`/`struct` `==` typechecked but had no
-  interpreter arm, traps at runtime (fixed) — was found by accident,
-  not a deliberate audit. Needs a real pass across operator × type
-  combinations, not opportunistic discovery.
-- `[OPEN]` **A2. `transact` durability under real failure conditions** —
+- `[OPEN]` **A1. `transact` durability under real failure conditions** —
   actually kill the process mid-transaction under load and confirm
   crash-replay behaves, not just trust the existing test suite.
-- `[OPEN]` **A3. Deployment story for the interpreted path** —
+- `[OPEN]` **A2. Deployment story for the interpreted path** —
   containerize `nirdosha serve` + source properly; secrets/JWKS
   handling; this is buildable now, independent of Track B.
-- `[OPEN]` **A4. Observability wired to something real** — the OTel
+- `[OPEN]` **A3. Observability wired to something real** — the OTel
   tracer (`observability.rs`) exists; connect it to an actual
   collector/backend for a real deployment.
-- `[OPEN]` **A5. Compatibility/versioning policy.** The str-ban
+- `[OPEN]` **A4. Compatibility/versioning policy.** The str-ban
   (2026-08-23) was a breaking language change shipped in one session —
   need a real policy before a deployed critical app can trust future
   changes won't silently break it.
-- `[OPEN]` **A6. `workflow`'s real-time presence gateway.** `notify()`
+- `[OPEN]` **A5. `workflow`'s real-time presence gateway.** `notify()`
   (`WORKFLOW.md`) publishes to `nirdosha:push:<subject>` (Redis) and
   reads `identity_presence` — both real — but nothing in this repo
   terminates a live browser WebSocket/SSE connection, and that's the
@@ -234,6 +286,56 @@ of Track B has landed.*
   each `nirdosha:push:<subject>` channel to relay to the right live
   connection. `send_email`/`send_sms`/`send_push` and every other part
   of `workflow` are unaffected and fully functional without this.
+- `[OPEN]` **A6. Identity admin console: multi-IdP registry, role
+  mapping + cache, roles/ACL introspection, opt-in scaffolding.**
+  Prompted by a real gap: `requires(role: "compliance_officer")` and a
+  `screen` field's `view`/`edit` role gates only work today if the
+  string literal in `.nir` source is byte-identical to whatever the
+  connected IdP actually puts in the token's roles claim — no
+  translation layer, and a renamed IdP group silently breaks every
+  check it gated (no error, the check just stops matching). Design,
+  not yet built:
+  - **Role mapping** — a per-project, admin-editable `RoleMapping
+    { app_role: str, idp_role: str }` table (same "ordinary struct,
+    free CRUD screen" convention `EmailProviderConfig` already
+    established for the communications panel) translating the app's
+    canonical role vocabulary into whatever the connected IdP actually
+    emits.
+  - **In-memory cache, not a DB read per request** — load the mapping
+    (and the IdP registry below) once into a long-lived, shared
+    structure at `serve::run` startup (the same pattern `table_db`/
+    `table_catalog` already use — built once, shared across every
+    request's own fresh `Interpreter`), refreshed on a short TTL
+    (~30-60s) rather than re-queried per auth check. Bounded staleness
+    (an admin's edit takes up to one TTL window to take effect) is an
+    accepted, disclosed tradeoff, not a correctness bug — the same
+    category of real-clock/real-world exception `resolve_identity`'s
+    existing token-`expires_at` check already is, not a new violation
+    of `.nir`'s own determinism story. Also fixes an existing
+    inefficiency: `identity_directory` currently reopens a fresh
+    SQLite connection on every single `resolve_identity` call.
+  - **Multi-IdP registry** — today `nirdosha serve` takes exactly one
+    fixed `--jwks-file`/`--issuer`/`--audience` triple (`AuthConfig`).
+    An admin-editable `IdentityProviderConfig` list (mirroring the
+    provider-config struct pattern again) would let `resolve_identity`
+    pick the right provider by the token's own issuer claim.
+  - **Roles → functions/fields report** — pure static analysis, no new
+    runtime concept: walk `program.fns`' `requires(role: ...)` and
+    `ui_gen::field_gates_for_struct`'s already-computed table/field ACL
+    gates (that data already exists, just isn't surfaced as a page),
+    group by role name.
+  - **On-demand activation is already solved, not a new problem** — a
+    program that declares none of these marker structs renders none of
+    this UI today, the same way a hello-world script that never
+    declares `EmailProviderConfig` gets no communications panel:
+    `ui_gen`/`serve` only render screens for structs that exist. A
+    proposed `nirdosha init <project-name>` scaffolding command would
+    only be solving *ergonomics* (not hand-typing the marker structs),
+    not cost — worth keeping scoped as a text-generation convenience,
+    not a new "project manifest" concept the compiler itself needs to
+    understand (Nirdosha has no notion of "a project" beyond a source
+    file today, and this shouldn't quietly become the thing that
+    introduces one).
 
 ---
 
@@ -257,7 +359,13 @@ claim, though that section is currently accurate).
    `db_query`/`db_execute`; all 8 `json_*` builtins. Unlocks compiling
    `trade_finance.nir`/`store.nir` at all. Note: `rusqlite` already
    uses the `bundled` feature (fully static SQLite) — no new
-   dependency-linking design needed there.
+   dependency-linking design needed there. The Postgres backend added
+   2026-08-24 (`dbconn.rs`) is a real, separate wrinkle for this item:
+   `postgres`/`postgres-native-tls` are *not* statically bundled the way
+   `rusqlite` is, so a compiled binary using a Postgres `db_connect`
+   would need real dynamic-linking/deployment design (a system TLS
+   library at minimum) — not just "port the interpreter's dispatch to
+   LLVM IR" the way the SQLite path is.
 3. `[OPEN]` **B3. `mq` codegen** (`mq_connect`/`mq_publish`/
    `mq_consume` — Redis). Network client either way; no static-linking
    concern, same as today.
@@ -328,11 +436,63 @@ interpreter/compiler capabilities, not blocked on either track.
 
 ---
 
+## Track D — Mobile app generation (`MOBILE.md`)
+
+*Priority: independent of Tracks A–C — a second renderer of `ui_gen.rs`'s
+existing manifest, not a change to the interpreter/compiler/agent-API
+work above. D1 has zero new server-side dependencies and can start any
+time; D2–D5 each stand alone (no ordering constraint between them),
+picked up in proportion to which example app actually needs the
+capability, per `MOBILE.md`'s own archetype ranking.*
+
+- `[OPEN]` **D1. `emit-mobile` codegen scaffold + Standard profile.**
+  New `mobile_gen.rs` (`generate_ios`/`generate_android`), consuming
+  `ui_gen.rs::build_screens`'s existing `Screen`/`FieldSpec`/`Action`/
+  `Metric` IR unchanged; a checked-in Swift/Kotlin runtime library
+  (generic per-`control`-kind field views, list/singular/dashboard/login
+  screens, networking client, `Theme` mapper) embedded via `include_str!`
+  the same way `codegen.rs`'s `RUNTIME_KERNELS_LIB` is; per-app generated
+  code is one typed struct per `Screen`, not per-struct logic. No new
+  `ScreenDecl` grammar, no new builtins, no new `serve.rs` routes.
+- `[OPEN]` **D2. Device-bound biometric step-up.** New credential
+  artifact a native app can hold in Keychain/Keystore and unlock via
+  Face ID/Touch ID/BiometricPrompt before presenting — layered on
+  `nirdosha_row12_functions_identity.md`'s `RefreshTokenHandle` shape,
+  since nothing today (`VerifiedIdentity`/`TokenReference`/
+  `ApplicationSession`) is client-holdable. New `action { step_up:
+  biometric }` `ScreenDecl` key.
+- `[BLOCKED: a new file/blob/attachment type, itself undesigned]`
+  **D3. Camera/document capture on upload-shaped fields.** Nothing
+  mobile-specific — Nirdosha has no file/blob/attachment type at all
+  today (confirmed absent, `trade-finance/todo.md` names it explicitly).
+  That type needs its own design pass before this item can move.
+- `[OPEN]` **D4. Real push adapter (APNs/FCM) + device-token
+  registration.** `send_push`/`notify` (`WORKFLOW.md`) exist but their
+  transport is the same generic authenticated-POST adapter every
+  channel shares — needs a real provider-specific adapter and a new
+  way for a native app to register a device token against a subject.
+  Sidesteps Track A5's presence-gateway gap entirely (no live-connection
+  routing needed for push).
+- `[OPEN]` **D5. RPC-layer idempotency key for offline action queues.**
+  `txn_id` (`TRANSACT.md`) is scoped to a `transact` block's own
+  `network` slot, not exposed on the ordinary `POST /api/<fn>` RPC
+  layer. Needs an optional client-supplied idempotency key at
+  `serve.rs::dispatch` plus a durable "seen keys" table, so a mobile
+  app can safely replay queued calls after reconnecting. At-least-once,
+  not exactly-once — same disclosed limit `TRANSACT.md`/`WORKFLOW.md`
+  already carry.
+
+---
+
 ## Suggested near-term order
 
-Given "critical apps soon": the security review (now `[DONE]`) has
-already landed; **A1 (correctness-gap sweep) is the next concrete
-blocking work**, since it finds the class of bugs the review just
-illustrated. A2–A5 and C1 can run in parallel with each other and
-with the start of B1. B1–B9 is the long track — pick up items as they
-become relevant to what's actually being built, not in lockstep.
+Given "critical apps soon": the security review (now `[DONE]`) and the
+systematic correctness-gap sweep (now `[DONE]`) have both landed;
+**A1 (`transact` durability under real failure conditions) is the next
+concrete blocking work**, since it closes the largest remaining
+interpreted-path correctness risk. A2–A4 and C1 can run in parallel with
+each other and with the start of B1. B1–B9 is the long track — pick up
+items as they become relevant to what's actually being built, not in
+lockstep. Track D runs independently of all of the above — D1 can start
+whenever native app delivery actually becomes a priority, without waiting
+on A/B/C.
