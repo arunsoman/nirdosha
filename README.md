@@ -374,9 +374,24 @@ cargo build --release
 # binary: compiler/target/release/nirdosha
 ```
 
-Toolchain: Rust (edition 2024). The compiler shells out to `clang` for
-native codegen, so have `clang` installed for `build`/`emit-llvm`. Z3 is
-pulled in for the SMT refinement layer (row 4).
+Toolchain: Rust (edition 2024), plus two system libraries the build links
+against directly — install these *before* `cargo build` or the build fails
+with a linker error, not a friendly message:
+
+```sh
+# Debian/Ubuntu
+sudo apt install clang libz3-dev
+
+# macOS (Homebrew)
+brew install llvm z3
+
+# Arch
+sudo pacman -S clang z3
+```
+
+`clang` is invoked at runtime by `nirdosha build`/`emit-llvm` (native codegen);
+`z3` is linked at compile time for the SMT refinement layer (row 4) and is
+required even just to build the compiler, not only to use that feature.
 
 ### Run a program
 
