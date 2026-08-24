@@ -1,5 +1,8 @@
 # Nirdosha — निर्दोष ("without fault")
 
+[![build](https://github.com/arunsoman/nirdosha/actions/workflows/build.yml/badge.svg)](https://github.com/arunsoman/nirdosha/actions/workflows/build.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
 > A research-stage systems language with no garbage collector, no data races,
 > no deadlocks, no integer/buffer overflow, and hardware-native speed —
 > *and* a small, composable grammar that an LLM can write and reason about
@@ -17,7 +20,7 @@ above — including the `requires(role: "admin")` gate and the custom
 "Restock +10" action — from `struct Product` and its `list_/create_/
 update_/delete_product` functions. Login goes through a real mock IdP
 (`examples/identity_mock.nir`), and the create call really persists to
-SQLite (not simulated for this recording — see §5, §8).*
+SQLite (not simulated for this recording — see §6, §9).*
 
 ---
 
@@ -25,13 +28,14 @@ SQLite (not simulated for this recording — see §5, §8).*
 
 1. [What the name means](#1-what-the-name-means)
 2. [Motivation](#2-motivation)
-3. [Grammar](#3-grammar)
-4. [Features](#4-features)
-5. [The UI engine](#5-the-ui-engine)
-6. [Benchmarks](#6-benchmarks)
-7. [LLM integration](#7-llm-integration)
-8. [Try it out today](#8-try-it-out-today)
-9. [Honest scope](#9-honest-scope)
+3. [Who this is for (and who it isn't)](#3-who-this-is-for-and-who-it-isnt)
+4. [Grammar](#4-grammar)
+5. [Features](#5-features)
+6. [The UI engine](#6-the-ui-engine)
+7. [Benchmarks](#7-benchmarks)
+8. [LLM integration](#8-llm-integration)
+9. [Try it out today](#9-try-it-out-today)
+10. [Honest scope](#10-honest-scope)
 
 ---
 
@@ -81,7 +85,45 @@ Pony — accepting a smaller language in exchange for the guarantee
 model — does at it.* That boundary matters equally for formal-methods
 correctness and for whether an LLM can reliably work around it.
 
-## 3. Grammar
+## 3. Who this is for (and who it isn't)
+
+The honest fit, not the marketing one.
+
+**Squarely for:**
+
+- **Backend/network services written or maintained by an AI coding agent,
+  with no human reviewing every line before it runs.** This is the one
+  problem nothing else on the market is built for from the grammar up: an
+  LL(1) grammar exported to GBNF lets a sampler force every token an agent
+  emits to stay syntactically valid; `--format=json` gives a self-repair
+  loop a structured proof obligation instead of a paragraph to guess at;
+  `sandbox` is a real OS process and a language primitive, not a bolted-on
+  Docker wrapper around output nobody trusts; and there is no mutex in the
+  language, so an agent literally cannot generate a deadlock. If you're
+  building an autonomous coding agent, or letting one operate against
+  production, this is the concrete gap Nirdosha targets.
+- **Compliance-shaped CRUD systems** — trade finance, KYC/onboarding,
+  anything where "who is allowed to call this" is part of the spec, not an
+  afterthought. `requires(role: "admin")` / `requires(claim: "department",
+  "cardiology")` are type-checked at the call site, not `if user.role ==
+  "admin"` sprinkled through handlers — §6's UI engine derives the
+  login/role gate automatically from the same annotation.
+- **Deterministic simulations and audits**, where "run it twice, get the
+  same trace" matters. `rand_seed` resets a from-scratch RNG with no OS
+  entropy, so a run is byte-for-byte reproducible from a seed.
+
+**Not (yet) for:**
+
+- OS/kernel or embedded work — no `no_std`, no freestanding target; the
+  runtime assumes a real OS underneath it for threads and processes.
+- General frontend/UI work — `emit-ui`/`serve` generate CRUD + dashboard
+  screens from struct/fn naming, not a general application-UI framework.
+- Anything where you need the crate ecosystem, hiring pool, or decade of
+  production hardening Rust/Go already have. Nirdosha is two days into
+  being public; picking it over Rust today is a research bet, not an
+  engineering one — see §10.
+
+## 4. Grammar
 
 The parser (`compiler/src/parser.rs`) is **hand-written recursive descent
 with strictly one token of lookahead and no backtracking, anywhere** — the
@@ -128,7 +170,7 @@ Notable choices:
   `claim`) are matched only in their leading slot, so they stay ordinary
   identifiers everywhere else.
 
-## 4. Features
+## 5. Features
 
 Mined from the actual implementation (`compiler/src/`), not the design
 docs. See [`LANGUAGE.md`](./LANGUAGE.md) for the authoritative reference.
@@ -207,7 +249,7 @@ own concrete type arguments, the same way it does through `box`.
 `frobenius_norm`, `trace`, matrix×matrix and matrix×vector multiply with
 shape checking at typecheck time. `Vector * Vector` is a **type error by
 design** (ambiguous inner vs. outer product) — use `dot()`. The whole
-linalg feature set is modeled on Julia and now **compiled** (see §6).
+linalg feature set is modeled on Julia and now **compiled** (see §7).
 
 ### I/O & networking
 `print`, `file` handles (`open`/`read`/`write`/`stop`), `tcp` client
@@ -221,10 +263,10 @@ including cross-process transactions, and a `redis`-backed message queue.
 ### Structured diagnostics (row 9)
 Every error — type, ownership, runtime — has **one structured shape**
 (`Diagnostic` JSON via `--format=json`), not English prose. This is what
-makes the LLM self-repair loop (§7) possible: the model gets a
+makes the LLM self-repair loop (§8) possible: the model gets a
 machine-parseable proof obligation back, not a sentence to guess at.
 
-## 5. The UI engine
+## 6. The UI engine
 
 Nirdosha ships a **declarative UI DSL** plus a UI generator that derives a
 full CRUD + dashboard web application from a program's `struct`
@@ -281,9 +323,9 @@ dashboard {
 ### Serving
 `nirdosha serve <file.nir>` runs a `tiny_http` server exposing the inferred
 functions as a JSON API (`POST /api/<fn>`), with optional OIDC JWKS/issuer/
-audience gating — the same identity primitives as §4, applied to HTTP.
+audience gating — the same identity primitives as §5, applied to HTTP.
 
-## 6. Benchmarks
+## 7. Benchmarks
 
 Full methodology and caveats in [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
 Numbers are **compiled-vs-compiled**, best-of-3 wall time, every output
@@ -321,7 +363,7 @@ codegen there.)
 
 Benchmarks live in [`benchmarks/{c,julia,nirdosha}/`](./benchmarks/).
 
-## 7. LLM integration
+## 8. LLM integration
 
 Nirdosha is designed so an LLM is a **first-class programmer**: agents emit
 **typed AST/IR fragments the compiler validates before splicing**, not raw
@@ -373,7 +415,7 @@ context — the same re-prompt loop a real self-repair integration would use.
 It ships mock models today; wiring a real LLM API is a distinct, separate
 piece of work the harness is built to plug into.
 
-## 8. Try it out today
+## 9. Try it out today
 
 ### Build the compiler
 
@@ -444,7 +486,7 @@ Start small (`hello.nir` → `factorial.nir` → `ownership.nir` →
 `sandbox.nir`), then the domain-scale examples (`store.nir`,
 `transact.nir`, `rev-assurence/`, `trade-finance/`).
 
-## 9. Honest scope
+## 10. Honest scope
 
 This README states what's real and checkable today vs. what's aspirational,
 following the project's own discipline (see `goal.md`'s "Honest correction"

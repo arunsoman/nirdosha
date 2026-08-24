@@ -1,0 +1,26 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies (clang, z3)
+        run: sudo apt-get update && sudo apt-get install -y clang libz3-dev
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            compiler/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('compiler/Cargo.lock') }}
+      - name: Build
+        working-directory: compiler
+        run: cargo build --release
