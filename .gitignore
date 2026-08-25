@@ -12,5 +12,8 @@
 # Runtime database artifacts
 *.db
 
+# Claude Code local session/state (never commit)
+/.claude
+
 # Launch marketing drafts (not project documentation)
 /announcements
