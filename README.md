@@ -72,8 +72,8 @@ here is simulated — see §6, §7, §11.*
 6. [Features](#6-features)
 7. [The UI engine](#7-the-ui-engine)
 8. [Benchmarks](#8-benchmarks)
-9. [LLM integration — code in Nirdosha without learning Nirdosha](#9-llm-integration)
-10. [Try it out today](#10-try-it-out-today)
+9. [LLM integration](#9-llm-integration)
+10. [Try it out today — code in Nirdosha without learning Nirdosha](#10-try-it-out-today--code-in-nirdosha-without-learning-nirdosha)
 11. [Honest scope](#11-honest-scope)
 
 ---
@@ -91,7 +91,7 @@ guarantee, and the name states it up front.
 
 ## 2. Motivation
 
-The design is driven by **eleven requirements, treated as one set** —
+The design is driven by **twelve requirements, treated as one set** —
 because none of them stands independently of the others. Roughly half are
 things a compiler can *prove* (hard), half are things that can only be
 *measured* against how humans and models behave (soft). A design that
@@ -113,6 +113,7 @@ from the start**.
 | 9 | AI as a first-class citizen | measured; agent-facing API is hard-typed |
 | 10 | Tamper-evidence — detect "alien" code in the binary | proof (reproducible builds, content-addressed source) — **aspirational** |
 | 11 | Closed product types, sum types, generics | proof (decidable) — `struct`/`enum`/`match` + per-instantiation generics |
+| 12 | Capability-gated access — "who is allowed to call this" is checked, not trusted | proof (statically checked at the call site) — `requires(role/claim: ...)` + `acquire`d `RoleView`/`ClaimView` proofs |
 
 **The constraint that shapes everything** is Rice's theorem (1953): no
 algorithm can decide a non-trivial semantic property (termination, race,
@@ -297,6 +298,23 @@ dotted-path siblings for nested IdP schemas like Keycloak) produce
 `RoleView` / `ClaimView` proofs. `requires(role: "admin")` /
 `requires(claim: "department", "cardiology")` on a `fn` demands such a
 proof at the call site — capability-gated, statically tracked.
+
+### Workflows (row 9)
+`workflow Name { data { ... } state ... }` declares a durable, named
+state machine — `state`s, `on <Event> -> <Target>` transitions (a `link`
+mark makes one an unauthenticated, single-use magic link), and
+`on_entry`/`on_exit` actions that can call the notification builtins
+(`send_email`/`send_sms`/`send_push`/`notify`). It's **pure desugaring,
+not a new runtime primitive**: `workflow_lower.rs` turns the block into
+ordinary `fn`/`enum`/`struct` declarations right after parsing, so
+`nirdosha serve`'s automatic `POST /api/<fn>` RPC exposure — and every
+other later pass — never sees `workflow` syntax itself. `on_entry`/
+`on_exit` actions are crash-durable (logged before running, replayed on
+restart), the same discipline `transact` already uses. Interpreter-only,
+the same way `transact`/`db`/`mq` are (§11): `nirdosha build`/`emit-llvm`
+cleanly rejects a program using `workflow`, naming the specific
+unsupported builtin, never a silent mis-compile. Full grammar and
+runtime protocol in [`WORKFLOW.md`](./WORKFLOW.md).
 
 ### Data types & generics (row 11)
 `struct`, `enum`, and `match` (exhaustive, no wildcard/binding patterns in
@@ -534,7 +552,15 @@ prompt doesn't repeat it. The loop — generate, compile, fix, feed the
 fix back into the prompt — is how this guide gets better, not a one-time
 write-up.
 
-## 10. Try it out today
+## 10. Try it out today — code in Nirdosha without learning Nirdosha
+
+**Don't want to learn the syntax first?** Paste
+[`agent-skills/nirdosha/paste-anywhere-prompt.md`](./agent-skills/nirdosha/paste-anywhere-prompt.md)
+into any LLM chat (ChatGPT, Claude.ai, Gemini, ...), describe what you
+want in plain English, and it writes the `.nir` code for you — no
+install needed for that step. See [§9](#9-llm-integration) for what
+that's been used to build. The install below is for actually running
+the code it hands you back.
 
 ### Install (no Rust, no clang, no z3)
 
@@ -656,8 +682,14 @@ notes):
   engine (`emit-ui`/`serve`), the GBNF artifact, the benchmark harness.
 - **Interpreter-only (rejected at compile time, not mis-compiled)**:
   `spawn`/`join`/`thread`/`chan`/`send`/`recv`, `sandbox`, and
-  `struct`/`enum`/`match` over *affine-containing* payloads. A program that
-  never actually uses one compiles normally.
+  `struct`/`enum`/`match` over *affine-containing* payloads, plus every
+  `db`/`json`/`http` builtin, identity (`oidc_validate_token`/
+  `check_role`/`extract_claim`), `transact`, and `workflow` — none of
+  these is in `codegen.rs`'s `PHASE4_BUILTINS`/`PHASE5_BUILTINS`/
+  `STR_CRYPTO_BUILTINS`/`RAND_BUILTINS` allowlists, so `nirdosha build`/
+  `emit-llvm` names the specific unsupported builtin and stops, rather
+  than silently miscompiling it. A program that never actually uses one
+  compiles normally.
 - **Aspirational, not built**: row 10's full ambition (reproducible builds,
   content-addressed source, capability manifests at the kernel boundary, a
   signed provenance chain) — a future implementation pass extending the
