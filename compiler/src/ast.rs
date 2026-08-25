@@ -1290,6 +1290,41 @@ pub struct Program {
 /// / the UI DSL design doc for the full key vocabulary.
 pub type KvEntry = (String, Expr);
 
+/// `field <name> { format: "..." }` — sugar over `pattern: "<regex>"` for
+/// a fixed, finite set of common `str` shapes, so an author (or an LLM
+/// writing `.nir` from a user story) doesn't have to hand-roll a regex
+/// for the same handful of formats every project needs. Deliberately a
+/// small, closed vocabulary rather than open-ended — `pattern` is
+/// already the fully general escape hatch for anything not listed here.
+/// Shared between `typeck.rs::check_screen` (validates the name is one
+/// of these) and `ui_gen.rs` (resolves it into the same `pattern` slot
+/// `FieldSpec`/`ValidatedField` already carry, so client and server
+/// enforcement are the literal same string, not two independently
+/// maintained regexes).
+///
+/// - `"email"` — pragmatic `local@domain.tld` shape, not full RFC 5322
+///   (matching HTML5 `<input type=email>`'s own lenient posture).
+/// - `"phone"` — lenient international: optional leading `+`, 7-15
+///   digits. Doesn't validate a specific country's numbering plan.
+/// - `"date"` — ISO 8601 `YYYY-MM-DD`, the same value shape a `date`-
+///   named field's `<input type=date>` picker already produces
+///   (`ui_gen.rs::is_date_like_field_name`) — this is what actually
+///   enforces it server-side, since that picker is client-side/cosmetic
+///   only and a direct API call bypasses it entirely.
+/// - `"url"` — `http://` or `https://` followed by at least one
+///   non-whitespace character.
+/// - `"uuid"` — canonical 8-4-4-4-12 hyphenated hex.
+pub fn well_known_format_pattern(name: &str) -> Option<&'static str> {
+    match name {
+        "email" => Some(r"^[^\s@]+@[^\s@]+\.[^\s@]+$"),
+        "phone" => Some(r"^\+?[0-9]{7,15}$"),
+        "date" => Some(r"^\d{4}-\d{2}-\d{2}$"),
+        "url" => Some(r"^https?://\S+$"),
+        "uuid" => Some(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"),
+        _ => None,
+    }
+}
+
 /// `field <name> { ... }` inside a `screen` block — overrides/supplements
 /// one field's label, formatting, searchability, sortability, and
 /// view/edit visibility for the struct's inferred UI. Every entry is a

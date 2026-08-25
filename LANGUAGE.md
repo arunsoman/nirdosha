@@ -595,6 +595,10 @@ screen Product {
     title: "Catalog"
     field name {
         label: "Product Name"
+        pattern: "^[A-Za-z0-9 ]+$"
+    }
+    field stock {
+        min: 0
     }
     action "Restock +10" -> restock_product {
         style: "outlined"
@@ -628,8 +632,12 @@ parser): `screen <Name>` must name a real `struct`; every `field
 `delete`, and every `action`'s `->` target, must resolve to a real
 function; `view`/`edit` must be `role(...)`/`claim(...)` calls with
 string-literal arguments (the same shape `requires(...)` itself already
-accepts); `dashboard`'s `tile`/`chart` targets must resolve to real
-functions.
+accepts); `pattern` must be a string literal that compiles as a valid
+regex, and only on a `str` field; `format` must be one of a fixed set
+of named shapes (below), and only on a `str` field; `min`/`max` must be
+an int/float literal, and only on a numeric field; `pattern` and
+`format` may not both be declared on the same field; `dashboard`'s
+`tile`/`chart` targets must resolve to real functions.
 
 **What `screen`/`dashboard` currently change in the generated UI**:
 `title` overrides the nav label/heading/toast text (default: the struct
@@ -641,14 +649,140 @@ label everywhere one is shown (default: the raw field name); `list`/
 renders as an extra per-row button beyond the inferred CRUD set, calling
 `<fn>` with just the row's own primary-key-shaped first param (the same
 single-param shape a declared `delete` action already uses) —
-`window.confirm(...)`-gated when `confirm` is set.
+`window.confirm(...)`-gated when `confirm` is set. `field { view, edit }`
+(role/claim visibility) is enforced both client- and server-side (see
+below). `field { pattern: "<regex>" }` / `field { min/max: ... }`
+constrain a `str`/numeric field's value on both `create_<S>` and
+`update_<S>` — a violating submission is rejected with a `400` naming
+the offending field, both as native HTML5 `pattern`/`min`/`max`
+attributes on the generated form (client-side, cosmetic) and, the real
+boundary, in `serve.rs::check_field_validations` before the fn's own
+body ever runs. `field { format: "..." }` is sugar over `pattern` for a
+fixed, closed vocabulary — `"email"`, `"phone"`, `"date"`, `"url"`,
+`"uuid"` — expanding to the matching regex at typeck/`ui_gen` time
+(`ast::well_known_format_pattern`); anything else needs a hand-written
+`pattern`.
+
+**Field-level `view`/`edit` RBAC is real, both sides**: `ui_gen.rs`
+computes `view_roles`/`view_claim`/`edit_roles`/`edit_claim` per field
+and applies them to both the list/detail view and the create/update
+form; `serve.rs` independently redacts every view-gated field to `null`
+in every response (`redact_gated_fields`, including the generic
+`/_nirdosha/table/<name>` route) and rejects (`403`) a real change to
+an edit-gated field from an unauthorized caller
+(`check_edit_gates`) — the client-side hide/disable is cosmetic
+convenience, not the security boundary.
 
 **What's parsed and typechecked but not yet wired into the generated
 UI**: `paginate { page_size, total }`, `field { searchable, sortable }`,
-`field { view, edit }` (role/claim visibility — parses, but nothing
-server-side enforces it yet), form insert-vs-update auto-hide-primary-key
-behavior. Tracked, with the reason each is still open, in
-`compiler/UI_DSL_TODO.md`.
+form insert-vs-update auto-hide-primary-key behavior. Tracked, with the
+reason each is still open, in `compiler/UI_DSL_TODO.md`.
+
+### 11a. Identity role-mapping cache (`ROADMAP.md` Track A item A6)
+
+`requires(role: "compliance_officer")` and every `screen` field's
+`view`/`edit` role gate only ever matched, historically, if the IdP
+token's `roles` claim contained that *exact* string — no translation
+layer, so a renamed IdP group or an app deployed against two IdPs with
+different naming conventions would silently stop matching, with no
+error. An ordinary admin-editable struct closes this gap, the same
+"free CRUD screen, no new language surface" convention `EmailProvider
+Config` (§14) already established:
+
+```nirdosha
+struct RoleMapping {
+    id: i64,
+    app_role: str,
+    idp_role: str,
+}
+// + list_/create_/update_/delete_role_mapping fns, same shape as any
+// other CRUD screen (see scratch/nirdosha_llm_prompt.md's standing
+// fixture for a complete worked example).
+```
+
+`nirdosha serve --db <path>` loads every `(app_role, idp_role)` row of
+`role_mapping` (if the table exists — a program that never declares
+`RoleMapping` gets byte-for-byte the original literal-match-only
+behavior) into an in-memory cache once at startup, then re-reads it at
+most once every 30 seconds, on demand, the next time a request needs
+it (never on a fixed background timer) — bounded staleness (an admin's
+edit takes up to 30s to take effect), not real-time, the same disclosed
+tradeoff `resolve_identity`'s own token-`expires_at` check already is.
+Every `requires(role: ...)` check and every `screen` field's `view`/
+`edit` gate now passes through this cache (`serve.rs::
+identity_has_mapped_role`): the identity's raw token roles satisfy
+`app_role` if they contain it *literally* (checked first, so a program
+with no `RoleMapping` declared, or an identity whose token already uses
+the app's own vocabulary, is completely unaffected) **or** if they
+contain any `idp_role` the table maps to that `app_role`. One app role
+may have more than one IdP-side synonym (e.g. migrating naming
+conventions). This is `--db`-gated like every other `--db`-only feature
+in this file — omit `--db` and role checks are exactly what they always
+were, no mapping cache at all.
+
+### 11b. Design-token theming: `--theme`, real motion/interaction, live reload
+
+`--theme <path>` (`emit-ui`/`serve`) layers a per-project design system
+on top of the baked-in Material Design 3 defaults — `ui_gen::Theme`
+(`compiler/src/ui_gen.rs`) is a 1:1 mirror of protobox's
+`resolve_design_tokens(spec)` JSON shape (`be-v2/src/features/
+design_studio/generate_palettes.py`): a project's `theme.json` **is**
+that function's direct output, no hand-picked subset, no second
+field-name vocabulary to keep in sync by hand. Every top-level section
+(`brand`/`neutral` 11-step ramps, `fonts`, `radius`, `shadow_card`,
+`density`, `motion`, `dark_mode`, `layout`, `type_scale`) is optional —
+an absent section leaves those tokens at their MD3 defaults, so a
+`.nir` app with no `--theme` at all renders exactly as it did before
+this existed.
+
+**What a theme actually changes**:
+- **Color**: `brand`/`neutral` ramps resolve into the existing `--md-
+  primary`/`--md-surface`/etc. custom properties via a fixed semantic-
+  role → ramp-step mapping (light and dark steps chosen per role,
+  `ui_gen.rs`'s own `RampRoleStep` table) — not sourced from a
+  protobox internal file, an ordinary Tailwind-ramp convention chosen
+  for this integration.
+- **Motion**: real `@keyframes` (`fade-in`/`slide-up`/`scale-in`/
+  `pop` — a fixed 4-name vocabulary, matching protobox's own "no other
+  animate-* names exist" contract) drive a screen's entrance animation
+  and a table's per-row staggered entrance (`--stagger-ms`, JS-computed
+  `animation-delay` per row, same convention protobox's own React
+  codegen prompt describes). Every interactive element (buttons, nav
+  items, inputs, selects) gets real `transition`/`:hover`/
+  `:focus-visible`/`:active`/`:disabled` states — hover lift+scale,
+  press scale, driven by `--hover-lift-px`/`--hover-scale`/
+  `--press-scale`. `motion: "none"` needs no special-casing anywhere:
+  its duration/lift/scale values are all already zero/neutral, so
+  every transition/animation using them is naturally instant/absent.
+  `prefers-reduced-motion` is honored unconditionally, globally, with
+  no DSL surface to opt in.
+- **`dark_mode`** (`"none"`/`"media"`/`"class"`/`"always"`): `"media"`
+  (the default when a ramp is set with no explicit strategy) keeps
+  today's `prefers-color-scheme` block; `"class"` wraps the same
+  overrides in `:root.dark` instead, plus a tiny inline bootstrap
+  script (system-preference-only — no manual toggle control exists in
+  this template) that adds the class before first paint; `"always"`
+  writes the dark values directly into the base `:root` (no light
+  variant at all); `"none"` emits no dark block regardless of ramp
+  presence.
+- **`layout.app_shell`/`content_width`**: CSS-only variants on the one
+  fixed shell, applied via a static `<html class="...">` computed once
+  at generation time (`ui_gen::theme_html_class`) — `"auto"`/absent
+  keeps today's nav-rail + top-app-bar shell, byte-for-byte, for every
+  `.nir` app that predates this field. `"topbar"` repositions the same
+  nav rail into a horizontal bar; `"minimal"` hides it entirely for a
+  centered single-column layout (protobox's own "auth-style" prose).
+  `"boxed"`/`"fluid"` cap or uncap `main`'s width.
+
+**Live reload**: `--theme <path>` used to be read once, at `nirdosha
+serve` startup — a redeployed `theme.json` needed a full restart.
+`serve.rs`'s `ThemeCache` now re-reads the file on `GET /`, at most
+once per 30-second TTL (env-overridable for tests, same seam
+`RoleMappingCache`'s TTL uses) — bounded staleness, the same disclosed
+tradeoff the role-mapping cache above already takes. A missing file, an
+I/O error, or a `theme.json` that doesn't parse (an editor's
+half-written save) is tolerated: logged to stderr, the last-good page
+kept serving, never a crash or a broken response.
 
 ## 12. `module "Name" { ... }` — nav grouping, not scoping
 

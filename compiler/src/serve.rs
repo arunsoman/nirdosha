@@ -42,7 +42,14 @@
 //! same `identity_has_role`/`identity_claim` helpers the `check_role`/
 //! `extract_claim` builtins themselves use (`interpreter.rs`) — one
 //! source of truth, not a third copy of "does this identity have that
-//! role."
+//! role." A role check specifically (never a claim check) additionally
+//! passes through `identity_has_mapped_role`/`RoleMappingCache` —
+//! `ROADMAP.md` Track A6 — so a `RoleMapping`-configured project
+//! translates the app's own role vocabulary into whatever the connected
+//! IdP actually emits; `identity_has_role` itself stays untouched and
+//! still means literal-match, since it's also the in-language
+//! `check_role` builtin's own implementation, which has no server-only
+//! cache to consult.
 
 use std::sync::Arc;
 
@@ -104,7 +111,16 @@ fn read_limited_body(request: &mut tiny_http::Request) -> Result<String, (u16, S
 /// tuned production server). `identity_base`, if given, is baked into
 /// the served UI so its login screen talks to a real (mock) identity
 /// app instead of the pure client-side stub (`ui_gen::generate`'s doc
-/// comment).
+/// comment). `otel_port`/`otel_token` are `observability.rs`'s layer 2a
+/// — see that module's "Rollout layers 2-4" section: `otel_port` opens a
+/// second, loopback-only listener dedicated to APM consumers, separate
+/// from `port` above, and every request's own `Interpreter` (`dispatch`,
+/// below) carries the same dormant `Tracer`, gated live by whether an
+/// APM client is currently connected there. `main.rs::cmd_serve` refuses
+/// to call this with `otel_port: Some(_)` and `otel_token: None` — this
+/// function itself trusts that invariant rather than re-checking it, the
+/// same relationship it already has with `auth`'s all-or-nothing
+/// JWKS/issuer/audience validation.
 pub fn run(
     program: Arc<Program>,
     host: &str,
@@ -116,13 +132,47 @@ pub fn run(
     presence_token: Option<String>,
     db_path: Option<String>,
     theme: Option<&crate::ui_gen::Theme>,
+    theme_path: Option<&str>,
+    otel_port: Option<u16>,
+    otel_token: Option<String>,
 ) -> Result<(), String> {
     let registry = crate::ast::TypeRegistry::build(&program);
     let effects = crate::effects::infer_effects(&program, &registry);
-    let ui_html = crate::ui_gen::generate(&program, &effects, identity_base, db_path.is_some(), theme);
+    let server_table_api = db_path.is_some();
+    let ui_html = crate::ui_gen::generate(&program, &effects, identity_base, server_table_api, theme);
+    // Live theme reload: `--theme <path>` is otherwise read exactly once,
+    // at this startup — a redeployed `theme.json` would need a full
+    // server restart to take effect. Same TTL-cache pattern
+    // `RoleMappingCache` already established (eager value above, then
+    // re-checked/refreshed at most once per `theme_ttl()` window, on
+    // demand rather than a background timer): bounded staleness (a new
+    // theme takes effect within one TTL window, no restart), the same
+    // disclosed tradeoff every other "does this update live" feature in
+    // this file already takes. `None` without `--theme` at all — the
+    // cache is never consulted, `GET /` serves the captured `ui_html`
+    // above forever, byte-for-byte today's behavior.
+    let theme_cache: Option<Arc<std::sync::Mutex<ThemeCache>>> =
+        theme_path.map(|_| Arc::new(std::sync::Mutex::new(ThemeCache { html: ui_html.clone(), loaded_at: std::time::Instant::now() })));
     let auth = Arc::new(auth);
     let transact_log_path = Arc::new(transact_log_path);
     let workflow_log_path = Arc::new(workflow_log_path);
+    // Layer 2a: built once, dormant, for the server's whole lifetime —
+    // every request's `Interpreter` gets a cheap `Arc::clone` of this
+    // same `Tracer` (`dispatch`, below), same threading `--otel-console`
+    // already established (`lib.rs`'s `_with_tracer` variants). `None`
+    // entirely when `--otel-port` wasn't passed: no listener, no
+    // `Tracer`, byte-for-byte the same server this always was.
+    let tracer = match otel_port {
+        Some(p) => {
+            let t = crate::observability::Tracer::new_dynamic();
+            let token = otel_token.expect("cmd_serve requires --otel-token whenever --otel-port is set");
+            crate::observability::spawn_otel_port_listener(Arc::clone(&t), p, token)
+                .map_err(|e| format!("failed to bind --otel-port {p}: {e}"))?;
+            eprintln!("nirdosha serve: APM port listening on http://127.0.0.1:{p} (dormant until an APM client connects)");
+            Some(t)
+        }
+        None => None,
+    };
     let presence_token = Arc::new(presence_token);
     // `--db <path>`: opens one shared connection, direct rusqlite (not
     // through the interpreter), backing the generic
@@ -140,6 +190,14 @@ pub fn run(
         None => None,
     };
     let table_catalog = Arc::new(build_table_catalog(&program));
+    // ROADMAP.md A6's role-mapping cache — see `RoleMappingCache`'s own
+    // doc comment. `None` without `--db` (the same all-or-nothing
+    // posture every other `--db`-gated feature here already takes):
+    // `identity_has_mapped_role` falls back to plain literal-match
+    // `identity_has_role` behavior whenever this is `None`, so omitting
+    // `--db` leaves role checks byte-for-byte what they always were.
+    let role_mapping_cache: Option<Arc<std::sync::Mutex<RoleMappingCache>>> =
+        table_db.as_ref().map(|_| Arc::new(std::sync::Mutex::new(RoleMappingCache::empty())));
 
     // Schema migration (`migrate.rs`) once, before crash replay -- replay
     // may write to tables a migration is about to create. Only runs when
@@ -157,6 +215,23 @@ pub fn run(
             }
             Err(e) => return Err(format!("schema migration failed: {e}")),
         }
+    }
+
+    // Eager first load of the role-mapping cache, right after migration
+    // (so `role_mapping` is guaranteed to exist if `RoleMapping` was
+    // declared) and before the server accepts any request — ROADMAP.md
+    // A6's own stated design ("load once into a long-lived structure at
+    // `serve::run` startup, refreshed on a short TTL"). Without this, a
+    // mapping already present in the DB before this process started
+    // wouldn't take effect until the first TTL window elapsed, since
+    // `RoleMappingCache::empty()`'s `loaded_at` is "just now," which
+    // `refresh_role_mapping_if_stale` would otherwise read as "already
+    // fresh, nothing to do."
+    if let (Some(db), Some(cache)) = (&table_db, &role_mapping_cache) {
+        let conn = db.lock().unwrap();
+        let mut guard = cache.lock().unwrap();
+        guard.by_app_role = load_role_mapping(&conn);
+        guard.loaded_at = std::time::Instant::now();
     }
 
     // Crash replay (`TRANSACT.md`'s Layer 4) once, before the server ever
@@ -206,7 +281,14 @@ pub fn run(
         }
 
         if method == tiny_http::Method::Get && url == "/" {
-            let mut resp = tiny_http::Response::from_string(ui_html.clone())
+            let html = match (&theme_cache, theme_path) {
+                (Some(cache), Some(path)) => {
+                    refresh_theme_html_if_stale(cache, path, &program, &effects, identity_base, server_table_api);
+                    cache.lock().unwrap().html.clone()
+                }
+                _ => ui_html.clone(),
+            };
+            let mut resp = tiny_http::Response::from_string(html)
                 .with_header(header("Content-Type", "text/html; charset=utf-8"));
             for h in cors_headers() {
                 resp.add_header(h);
@@ -241,7 +323,7 @@ pub fn run(
                 let (status, payload) = match &table_db {
                     Some(db) => match resolve_identity(auth_header.as_deref(), auth.as_ref().as_ref(), &workflow_log_path) {
                         Ok(identity) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            dispatch_table_query(db, &table_catalog, table, &body, &program, identity.as_ref())
+                            dispatch_table_query(db, &table_catalog, table, &body, &program, identity.as_ref(), role_mapping_cache.as_deref())
                         }))
                         .unwrap_or_else(|_| (500, json_err("internal server error"))),
                         Err(status_body) => status_body,
@@ -328,6 +410,8 @@ pub fn run(
                         &transact_log_path,
                         &workflow_log_path,
                         table_db.as_deref(),
+                        tracer.as_ref(),
+                        role_mapping_cache.as_deref(),
                     )
                 })) {
                     Ok(result) => result,
@@ -386,6 +470,177 @@ fn to_snake_case(name: &str) -> String {
 /// SQLite can't bind an identifier as a `?` parameter, only a value, so
 /// allowlisting first is the only correct way to build a dynamic
 /// `ORDER BY`/`WHERE`, not a shortcut.
+/// `ROADMAP.md` A6's "identity admin console" — role mapping half. A
+/// per-project, admin-editable `RoleMapping { app_role: str, idp_role:
+/// str }` table (an ordinary struct, same "communication control"
+/// free-CRUD-screen convention `EmailProviderConfig` established)
+/// translates the app's canonical role vocabulary into whatever the
+/// connected IdP actually puts in a token's `roles` claim — without
+/// this, `requires(role: "compliance_officer")` and every `screen`
+/// field's `view`/`edit` gate only ever matched if the `.nir` source's
+/// string literal was byte-identical to the IdP's own role name, with
+/// no translation layer and no error when it silently stopped matching
+/// (a renamed IdP group, or two identical apps on two different IdPs
+/// with different naming conventions).
+///
+/// In-memory, refreshed on a short TTL rather than re-queried on every
+/// single auth check (this server's request loop is strictly
+/// sequential — one process, no concurrent requests — so a plain
+/// `Mutex` needs no contention story, just interior mutability for a
+/// free function to update from a `&` reference). Bounded staleness (an
+/// admin's edit takes up to one TTL window to take effect) is an
+/// accepted, disclosed tradeoff — the same category of real-clock/
+/// real-world exception `resolve_identity`'s own token-`expires_at`
+/// check already is, not a new violation of `.nir`'s own determinism
+/// story (this cache lives entirely in `serve.rs`, never touched by
+/// interpreted `.nir` code itself).
+struct RoleMappingCache {
+    /// app_role -> every idp_role that maps to it (a role can have more
+    /// than one IdP-side synonym, e.g. migrating naming conventions).
+    by_app_role: std::collections::HashMap<String, Vec<String>>,
+    loaded_at: std::time::Instant,
+}
+
+/// `RoleMappingCache::empty()`'s empty map is the correct "no mapping
+/// configured" state, not a sentinel needing special-casing:
+/// `identity_has_mapped_role` falls back to `identity_has_role`'s
+/// literal-match behavior whenever the map has no entry for the app
+/// role being checked, so a program that never declares `RoleMapping`
+/// (or one whose table is just empty) behaves byte-for-byte like it
+/// always did.
+impl RoleMappingCache {
+    fn empty() -> Self {
+        Self { by_app_role: std::collections::HashMap::new(), loaded_at: std::time::Instant::now() }
+    }
+}
+
+/// 30s in production. `tests/role_mapping.rs` (an integration test,
+/// compiled as its own crate against a normally-built `nirdosha` rlib —
+/// `#[cfg(test)]` items in this crate aren't visible to it at all, so
+/// that's not an available seam) overrides this via
+/// `NIRDOSHA_TEST_ROLE_MAPPING_TTL_MS` to prove the actual TTL boundary
+/// with a real, just much shorter, wait instead of eating a 30-second
+/// tax on every test run or faking the clock. Same opt-in-override
+/// pattern `NIRDOSHA_TEST_POSTGRES_URL` already established for this
+/// codebase's other environment-dependent-by-nature integration tests.
+fn role_mapping_ttl() -> std::time::Duration {
+    if let Some(ms) = std::env::var("NIRDOSHA_TEST_ROLE_MAPPING_TTL_MS").ok().and_then(|s| s.parse::<u64>().ok()) {
+        return std::time::Duration::from_millis(ms);
+    }
+    std::time::Duration::from_secs(30)
+}
+
+/// Reads every `(app_role, idp_role)` row of `role_mapping`, if the
+/// table exists at all — a program that never declared a `RoleMapping`
+/// struct has no such table, and `migrate.rs` only ever creates tables
+/// for structs the program actually declares, so a missing-table query
+/// error here is the normal "not opted into this feature" case, not a
+/// fault; tolerated the same way `check_edit_gates`/`send_via_channel`
+/// already tolerate "no such row/table yet" elsewhere in this codebase.
+fn load_role_mapping(conn: &rusqlite::Connection) -> std::collections::HashMap<String, Vec<String>> {
+    let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT app_role, idp_role FROM role_mapping") {
+        if let Ok(rows) = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+            for (app_role, idp_role) in rows.flatten() {
+                out.entry(app_role).or_default().push(idp_role);
+            }
+        }
+    }
+    out
+}
+
+/// Reloads `cache` from `db` only if the TTL has elapsed — called once
+/// per request (cheap: just an `Instant::elapsed` check under the lock
+/// in the common case), so an admin's edit through the `RoleMapping`
+/// CRUD screen is picked up within one TTL window without a DB round
+/// trip on every single request.
+fn refresh_role_mapping_if_stale(cache: &std::sync::Mutex<RoleMappingCache>, db: &std::sync::Mutex<rusqlite::Connection>) {
+    let mut guard = cache.lock().unwrap();
+    if guard.loaded_at.elapsed() < role_mapping_ttl() {
+        return;
+    }
+    let conn = db.lock().unwrap();
+    guard.by_app_role = load_role_mapping(&conn);
+    guard.loaded_at = std::time::Instant::now();
+}
+
+/// The actual translated role check every `requires(role: ...)`/`view`/
+/// `edit` enforcement point below now goes through, in place of a bare
+/// `interpreter::identity_has_role` call: `app_role` matches if the
+/// identity's raw token roles contain `app_role` *literally* (today's
+/// pre-mapping behavior, always checked first so "no mapping
+/// configured" is exactly as fast and exactly as correct as before this
+/// feature existed) OR contain any `idp_role` the cache maps to
+/// `app_role`. `cache: None` (no `--db`, the same all-or-nothing
+/// posture every other `--db`-gated feature in this file already
+/// takes) skips the second half entirely — literal match only, byte-
+/// for-byte the original behavior.
+fn identity_has_mapped_role(identity: &Value, app_role: &str, cache: Option<&std::sync::Mutex<RoleMappingCache>>) -> bool {
+    if interpreter::identity_has_role(identity, app_role).unwrap_or(false) {
+        return true;
+    }
+    let Some(cache) = cache else { return false };
+    let guard = cache.lock().unwrap();
+    let Some(synonyms) = guard.by_app_role.get(app_role) else { return false };
+    synonyms.iter().any(|idp_role| interpreter::identity_has_role(identity, idp_role).unwrap_or(false))
+}
+
+/// Live theme reload's cached, ready-to-serve page — see `run`'s own
+/// `theme_cache` doc comment for the "why."
+struct ThemeCache {
+    html: String,
+    loaded_at: std::time::Instant,
+}
+
+/// 30s in production; overridable via `NIRDOSHA_TEST_THEME_TTL_MS` for
+/// `tests/theme_reload.rs`, same reasoning and same env-var-seam pattern
+/// as `role_mapping_ttl` above (a `#[cfg(test)]` item in this crate
+/// isn't visible to an integration-test crate at all).
+fn theme_ttl() -> std::time::Duration {
+    if let Some(ms) = std::env::var("NIRDOSHA_TEST_THEME_TTL_MS").ok().and_then(|s| s.parse::<u64>().ok()) {
+        return std::time::Duration::from_millis(ms);
+    }
+    std::time::Duration::from_secs(30)
+}
+
+/// Reloads `theme_path` from disk and regenerates `cache`'s HTML only if
+/// the TTL has elapsed — called on every `GET /` (cheap: just an
+/// `Instant::elapsed` check under the lock in the common case). A
+/// missing file, an I/O error, or a `theme.json` that doesn't parse
+/// (e.g. an editor's half-written save caught mid-write) is tolerated —
+/// logged to stderr, cache left exactly as it was — rather than ever
+/// serving a broken page or crashing the server over one bad edit; the
+/// next TTL window tries again.
+fn refresh_theme_html_if_stale(
+    cache: &std::sync::Mutex<ThemeCache>,
+    theme_path: &str,
+    program: &Program,
+    effects: &std::collections::HashMap<String, crate::effects::FnEffects>,
+    identity_base: Option<&str>,
+    server_table_api: bool,
+) {
+    let mut guard = cache.lock().unwrap();
+    if guard.loaded_at.elapsed() < theme_ttl() {
+        return;
+    }
+    guard.loaded_at = std::time::Instant::now();
+    let text = match std::fs::read_to_string(theme_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("nirdosha serve: live theme reload: error reading {theme_path}: {e} (keeping previous theme)");
+            return;
+        }
+    };
+    let theme: crate::ui_gen::Theme = match serde_json::from_str(&text) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("nirdosha serve: live theme reload: error parsing {theme_path}: {e} (keeping previous theme)");
+            return;
+        }
+    };
+    guard.html = crate::ui_gen::generate(program, effects, identity_base, server_table_api, Some(&theme));
+}
+
 fn build_table_catalog(program: &Program) -> std::collections::HashMap<String, Vec<String>> {
     const PRELUDE_STRUCT_NAMES: &[&str] =
         &["HttpResponse", "VerifiedIdentity", "RoleView", "ClaimView", "ApplicationSession", "RefreshTokenHandle", "Pair"];
@@ -445,7 +700,11 @@ fn dispatch_table_query(
     body: &str,
     program: &Program,
     identity: Option<&Value>,
+    role_mapping: Option<&std::sync::Mutex<RoleMappingCache>>,
 ) -> (u16, String) {
+    if let Some(cache) = role_mapping {
+        refresh_role_mapping_if_stale(cache, db);
+    }
     let Some(columns) = catalog.get(table) else {
         return (404, json_err(&format!("no such table `{table}`")));
     };
@@ -555,7 +814,7 @@ fn dispatch_table_query(
         Err(e) => return (500, json_err(&format!("query failed: {e}"))),
     };
     for row in &mut rows {
-        redact_gated_fields(row, identity, &view_gates);
+        redact_gated_fields(row, identity, &view_gates, role_mapping);
     }
 
     let body = serde_json::json!({ "rows": rows, "total": total, "page": page, "page_size": page_size }).to_string();
@@ -681,12 +940,17 @@ fn handle_presence(
 /// key/value, if either was declared; ungated (`roles` empty and `claim`
 /// `None`) always satisfies. No identity at all only satisfies an
 /// ungated field.
-fn identity_satisfies_gate(identity: Option<&Value>, roles: &[String], claim: &Option<(String, String)>) -> bool {
+fn identity_satisfies_gate(
+    identity: Option<&Value>,
+    roles: &[String],
+    claim: &Option<(String, String)>,
+    role_mapping: Option<&std::sync::Mutex<RoleMappingCache>>,
+) -> bool {
     if roles.is_empty() && claim.is_none() {
         return true;
     }
     let Some(id) = identity else { return false };
-    if roles.iter().any(|r| interpreter::identity_has_role(id, r).unwrap_or(false)) {
+    if roles.iter().any(|r| identity_has_mapped_role(id, r, role_mapping)) {
         return true;
     }
     if let Some((k, v)) = claim {
@@ -707,19 +971,24 @@ fn identity_satisfies_gate(identity: Option<&Value>, roles: &[String], claim: &O
 /// that ever changes. `gates` is unfiltered (may include edit-only
 /// entries with no `view` gate at all); those are simply never matched
 /// below since their `view_roles`/`view_claim` stay empty/`None`.
-fn redact_gated_fields(json: &mut JsonVal, identity: Option<&Value>, gates: &[crate::ui_gen::GatedField]) {
+fn redact_gated_fields(
+    json: &mut JsonVal,
+    identity: Option<&Value>,
+    gates: &[crate::ui_gen::GatedField],
+    role_mapping: Option<&std::sync::Mutex<RoleMappingCache>>,
+) {
     if gates.is_empty() {
         return;
     }
     match json {
         JsonVal::Array(items) => {
             for item in items {
-                redact_gated_fields(item, identity, gates);
+                redact_gated_fields(item, identity, gates, role_mapping);
             }
         }
         JsonVal::Object(m) => {
             if let Some(inner) = m.get_mut("ok") {
-                redact_gated_fields(inner, identity, gates);
+                redact_gated_fields(inner, identity, gates, role_mapping);
                 return;
             }
             if m.contains_key("err") {
@@ -729,7 +998,7 @@ fn redact_gated_fields(json: &mut JsonVal, identity: Option<&Value>, gates: &[cr
                 if g.view_roles.is_empty() && g.view_claim.is_none() {
                     continue;
                 }
-                if identity_satisfies_gate(identity, &g.view_roles, &g.view_claim) {
+                if identity_satisfies_gate(identity, &g.view_roles, &g.view_claim, role_mapping) {
                     continue;
                 }
                 if let Some(v) = m.get_mut(&g.field_name) {
@@ -755,10 +1024,15 @@ fn dispatch(
     transact_log_path: &std::path::Path,
     workflow_log_path: &std::path::Path,
     table_db: Option<&std::sync::Mutex<rusqlite::Connection>>,
+    tracer: Option<&Arc<crate::observability::Tracer>>,
+    role_mapping: Option<&std::sync::Mutex<RoleMappingCache>>,
 ) -> (u16, String) {
     let Some(f) = program.fns.iter().find(|f| f.name == fn_name) else {
         return (404, json_err(&format!("no such function `{fn_name}`")));
     };
+    if let (Some(db), Some(cache)) = (table_db, role_mapping) {
+        refresh_role_mapping_if_stale(cache, db);
+    }
 
     // Bearer token -> VerifiedIdentity, if present and valid.
     let identity: Option<Value> = match resolve_identity(auth_header, auth, workflow_log_path) {
@@ -768,13 +1042,17 @@ fn dispatch(
 
     // `requires(role/claim: ...)` is enforced here, independently of
     // `f`'s own parameter list — see this module's doc comment for why
-    // `call_named` alone can't be trusted to do this.
+    // `call_named` alone can't be trusted to do this. `Requirement::Role`
+    // goes through `identity_has_mapped_role`, not a bare
+    // `identity_has_role`, so a `RoleMapping`-configured project
+    // translates the IdP's own role name transparently here too, not
+    // just on `screen` field gates.
     if let Some(req) = &f.requires {
         match &identity {
             None => return (401, json_err(&format!("sign in required: {}", describe_requirement(req)))),
             Some(id) => {
                 let ok = match req {
-                    Requirement::Role(role) => interpreter::identity_has_role(id, role).unwrap_or(false),
+                    Requirement::Role(role) => identity_has_mapped_role(id, role, role_mapping),
                     Requirement::Claim(key, value) => interpreter::identity_claim(id, key).map(|v| v == *value).unwrap_or(false),
                 };
                 if !ok {
@@ -821,7 +1099,7 @@ fn dispatch(
                         if let Some(id) = obj.get("id").and_then(JsonVal::as_i64) {
                             let conn = db.lock().unwrap();
                             for g in &view_gates {
-                                if identity_satisfies_gate(identity.as_ref(), &g.view_roles, &g.view_claim) {
+                                if identity_satisfies_gate(identity.as_ref(), &g.view_roles, &g.view_claim, role_mapping) {
                                     continue;
                                 }
                                 let needs_fill = obj.get(&g.field_name).map(JsonVal::is_null).unwrap_or(true);
@@ -865,6 +1143,21 @@ fn dispatch(
         }
     }
 
+    // Field-level format validation (`screen <Struct> { field <name> {
+    // pattern/min/max: ... } }`) — unlike edit RBAC below, this needs no
+    // `--db` (nothing to compare against, just the incoming value) and
+    // applies to BOTH `create_<S>` and `update_<S>` (a brand-new row's
+    // fields need to satisfy the same format constraints an edited row's
+    // do). `typeck.rs::check_pattern_expr`/`check_min_max_expr` already
+    // proved each `pattern` compiles as a regex and every constrained
+    // field is a type it can actually apply to, so this only ever
+    // rejects on the *value*, never on a malformed declaration.
+    if let Some((struct_name, validations)) = crate::ui_gen::field_validations_for_fn(program, fn_name) {
+        if let Some(status_body) = check_field_validations(program, f, &args, &struct_name, &validations) {
+            return status_body;
+        }
+    }
+
     // Field-level `edit` RBAC (`screen <Struct> { field <name> { edit:
     // role(...) } }`) — enforced only for a struct's `update` slot (not
     // `create`, see `ui_gen::update_gates_for_fn`'s own doc comment for
@@ -875,20 +1168,23 @@ fn dispatch(
     // present" — every submission necessarily includes every field,
     // changed or not.
     if let (Some(db), Some((struct_name, gates))) = (table_db, crate::ui_gen::update_gates_for_fn(program, fn_name)) {
-        if let Some(status_body) = check_edit_gates(db, program, f, &args, &struct_name, &gates, identity.as_ref()) {
+        if let Some(status_body) = check_edit_gates(db, program, f, &args, &struct_name, &gates, identity.as_ref(), role_mapping) {
             return status_body;
         }
     }
 
     let program_arc = Arc::clone(program);
-    let interp = Interpreter::new(program_arc, Arc::from(""))
+    let mut interp = Interpreter::new(program_arc, Arc::from(""))
         .with_transact_log_path(transact_log_path.to_path_buf())
         .with_workflow_log_path(workflow_log_path.to_path_buf());
+    if let Some(t) = tracer {
+        interp = interp.with_tracer(Arc::clone(t));
+    }
     match interp.call_named_on_big_stack(fn_name, &args) {
         Ok(result) => match encode_value(&result, program) {
             Ok(mut json) => {
                 let view_gates = crate::ui_gen::field_gates_for_fn(program, fn_name);
-                redact_gated_fields(&mut json, identity.as_ref(), &view_gates);
+                redact_gated_fields(&mut json, identity.as_ref(), &view_gates, role_mapping);
                 (200, json.to_string())
             }
             Err(e) => (500, json_err(&format!("`{fn_name}` returned a value this server can't encode as JSON: {e}"))),
@@ -919,6 +1215,7 @@ fn check_edit_gates(
     struct_name: &str,
     gates: &[crate::ui_gen::GatedField],
     identity: Option<&Value>,
+    role_mapping: Option<&std::sync::Mutex<RoleMappingCache>>,
 ) -> Option<(u16, String)> {
     let struct_arg = f
         .params
@@ -949,10 +1246,74 @@ fn check_edit_gates(
         if unchanged {
             continue;
         }
-        if identity_satisfies_gate(identity, &g.edit_roles, &g.edit_claim) {
+        if identity_satisfies_gate(identity, &g.edit_roles, &g.edit_claim, role_mapping) {
             continue;
         }
         return Some((403, json_err(&format!("insufficient privilege: cannot change `{}.{}`", struct_name, g.field_name))));
+    }
+    None
+}
+
+/// The actual format-validation check `dispatch` runs before calling a
+/// `create_<S>` or `update_<S>` fn: finds the struct-typed arg among
+/// `args`, and for every `ValidatedField`, checks the incoming decoded
+/// value against its `pattern`/`min`/`max`. Unlike `check_edit_gates`,
+/// needs no `--db` connection at all — a format constraint is checked
+/// purely against the submitted value, never against what's currently
+/// stored. Returns `Some((400, ...))` for the first field that fails
+/// its constraint; `None` means every constrained field passes (or
+/// wasn't present as a real struct field/value pairing this can check
+/// at all, treated as "nothing to enforce," the same tolerant posture
+/// `check_edit_gates`/`value_matches_stored` already take for a
+/// pairing they can't compare).
+fn check_field_validations(
+    program: &Program,
+    f: &crate::ast::FnDecl,
+    args: &[Value],
+    struct_name: &str,
+    validations: &[crate::ui_gen::ValidatedField],
+) -> Option<(u16, String)> {
+    let struct_arg = f
+        .params
+        .iter()
+        .zip(args)
+        .find_map(|(p, v)| if matches!(&p.ty, Ty::Named(n, a) if n == struct_name && a.is_empty()) { Some(v) } else { None })?;
+    let Value::Struct(_, fields) = struct_arg else { return None };
+    let decl = resolve_struct(program, struct_name)?;
+    for v in validations {
+        let Some(field_idx) = decl.fields.iter().position(|fd| fd.name == v.field_name) else { continue };
+        let value = &fields[field_idx];
+        if let Some(pattern) = &v.pattern {
+            if let Value::Str(s) = value {
+                // Already proven to compile by `typeck.rs::check_pattern_expr`
+                // — a construction failure here would mean that guarantee
+                // broke, not that this request is malformed, so it's
+                // treated as "nothing to enforce" rather than a 500.
+                if let Ok(re) = regex::Regex::new(pattern) {
+                    if !re.is_match(s) {
+                        return Some((
+                            400,
+                            json_err(&format!("field `{}.{}` does not match the required pattern", struct_name, v.field_name)),
+                        ));
+                    }
+                }
+            }
+        }
+        let numeric = match value {
+            Value::Int(n) => Some(*n as f64),
+            Value::Float(n) => Some(*n),
+            _ => None,
+        };
+        if let (Some(n), Some(min)) = (numeric, v.min) {
+            if n < min {
+                return Some((400, json_err(&format!("field `{}.{}` must be >= {min}", struct_name, v.field_name))));
+            }
+        }
+        if let (Some(n), Some(max)) = (numeric, v.max) {
+            if n > max {
+                return Some((400, json_err(&format!("field `{}.{}` must be <= {max}", struct_name, v.field_name))));
+            }
+        }
     }
     None
 }

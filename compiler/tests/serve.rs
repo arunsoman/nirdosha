@@ -7,10 +7,10 @@
 //! it with a hand-rolled HTTP/1.1 request over a raw `TcpStream` — no
 //! HTTP client dependency needed for the test itself.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nirdosha::ast::Program;
 use nirdosha::ownership::check_ownership;
@@ -62,7 +62,7 @@ fn start_server(auth: Option<AuthConfig>) -> u16 {
     let transact_log = std::env::temp_dir().join(format!("nirdosha-test-transact-{port}.db"));
     let workflow_log = std::env::temp_dir().join(format!("nirdosha-test-workflow-{port}.db"));
     std::thread::spawn(move || {
-        nirdosha::serve::run(program, "127.0.0.1", port, auth, None, transact_log, workflow_log, None, None, None)
+        nirdosha::serve::run(program, "127.0.0.1", port, auth, None, transact_log, workflow_log, None, None, None, None, None, None)
             .expect("serve::run should not fail to bind");
     });
     for _ in 0..100 {
@@ -250,4 +250,126 @@ fn requires_gated_fn_with_a_garbage_token_is_401_not_a_500() {
     let (status, body) = http_request(port, "POST", "/api/admin_only", r#"{"x":21}"#, Some("Bearer not-a-real-jwt"));
     assert_eq!(status, 401, "body was: {body}");
     assert!(body.contains("invalid token"));
+}
+
+// ---- observability layer 2a: `--otel-port`/`--otel-token`, end to end -----
+//
+// `tests/observability_layer2a.rs` covers the mechanism itself
+// (enable/disable/debounce/fanout) directly against `observability::
+// Tracer`. These two tests instead prove the whole stack this module
+// actually wires together: a real `nirdosha serve` app port plus its
+// APM port, live, at the same time.
+
+/// Same shape as `start_server`, plus a second, loopback-only APM port
+/// dynamically gated by `otel_token`.
+fn start_server_with_otel(otel_token: &str) -> (u16, u16) {
+    let port = free_port();
+    let otel_port = free_port();
+    let program = Arc::new(build_program(SRC));
+    let transact_log = std::env::temp_dir().join(format!("nirdosha-test-transact-otel-{port}.db"));
+    let workflow_log = std::env::temp_dir().join(format!("nirdosha-test-workflow-otel-{port}.db"));
+    let token = otel_token.to_string();
+    std::thread::spawn(move || {
+        nirdosha::serve::run(
+            program,
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            transact_log,
+            workflow_log,
+            None,
+            None,
+            None,
+            None,
+            Some(otel_port),
+            Some(token),
+        )
+        .expect("serve::run should not fail to bind");
+    });
+    for _ in 0..100 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() && TcpStream::connect(("127.0.0.1", otel_port)).is_ok() {
+            return (port, otel_port);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("server on port {port} (otel port {otel_port}) never came up");
+}
+
+#[test]
+fn api_call_is_traced_live_to_a_connected_otel_client_and_not_before_it_connects() {
+    let (port, otel_port) = start_server_with_otel("apm-secret");
+
+    // Before any APM client connects: an ordinary call still works
+    // (dormant tracing must never break the app itself).
+    let (status, body) = http_request(port, "POST", "/api/list_widget", "{}", None);
+    assert_eq!(status, 200, "body was: {body}");
+
+    // Connect and authenticate the APM client.
+    let mut stream = TcpStream::connect(("127.0.0.1", otel_port)).expect("connect to the APM port");
+    stream.write_all(b"Bearer apm-secret\n").expect("write handshake");
+    let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut reply = String::new();
+    reader.read_line(&mut reply).expect("read handshake reply");
+    assert_eq!(reply, "ok\n");
+
+    // Give the accept loop a moment to register the client and flip
+    // `enabled()` before issuing the call that should now be traced.
+    std::thread::sleep(Duration::from_millis(200));
+    let (status, body) = http_request(port, "POST", "/api/list_widget", "{}", None);
+    assert_eq!(status, 200, "body was: {body}");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_list_widget_call = false;
+    while Instant::now() < deadline {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        let parsed: serde_json::Value = match serde_json::from_str(line.trim_end()) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if parsed["type"] == "span" && parsed["name"] == "call" && parsed["fn_name"] == "list_widget" {
+            saw_list_widget_call = true;
+            break;
+        }
+    }
+    assert!(saw_list_widget_call, "expected a `call` span for `list_widget` to reach the connected APM client");
+}
+
+#[test]
+fn otel_port_rejects_a_wrong_token() {
+    let (_port, otel_port) = start_server_with_otel("right-token");
+    let mut stream = TcpStream::connect(("127.0.0.1", otel_port)).expect("connect to the APM port");
+    stream.write_all(b"Bearer wrong-token\n").expect("write handshake");
+    let mut reader = std::io::BufReader::new(stream);
+    let mut reply = String::new();
+    reader.read_line(&mut reply).expect("read handshake reply");
+    assert!(reply.starts_with("err "), "expected a rejection, got: {reply:?}");
+}
+
+#[test]
+fn otel_port_without_a_token_is_rejected_at_cli_startup() {
+    let exe = env!("CARGO_BIN_EXE_nirdosha");
+    let mut src_file = std::env::temp_dir();
+    src_file.push(format!("nirdosha_test_otel_no_token_{}.nir", std::process::id()));
+    std::fs::write(&src_file, SRC).expect("write temp source file");
+    let port = free_port();
+    let otel_port = free_port();
+
+    let output = std::process::Command::new(exe)
+        .arg("serve")
+        .arg(&src_file)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--otel-port")
+        .arg(otel_port.to_string())
+        .output()
+        .expect("nirdosha serve should launch");
+    let _ = std::fs::remove_file(&src_file);
+
+    assert!(!output.status.success(), "`serve --otel-port` with no `--otel-token` must fail to start");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--otel-token"), "expected the error to mention --otel-token, got: {stderr}");
 }

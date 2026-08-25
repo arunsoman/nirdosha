@@ -2922,12 +2922,16 @@ pub struct Interpreter {
     /// `None` by default — the exact "one field, one branch, no cost
     /// when disabled" mechanism the design plan requires. Every hook
     /// point in this file is `let Some(tracer) = &self.tracer else {
-    /// return <original, untraced path>; };` (see `Interpreter::traced`
-    /// and `Interpreter::call`) — when `None`, that's the *entire* cost
-    /// paid. Threaded into spawned threads' own fresh `Interpreter` the
-    /// same cheap-`Arc::clone` way `sandbox_exe` already is (see
-    /// `Expr::Spawn`'s closure below). `with_tracer` is the builder,
-    /// mirroring `with_sandbox_exe` exactly.
+    /// return <original, untraced path>; };` followed by an
+    /// `if !tracer.enabled() { return <untraced path>; }` (layer 2a —
+    /// see `Interpreter::traced` and `Interpreter::call`) — when `None`,
+    /// or when `Some` but dormant (no APM client connected to
+    /// `--otel-port`), that's the *entire* cost paid: one `Option` check,
+    /// or that plus one relaxed atomic load. Threaded into spawned
+    /// threads' own fresh `Interpreter` the same cheap-`Arc::clone` way
+    /// `sandbox_exe` already is (see `Expr::Spawn`'s closure below).
+    /// `with_tracer` is the builder, mirroring `with_sandbox_exe`
+    /// exactly.
     tracer: Option<Arc<observability::Tracer>>,
     /// `call()`'s hotspot-attribution tag: each function's inferred
     /// `ast::Effect` set (`effects::infer_effects`), computed lazily —
@@ -4216,8 +4220,16 @@ impl Interpreter {
         // `run()`, no `Instant::now()`, no `effect_of_fn` lookup, no
         // allocation. Every user-function call goes through here
         // (unconditionally, when a tracer *is* attached), so a slow pure
-        // helper nested inside a traced function still shows up.
+        // helper nested inside a traced function still shows up. The
+        // `enabled()` check right after is layer 2a's addition
+        // (`observability.rs`'s "Rollout layers 2-4" section) — a
+        // dormant, port-gated tracer with no APM client connected bails
+        // here too, at the cost of one relaxed atomic load beyond the
+        // `Option` check.
         let Some(tracer) = &self.tracer else { return run() };
+        if !tracer.enabled() {
+            return run();
+        }
         let effect = self.effect_of_fn(name);
         let start = std::time::Instant::now();
         let result = run();
@@ -4262,6 +4274,9 @@ impl Interpreter {
         outcome_of: fn(&T) -> observability::Outcome,
     ) -> T {
         let Some(tracer) = &self.tracer else { return f() };
+        if !tracer.enabled() {
+            return f();
+        }
         let start = std::time::Instant::now();
         let result = f();
         tracer.record_span(effect, site, name, fn_name, start, outcome_of(&result));
@@ -4524,11 +4539,14 @@ impl Interpreter {
                     }
                     // Observability layer 1's third and last hook point —
                     // one wrapping call at this single dispatch site (not
-                    // per-builtin-arm), gated behind `self.tracer.is_some()`
-                    // *before* even looking `name` up in
+                    // per-builtin-arm), gated behind `self.tracer` being
+                    // both attached *and* `enabled()` (layer 2a) *before*
+                    // even looking `name` up in
                     // `observability::traced_builtin`'s table, so a plain
-                    // `tracer: None` run doesn't pay that lookup either.
-                    if self.tracer.is_some() {
+                    // `tracer: None` run — or a dormant, port-gated one
+                    // with no APM client connected — doesn't pay that
+                    // lookup either.
+                    if self.tracer.as_ref().is_some_and(|t| t.enabled()) {
                         if let Some((effect, static_name)) = observability::traced_builtin(name) {
                             return self
                                 .traced(

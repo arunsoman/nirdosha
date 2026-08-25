@@ -120,6 +120,19 @@ struct FieldSpec {
     /// edit-gated field still renders, just disabled).
     edit_roles: Vec<String>,
     edit_claim: Option<(String, String)>,
+    /// `screen <Struct> { field <name> { pattern: "..." } }` — a regex a
+    /// `str` field's value must match, already proven to compile
+    /// (`typeck.rs::check_pattern_expr`). `None` means unconstrained.
+    /// Client-side-only here (drives the input's HTML5 `pattern`
+    /// attribute); `serve.rs`'s `check_field_validations` is the real
+    /// enforcement, same split as `view_roles`/`edit_roles` above.
+    pattern: Option<String>,
+    /// `screen <Struct> { field <name> { min: ... } }` / `{ max: ... }`
+    /// — inclusive numeric bounds for a numeric field, already proven
+    /// applicable to this field's type at typeck time. `None` means
+    /// unbounded on that side.
+    min: Option<f64>,
+    max: Option<f64>,
 }
 
 /// One CRUD-convention function backing a screen, plus what it costs to
@@ -319,6 +332,9 @@ fn build_field(program: &Program, name: &str, ty: &Ty, depth: u8) -> FieldSpec {
         view_claim: None,
         edit_roles: vec![],
         edit_claim: None,
+        pattern: None,
+        min: None,
+        max: None,
     };
     match ty {
         // `date`/`time`-named str fields get a calendar picker instead of
@@ -365,6 +381,9 @@ fn build_field(program: &Program, name: &str, ty: &Ty, depth: u8) -> FieldSpec {
                         view_claim: None,
                         edit_roles: vec![],
                         edit_claim: None,
+                        pattern: None,
+                        min: None,
+                        max: None,
                     };
                 }
                 return base("readonly", false);
@@ -401,6 +420,9 @@ fn build_field(program: &Program, name: &str, ty: &Ty, depth: u8) -> FieldSpec {
                         view_claim: None,
                         edit_roles: vec![],
                         edit_claim: None,
+                        pattern: None,
+                        min: None,
+                        max: None,
                     };
                 }
             }
@@ -487,6 +509,18 @@ fn build_custom_action(
 fn kv_str<'a>(entries: &'a [(String, Expr)], key: &str) -> Option<&'a str> {
     entries.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
         Expr::Str(s, _) => Some(s.as_str()),
+        _ => None,
+    })
+}
+
+/// `kv_str`'s numeric sibling, for `field <name> { min: ... }`/`{ max:
+/// ... }` — `typeck.rs::check_min_max_expr` already proved the value is
+/// an `Expr::Int`/`Expr::Float`, so this trusts that the same way every
+/// other `screen`-block consumer here trusts typeck's shape checks.
+fn kv_num(entries: &[(String, Expr)], key: &str) -> Option<f64> {
+    entries.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
+        Expr::Int(n, _) => Some(*n as f64),
+        Expr::Float(n, _) => Some(*n),
         _ => None,
     })
 }
@@ -715,8 +749,84 @@ pub fn update_gates_for_fn(program: &Program, fn_name: &str) -> Option<(String, 
     None
 }
 
+/// One `screen <Struct> { field <name> { pattern/min/max: ... } }`
+/// field's resolved format constraint — the shared shape
+/// `field_validations_for_fn` returns to `serve.rs`, mirroring
+/// `GatedField`'s role in the RBAC path: the server enforces exactly
+/// what the client was told to constrain, not a second, independently-
+/// derived notion of it.
+pub struct ValidatedField {
+    pub field_name: String,
+    pub pattern: Option<String>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+/// `pattern: "<regex>"` directly, or `format: "email"|"phone"|"date"|
+/// "url"|"uuid"` resolved through `ast::well_known_format_pattern` —
+/// `typeck.rs::check_screen` already rejected declaring both on the same
+/// field, so this trusts at most one is actually present, same posture
+/// every other `kv_*` helper here already takes toward typeck's proofs.
+fn resolve_pattern(entries: &[(String, Expr)]) -> Option<String> {
+    kv_str(entries, "pattern")
+        .map(str::to_string)
+        .or_else(|| kv_str(entries, "format").and_then(crate::ast::well_known_format_pattern).map(str::to_string))
+}
+
+fn validations_from_screen_decl(decl: &ScreenDecl) -> Vec<ValidatedField> {
+    decl.fields
+        .iter()
+        .filter_map(|fo| {
+            let pattern = resolve_pattern(&fo.entries);
+            let min = kv_num(&fo.entries, "min");
+            let max = kv_num(&fo.entries, "max");
+            if pattern.is_none() && min.is_none() && max.is_none() {
+                return None;
+            }
+            Some(ValidatedField { field_name: fo.field_name.clone(), pattern, min, max })
+        })
+        .collect()
+}
+
+/// Like `update_gates_for_fn`, but for format validation
+/// (`pattern`/`min`/`max`) rather than RBAC, and matches EITHER a
+/// struct's `create` OR `update` slot — unlike an edit gate (which only
+/// makes sense once a row already exists to compare against), a format
+/// constraint applies just as much to a brand-new row as to a changed
+/// one, so both write slots need the same check. Returns `None` if
+/// `fn_name` isn't a struct's `create`/`update` slot, or that struct's
+/// screen declares no `pattern`/`min`/`max` at all.
+pub fn field_validations_for_fn(program: &Program, fn_name: &str) -> Option<(String, Vec<ValidatedField>)> {
+    for s in &program.structs {
+        if PRELUDE_STRUCT_NAMES.contains(&s.name.as_str()) {
+            continue;
+        }
+        let Some(decl) = find_screen_decl(program, &s.name) else { continue };
+        let snake = to_snake_case(&s.name);
+        let crud_fn_name = |kind: &str, default: String| -> String {
+            decl.entries
+                .iter()
+                .find(|(k, _)| k == kind)
+                .and_then(|(_, v)| if let Expr::Ident(n, _) = v { Some(n.clone()) } else { None })
+                .unwrap_or(default)
+        };
+        let is_create = crud_fn_name("create", format!("create_{snake}")) == fn_name;
+        let is_update = crud_fn_name("update", format!("update_{snake}")) == fn_name;
+        if !is_create && !is_update {
+            continue;
+        }
+        let validations = validations_from_screen_decl(decl);
+        if validations.is_empty() {
+            return None;
+        }
+        return Some((s.name.clone(), validations));
+    }
+    None
+}
+
 /// Applies a `screen <Struct> { field <name> { ... } }` block's per-field
-/// overrides (`label`, `view`, `edit`) to a `FieldSpec` tree — either
+/// overrides (`label`, `view`, `edit`, `pattern`, `min`, `max`) to a
+/// `FieldSpec` tree — either
 /// `owner_struct`'s own top-level fields directly (`Screen.fields`), or,
 /// one level down, a struct-typed action param's `nested` fields (an
 /// action's `c: Counterparty` param is itself a `FieldSpec` with
@@ -743,6 +853,9 @@ fn apply_field_overrides(decl: Option<&ScreenDecl>, fields: &mut [FieldSpec], ow
         let (edit_roles, edit_claim) = kv_gate(&fo.entries, "edit");
         spec.edit_roles = edit_roles;
         spec.edit_claim = edit_claim;
+        spec.pattern = resolve_pattern(&fo.entries);
+        spec.min = kv_num(&fo.entries, "min");
+        spec.max = kv_num(&fo.entries, "max");
     }
 }
 
@@ -823,6 +936,7 @@ fn field_json(f: &FieldSpec) -> serde_json::Value {
         "options": f.options,
         "requiredViewRoles": f.view_roles, "requiredViewClaim": f.view_claim,
         "requiredEditRoles": f.edit_roles, "requiredEditClaim": f.edit_claim,
+        "pattern": f.pattern, "min": f.min, "max": f.max,
     })
 }
 
@@ -919,87 +1033,324 @@ pub fn generate(
         .replace("__NIRDOSHA_IDENTITY_BASE__", &identity_base_js)
         .replace("__NIRDOSHA_SERVER_TABLE_API__", if server_table_api { "true" } else { "false" })
         .replace("__NIRDOSHA_THEME_OVERRIDE__", &theme_override_css(theme))
+        .replace("__NIRDOSHA_HTML_CLASS__", &theme_html_class(theme))
+        .replace("__NIRDOSHA_THEME_SCRIPT__", &theme_bootstrap_script(theme))
 }
 
 /// Optional per-project theme, layered on top of the baked-in Material
 /// Design 3 token set (`ui_gen_template.html`'s own `:root`/dark `:root`
-/// blocks) rather than replacing it — every field is `Option`, and an
-/// absent field simply leaves that token at its MD3 default. Sourced from
-/// protobox's `DesignSpec`/DESIGN.md (`be-v2/src/plugins/languages/
-/// nirdosha.py`'s theme mapper writes this as JSON next to the project's
-/// `.nir` entrypoint) — deliberately a narrow token set (primary/
-/// on-primary/primary-container/on-primary-container color roles, corner
-/// radii, one font stack), not a full re-theme: nirdosha's generated UI
-/// has exactly one layout (`ui_gen_template.html`'s nav-rail + top-app-bar
-/// shell, driven entirely by the manifest, same as before this existed),
-/// so there is no per-component styling surface to expose beyond these
-/// tokens without inventing one.
+/// blocks) rather than replacing it — every top-level field is `Option`,
+/// and an absent section simply leaves those tokens at their MD3
+/// defaults. This struct is a 1:1 mirror of protobox's
+/// `resolve_design_tokens(spec)` (`be-v2/src/features/design_studio/
+/// generate_palettes.py`) — a project's `theme.json` IS that function's
+/// direct JSON output (`nirdosha.py`'s theme mapper writes it verbatim,
+/// no hand-picked subset, no second field-name vocabulary to keep in
+/// sync by hand) — unknown fields (e.g. its `spec_hash`) are ignored by
+/// ordinary `serde` deserialization, not an error. Each present
+/// sub-object's own fields are NOT further `Option`-wrapped: `resolve_
+/// design_tokens()` always emits a section whole or not at all, never
+/// partially, so this struct only needs one level of "is this section
+/// present" optionality.
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 pub struct Theme {
-    pub primary_light: Option<String>,
-    pub on_primary_light: Option<String>,
-    pub primary_container_light: Option<String>,
-    pub on_primary_container_light: Option<String>,
-    pub primary_dark: Option<String>,
-    pub on_primary_dark: Option<String>,
-    pub primary_container_dark: Option<String>,
-    pub on_primary_container_dark: Option<String>,
-    pub radius_sm: Option<String>,
-    pub radius_md: Option<String>,
-    pub radius_lg: Option<String>,
-    pub font_sans: Option<String>,
+    /// 11-step brand ramp, keys `"50"`..`"950"` (`RAMP_STEPS`), values
+    /// `#rrggbb`.
+    pub brand: Option<std::collections::HashMap<String, String>>,
+    /// Same 11-step shape, the neutral scale (page background, borders,
+    /// text hierarchy).
+    pub neutral: Option<std::collections::HashMap<String, String>>,
+    pub fonts: Option<ThemeFonts>,
+    pub radius: Option<ThemeRadius>,
+    pub shadow_card: Option<String>,
+    pub density: Option<ThemeDensity>,
+    pub motion: Option<ThemeMotion>,
+    /// `"none" | "media" | "class" | "always"` — `DesignSpec.dark_mode`'s
+    /// own vocabulary, passed through unchanged (`theme_override_css`
+    /// dispatches on the string directly rather than parsing it into a
+    /// Rust enum, since the only consumer is string-matching into a CSS
+    /// shape, not language-level logic).
+    pub dark_mode: Option<String>,
+    pub layout: Option<ThemeLayout>,
+    pub type_scale: Option<ThemeTypeScale>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ThemeFonts {
+    pub sans: String,
+    pub display: String,
+    pub mono: Option<String>,
+}
+
+/// CSS length strings (`"0.375rem"`, `"9999px"`, ...) — `DesignSpec.
+/// radius_tokens()`'s own value shape, not px numbers.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ThemeRadius {
+    pub control: String,
+    pub card: String,
+}
+
+/// All four fields are px numbers (`generate_palettes.py::_DENSITY_PX`).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ThemeDensity {
+    pub card_padding: f64,
+    pub gap: f64,
+    pub control_height: f64,
+    pub font_size: f64,
+}
+
+/// `DesignSpec`'s motion vocabulary, fully resolved
+/// (`generate_palettes.py::resolve_design_tokens`'s `"motion"` key) —
+/// `animations` is a subset of the fixed 4-name vocabulary
+/// `ui_gen_template.html`'s `@keyframes` block hardcodes (`fade-in`/
+/// `slide-up`/`scale-in`/`pop`), never an arbitrary string.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ThemeMotion {
+    pub level: String,
+    pub interaction_ms: f64,
+    pub entrance_ms: f64,
+    pub easing: String,
+    pub animations: Vec<String>,
+    pub hover_lift_px: f64,
+    pub hover_scale: f64,
+    pub press_scale: f64,
+    pub stagger_ms: f64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ThemeLayout {
+    /// `"auto" | "sidebar" | "topbar" | "sidebar-topbar" | "minimal"` —
+    /// `"auto"`/absent keeps today's fixed nav-rail + top-app-bar shell,
+    /// byte-for-byte, for every `.nir` app that predates this field.
+    pub app_shell: String,
+    /// `"auto" | "boxed" | "fluid"`.
+    pub content_width: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ThemeTypeScale {
+    pub level: String,
+    pub title_px: f64,
+    pub hero_px: f64,
 }
 
 /// A CSS value is only ever a bare hex color, a CSS length (`12px`,
-/// `0.5rem`, ...), or a font-family list here (`ui_gen.rs`'s only three
-/// `Theme` value shapes) — never markup. Reject anything containing `<`,
-/// `>`, `{`, or `}` outright rather than trying to validate each shape
-/// precisely: those four characters are the only ones that could break
-/// out of "one CSS custom-property declaration value" into a new rule or
-/// (via `<`/`>`) out of the `<style>` element entirely, and a theme file
-/// with a legitimate value never needs any of them.
+/// `0.5rem`, ...), a font-family list, a bare number, or a `cubic-
+/// bezier(...)`/keyword easing function here — never markup. Reject
+/// anything containing `<`, `>`, `{`, or `}` outright rather than trying
+/// to validate each shape precisely: those four characters are the only
+/// ones that could break out of "one CSS custom-property declaration
+/// value" into a new rule or (via `<`/`>`) out of the `<style>` element
+/// entirely, and a theme file with a legitimate value never needs any of
+/// them.
 fn theme_value_is_safe(v: &str) -> bool {
     !v.is_empty() && !v.contains(['<', '>', '{', '}'])
 }
 
+/// `RAMP_STEPS` (`design_spec.py`) in order — the fixed 11-step key set
+/// every `brand`/`neutral` ramp carries. Iterated in this order (not
+/// `HashMap`'s arbitrary order) so `--brand-50`.`--brand-950` emit
+/// deterministically; a step missing from a hand-authored (non-
+/// `resolve_design_tokens()`-sourced) theme file is silently skipped,
+/// same tolerant posture every other optional theme field already takes.
+const RAMP_STEPS: [&str; 11] = ["50", "100", "200", "300", "400", "500", "600", "700", "800", "900", "950"];
+
+/// Semantic MD3 role -> which ramp step backs it, light and dark. Not
+/// sourced from an unread protobox internal file — `resolve_design_
+/// tokens()` hands over the raw 11-step ramps only, not pre-resolved
+/// semantic roles, so this mapping is this integration's own choice,
+/// using ordinary, widely-used Tailwind-ramp semantic conventions (mid
+/// ramp for a light-mode primary/on light text, inverted for dark) —
+/// visually correct against the project's real brand/neutral colors
+/// either way, since the ramp values themselves come straight from
+/// `DesignSpec`, only the *step choice* per role is this file's own.
+struct RampRoleStep {
+    step: &'static str,
+    dark_step: &'static str,
+}
+const PRIMARY: RampRoleStep = RampRoleStep { step: "600", dark_step: "300" };
+const ON_PRIMARY: RampRoleStep = RampRoleStep { step: "50", dark_step: "900" };
+const PRIMARY_CONTAINER: RampRoleStep = RampRoleStep { step: "100", dark_step: "800" };
+const ON_PRIMARY_CONTAINER: RampRoleStep = RampRoleStep { step: "900", dark_step: "100" };
+const SURFACE: RampRoleStep = RampRoleStep { step: "50", dark_step: "900" };
+const ON_SURFACE: RampRoleStep = RampRoleStep { step: "900", dark_step: "50" };
+const SURFACE_VARIANT: RampRoleStep = RampRoleStep { step: "100", dark_step: "800" };
+const ON_SURFACE_VARIANT: RampRoleStep = RampRoleStep { step: "600", dark_step: "400" };
+const OUTLINE: RampRoleStep = RampRoleStep { step: "300", dark_step: "600" };
+const BACKGROUND: RampRoleStep = RampRoleStep { step: "50", dark_step: "950" };
+
 fn theme_override_css(theme: Option<&Theme>) -> String {
     let Some(t) = theme else { return String::new() };
-    let push = |out: &mut Vec<String>, indent: &str, prop: &str, value: &Option<String>| {
-        if let Some(v) = value {
-            if theme_value_is_safe(v) {
-                out.push(format!("{indent}--{prop}: {v};"));
-            }
+    let push = |out: &mut Vec<String>, indent: &str, prop: &str, value: &str| {
+        if theme_value_is_safe(value) {
+            out.push(format!("{indent}--{prop}: {value};"));
         }
     };
+    let push_opt = |out: &mut Vec<String>, indent: &str, prop: &str, value: &Option<String>| {
+        if let Some(v) = value {
+            push(out, indent, prop, v);
+        }
+    };
+    let push_num = |out: &mut Vec<String>, indent: &str, prop: &str, value: f64, suffix: &str| {
+        out.push(format!("{indent}--{prop}: {value}{suffix};"));
+    };
+    let ramp_color = |ramp: &std::collections::HashMap<String, String>, role: &RampRoleStep, dark: bool| -> Option<String> {
+        ramp.get(if dark { role.dark_step } else { role.step }).cloned()
+    };
 
-    let mut light = Vec::new();
-    push(&mut light, "    ", "md-primary", &t.primary_light);
-    push(&mut light, "    ", "md-on-primary", &t.on_primary_light);
-    push(&mut light, "    ", "md-primary-container", &t.primary_container_light);
-    push(&mut light, "    ", "md-on-primary-container", &t.on_primary_container_light);
-    push(&mut light, "    ", "md-radius-sm", &t.radius_sm);
-    push(&mut light, "    ", "md-radius-md", &t.radius_md);
-    push(&mut light, "    ", "md-radius-lg", &t.radius_lg);
-    push(&mut light, "    ", "md-font", &t.font_sans);
-
+    let mut base = Vec::new();
     let mut dark = Vec::new();
-    push(&mut dark, "      ", "md-primary", &t.primary_dark);
-    push(&mut dark, "      ", "md-on-primary", &t.on_primary_dark);
-    push(&mut dark, "      ", "md-primary-container", &t.primary_container_dark);
-    push(&mut dark, "      ", "md-on-primary-container", &t.on_primary_container_dark);
+
+    if let Some(brand) = &t.brand {
+        for step in RAMP_STEPS {
+            if let Some(v) = brand.get(step) {
+                push(&mut base, "    ", &format!("brand-{step}"), v);
+            }
+        }
+        push_opt(&mut base, "    ", "md-primary", &ramp_color(brand, &PRIMARY, false));
+        push_opt(&mut base, "    ", "md-on-primary", &ramp_color(brand, &ON_PRIMARY, false));
+        push_opt(&mut base, "    ", "md-primary-container", &ramp_color(brand, &PRIMARY_CONTAINER, false));
+        push_opt(&mut base, "    ", "md-on-primary-container", &ramp_color(brand, &ON_PRIMARY_CONTAINER, false));
+        push_opt(&mut dark, "      ", "md-primary", &ramp_color(brand, &PRIMARY, true));
+        push_opt(&mut dark, "      ", "md-on-primary", &ramp_color(brand, &ON_PRIMARY, true));
+        push_opt(&mut dark, "      ", "md-primary-container", &ramp_color(brand, &PRIMARY_CONTAINER, true));
+        push_opt(&mut dark, "      ", "md-on-primary-container", &ramp_color(brand, &ON_PRIMARY_CONTAINER, true));
+    }
+    if let Some(neutral) = &t.neutral {
+        for step in RAMP_STEPS {
+            if let Some(v) = neutral.get(step) {
+                push(&mut base, "    ", &format!("neutral-{step}"), v);
+            }
+        }
+        push_opt(&mut base, "    ", "md-surface", &ramp_color(neutral, &SURFACE, false));
+        push_opt(&mut base, "    ", "md-on-surface", &ramp_color(neutral, &ON_SURFACE, false));
+        push_opt(&mut base, "    ", "md-surface-variant", &ramp_color(neutral, &SURFACE_VARIANT, false));
+        push_opt(&mut base, "    ", "md-on-surface-variant", &ramp_color(neutral, &ON_SURFACE_VARIANT, false));
+        push_opt(&mut base, "    ", "md-outline", &ramp_color(neutral, &OUTLINE, false));
+        push_opt(&mut base, "    ", "md-background", &ramp_color(neutral, &BACKGROUND, false));
+        push_opt(&mut dark, "      ", "md-surface", &ramp_color(neutral, &SURFACE, true));
+        push_opt(&mut dark, "      ", "md-on-surface", &ramp_color(neutral, &ON_SURFACE, true));
+        push_opt(&mut dark, "      ", "md-surface-variant", &ramp_color(neutral, &SURFACE_VARIANT, true));
+        push_opt(&mut dark, "      ", "md-on-surface-variant", &ramp_color(neutral, &ON_SURFACE_VARIANT, true));
+        push_opt(&mut dark, "      ", "md-outline", &ramp_color(neutral, &OUTLINE, true));
+        push_opt(&mut dark, "      ", "md-background", &ramp_color(neutral, &BACKGROUND, true));
+    }
+    if let Some(fonts) = &t.fonts {
+        push(&mut base, "    ", "font-sans", &fonts.sans);
+        push(&mut base, "    ", "md-font", &fonts.sans);
+        push(&mut base, "    ", "font-display", &fonts.display);
+        if let Some(mono) = &fonts.mono {
+            push(&mut base, "    ", "font-mono", mono);
+        }
+    }
+    if let Some(radius) = &t.radius {
+        push(&mut base, "    ", "radius-control", &radius.control);
+        push(&mut base, "    ", "radius-card", &radius.card);
+        push(&mut base, "    ", "md-radius-sm", &radius.control);
+        push(&mut base, "    ", "md-radius-md", &radius.control);
+        push(&mut base, "    ", "md-radius-lg", &radius.card);
+    }
+    push_opt(&mut base, "    ", "shadow-card", &t.shadow_card);
+    if let Some(density) = &t.density {
+        push_num(&mut base, "    ", "density-card-padding", density.card_padding, "px");
+        push_num(&mut base, "    ", "density-gap", density.gap, "px");
+        push_num(&mut base, "    ", "density-control-height", density.control_height, "px");
+        push_num(&mut base, "    ", "density-font-size", density.font_size, "px");
+    }
+    if let Some(motion) = &t.motion {
+        push_num(&mut base, "    ", "motion-interaction-ms", motion.interaction_ms, "ms");
+        push_num(&mut base, "    ", "motion-entrance-ms", motion.entrance_ms, "ms");
+        push(&mut base, "    ", "motion-easing", &motion.easing);
+        push_num(&mut base, "    ", "hover-lift-px", motion.hover_lift_px, "px");
+        push_num(&mut base, "    ", "hover-scale", motion.hover_scale, "");
+        push_num(&mut base, "    ", "press-scale", motion.press_scale, "");
+        push_num(&mut base, "    ", "stagger-ms", motion.stagger_ms, "");
+    }
+    if let Some(type_scale) = &t.type_scale {
+        push_num(&mut base, "    ", "title-px", type_scale.title_px, "px");
+        push_num(&mut base, "    ", "hero-px", type_scale.hero_px, "px");
+    }
 
     let mut out = String::new();
-    if !light.is_empty() {
+    if !base.is_empty() {
         out.push_str("  :root {\n");
-        out.push_str(&light.join("\n"));
+        out.push_str(&base.join("\n"));
         out.push_str("\n  }\n");
     }
+    // `dark_mode` strategy dispatch — "media" (default when a brand/
+    // neutral ramp is present but no strategy is named, matching every
+    // pre-existing theme's behavior) wraps the same overrides in
+    // `prefers-color-scheme`; "class" wraps them in `:root.dark` instead
+    // (the template's own tiny toggle script, added alongside this,
+    // flips that class); "always" writes the dark values directly into
+    // the base `:root` block above instead of a separate one (no light
+    // variant at all); "none" emits no dark block regardless of ramp
+    // presence.
     if !dark.is_empty() {
-        out.push_str("  @media (prefers-color-scheme: dark) {\n    :root {\n");
-        out.push_str(&dark.join("\n"));
-        out.push_str("\n    }\n  }\n");
+        match t.dark_mode.as_deref() {
+            Some("none") => {}
+            Some("class") => {
+                out.push_str("  :root.dark {\n");
+                out.push_str(&dark.join("\n"));
+                out.push_str("\n  }\n");
+            }
+            Some("always") => {
+                out.push_str("  :root {\n");
+                out.push_str(&dark.join("\n").replace("      ", "    "));
+                out.push_str("\n  }\n");
+            }
+            _ => {
+                out.push_str("  @media (prefers-color-scheme: dark) {\n    :root {\n");
+                out.push_str(&dark.join("\n"));
+                out.push_str("\n    }\n  }\n");
+            }
+        }
     }
     out
+}
+
+/// `Theme.layout`'s `app_shell`/`content_width` -- computed once, here,
+/// into a static `<html class="...">` list (`__NIRDOSHA_HTML_CLASS__`)
+/// rather than shipped to the client as JSON: both are whole-page layout
+/// decisions known entirely at generation time, so there is nothing for
+/// client JS to decide at runtime. `"auto"`/absent (or an unrecognized
+/// value — tolerated, not an error, same posture as an unset field)
+/// contributes no class at all, keeping today's one fixed shell
+/// (`ui_gen_template.html`'s nav-rail + top-app-bar) the default for
+/// every `.nir` app, unaffected by this field's mere existence.
+fn theme_html_class(theme: Option<&Theme>) -> String {
+    let Some(t) = theme else { return String::new() };
+    let Some(layout) = &t.layout else { return String::new() };
+    let mut classes = Vec::new();
+    match layout.app_shell.as_str() {
+        "topbar" => classes.push("shell-topbar"),
+        "minimal" => classes.push("shell-minimal"),
+        _ => {} // "auto" | "sidebar" | "sidebar-topbar" | anything else: today's shell, unchanged
+    }
+    match layout.content_width.as_str() {
+        "boxed" => classes.push("content-boxed"),
+        "fluid" => classes.push("content-fluid"),
+        _ => {}
+    }
+    classes.join(" ")
+}
+
+/// `Theme.dark_mode == "class"` needs one small inline script
+/// (`__NIRDOSHA_THEME_SCRIPT__`, spliced into `<head>` before `<style>`
+/// so it runs before first paint — no flash of the wrong mode): with no
+/// manual light/dark toggle control in this template, "class" strategy
+/// still needs *something* to decide the class's initial state, so it
+/// mirrors system preference the same way "media" would, just via a
+/// class instead of a media query — a real, distinct CSS mechanism
+/// (proven by `tests/emit_ui.rs`'s `dark_mode_class_*` tests), not
+/// cosmetically identical output to "media" reached a different way.
+/// Every other `dark_mode` value (including absent) emits nothing.
+fn theme_bootstrap_script(theme: Option<&Theme>) -> String {
+    let Some(t) = theme else { return String::new() };
+    if t.dark_mode.as_deref() != Some("class") {
+        return String::new();
+    }
+    "<script>(function(){try{if(window.matchMedia('(prefers-color-scheme: dark)').matches){document.documentElement.classList.add('dark');}}catch(e){}})();</script>".to_string()
 }
 
 /// The one baked-in design: a Material Design 3 token set (color roles,
@@ -1047,5 +1398,79 @@ mod tests {
         let entries = vec![("label".to_string(), str_expr("Whatever"))];
         let (roles, claim) = kv_gate(&entries, "view");
         assert!(roles.is_empty() && claim.is_none());
+    }
+
+    fn int_expr(n: i64) -> Expr {
+        Expr::Int(n, SPAN)
+    }
+
+    fn float_expr(n: f64) -> Expr {
+        Expr::Float(n, SPAN)
+    }
+
+    #[test]
+    fn kv_num_extracts_int_literal() {
+        let entries = vec![("min".to_string(), int_expr(5))];
+        assert_eq!(kv_num(&entries, "min"), Some(5.0));
+    }
+
+    #[test]
+    fn kv_num_extracts_float_literal() {
+        let entries = vec![("max".to_string(), float_expr(9.5))];
+        assert_eq!(kv_num(&entries, "max"), Some(9.5));
+    }
+
+    #[test]
+    fn kv_num_absent_key_is_none() {
+        let entries = vec![("label".to_string(), str_expr("Whatever"))];
+        assert_eq!(kv_num(&entries, "min"), None);
+    }
+
+    #[test]
+    fn resolve_pattern_prefers_explicit_pattern_over_format() {
+        let entries = vec![("pattern".to_string(), str_expr("^abc$")), ("format".to_string(), str_expr("email"))];
+        assert_eq!(resolve_pattern(&entries), Some("^abc$".to_string()));
+    }
+
+    #[test]
+    fn resolve_pattern_expands_known_format() {
+        let entries = vec![("format".to_string(), str_expr("email"))];
+        assert_eq!(resolve_pattern(&entries), Some(crate::ast::well_known_format_pattern("email").unwrap().to_string()));
+    }
+
+    #[test]
+    fn resolve_pattern_absent_is_none() {
+        let entries = vec![("label".to_string(), str_expr("Whatever"))];
+        assert_eq!(resolve_pattern(&entries), None);
+    }
+
+    #[test]
+    fn validations_from_screen_decl_collects_pattern_min_max() {
+        let decl = ScreenDecl {
+            struct_name: "Widget".to_string(),
+            entries: vec![],
+            fields: vec![
+                crate::ast::FieldOverride {
+                    field_name: "name".to_string(),
+                    entries: vec![("pattern".to_string(), str_expr("^[A-Z]"))],
+                    span: SPAN,
+                },
+                crate::ast::FieldOverride {
+                    field_name: "quantity".to_string(),
+                    entries: vec![("min".to_string(), int_expr(0)), ("max".to_string(), int_expr(100))],
+                    span: SPAN,
+                },
+                crate::ast::FieldOverride { field_name: "untouched".to_string(), entries: vec![], span: SPAN },
+            ],
+            actions: vec![],
+            span: SPAN,
+        };
+        let validations = validations_from_screen_decl(&decl);
+        assert_eq!(validations.len(), 2, "the untouched field should contribute nothing");
+        let name_v = validations.iter().find(|v| v.field_name == "name").unwrap();
+        assert_eq!(name_v.pattern, Some("^[A-Z]".to_string()));
+        let qty_v = validations.iter().find(|v| v.field_name == "quantity").unwrap();
+        assert_eq!(qty_v.min, Some(0.0));
+        assert_eq!(qty_v.max, Some(100.0));
     }
 }

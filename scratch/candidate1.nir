@@ -1,0 +1,15 @@
+// Candidate 1: hello + ownership + spawn + role syntax (declared, not exercised)
+fn admin_greet(n: i64) -> i64 requires(role: "admin") {
+    return n + 1
+}
+
+fn worker(b: box i64) -> i64 {
+    return *b
+}
+
+fn main() {
+    print("hello, Nirdosha")
+    let h: box i64 = box 21
+    let t: thread i64 = spawn worker(h)
+    print(join t)
+}

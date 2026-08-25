@@ -235,6 +235,205 @@ fn a_second_dashboard_block_is_a_parse_error() {
     assert!(err.message.contains("only one"), "unexpected message: {}", err.message);
 }
 
+const WITH_VALIDATION_FIELDS: &str = r#"
+    struct Widget {
+        id: i64,
+        name: str,
+        quantity: i64,
+    }
+    fn list_widget() -> i64 { return 0 }
+
+    screen Widget {
+        field name {
+            pattern: "^[A-Za-z ]+$"
+        }
+        field quantity {
+            min: 0
+            max: 1000
+        }
+    }
+
+    fn main() {}
+"#;
+
+#[test]
+fn pattern_and_min_max_on_appropriate_fields_typecheck_cleanly() {
+    let program = parse_ok(WITH_VALIDATION_FIELDS);
+    typecheck(&program).expect("pattern on a str field + min/max on a numeric field should typecheck cleanly");
+}
+
+#[test]
+fn pattern_on_non_str_field_is_rejected() {
+    let src = r#"
+        struct Widget {
+            id: i64,
+        }
+        fn main() {}
+
+        screen Widget {
+            field id {
+                pattern: "^[0-9]+$"
+            }
+        }
+    "#;
+    assert_eq!(
+        first_type_error(src),
+        TypeErrorKind::FieldValidationTypeMismatch {
+            struct_name: "Widget".to_string(),
+            field_name: "id".to_string(),
+            key: "pattern".to_string(),
+            field_ty: "I64".to_string(),
+        }
+    );
+}
+
+#[test]
+fn min_on_non_numeric_field_is_rejected() {
+    let src = r#"
+        struct Widget {
+            id: i64,
+            name: str,
+        }
+        fn main() {}
+
+        screen Widget {
+            field name {
+                min: 0
+            }
+        }
+    "#;
+    assert_eq!(
+        first_type_error(src),
+        TypeErrorKind::FieldValidationTypeMismatch {
+            struct_name: "Widget".to_string(),
+            field_name: "name".to_string(),
+            key: "min".to_string(),
+            field_ty: "Str".to_string(),
+        }
+    );
+}
+
+#[test]
+fn pattern_value_must_be_a_string_literal() {
+    let src = r#"
+        struct Widget {
+            id: i64,
+            name: str,
+        }
+        fn main() {}
+
+        screen Widget {
+            field name {
+                pattern: 5
+            }
+        }
+    "#;
+    assert_eq!(first_type_error(src), TypeErrorKind::InvalidFieldValidationExpr { key: "pattern".to_string() });
+}
+
+#[test]
+fn min_value_must_be_a_number_literal() {
+    let src = r#"
+        struct Widget {
+            id: i64,
+            quantity: i64,
+        }
+        fn main() {}
+
+        screen Widget {
+            field quantity {
+                min: "zero"
+            }
+        }
+    "#;
+    assert_eq!(first_type_error(src), TypeErrorKind::InvalidFieldValidationExpr { key: "min".to_string() });
+}
+
+#[test]
+fn invalid_regex_pattern_is_rejected() {
+    let src = r#"
+        struct Widget {
+            id: i64,
+            name: str,
+        }
+        fn main() {}
+
+        screen Widget {
+            field name {
+                pattern: "["
+            }
+        }
+    "#;
+    match first_type_error(src) {
+        TypeErrorKind::InvalidRegexPattern { struct_name, field_name, .. } => {
+            assert_eq!(struct_name, "Widget");
+            assert_eq!(field_name, "name");
+        }
+        other => panic!("expected InvalidRegexPattern, got {other:?}"),
+    }
+}
+
+#[test]
+fn format_expands_and_typechecks_cleanly() {
+    let src = r#"
+        struct Contact {
+            id: i64,
+            email: str,
+        }
+        fn list_contact() -> i64 { return 0 }
+
+        screen Contact {
+            field email {
+                format: "email"
+            }
+        }
+
+        fn main() {}
+    "#;
+    let program = parse_ok(src);
+    typecheck(&program).expect("a known `format` on a str field should typecheck cleanly");
+}
+
+#[test]
+fn unknown_format_is_rejected() {
+    let src = r#"
+        struct Contact {
+            id: i64,
+            email: str,
+        }
+        fn main() {}
+
+        screen Contact {
+            field email {
+                format: "not-a-real-format"
+            }
+        }
+    "#;
+    assert_eq!(first_type_error(src), TypeErrorKind::UnknownFieldFormat { format: "not-a-real-format".to_string() });
+}
+
+#[test]
+fn pattern_and_format_together_is_rejected() {
+    let src = r#"
+        struct Contact {
+            id: i64,
+            email: str,
+        }
+        fn main() {}
+
+        screen Contact {
+            field email {
+                pattern: "^.+@.+$"
+                format: "email"
+            }
+        }
+    "#;
+    assert_eq!(
+        first_type_error(src),
+        TypeErrorKind::ConflictingPatternAndFormat { struct_name: "Contact".to_string(), field_name: "email".to_string() }
+    );
+}
+
 #[test]
 fn struct_with_no_screen_block_is_completely_unaffected() {
     // The progressive-fallback promise: `screens`/`dashboard` start empty

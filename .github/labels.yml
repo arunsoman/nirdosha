@@ -1,0 +1,40 @@
+# Documented label set for this repo. Not yet applied to GitHub — this
+# is the source of truth to create them from (manually, via `gh label
+# create`, or a labeler GitHub Action) once the maintainer is ready.
+#
+#   gh label create "good first issue" --color 7057ff --description "..."
+#   (repeat per row, or script it from this file)
+
+- name: "good first issue"
+  color: "7057ff"
+  description: "Small, well-scoped, good for a first contribution"
+- name: "help wanted"
+  color: "008672"
+  description: "Open for anyone to pick up"
+- name: bug
+  color: "d73a4a"
+  description: "Something isn't working as documented"
+- name: enhancement
+  color: "a2eeef"
+  description: "New feature or capability request"
+- name: docs
+  color: "0075ca"
+  description: "Documentation only"
+- name: compiler
+  color: "5319e7"
+  description: "Parser, typeck, ownership, codegen, interpreter"
+- name: grammar
+  color: "5319e7"
+  description: "Grammar/GBNF/LL(1) surface, not codegen internals"
+- name: ui
+  color: "fbca04"
+  description: "The screen/dashboard DSL, ui_gen.rs, or the generated client"
+- name: examples
+  color: "c5def5"
+  description: "A `.nir` example — new, broken, or needs updating"
+- name: question
+  color: "d876e3"
+  description: "Further information is requested"
+- name: blocked
+  color: "b60205"
+  description: "Can't proceed until a named dependency lands"

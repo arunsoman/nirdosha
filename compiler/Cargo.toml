@@ -16,3 +16,12 @@ redis = "0.27"
 tiny_http = "0.12"
 postgres = "0.19"
 postgres-native-tls = "0.5"
+regex = "1.13.1"
+
+# `dist`: statically vendors Z3 (compiles it from source via `z3-src`)
+# instead of dynamically linking the system `libz3` — same pattern as
+# rusqlite's `bundled` feature above. Only used for release/CI binaries
+# (see .github/workflows/release.yml); local dev builds keep using
+# system z3 via pkg-config since the vendored build is much slower.
+[features]
+dist = ["z3/vendored"]

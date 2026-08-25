@@ -36,14 +36,14 @@ fn derives_a_screen_per_struct_with_a_convention_fn() {
     // (`manifest_json` serializes via `serde_json`'s default `BTreeMap`,
     // so object keys land in alphabetical order, not insertion order --
     // these substrings rely on that, not on insertion order.)
-    assert!(html.contains(r#""control":"text","displayLabel":null,"label":"str","name":"title""#));
-    assert!(html.contains(r#""control":"checkbox","displayLabel":null,"label":"bool","name":"done""#));
-    assert!(html.contains(r#""control":"number","displayLabel":null,"label":"i64","name":"id""#));
+    assert!(html.contains(r#""control":"text","displayLabel":null,"label":"str","max":null,"min":null,"name":"title""#));
+    assert!(html.contains(r#""control":"checkbox","displayLabel":null,"label":"bool","max":null,"min":null,"name":"done""#));
+    assert!(html.contains(r#""control":"number","displayLabel":null,"label":"i64","max":null,"min":null,"name":"id""#));
 
     // `create_todo(t: Todo)` expands one level into Todo's own fields
     // instead of rendering a single unfillable blob.
     assert!(html.contains(r#""fn":"create_todo","kind":"create""#));
-    assert!(html.contains(r#""control":"struct","displayLabel":null,"label":"Todo","name":"t""#), "struct-typed param should expand into nested fields");
+    assert!(html.contains(r#""control":"struct","displayLabel":null,"label":"Todo","max":null,"min":null,"name":"t""#), "struct-typed param should expand into nested fields");
 
     // `delete_todo(identity: VerifiedIdentity, id: i64) requires(role: "admin")`
     // -- login + role gating derived correctly, and the identity param is
@@ -109,8 +109,44 @@ fn option_field_is_optional_but_keeps_its_inner_control() {
     "#;
     let html = emit_ui(src);
     assert!(html.contains(
-        r#""control":"number","displayLabel":null,"label":"i64","name":"reminder","nested":[],"options":[],"required":false"#
+        r#""control":"number","displayLabel":null,"label":"i64","max":null,"min":null,"name":"reminder","nested":[],"options":[],"pattern":null,"required":false"#
     ));
+}
+
+#[test]
+fn field_pattern_min_max_and_format_reach_the_manifest() {
+    let src = r#"
+        struct Contact {
+            id: i64,
+            name: str,
+            email: str,
+            age: i64,
+        }
+        fn list_contact() -> i64 { return 0 }
+        fn create_contact(c: Contact) -> i64 { return 0 }
+
+        screen Contact {
+            field name {
+                pattern: "^[A-Za-z ]+$"
+            }
+            field email {
+                format: "email"
+            }
+            field age {
+                min: 18
+                max: 120
+            }
+        }
+
+        fn main() -> i64 { return 0 }
+    "#;
+    let html = emit_ui(src);
+    assert!(html.contains(r#""pattern":"^[A-Za-z ]+$""#), "an explicit `pattern` should reach the manifest verbatim");
+    assert!(html.contains(r#""pattern":"^[^"#), "a `format` should expand into the manifest's `pattern` slot");
+    assert!(html.contains("\"min\":18"), "`min` should reach the manifest");
+    assert!(html.contains("\"max\":120"), "`max` should reach the manifest");
+    // A field with neither key declared stays unconstrained.
+    assert!(html.contains(r#""max":null,"min":null,"name":"id""#), "an unconstrained field's pattern/min/max should serialize as null, not be omitted");
 }
 
 #[test]
@@ -221,11 +257,11 @@ fn declared_screen_title_and_field_label_override_inference() {
     let html = emit_ui(src);
     assert!(html.contains(r#""title":"Catalog""#), "declared title should override the struct name as the screen's display title");
     assert!(
-        html.contains(r#""displayLabel":"Product Name","label":"str","name":"name""#),
+        html.contains(r#""displayLabel":"Product Name","label":"str","max":null,"min":null,"name":"name""#),
         "declared field label should attach as displayLabel without disturbing the inferred type label"
     );
     // Untouched field keeps displayLabel: null.
-    assert!(html.contains(r#""displayLabel":null,"label":"i64","name":"id""#));
+    assert!(html.contains(r#""displayLabel":null,"label":"i64","max":null,"min":null,"name":"id""#));
 }
 
 #[test]
@@ -320,8 +356,8 @@ fn no_theme_produces_no_theme_override_block() {
 }
 
 #[test]
-fn theme_overrides_only_the_tokens_it_sets() {
-    use nirdosha::ui_gen::Theme;
+fn theme_overrides_only_the_sections_it_sets() {
+    use nirdosha::ui_gen::{Theme, ThemeRadius};
     let src = "fn main() {}";
     let toks = nirdosha::token::Lexer::new(src).tokenize().unwrap();
     let program = nirdosha::parser::Parser::new(toks).parse_program().unwrap();
@@ -329,26 +365,42 @@ fn theme_overrides_only_the_tokens_it_sets() {
     nirdosha::ownership::check_ownership(&program).unwrap();
     let registry = TypeRegistry::build(&program);
     let effects = infer_effects(&program, &registry);
+    let mut brand = std::collections::HashMap::new();
+    brand.insert("600".to_string(), "#ff0000".to_string());
     let theme = Theme {
-        primary_light: Some("#ff0000".to_string()),
-        radius_sm: Some("2px".to_string()),
+        brand: Some(brand),
+        radius: Some(ThemeRadius { control: "2px".to_string(), card: "6px".to_string() }),
         ..Default::default()
     };
     let html = generate(&program, &effects, None, false, Some(&theme));
 
-    // The theme's own tokens appear...
+    // The theme's own tokens appear, both the raw ramp step and the
+    // semantic role it's mapped to for a light-mode primary...
+    assert!(html.contains("--brand-600: #ff0000;"));
     assert!(html.contains("--md-primary: #ff0000;"));
+    assert!(html.contains("--radius-control: 2px;"));
     assert!(html.contains("--md-radius-sm: 2px;"));
-    // ...but a token the theme never set is untouched (still the MD3
-    // default, not overwritten to empty/garbage).
-    assert!(html.contains("--md-radius-lg: 28px;"));
-    // No dark-mode override block at all when no *_dark field was set.
-    assert!(!html.contains("--md-primary: #ff0000;\n    }\n  }\n  @media (prefers-color-scheme: dark) {\n    :root {\n"));
+    // ...but a section the theme never set is untouched: no neutral-
+    // ramp custom property at all, and the baked-in MD3 default for a
+    // neutral-derived role (`--md-surface`) is still the only value
+    // present, not overwritten to empty/garbage.
+    assert!(!html.contains("--neutral-"));
+    assert!(html.contains("--md-surface: #fdfbff;"), "the baked-in MD3 light default should be untouched");
+    // Exactly 2: the baked-in light `:root` default plus the baked-in
+    // dark `@media` default -- both pre-existing, neither theme-driven.
+    // A third occurrence would mean a neutral-derived override leaked in
+    // despite no `neutral` section being set.
+    assert_eq!(html.matches("--md-surface:").count(), 2, "only the two baked-in MD3 defaults should be present, no theme-driven override");
+    // No SECOND, theme-driven dark-mode override block: the brand ramp
+    // only names step "600" (this role's light-mode step), never the
+    // dark-mode step ("300"), so nothing qualifies for one -- only the
+    // template's own pre-existing baked-in dark `@media` block remains.
+    assert_eq!(html.matches("@media (prefers-color-scheme: dark)").count(), 1);
 }
 
 #[test]
 fn theme_value_containing_markup_is_dropped_not_injected() {
-    use nirdosha::ui_gen::Theme;
+    use nirdosha::ui_gen::{Theme, ThemeFonts};
     let src = "fn main() {}";
     let toks = nirdosha::token::Lexer::new(src).tokenize().unwrap();
     let program = nirdosha::parser::Parser::new(toks).parse_program().unwrap();
@@ -357,7 +409,7 @@ fn theme_value_containing_markup_is_dropped_not_injected() {
     let registry = TypeRegistry::build(&program);
     let effects = infer_effects(&program, &registry);
     let theme = Theme {
-        font_sans: Some("</style><script>alert(1)</script>".to_string()),
+        fonts: Some(ThemeFonts { sans: "</style><script>alert(1)</script>".to_string(), display: "Inter".to_string(), mono: None }),
         ..Default::default()
     };
     let out = generate(&program, &effects, None, false, Some(&theme));
@@ -366,4 +418,67 @@ fn theme_value_containing_markup_is_dropped_not_injected() {
     // verbatim in the output as a second, injected one.
     assert!(!out.contains("alert(1)"));
     assert!(!out.contains("--md-font: </style>"));
+    assert!(!out.contains("--font-sans: </style>"));
+}
+
+fn fixture_program() -> (nirdosha::ast::Program, std::collections::HashMap<String, nirdosha::effects::FnEffects>) {
+    let src = "fn main() {}";
+    let toks = nirdosha::token::Lexer::new(src).tokenize().unwrap();
+    let program = nirdosha::parser::Parser::new(toks).parse_program().unwrap();
+    nirdosha::typeck::typecheck(&program).unwrap();
+    nirdosha::ownership::check_ownership(&program).unwrap();
+    let registry = TypeRegistry::build(&program);
+    let effects = infer_effects(&program, &registry);
+    (program, effects)
+}
+
+fn brand_theme_with_dark_mode(dark_mode: Option<&str>) -> nirdosha::ui_gen::Theme {
+    use nirdosha::ui_gen::Theme;
+    let mut brand = std::collections::HashMap::new();
+    brand.insert("600".to_string(), "#111111".to_string());
+    brand.insert("300".to_string(), "#eeeeee".to_string());
+    Theme { brand: Some(brand), dark_mode: dark_mode.map(str::to_string), ..Default::default() }
+}
+
+#[test]
+fn dark_mode_media_is_the_default_strategy() {
+    let (program, effects) = fixture_program();
+    let theme = brand_theme_with_dark_mode(None);
+    let html = generate(&program, &effects, None, false, Some(&theme));
+    assert_eq!(html.matches("@media (prefers-color-scheme: dark)").count(), 2, "the baked-in default plus this theme's own dark override");
+    assert!(html.contains("--md-primary: #eeeeee;"), "dark step (300) should land inside the media-query block");
+}
+
+#[test]
+fn dark_mode_class_uses_root_dot_dark_not_media_query() {
+    let (program, effects) = fixture_program();
+    let theme = brand_theme_with_dark_mode(Some("class"));
+    let html = generate(&program, &effects, None, false, Some(&theme));
+    assert!(html.contains(":root.dark {"));
+    assert!(html.contains("--md-primary: #eeeeee;"));
+    // Only the template's own pre-existing baked-in media block remains
+    // -- this theme's dark override did NOT also emit a media query.
+    assert_eq!(html.matches("@media (prefers-color-scheme: dark)").count(), 1);
+}
+
+#[test]
+fn dark_mode_always_writes_dark_values_into_base_root() {
+    let (program, effects) = fixture_program();
+    let theme = brand_theme_with_dark_mode(Some("always"));
+    let html = generate(&program, &effects, None, false, Some(&theme));
+    assert!(!html.contains(":root.dark"));
+    assert_eq!(html.matches("@media (prefers-color-scheme: dark)").count(), 1, "only the baked-in block -- no theme-driven one");
+    // The dark-step color (300 -> #eeeeee) lands directly in the base
+    // override `:root` alongside the light-step color, no separate block.
+    assert!(html.contains("--md-primary: #eeeeee;"));
+}
+
+#[test]
+fn dark_mode_none_emits_no_dark_override_at_all() {
+    let (program, effects) = fixture_program();
+    let theme = brand_theme_with_dark_mode(Some("none"));
+    let html = generate(&program, &effects, None, false, Some(&theme));
+    assert!(!html.contains(":root.dark"));
+    assert!(!html.contains("--md-primary: #eeeeee;"), "the dark-step color should never appear anywhere");
+    assert_eq!(html.matches("@media (prefers-color-scheme: dark)").count(), 1, "only the baked-in block");
 }

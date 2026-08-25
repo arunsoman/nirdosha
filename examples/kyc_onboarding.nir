@@ -41,6 +41,54 @@ struct EmailProviderConfig {
     from_address: str,
 }
 
+// The `list_/create_/update_/delete_` quartet `ui_gen.rs::build_screens`
+// actually looks for -- without these, the struct above renders no
+// screen at all (a struct with zero matching CRUD-convention fns is
+// "just a data type," not a screen; verified by direct `emit-ui` check
+// before this comment's older, unqualified "the free CRUD screen this
+// struct already gets" claim was corrected to be true rather than
+// aspirational). `requires(role: "admin")` on every write, matching
+// this file's own `submit_kyc_application`'s privilege posture below.
+fn list_email_provider_config() -> Result(json, Text) requires(role: "admin") {
+    return match db_connect("kyc_onboarding.db") {
+        Ok(conn) => match db_query(conn, "SELECT id, active, host, port, path, api_key, from_address FROM email_provider_config ORDER BY id") {
+            Ok(rows) => Ok(rows),
+            Err(e) => Err(Text(e)),
+        },
+        Err(e) => Err(Text(e)),
+    }
+}
+
+fn create_email_provider_config(c: EmailProviderConfig) -> Result(i64, Text) requires(role: "admin") {
+    return match db_connect("kyc_onboarding.db") {
+        Ok(conn) => match db_execute(conn, "INSERT INTO email_provider_config (active, host, port, path, api_key, from_address) VALUES (?, ?, ?, ?, ?, ?)", c.active, c.host, c.port, c.path, c.api_key, c.from_address) {
+            Ok(n) => Ok(n),
+            Err(e) => Err(Text(e)),
+        },
+        Err(e) => Err(Text(e)),
+    }
+}
+
+fn update_email_provider_config(c: EmailProviderConfig) -> Result(i64, Text) requires(role: "admin") {
+    return match db_connect("kyc_onboarding.db") {
+        Ok(conn) => match db_execute(conn, "UPDATE email_provider_config SET active = ?, host = ?, port = ?, path = ?, api_key = ?, from_address = ? WHERE id = ?", c.active, c.host, c.port, c.path, c.api_key, c.from_address, c.id) {
+            Ok(n) => Ok(n),
+            Err(e) => Err(Text(e)),
+        },
+        Err(e) => Err(Text(e)),
+    }
+}
+
+fn delete_email_provider_config(id: i64) -> Result(i64, Text) requires(role: "admin") {
+    return match db_connect("kyc_onboarding.db") {
+        Ok(conn) => match db_execute(conn, "DELETE FROM email_provider_config WHERE id = ?", id) {
+            Ok(n) => Ok(n),
+            Err(e) => Err(Text(e)),
+        },
+        Err(e) => Err(Text(e)),
+    }
+}
+
 // `send_email`/`notify` on_entry wrappers. Each is a real `fn` (a
 // `TransactSlot`-shaped `on_entry` action call is a bare `name(args)`),
 // opening its own `db`/`mq` handles internally — an on_entry action's

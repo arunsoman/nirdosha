@@ -102,7 +102,7 @@ fn start_server(db_path: &str) -> u16 {
     let workflow_log = std::env::temp_dir().join(format!("nirdosha-field-rbac-workflow-{port}.db"));
     let db_path = db_path.to_string();
     std::thread::spawn(move || {
-        nirdosha::serve::run(program, "127.0.0.1", port, Some(auth), None, transact_log, workflow_log, None, Some(db_path), None)
+        nirdosha::serve::run(program, "127.0.0.1", port, Some(auth), None, transact_log, workflow_log, None, Some(db_path), None, None, None, None)
             .expect("serve::run should not fail to bind");
     });
     for _ in 0..100 {

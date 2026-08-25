@@ -353,6 +353,33 @@ pub enum TypeErrorKind {
     /// `requires(...)` already enforces via `ast::Requirement`, reused
     /// here rather than inventing a second visibility grammar.
     InvalidVisibilityExpr { key: String },
+    /// A `field <name> { pattern: ... }` whose value isn't a plain string
+    /// literal, or a `field <name> { min/max: ... }` whose value isn't a
+    /// plain int/float literal — the only shapes `serve.rs`'s runtime
+    /// enforcement (and `ui_gen_template.html`'s client-side mirror) know
+    /// how to read.
+    InvalidFieldValidationExpr { key: String },
+    /// `field <name> { pattern: "..." }` where `<name>`'s declared type
+    /// isn't `str` (a regex has nothing to match against a number/bool/
+    /// enum), or `field <name> { min/max: ... }` where `<name>`'s type
+    /// isn't one of Nirdosha's numeric scalars — the same "shape must
+    /// match what the field can actually carry" posture `check_screen`
+    /// already applies to `view`/`edit`.
+    FieldValidationTypeMismatch { struct_name: String, field_name: String, key: String, field_ty: String },
+    /// A `field <name> { pattern: "..." }` string that doesn't compile as
+    /// a valid regex (`regex` crate syntax) — caught here, at typeck
+    /// time, rather than surfacing as a confusing 500 the first time an
+    /// admin submits a form that happens to hit `create_`/`update_`.
+    InvalidRegexPattern { struct_name: String, field_name: String, error: String },
+    /// `field <name> { format: "..." }` where `"..."` isn't one of
+    /// `ast::well_known_format_pattern`'s fixed set — that function is
+    /// the single source of truth for valid names, so this only fires
+    /// when it returns `None`.
+    UnknownFieldFormat { format: String },
+    /// `field <name> { pattern: ..., format: ... }` declared together on
+    /// the same field — ambiguous which one actually constrains the
+    /// value, so rejected rather than silently picking one.
+    ConflictingPatternAndFormat { struct_name: String, field_name: String },
     /// A `dashboard` `tile`/`chart` target that doesn't resolve to a real
     /// user-defined function.
     UnknownDashboardFn { metric_kind: String, fn_name: String },
@@ -698,6 +725,37 @@ impl std::fmt::Display for TypeError {
                 "{line}:{col}: `{key}` must be `role(\"...\")` or `claim(\"...\", \"...\")` \
                  with string-literal arguments"
             ),
+            TypeErrorKind::InvalidFieldValidationExpr { key } if key == "pattern" => {
+                write!(f, "{line}:{col}: `pattern` must be a string literal (a regex)")
+            }
+            TypeErrorKind::InvalidFieldValidationExpr { key } => {
+                write!(f, "{line}:{col}: `{key}` must be an int or float literal")
+            }
+            TypeErrorKind::FieldValidationTypeMismatch { struct_name, field_name, key, field_ty } if key == "pattern" => write!(
+                f,
+                "{line}:{col}: `field {field_name} {{ pattern: ... }}` on `{struct_name}` — \
+                 `{field_name}` is `{field_ty}`, not `str`; `pattern` only applies to `str` fields"
+            ),
+            TypeErrorKind::FieldValidationTypeMismatch { struct_name, field_name, key, field_ty } => write!(
+                f,
+                "{line}:{col}: `field {field_name} {{ {key}: ... }}` on `{struct_name}` — \
+                 `{field_name}` is `{field_ty}`, not numeric; `{key}` only applies to a numeric field"
+            ),
+            TypeErrorKind::InvalidRegexPattern { struct_name, field_name, error } => write!(
+                f,
+                "{line}:{col}: `field {field_name} {{ pattern: ... }}` on `{struct_name}` — \
+                 not a valid regex: {error}"
+            ),
+            TypeErrorKind::UnknownFieldFormat { format } => write!(
+                f,
+                "{line}:{col}: `format: \"{format}\"` — not a recognized format; use one of \
+                 \"email\", \"phone\", \"date\", \"url\", \"uuid\", or write your own `pattern: \"<regex>\"`"
+            ),
+            TypeErrorKind::ConflictingPatternAndFormat { struct_name, field_name } => write!(
+                f,
+                "{line}:{col}: `field {field_name}` on `{struct_name}` declares both `pattern` \
+                 and `format` — pick one"
+            ),
             TypeErrorKind::UnknownDashboardFn { metric_kind, fn_name } => write!(
                 f,
                 "{line}:{col}: `{metric_kind} ... -> {fn_name}` — no function named `{fn_name}` is declared"
@@ -1041,6 +1099,98 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `field <name> { pattern: "..." }` — value must be a string literal,
+    /// `<name>` must actually be a `str` field, and the literal itself
+    /// must compile as a valid regex (`regex` crate syntax) — the same
+    /// engine `serve.rs`'s runtime enforcement uses, so a pattern that
+    /// typechecks is guaranteed to actually compile at request time too.
+    /// `field_ty: None` means `fo.field_name` didn't resolve to a real
+    /// field at all — already reported as `UnknownScreenField` by the
+    /// caller, so this silently skips rather than piling on a second,
+    /// confusing error about a field that doesn't exist.
+    fn check_pattern_expr(&mut self, struct_name: &str, field_name: &str, field_ty: Option<&Ty>, value: &Expr) {
+        let Expr::Str(pattern, _) = value else {
+            self.error(TypeErrorKind::InvalidFieldValidationExpr { key: "pattern".to_string() }, value.span());
+            return;
+        };
+        let Some(ty) = field_ty else { return };
+        if *ty != Ty::Str {
+            self.error(
+                TypeErrorKind::FieldValidationTypeMismatch {
+                    struct_name: struct_name.to_string(),
+                    field_name: field_name.to_string(),
+                    key: "pattern".to_string(),
+                    field_ty: format!("{ty:?}"),
+                },
+                value.span(),
+            );
+            return;
+        }
+        if let Err(e) = regex::Regex::new(pattern) {
+            self.error(
+                TypeErrorKind::InvalidRegexPattern {
+                    struct_name: struct_name.to_string(),
+                    field_name: field_name.to_string(),
+                    error: e.to_string(),
+                },
+                value.span(),
+            );
+        }
+    }
+
+    /// `field <name> { format: "..." }` — sugar over `pattern`
+    /// (`ast::well_known_format_pattern`'s fixed vocabulary). Same
+    /// string-literal-and-`str`-field shape checks as `check_pattern_expr`,
+    /// plus validating the name itself is one of the known formats — no
+    /// regex-compile check needed here, every entry in that table is a
+    /// hardcoded, already-valid pattern.
+    fn check_format_expr(&mut self, struct_name: &str, field_name: &str, field_ty: Option<&Ty>, value: &Expr) {
+        let Expr::Str(format, _) = value else {
+            self.error(TypeErrorKind::InvalidFieldValidationExpr { key: "format".to_string() }, value.span());
+            return;
+        };
+        if crate::ast::well_known_format_pattern(format).is_none() {
+            self.error(TypeErrorKind::UnknownFieldFormat { format: format.clone() }, value.span());
+            return;
+        }
+        let Some(ty) = field_ty else { return };
+        if *ty != Ty::Str {
+            self.error(
+                TypeErrorKind::FieldValidationTypeMismatch {
+                    struct_name: struct_name.to_string(),
+                    field_name: field_name.to_string(),
+                    key: "format".to_string(),
+                    field_ty: format!("{ty:?}"),
+                },
+                value.span(),
+            );
+        }
+    }
+
+    /// `field <name> { min: ... }` / `field <name> { max: ... }` — value
+    /// must be an int or float literal, `<name>` must be one of
+    /// Nirdosha's numeric scalar types (`Ty::is_numeric`). Same
+    /// "already reported, don't pile on" skip for `field_ty: None` as
+    /// `check_pattern_expr`.
+    fn check_min_max_expr(&mut self, struct_name: &str, field_name: &str, key: &str, field_ty: Option<&Ty>, value: &Expr) {
+        if !matches!(value, Expr::Int(..) | Expr::Float(..)) {
+            self.error(TypeErrorKind::InvalidFieldValidationExpr { key: key.to_string() }, value.span());
+            return;
+        }
+        let Some(ty) = field_ty else { return };
+        if !ty.is_numeric() {
+            self.error(
+                TypeErrorKind::FieldValidationTypeMismatch {
+                    struct_name: struct_name.to_string(),
+                    field_name: field_name.to_string(),
+                    key: key.to_string(),
+                    field_ty: format!("{ty:?}"),
+                },
+                value.span(),
+            );
+        }
+    }
+
     /// `screen <Struct> { ... }` — existence/shape checks only; see the
     /// module-level note above `typecheck`'s `screens`/`dashboard` pass.
     fn check_screen(&mut self, screen: &ScreenDecl) {
@@ -1070,9 +1220,22 @@ impl<'a> Checker<'a> {
                     fo.span,
                 );
             }
+            let field_ty = fields.iter().find(|f| f.name == fo.field_name).map(|f| &f.ty);
+            if fo.entries.iter().any(|(k, _)| k == "pattern") && fo.entries.iter().any(|(k, _)| k == "format") {
+                self.error(
+                    TypeErrorKind::ConflictingPatternAndFormat {
+                        struct_name: screen.struct_name.clone(),
+                        field_name: fo.field_name.clone(),
+                    },
+                    fo.span,
+                );
+            }
             for (key, value) in &fo.entries {
                 match key.as_str() {
                     "view" | "edit" => self.check_visibility_expr(key, value),
+                    "pattern" => self.check_pattern_expr(&screen.struct_name, &fo.field_name, field_ty, value),
+                    "format" => self.check_format_expr(&screen.struct_name, &fo.field_name, field_ty, value),
+                    "min" | "max" => self.check_min_max_expr(&screen.struct_name, &fo.field_name, key, field_ty, value),
                     _ => {}
                 }
             }

@@ -94,9 +94,12 @@ fn print_usage() {
     eprintln!("  nirdosha emit-ui <file.nir> [-o out.html]");
     eprintln!("                                      derive a Material-styled web UI from struct/fn conventions");
     eprintln!("  nirdosha serve <file.nir> [--host 127.0.0.1] [--port 8080] [--jwks-file P --issuer S --audience S]");
-    eprintln!("                             [--identity-base URL] [--db PATH]");
+    eprintln!("                             [--identity-base URL] [--db PATH] [--otel-port PORT --otel-token TOKEN]");
     eprintln!("                                      run the program as a real HTTP service (UI at GET /,");
     eprintln!("                                      API at POST /api/<fn>) -- see src/serve.rs");
+    eprintln!("                                      (--otel-port: a second, loopback-only APM port, dynamically");
+    eprintln!("                                       enabled only while a token-authenticated client is connected");
+    eprintln!("                                       -- observability layer 2a, requires --otel-token)");
 }
 
 fn read_source(path: &str) -> Result<String, ExitCode> {
@@ -422,11 +425,11 @@ fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
 }
 
 /// `nirdosha serve <file.nir> [--port 8080] [--jwks-file P --issuer S
-/// --audience S] [--identity-base URL] [--db PATH]` — runs the program
-/// as a real HTTP service via `serve::run` (`tiny_http`; see
-/// `src/serve.rs`'s module doc for the request-handling design and,
-/// importantly, the authz gate it adds on top of
-/// `Interpreter::call_named`, which by itself does not enforce
+/// --audience S] [--identity-base URL] [--db PATH] [--otel-port PORT
+/// --otel-token TOKEN]` — runs the program as a real HTTP service via
+/// `serve::run` (`tiny_http`; see `src/serve.rs`'s module doc for the
+/// request-handling design and, importantly, the authz gate it adds on
+/// top of `Interpreter::call_named`, which by itself does not enforce
 /// `requires(role: ...)`). `--db PATH` additionally exposes the generic
 /// `/_nirdosha/table/<snake>` pagination/sort/filter/search route
 /// (`serve.rs`'s own doc comment on `dispatch_table_query`) against the
@@ -437,6 +440,13 @@ fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
 /// than silently accepted or silently ignored, and any `requires`-gated
 /// handler is simply unreachable (every caller gets 401) — an honest
 /// failure mode, not a security hole disguised as "it just worked."
+/// `--otel-port`/`--otel-token` are observability layer 2a
+/// (`observability.rs`'s "Rollout layers 2-4" section): a second,
+/// loopback-only listener a token-bearing APM client connects to, live-
+/// gating every request's tracer for as long as one stays connected.
+/// Unlike `--jwks-file`'s trio, `--otel-port` is meaningful alone at the
+/// parser level, but validated here as effectively all-or-nothing too —
+/// see the check right below.
 fn cmd_serve(
     mut args: impl Iterator<Item = String>,
     transact_log_path: Option<String>,
@@ -452,6 +462,8 @@ fn cmd_serve(
     let mut db_path: Option<String> = None;
     let mut theme_path: Option<String> = None;
     let mut presence_token: Option<String> = None;
+    let mut otel_port: Option<u16> = None;
+    let mut otel_token: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--host" => host = args.next().unwrap_or(host),
@@ -471,15 +483,35 @@ fn cmd_serve(
             // path, the same "a feature you don't opt into costs nothing"
             // degradation `--db`-gated routes already follow.
             "--presence-token" => presence_token = args.next(),
+            // Observability layer 2a (`observability.rs`'s "Rollout
+            // layers 2-4" section): a second, loopback-only listener
+            // dedicated to APM consumers, dynamically gated by whether
+            // one is actually connected. Omitted entirely means no
+            // listener, no `Tracer` at all — byte-for-byte the same
+            // server this always was, the same degradation every other
+            // opt-in flag here already follows.
+            "--otel-port" => otel_port = args.next().and_then(|s| s.parse().ok()),
+            "--otel-token" => otel_token = args.next(),
             other => input = Some(other.to_string()),
         }
     }
     let Some(path) = input else {
         eprintln!(
-            "usage: nirdosha serve <file.nir> [--host 127.0.0.1] [--port 8080] [--jwks-file P --issuer S --audience S] [--identity-base URL] [--db PATH] [--theme theme.json] [--presence-token TOKEN]"
+            "usage: nirdosha serve <file.nir> [--host 127.0.0.1] [--port 8080] [--jwks-file P --issuer S --audience S] [--identity-base URL] [--db PATH] [--theme theme.json] [--presence-token TOKEN] [--otel-port PORT --otel-token TOKEN]"
         );
         return ExitCode::FAILURE;
     };
+    // All-or-nothing, same posture `--jwks-file`/`--issuer`/`--audience`
+    // already take below: a bearer-token-gated internal channel that
+    // silently ran with no token would be a security hole disguised as
+    // "it just worked" (`observability.rs`'s layer 2a design explicitly
+    // calls this out — mandatory, not optional, unlike `--presence-token`
+    // which is allowed to be absent because absence just 404s the routes
+    // it gates instead of exposing anything).
+    if otel_port.is_some() && otel_token.is_none() {
+        eprintln!("--otel-port requires --otel-token (an unauthenticated APM port would leak call timing/error-rate data to anyone who can reach it)");
+        return ExitCode::FAILURE;
+    }
     let src = match read_source(&path) {
         Ok(s) => s,
         Err(code) => return code,
@@ -533,6 +565,9 @@ fn cmd_serve(
         presence_token,
         db_path,
         theme.as_ref(),
+        theme_path.as_deref(),
+        otel_port,
+        otel_token,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {

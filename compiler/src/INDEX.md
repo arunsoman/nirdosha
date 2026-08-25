@@ -102,6 +102,7 @@ part.
 - `771` `pub fn typecheck` — top-level entry point; registers every struct/enum/fn name (two namespaces: type names vs. callable names — see Row 11 §3.1/3.2), then checks every `fn` body. A program the interpreter runs was always fully typed and proved-returning first.
 - `921` `fn error` — push one `TypeErrorKind` at a `Span`, the one place every check funnels through
 - `968`/`1009`/`1018` `fn check_screen`/`check_dashboard`/`check_metric_ref` — Row 12 UI-DSL shape checks (existence/shape only, not full signature enforcement — see `compiler/UI_DSL_TODO.md`)
+- (near `check_screen`) `fn check_pattern_expr`/`check_format_expr`/`check_min_max_expr` — `field <name> { pattern/format/min/max: ... }` shape + field-type-applicability checks (2026-08-24), incl. compiling `pattern`'s regex via the `regex` crate at typeck time
 - `1050` `fn validate_ty` — well-formedness of a type expression itself (arity, unknown names) — recurses through every type-former the same way `ast.rs::Ty::contains_str` does
 - `1100` `fn check_fn` — per-function entry point: the "enum favoring" `str`-in-signature scan lives here (2026-08-23), then body-checks, then `NotAllPathsReturn`
 - `1132`/`1138`/`1144` `fn check_stmts`/`check_block`/`check_stmt` — statement-level checking (no value context)
@@ -151,6 +152,7 @@ part.
 - `1178` `impl Expr` (`span`) — every `Expr` variant's source span, for error reporting
 - `1216` `pub struct Program` — the whole-program AST root (`fns`/`structs`/`enums`/`screens`/`dashboard`)
 - `1244`–`1305` Row 12 UI-DSL AST: `FieldOverride`, `ActionDecl`, `ScreenDecl`, `MetricRef`, `DashboardDecl`
+- (just above `FieldOverride`) `pub fn well_known_format_pattern` — `field <name> { format: "..." }`'s fixed vocabulary (`email`/`phone`/`date`/`url`/`uuid`) → regex, the single source of truth `typeck.rs`/`ui_gen.rs` both consume (2026-08-24)
 - `1305` `pub struct TypeRegistry<'a>` — the struct/enum declaration lookup table every later pass (typeck, ownership, effects, codegen, ui_gen) builds once and queries repeatedly
 - `1327`–`1396` `impl TypeRegistry` methods: `build`, `struct_decl`/`enum_decl`, `struct_fields`/`enum_variants`, `struct_type_params`/`enum_type_params`, `is_struct`/`is_enum`, `find_variant`, `is_affine` (the struct/enum-aware version, delegates to `Ty::is_affine` for everything else)
 - `1435` `pub fn result_of` — `Result(ok, str)` shorthand every builtin signature uses (builtins are exempt from the str-ban — see `LANGUAGE.md` §6b)
@@ -201,22 +203,27 @@ part.
 - `425` `fn effect_badges`
 - `441`/`469` `fn build_action`/`build_custom_action` — CRUD-convention and declared-`screen`-action derivation
 - `487`/`503` `fn kv_str`/`kv_gate` — `screen` DSL's `key: value` entry helpers (`role(...)`/`claim(...)` extraction)
+- (near `kv_str`) `fn kv_num` — numeric sibling of `kv_str`, for `min`/`max` (2026-08-24)
 - `521` `fn find_screen_decl`
 - `527` `fn to_title_case`
 - `541`/`548`/`559` `fn is_numeric_scalar`/`is_stat_return_ty`/`is_chart_return_ty` — `stat_`/`chart_` naming-convention dashboard-metric detection
 - `570`/`588`/`592` `fn build_metrics`/`build_stats`/`build_charts`
 - `600` `pub struct GatedField` / `608`/`629`/`651`/`692` field-visibility gate resolution: `gates_from_screen_decl`, `field_gates_for_struct`, `field_gates_for_fn`, `update_gates_for_fn` — this is what `serve.rs`'s server-side redaction/edit-blocking actually consults
+- (near `update_gates_for_fn`) `pub struct ValidatedField` / `fn resolve_pattern`/`validations_from_screen_decl` / `pub fn field_validations_for_fn` — field-format-constraint resolution (`pattern`/`format`/`min`/`max`), 2026-08-24; unlike `update_gates_for_fn`, matches either a struct's `create` OR `update` slot — this is what `serve.rs::check_field_validations` consults
 - `727` `fn apply_field_overrides`
 - `749` `fn build_screens` — assembles the full per-struct `Screen` list (the main derivation pass)
 - `818`/`829`/`840` `fn field_json`/`metrics_json`/`manifest_json` — JSON-manifest serialization
 - `900` `pub fn generate` — top-level entry point: program → complete self-contained HTML string (embeds `manifest_json` into `ui_gen_template.html`)
+- (near `generate`) `pub struct Theme` / `ThemeFonts`/`ThemeRadius`/`ThemeDensity`/`ThemeMotion`/`ThemeLayout`/`ThemeTypeScale` — 2026-08-25 redesign, a 1:1 mirror of protobox's `resolve_design_tokens()` JSON shape (LANGUAGE.md SS11b); `fn theme_override_css`/`theme_html_class`/`theme_bootstrap_script` — the three `__NIRDOSHA_*__` placeholders `generate` splices in; `const RAMP_STEPS` / `struct RampRoleStep` + the `PRIMARY`/`ON_PRIMARY`/`SURFACE`/etc. consts — the semantic-role → ramp-step mapping deriving `--md-*` from the raw `brand`/`neutral` ramps
 
 ## serve.rs (957 lines, as of 2026-08-23)
 - `54` `pub struct AuthConfig` — JWKS/issuer/audience server-side config
 - `60`/`68` `fn cors_headers`/`header`
 - `78` `pub fn run` — top-level entry point: binds the HTTP server, wires `--db` migration (`migrate.rs::plan_and_apply`) + crash-replay before serving
+- (near `run`) `struct ThemeCache` / `fn theme_ttl`/`refresh_theme_html_if_stale` — live `--theme` reload, 2026-08-25 (LANGUAGE.md SS11b): re-reads `theme.json` from disk and regenerates the served HTML on `GET /` at most once per TTL (env-overridable via `NIRDOSHA_TEST_THEME_TTL_MS` for `tests/theme_reload.rs`), tolerating a missing/malformed file by keeping the last-good page instead of erroring
 - `113` (inline in `run`) — `migrations_dir` derivation (`--db` path's parent + `/migrations`) and the `migrate.rs`/`replay_pending_transactions` call sequence — see `ROADMAP.md` Track B1/B2 before changing this
 - `262` `fn to_snake_case`
+- (near `build_table_catalog`) `struct RoleMappingCache` / `fn load_role_mapping`/`refresh_role_mapping_if_stale`/`role_mapping_ttl`/`identity_has_mapped_role` — the identity role-mapping cache (`ROADMAP.md` Track A6, 2026-08-24): app_role -> idp_role synonyms, loaded eagerly at `run` startup + refreshed on a TTL (env-overridable for `tests/role_mapping.rs`), consulted by every `requires(role:...)`/`view`/`edit` check via `identity_has_mapped_role` in place of a bare `interpreter::identity_has_role`
 - `290` `fn build_table_catalog`
 - `301`/`317` `fn json_to_sql_value`/`sql_value_to_json`
 - `342` `fn dispatch_table_query` — the paginated/searchable table route (`serverTableApi`); a `list_<struct>` doing a join or computed column is invisible to this route, client falls back to the plain unpaginated call
@@ -225,6 +232,7 @@ part.
 - `540` `fn redact_gated_fields` — field-level view-gate enforcement (reads `ui_gen::GatedField`)
 - `579` `fn dispatch` — the actual request router, deliberately plain-data-in/`(status, json body)`-out with no `tiny_http` types, so `tests/serve.rs` can exercise it without a real socket
 - `741` `fn check_edit_gates` — field-level edit-gate enforcement
+- (near `check_edit_gates`) `fn check_field_validations` — field-format-constraint enforcement (`pattern`/`format`/`min`/`max`), 2026-08-24; unlike `check_edit_gates`, needs no `--db` (checks only the incoming value, never a stored one) and runs for both `create_`/`update_`
 - `794` `fn value_matches_stored`
 - `806` `fn describe_requirement`
 - `813` `fn is_verified_identity`

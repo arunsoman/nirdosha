@@ -2,25 +2,63 @@
 
 [![build](https://github.com/arunsoman/nirdosha/actions/workflows/build.yml/badge.svg)](https://github.com/arunsoman/nirdosha/actions/workflows/build.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![docs](https://img.shields.io/badge/docs-LANGUAGE.md-blue)](./LANGUAGE.md)
+[![Contributing](https://img.shields.io/badge/CONTRIBUTING-read-blue)](./CONTRIBUTING.md)
+[![Roadmap](https://img.shields.io/badge/ROADMAP-view-purple)](./PUBLIC_ROADMAP.md)
 
-> A research-stage systems language with no garbage collector, no data races,
-> no deadlocks, no integer/buffer overflow, and hardware-native speed —
-> *and* a small, composable grammar that an LLM can write and reason about
-> as a first-class programmer, not a guest typing into a text box.
+> **A systems language designed for LLMs to write, with a grammar so
+> constrained the model can't emit invalid syntax.** No garbage collector,
+> no data races, no deadlocks, no integer/buffer overflow — those aren't
+> the pitch, they're the proof that a language built for an AI agent to
+> write unsupervised can also be trusted to run.
 
 Status: active research prototype. The compiler is a real, runnable Rust
 crate (`compiler/`); many safety properties are *proven* today and some are
 *aspirational* (called out honestly below). Source files use the `.nir`
 extension.
 
-![nirdosha serve deriving a role-gated CRUD catalog from a struct + fn naming convention, then creating a product that persists to real SQLite](./demo.gif)
+```nirdosha
+fn secret(n: i64) -> i64 requires(role: "admin") {
+    return n + 1
+}
 
-*Zero UI code. `nirdosha serve examples/store.nir` derives the whole screen
-above — including the `requires(role: "admin")` gate and the custom
-"Restock +10" action — from `struct Product` and its `list_/create_/
-update_/delete_product` functions. Login goes through a real mock IdP
-(`examples/identity_mock.nir`), and the create call really persists to
-SQLite (not simulated for this recording — see §6, §9).*
+fn work(b: box i64) -> i64 {
+    return *b
+}
+
+fn main() {
+    print("hello, Nirdosha")
+    let h: box i64 = box 21
+    let t: thread i64 = spawn work(h)
+    print(join t)
+}
+```
+
+```sh
+cd compiler && cargo run -- ../examples/hello_above_fold.nir
+# hello, Nirdosha
+# 21
+```
+
+`box` is single-owner — `spawn` moves `h` into the thread, so `main` can
+never touch it again; that's checked at compile time, not by convention.
+`secret` is gated by `requires(role: "admin")` and is literally uncallable
+without an `acquire`d `RoleView` proof — see
+[`examples/privileged_fn.nir`](./examples/privileged_fn.nir) for the full
+role-acquisition flow.
+
+![334 lines of Nirdosha producing a themed dashboard with live SQLite data, a sortable/searchable vendor table, and a role-gated payout-approval action — then the same screens under a lower-privileged identity, with a field dropped and an action disabled by the server](./demo.gif)
+
+*334 lines, zero UI code — `examples/vendor_ops.nir`, verified with
+`wc -l`. `nirdosha serve examples/vendor_ops.nir --theme
+examples/vendor_ops_theme.json` derives a live dashboard, a
+sortable/searchable table, and a role-gated `Approve` action from two
+`struct`s and a `screen`/`dashboard` block. Signed in as `analyst`, the
+exact same screen drops the `risk_score` field and column entirely and
+disables `Approve` — both enforced by `serve.rs` on every call, not
+hidden by client JS. Signed in as `admin`, that same `Approve` action
+really flips a row from `requested` to `approved` in SQLite. Nothing
+here is simulated — see §6, §7, §11.*
 
 ---
 
@@ -29,13 +67,14 @@ SQLite (not simulated for this recording — see §6, §9).*
 1. [What the name means](#1-what-the-name-means)
 2. [Motivation](#2-motivation)
 3. [Who this is for (and who it isn't)](#3-who-this-is-for-and-who-it-isnt)
-4. [Grammar](#4-grammar)
-5. [Features](#5-features)
-6. [The UI engine](#6-the-ui-engine)
-7. [Benchmarks](#7-benchmarks)
-8. [LLM integration](#8-llm-integration)
-9. [Try it out today](#9-try-it-out-today)
-10. [Honest scope](#10-honest-scope)
+4. [Why not Rust, Go, or Mojo?](#4-why-not-rust-go-or-mojo)
+5. [Grammar](#5-grammar)
+6. [Features](#6-features)
+7. [The UI engine](#7-the-ui-engine)
+8. [Benchmarks](#8-benchmarks)
+9. [LLM integration](#9-llm-integration)
+10. [Try it out today](#10-try-it-out-today)
+11. [Honest scope](#11-honest-scope)
 
 ---
 
@@ -106,7 +145,7 @@ The honest fit, not the marketing one.
   anything where "who is allowed to call this" is part of the spec, not an
   afterthought. `requires(role: "admin")` / `requires(claim: "department",
   "cardiology")` are type-checked at the call site, not `if user.role ==
-  "admin"` sprinkled through handlers — §6's UI engine derives the
+  "admin"` sprinkled through handlers — §7's UI engine derives the
   login/role gate automatically from the same annotation.
 - **Deterministic simulations and audits**, where "run it twice, get the
   same trace" matters. `rand_seed` resets a from-scratch RNG with no OS
@@ -121,9 +160,34 @@ The honest fit, not the marketing one.
 - Anything where you need the crate ecosystem, hiring pool, or decade of
   production hardening Rust/Go already have. Nirdosha is two days into
   being public; picking it over Rust today is a research bet, not an
-  engineering one — see §10.
+  engineering one — see §11.
 
-## 4. Grammar
+## 4. Why not Rust, Go, or Mojo?
+
+Nirdosha isn't trying to be a better Rust; it gives up Rust's full
+expressiveness in exchange for a grammar an LLM can be forced to stay
+inside, and a concurrency model where whole bug classes are
+unrepresentable rather than merely unlikely.
+
+| | **Nirdosha** | **Rust** | **Go** | **Mojo** |
+|---|---|---|---|---|
+| **Target use case** | Deterministic backend services, compliance CRUD, LLM-written agents | General-purpose systems: kernels, browsers, databases, embedded | Cloud-native services, DevOps tooling | AI/ML-first, Python-compatible kernels for CPU/GPU |
+| **Memory management** | Affine ownership (`box`/`&`), single-owner heap, no GC | Ownership + borrowing + lifetimes, no GC in safe code | Tracing GC | Ownership/borrowing (Rust-inspired) + Python dynamic layer |
+| **Data-race freedom** | Static — no shared mutable state, no aliasing | Static — borrow checker rules them out | Not statically guaranteed (`go test -race` is dynamic-only) | Not yet fully guaranteed |
+| **Deadlock freedom** | Proof-by-construction — no locks in the language at all | Possible — `Mutex`/`Condvar`/async can deadlock | Possible — channels + `sync.Mutex` can deadlock | Not a current guarantee |
+| **LLM writability** | LL(1) grammar exported to GBNF for constrained decoding; structured JSON diagnostics | LLMs default to Python 90–97% of the time; Rust's API churn compounds it | Easy to generate syntactically; no constrained decoding or proof obligations built in | Easy for Python-like snippets; no published GBNF/constrained-decoding integration |
+| **Maturity** | 2-day-old public research prototype | Production-ready, decade of hardening | Production-ready, huge ecosystem | Pre-1.0, stabilizing |
+
+If you're wondering "why not just use Rust, Go, or Mojo?" — the honest
+answer is that those languages already solve memory safety and
+concurrency for teams that can invest in their learning curve. Nirdosha
+targets a different, narrower problem: AI agents writing backend code
+unsupervised, where the grammar itself has to make invalid syntax and
+whole bug classes impossible to emit, not just unlikely. If you love
+Rust, keep using it — Nirdosha is a research bet on a different user,
+not a replacement.
+
+## 5. Grammar
 
 The parser (`compiler/src/parser.rs`) is **hand-written recursive descent
 with strictly one token of lookahead and no backtracking, anywhere** — the
@@ -170,7 +234,7 @@ Notable choices:
   `claim`) are matched only in their leading slot, so they stay ordinary
   identifiers everywhere else.
 
-## 5. Features
+## 6. Features
 
 Mined from the actual implementation (`compiler/src/`), not the design
 docs. See [`LANGUAGE.md`](./LANGUAGE.md) for the authoritative reference.
@@ -249,7 +313,7 @@ own concrete type arguments, the same way it does through `box`.
 `frobenius_norm`, `trace`, matrix×matrix and matrix×vector multiply with
 shape checking at typecheck time. `Vector * Vector` is a **type error by
 design** (ambiguous inner vs. outer product) — use `dot()`. The whole
-linalg feature set is modeled on Julia and now **compiled** (see §7).
+linalg feature set is modeled on Julia and now **compiled** (see §8).
 
 ### I/O & networking
 `print`, `file` handles (`open`/`read`/`write`/`stop`), `tcp` client
@@ -263,10 +327,10 @@ including cross-process transactions, and a `redis`-backed message queue.
 ### Structured diagnostics (row 9)
 Every error — type, ownership, runtime — has **one structured shape**
 (`Diagnostic` JSON via `--format=json`), not English prose. This is what
-makes the LLM self-repair loop (§8) possible: the model gets a
+makes the LLM self-repair loop (§9) possible: the model gets a
 machine-parseable proof obligation back, not a sentence to guess at.
 
-## 6. The UI engine
+## 7. The UI engine
 
 Nirdosha ships a **declarative UI DSL** plus a UI generator that derives a
 full CRUD + dashboard web application from a program's `struct`
@@ -297,7 +361,8 @@ fn restock_product(id: i64) -> Result(i64, str) requires(role: "admin") { ... }
 
 screen Product {
     title: "Catalog"
-    field name { label: "Product Name" }
+    field name { label: "Product Name" pattern: "^[A-Za-z0-9 ]+$" }
+    field stock { min: 0 }
     action "Restock +10" -> restock_product {
         style: "outlined"
         confirm: "Restock this product by 10 units?"
@@ -313,47 +378,51 @@ dashboard {
 - `screen`/`dashboard` are real reserved keywords (top-level items like
   `struct`/`fn`); `field`/`action`/`tile`/`chart` are contextual keywords.
 - Typechecked: `screen <Name>` must name a real `struct`; `field`/`action`
-  targets must resolve; `view`/`edit` must be `role(...)`/`claim(...)`.
+  targets must resolve; `view`/`edit` must be `role(...)`/`claim(...)`;
+  `pattern` must compile as a regex and only apply to a `str` field;
+  `format` must be one of `"email"`/`"phone"`/`"date"`/`"url"`/`"uuid"`;
+  `min`/`max` must only apply to a numeric field.
 - **Inert to native codegen** — `nirdosha build` compiles a program
   containing `screen`/`dashboard` cleanly (codegen never inspects them).
   They're consumed only by `nirdosha emit-ui` / `nirdosha serve`.
+- `view`/`edit` (role/claim visibility) and `pattern`/`format`/`min`/`max`
+  (format validation) are enforced for real, both client- and
+  server-side — `serve.rs` is the actual security/validation boundary,
+  the client-side version is cosmetic convenience only.
 - Tracked-but-not-wired (see [`compiler/UI_DSL_TODO.md`](./compiler/UI_DSL_TODO.md)):
-  `paginate`, `searchable`/`sortable`, server-side role/claim visibility.
+  `paginate`, `searchable`/`sortable`.
+
+### Design tokens: `--theme`
+`nirdosha emit-ui`/`serve --theme theme.json` layers a full design
+system on the baked-in Material Design 3 defaults — brand/neutral color
+ramps, fonts, radius, shadow, density, real entrance/hover/press
+animations, three dark-mode strategies, and CSS-only layout shell
+variants (`LANGUAGE.md` §11b). Every section is optional; a program
+with no `--theme` renders exactly as before this existed.
+`nirdosha serve` re-reads the file on a TTL, so a redeployed theme
+takes effect without restarting the server.
 
 ### Serving
 `nirdosha serve <file.nir>` runs a `tiny_http` server exposing the inferred
 functions as a JSON API (`POST /api/<fn>`), with optional OIDC JWKS/issuer/
-audience gating — the same identity primitives as §5, applied to HTTP.
+audience gating — the same identity primitives as §6, applied to HTTP.
 
-## 7. Benchmarks
+## 8. Benchmarks
 
 Full methodology and caveats in [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
 Numbers are **compiled-vs-compiled**, best-of-3 wall time, every output
 verified bit-identical across all languages before any timing was trusted.
+The comparison that matters most is against C, since both are AOT-compiled
+to native code on equal footing — the Julia numbers below are informative
+but not apples-to-apples (see caveat).
 
-### Group A — dense linear algebra (Julia-derived features)
-Nirdosha compiled vs. Julia (JIT) vs. C. 200,000 iterations.
+### Group A — scalar / control flow (the credible comparison)
+Nirdosha compiled (`-O2`, default) vs. C.
 
-| Benchmark | C (gcc -O2) | Nirdosha (compiled) | Julia (JIT) | vs. Julia | vs. C |
-|---|---:|---:|---:|---:|---:|
-| `matmul` (4×4) | 0.0102 s | **0.0018 s** | 0.794 s | **441× faster** | 5.7× faster |
-| `det` (4×4) | 0.0093 s | 0.0272 s | 0.993 s | **36.5× faster** | 2.9× slower |
-| `dot` (8-vec) | 0.0023 s | **0.0017 s** | 0.418 s | **246× faster** | 1.4× faster |
-| `kalman` (4-state) | 0.0798 s | 0.3274 s | 2.735 s | **8.4× faster** | 4.1× slower |
-
-**Decisive win over Julia on all four once compiled.** The honest asterisk:
-Nirdosha loses to hand-specialized C on `det`/`kalman` because those go
-through a runtime-parameterized native call LLVM can't inline for `n=4`,
-while `matmul`/`dot` are fully unrolled at codegen time into straight-line
-IR. A future per-size monomorphization pass would likely close the gap.
-
-### Group B — scalar / control flow
-Nirdosha compiled (`-O2`, default) vs. C vs. Julia.
-
-| Benchmark | C (gcc -O2) | Nirdosha (`-O2`) | Julia (ref) |
-|---|---:|---:|---:|
-| `fib(35)` | 0.018 s | **0.026 s** | 0.283 s |
-| `floatloop` (2×10⁸) | 0.443 s | **0.436 s** | 0.686 s |
+| Benchmark | C (gcc -O2) | Nirdosha (`-O2`) |
+|---|---:|---:|
+| `fib(35)` | 0.018 s | **0.026 s** |
+| `floatloop` (2×10⁸) | 0.443 s | **0.436 s** |
 
 Within **1.4×** of `gcc -O2` on `fib`, and **noise-level tied** with C on
 `floatloop` — exactly where a thin LLVM-backed AOT compiler should land.
@@ -361,9 +430,30 @@ Within **1.4×** of `gcc -O2` on `fib`, and **noise-level tied** with C on
 than compiled; compiling linalg was the whole point of prioritizing
 codegen there.)
 
+### Group B — dense linear algebra (Julia-derived features)
+Nirdosha compiled vs. C vs. Julia (JIT). 200,000 iterations.
+
+| Benchmark | C (gcc -O2) | Nirdosha (compiled) | Julia (JIT) | vs. C |
+|---|---:|---:|---:|---:|
+| `matmul` (4×4) | 0.0102 s | **0.0018 s** | 0.794 s | 5.7× faster |
+| `det` (4×4) | 0.0093 s | 0.0272 s | 0.993 s | 2.9× slower |
+| `dot` (8-vec) | 0.0023 s | **0.0017 s** | 0.418 s | 1.4× faster |
+| `kalman` (4-state) | 0.0798 s | 0.3274 s | 2.735 s | 4.1× slower |
+
+**Caveat on the Julia column:** these numbers include Julia's JIT
+compilation overhead, not steady-state execution after warmup — an
+AOT-compiled binary vs. a JIT session isn't a fair fight, and the "vs.
+Julia" gap is mostly measuring that, not raw execution speed. Treat the
+Julia column as directional, not a benchmark claim; the **vs. C** column
+is the one worth trusting. On that measure Nirdosha wins `matmul`/`dot`
+(fully unrolled at codegen time into straight-line IR) and loses
+`det`/`kalman` (a runtime-parameterized native call LLVM can't inline for
+`n=4` — a future per-size monomorphization pass would likely close the
+gap).
+
 Benchmarks live in [`benchmarks/{c,julia,nirdosha}/`](./benchmarks/).
 
-## 8. LLM integration
+## 9. LLM integration
 
 Nirdosha is designed so an LLM is a **first-class programmer**: agents emit
 **typed AST/IR fragments the compiler validates before splicing**, not raw
@@ -415,9 +505,29 @@ context — the same re-prompt loop a real self-repair integration would use.
 It ships mock models today; wiring a real LLM API is a distinct, separate
 piece of work the harness is built to plug into.
 
-## 9. Try it out today
+## 10. Try it out today
 
-### Build the compiler
+### Install (no Rust, no clang, no z3)
+
+```sh
+# macOS / Linux
+curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/arunsoman/nirdosha/main/scripts/install.sh | sh
+```
+
+```powershell
+# Windows
+irm https://raw.githubusercontent.com/arunsoman/nirdosha/main/scripts/install.ps1 | iex
+```
+
+Prebuilt binaries (Linux x86_64, macOS Intel/Apple Silicon, Windows
+x86_64) have Z3 statically vendored — nothing to install first, no
+linker errors. `clang` is only needed later, and only on the machine
+running `nirdosha build`/`emit-llvm` (native codegen); interpreting,
+`emit-ui`, and `serve` all work straight out of the download. See
+[GitHub Releases](https://github.com/arunsoman/nirdosha/releases) to
+download a binary directly instead of piping the script.
+
+### Or build from source (for contributors)
 
 ```sh
 cd compiler
@@ -442,7 +552,10 @@ sudo pacman -S clang z3
 
 `clang` is invoked at runtime by `nirdosha build`/`emit-llvm` (native codegen);
 `z3` is linked at compile time for the SMT refinement layer (row 4) and is
-required even just to build the compiler, not only to use that feature.
+required even just to build the compiler, not only to use that feature. (The
+prebuilt binaries above sidestep this with `cargo build --features dist`,
+which vendors Z3 from source instead — see
+`.github/workflows/release.yml`.)
 
 ### Run a program
 
@@ -486,7 +599,7 @@ Start small (`hello.nir` → `factorial.nir` → `ownership.nir` →
 `sandbox.nir`), then the domain-scale examples (`store.nir`,
 `transact.nir`, `rev-assurence/`, `trade-finance/`).
 
-## 10. Honest scope
+## 11. Honest scope
 
 This README states what's real and checkable today vs. what's aspirational,
 following the project's own discipline (see `goal.md`'s "Honest correction"
@@ -508,10 +621,55 @@ notes):
   deterministic-RNG foundation, not a current claim.
 - **Open follow-ups**: per-size monomorphization of the `det`/`kalman`
   runtime kernels; `bench/`'s real-LLM integration; UI DSL's `paginate`/
-  `searchable`/`sortable` and server-side role/claim visibility.
+  `searchable`/`sortable` DSL keys (`nirdosha serve --db` already
+  provides real sorting/search/pagination unconditionally per struct —
+  see §7 — these two keys specifically remain parsed but inert).
 
 For precise syntax and semantics, the compiler sources under
 [`compiler/`](./compiler) are the authoritative reference.
+
+---
+
+## FAQ
+
+**Is Nirdosha production-ready?**
+Not yet. It's an active research prototype. Many safety properties are
+proven today; others are explicitly marked aspirational above. See §11
+and [`ROADMAP.md`](./ROADMAP.md) for the full status.
+
+**Why not just use Rust?**
+See §4. Short version: Rust already solves memory safety and
+concurrency for teams that can invest in its learning curve. Nirdosha
+targets a narrower, different problem — AI agents writing backend code
+where the grammar itself has to make invalid syntax impossible to
+emit, not just unlikely. If Rust already works for you, keep using it.
+
+**What compiles today vs. what only runs in the interpreter?**
+Compiled: numerics, `box`/`&`/`*`, `str`, `tcp`, `Vector`/`Matrix`,
+non-affine `struct`/`enum`/`match`, deterministic RNG. Interpreter-only:
+`spawn`/`chan`, `sandbox`, `db`/`json`/`http`, identity, `transact`,
+`workflow`. A program that avoids the interpreter-only features
+compiles to a native binary; one that doesn't is rejected at compile
+time, not silently mis-compiled. Full list in §11.
+
+**How do I report a bug?**
+Run `nirdosha <file.nir> --format=json` and paste the `Diagnostic` JSON
+into a GitHub issue. If it's a security issue (a type-checker/ownership
+soundness hole, an auth bypass, anything that breaks a safety
+guarantee this README claims), see [SECURITY.md](./SECURITY.md)
+instead — report it privately, not as a public issue.
+
+**How can I contribute?**
+See [CONTRIBUTING.md](./CONTRIBUTING.md). Docs, examples, and `.nir`
+test cases are the fastest way to start.
+
+**Where's the roadmap?**
+[`PUBLIC_ROADMAP.md`](./PUBLIC_ROADMAP.md) for the scannable version;
+[`ROADMAP.md`](./ROADMAP.md) for the full internal tracker with
+verification detail.
+
+**What's the license?**
+MIT — see [LICENSE](./LICENSE).
 
 ---
 

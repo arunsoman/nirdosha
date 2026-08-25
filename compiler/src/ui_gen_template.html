@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="__NIRDOSHA_HTML_CLASS__">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -11,6 +11,7 @@
   font stack is used until then.
 -->
 <!-- <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap"> -->
+__NIRDOSHA_THEME_SCRIPT__
 <style>
   :root {
     --md-primary: #4a5c92;
@@ -32,6 +33,30 @@
     --md-radius-md: 12px;
     --md-radius-lg: 28px;
     --md-font: Roboto, "Segoe UI", system-ui, -apple-system, sans-serif;
+    /* Design-token defaults below match `DesignSpec`'s own defaults
+       (radius=rounded, shadow=subtle, density=comfortable,
+       motion=subtle, type_scale=default) -- a `.nir` app with no
+       `--theme` at all renders identically to before these tokens
+       existed; a theme file overrides only the sections it sets
+       (`ui_gen.rs::theme_override_css`), everything else keeps these. */
+    --radius-control: 0.5rem;
+    --radius-card: 1rem;
+    --shadow-card: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+    --density-card-padding: 24px;
+    --density-gap: 16px;
+    --density-control-height: 40px;
+    --density-font-size: 14px;
+    --font-sans: var(--md-font);
+    --font-display: var(--md-font);
+    --motion-interaction-ms: 150ms;
+    --motion-entrance-ms: 200ms;
+    --motion-easing: ease-out;
+    --hover-lift-px: 2px;
+    --hover-scale: 1;
+    --press-scale: 0.95;
+    --stagger-ms: 40;
+    --title-px: 24px;
+    --hero-px: 30px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -51,6 +76,30 @@
     }
   }
   __NIRDOSHA_THEME_OVERRIDE__
+  /* Fixed 4-name animation vocabulary (`DesignSpec.MOTION_ANIMATIONS`)
+     -- no other `animate-*`-equivalent name exists in this template, by
+     design (protobox's own contract: "no other animate-* names exist").
+     `motion: none` needs no special-casing anywhere below: its
+     `--motion-*-ms`/`--hover-*`/`--press-scale` values are all already
+     zero/neutral (`MOTION_DURATIONS`/`MOTION_HOVER_*`/`MOTION_PRESS_
+     SCALE`'s own "none" entries), so every transition/animation using
+     them is naturally instant/absent without an `if` anywhere in CSS. */
+  @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes slide-up { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes scale-in { from { opacity: 0; transform: scale(.96); } to { opacity: 1; transform: scale(1); } }
+  @keyframes pop { 0% { opacity: 0; transform: scale(.9); } 60% { opacity: 1; transform: scale(1.03); } 100% { transform: scale(1); } }
+  .screen-enter { animation: fade-in var(--motion-entrance-ms) var(--motion-easing); }
+  .row-enter { animation: slide-up var(--motion-entrance-ms) var(--motion-easing) both; }
+  /* `prefers-reduced-motion` is honored globally, unconditionally --
+     same posture protobox's own contract takes ("already handled
+     globally -- never add your own reduced-motion CSS"): an author of a
+     `.nir` app gets this for free, no DSL surface needed to opt in. */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: .01ms !important; animation-iteration-count: 1 !important;
+      transition-duration: .01ms !important; scroll-behavior: auto !important;
+    }
+  }
   * { box-sizing: border-box; }
   body {
     margin: 0; font-family: var(--md-font); background: var(--md-background);
@@ -66,44 +115,69 @@
   .nav-rail {
     width: 220px; flex-shrink: 0; background: var(--md-surface);
     border-right: 1px solid var(--md-surface-variant); padding: 12px 8px;
+    transition: width var(--motion-interaction-ms) var(--motion-easing);
   }
   .nav-item {
     display: flex; align-items: center; gap: 12px; padding: 12px 16px;
     border-radius: var(--md-radius-lg); cursor: pointer; font-size: 14px;
     font-weight: 500; color: var(--md-on-surface-variant); margin-bottom: 4px;
     border: none; background: none; width: 100%; text-align: left; font-family: inherit;
+    transition: background-color var(--motion-interaction-ms) var(--motion-easing),
+                color var(--motion-interaction-ms) var(--motion-easing),
+                transform var(--motion-interaction-ms) var(--motion-easing);
   }
-  .nav-item:hover { background: color-mix(in srgb, var(--md-primary) 8%, transparent); }
+  .nav-item:hover { background: color-mix(in srgb, var(--md-primary) 8%, transparent); transform: translateY(calc(-1 * var(--hover-lift-px))); }
+  .nav-item:active { transform: scale(var(--press-scale)); }
+  .nav-item:focus-visible { outline: 2px solid var(--md-primary); outline-offset: 2px; }
   .nav-item.active { background: var(--md-primary-container); color: var(--md-on-primary-container); }
   main { flex: 1; padding: 24px 32px; max-width: 960px; }
-  .screen-title { font-size: 28px; font-weight: 400; margin: 0 0 4px; }
+  .screen-title { font-size: var(--title-px); font-weight: 400; margin: 0 0 4px; }
   .screen-sub { color: var(--md-on-surface-variant); font-size: 14px; margin: 0 0 24px; }
   .card {
     background: var(--md-surface); border: 1px solid var(--md-surface-variant);
-    border-radius: var(--md-radius-md); padding: 20px; margin-bottom: 20px; box-shadow: var(--md-elevation-1);
+    border-radius: var(--radius-card); padding: var(--density-card-padding); margin-bottom: var(--density-gap);
+    box-shadow: var(--shadow-card);
   }
   .field {
-    display: flex; flex-direction: column; gap: 4px; margin-bottom: 16px;
+    display: flex; flex-direction: column; gap: 4px; margin-bottom: var(--density-gap);
   }
   .field label { font-size: 12px; color: var(--md-on-surface-variant); font-weight: 500; }
-  .field input[type=text], .field input[type=number] {
-    font-family: inherit; font-size: 14px; padding: 12px 14px; border-radius: var(--md-radius-sm);
+  .field input[type=text], .field input[type=number], .field input[type=date], .field select {
+    font-family: var(--font-sans); font-size: var(--density-font-size); height: var(--density-control-height);
+    padding: 0 14px; border-radius: var(--radius-control);
     border: 1px solid var(--md-outline); background: transparent; color: var(--md-on-surface);
+    transition: border-color var(--motion-interaction-ms) var(--motion-easing),
+                box-shadow var(--motion-interaction-ms) var(--motion-easing);
   }
-  .field input:focus { outline: 2px solid var(--md-primary); outline-offset: -1px; }
+  .field input:hover, .field select:hover { border-color: var(--md-on-surface-variant); }
+  .field input:focus-visible, .field select:focus-visible {
+    outline: 2px solid var(--md-primary); outline-offset: -1px; border-color: var(--md-primary);
+  }
+  .field input:disabled, .field select:disabled { opacity: .5; pointer-events: none; }
   .field.checkbox { flex-direction: row; align-items: center; gap: 8px; }
   .field .readonly { font-size: 13px; color: var(--md-on-surface-variant); font-style: italic; }
   fieldset.field { padding-top: 20px; margin: 0 0 16px; }
   fieldset.field legend { padding: 0 6px; font-size: 12px; color: var(--md-on-surface-variant); font-weight: 500; }
   fieldset.field .field:last-child { margin-bottom: 0; }
   .btn {
-    font-family: inherit; font-size: 14px; font-weight: 500; padding: 10px 24px;
-    border-radius: var(--md-radius-lg); border: none; cursor: pointer;
+    font-family: var(--font-sans); font-size: 14px; font-weight: 500; padding: 0 24px;
+    height: var(--density-control-height); border-radius: var(--md-radius-lg); border: none; cursor: pointer;
+    transition: background-color var(--motion-interaction-ms) var(--motion-easing),
+                color var(--motion-interaction-ms) var(--motion-easing),
+                box-shadow var(--motion-interaction-ms) var(--motion-easing),
+                transform var(--motion-interaction-ms) var(--motion-easing),
+                opacity var(--motion-interaction-ms) var(--motion-easing);
   }
+  .btn:hover:not(:disabled) { transform: translateY(calc(-1 * var(--hover-lift-px))) scale(var(--hover-scale)); box-shadow: var(--md-elevation-1); }
+  .btn:active:not(:disabled) { transform: scale(var(--press-scale)); }
+  .btn:focus-visible { outline: 2px solid var(--md-primary); outline-offset: 2px; }
+  .btn:disabled { opacity: .5; cursor: not-allowed; pointer-events: none; }
   .btn-filled { background: var(--md-primary); color: var(--md-on-primary); }
-  .btn-filled:disabled { opacity: .38; cursor: not-allowed; }
+  .btn-filled:disabled { opacity: .38; }
   .btn-outlined { background: transparent; color: var(--md-primary); border: 1px solid var(--md-outline); }
+  .btn-outlined:hover:not(:disabled) { background: color-mix(in srgb, var(--md-primary) 8%, transparent); }
   .btn-text { background: transparent; color: var(--md-primary); }
+  .btn-text:hover:not(:disabled) { background: color-mix(in srgb, var(--md-primary) 8%, transparent); }
   .btn-danger { background: var(--md-error); color: var(--md-on-error); }
   /* Wraps every generated table -- a table wider than `main`'s own
      max-width scrolls inside this box instead of overflowing the page. */
@@ -115,11 +189,34 @@
   td { padding: 12px; border-bottom: 1px solid var(--md-surface-variant); white-space: nowrap; }
   .pager { display: flex; align-items: center; gap: 12px; margin-top: 12px; font-size: 13px; color: var(--md-on-surface-variant); }
   .search-box {
-    font-family: inherit; font-size: 14px; padding: 10px 14px; border-radius: var(--md-radius-sm);
+    font-family: var(--font-sans); font-size: 14px; padding: 10px 14px; border-radius: var(--radius-control);
     border: 1px solid var(--md-outline); background: transparent; color: var(--md-on-surface);
     width: 100%; max-width: 320px; margin-bottom: 12px; display: block;
+    transition: border-color var(--motion-interaction-ms) var(--motion-easing);
   }
-  .col-filter { font-family: inherit; font-size: 12px; padding: 4px 6px; border-radius: 6px; border: 1px solid var(--md-outline); }
+  .search-box:focus-visible { outline: 2px solid var(--md-primary); outline-offset: -1px; border-color: var(--md-primary); }
+  .col-filter {
+    font-family: inherit; font-size: 12px; padding: 4px 6px; border-radius: 6px; border: 1px solid var(--md-outline);
+    transition: border-color var(--motion-interaction-ms) var(--motion-easing);
+  }
+  .col-filter:focus-visible { outline: 2px solid var(--md-primary); outline-offset: -1px; }
+  /* `layout.app_shell`/`layout.content_width` -- CSS-only variants on the
+     one fixed shell (`html`'s static class list, computed once at
+     `emit-ui`/`serve` generation time from `Theme.layout`, LANGUAGE.md
+     SS11a). "auto"/absent (no class at all) keeps today's shell
+     byte-for-byte -- every `.nir` app that predates this field is
+     completely unaffected. */
+  html.shell-topbar .layout { flex-direction: column; }
+  html.shell-topbar .nav-rail {
+    width: 100%; height: auto; display: flex; flex-direction: row; flex-wrap: wrap; align-items: center;
+    border-right: none; border-bottom: 1px solid var(--md-surface-variant); padding: 8px 16px;
+  }
+  html.shell-topbar .nav-item { width: auto; margin-bottom: 0; }
+  html.shell-topbar .nav-item-secondary { padding-left: 16px; }
+  html.shell-minimal .nav-rail { display: none; }
+  html.shell-minimal main { flex: none; width: 100%; max-width: 420px; margin: 40px auto; padding: 24px; }
+  html.content-boxed main { margin: 0 auto; }
+  html.content-fluid main { max-width: none; }
   .nav-item-secondary { padding-left: 32px; font-size: 13px; }
   .date-lock { margin-left: 6px; cursor: help; font-size: 12px; opacity: .7; }
   .empty-state { color: var(--md-on-surface-variant); font-size: 14px; padding: 32px; text-align: center; }
@@ -345,7 +442,7 @@ function fieldLabel(f) {
 // here (already redacted to `null` by the server on the way in, for
 // anyone unauthorized) round-trips correctly either way; this is purely
 // about not rendering an input box for a value this viewer never saw.
-function buildFieldControl(f, value, isEdit) {
+function buildFieldControl(f, value, isEdit, topLevel) {
   // `edit`-gated: never blocks a *create* (only an update form passes
   // `isEdit === true`) -- see `serve.rs::check_edit_gates`'s own doc
   // comment for why. Disables the input rather than hiding it (the
@@ -356,9 +453,19 @@ function buildFieldControl(f, value, isEdit) {
   if (f.control === "struct") {
     const passthrough = f.nested.filter((nf) => (isEdit && nf.name === "id") || !canViewField(nf));
     const visible = f.nested.filter((nf) => !passthrough.includes(nf));
-    const children = visible.map((nf) => buildFieldControl(nf, value ? value[nf.name] : undefined, isEdit));
-    const wrap = el("fieldset", { class: "field", style: "border:1px solid var(--md-outline);border-radius:var(--md-radius-sm);padding:12px;" },
-      [el("legend", { text: fieldLabel(f) + (f.required ? " *" : "") }), ...children.map((c) => c.el)]);
+    const children = visible.map((nf) => buildFieldControl(nf, value ? value[nf.name] : undefined, isEdit, false));
+    // `topLevel`: this struct *is* the create/update action's own single
+    // param (`buildForm`'s direct call, e.g. `create_vendor(v: Vendor)`)
+    // -- not a field genuinely nested inside another struct. Wrapping
+    // that case in a bordered fieldset+legend just exposes the
+    // parameter's own terse name ("v *") for no reason, since the form
+    // itself is already that container; a real nested struct (one level
+    // deep, recursing into this same branch with `topLevel: false`)
+    // still gets the bordered/labeled treatment so it reads as a group.
+    const wrap = topLevel
+      ? el("div", { class: "field" }, children.map((c) => c.el))
+      : el("fieldset", { class: "field", style: "border:1px solid var(--md-outline);border-radius:var(--md-radius-sm);padding:12px;" },
+          [el("legend", { text: fieldLabel(f) + (f.required ? " *" : "") }), ...children.map((c) => c.el)]);
     return { el: wrap, getValue: () => {
       const out = Object.fromEntries(visible.map((nf, i) => [nf.name, children[i].getValue()]));
       for (const pf of passthrough) out[pf.name] = value ? value[pf.name] : undefined;
@@ -411,6 +518,19 @@ function buildFieldControl(f, value, isEdit) {
   const input = el("input", { type: f.control, value: value !== undefined && value !== null ? value : "" });
   if (f.required) input.setAttribute("required", "");
   if (editLocked) input.setAttribute("disabled", "");
+  // `screen <Struct> { field <name> { pattern/min/max: ... } }` —
+  // native HTML5 constraint validation, so a bad value never even
+  // reaches submit. Cosmetic only, same split as `canEditField`
+  // above: `serve.rs::check_field_validations` is the real boundary,
+  // enforcing the identical constraint server-side regardless of
+  // whether a client bypasses this (a raw `curl` to `/api/<fn>`, a
+  // browser with JS disabled, or a tampered DOM).
+  if (f.pattern) {
+    input.setAttribute("pattern", f.pattern);
+    input.setAttribute("title", `Must match pattern: ${f.pattern}`);
+  }
+  if (f.min !== undefined && f.min !== null) input.setAttribute("min", f.min);
+  if (f.max !== undefined && f.max !== null) input.setAttribute("max", f.max);
   const wrap = el("div", { class: "field" }, [el("label", { text: fieldLabel(f) + (f.required ? " *" : "") }), input]);
   return { el: wrap, getValue: () => (f.control === "number" ? Number(input.value) : input.value) };
 }
@@ -428,7 +548,7 @@ function buildFieldControl(f, value, isEdit) {
 function buildForm(fields, values, onSubmit, submitLabel, disabled, disabledReason, isEdit) {
   const passthrough = fields.filter((f) => (isEdit && f.name === "id") || !canViewField(f));
   const visible = fields.filter((f) => !passthrough.includes(f));
-  const controls = visible.map((f) => ({ f, c: buildFieldControl(f, values ? values[f.name] : undefined, isEdit) }));
+  const controls = visible.map((f) => ({ f, c: buildFieldControl(f, values ? values[f.name] : undefined, isEdit, true) }));
   const submitBtn = el("button", { type: "submit", class: "btn btn-filled", text: submitLabel }, []);
   if (disabled) submitBtn.setAttribute("disabled", "");
   const form = el("form", { class: "card", onsubmit: (e) => {
@@ -518,6 +638,12 @@ async function renderListScreen(screen, root) {
     root.appendChild(searchBox);
   }
 
+  // Paired with the create form's "New <Title>" heading above (when one
+  // exists) so a page with both a form and a table has an unambiguous
+  // boundary between "adding a record" and "the records that already
+  // exist" -- previously the table had no heading of its own at all,
+  // distinguishable from the create form only by page position.
+  root.appendChild(el("h2", { text: "Existing " + screen.title, style: "font-size:16px;font-weight:500;" }));
   const tableWrap = el("div", { class: "card" }, []);
   root.appendChild(tableWrap);
 
@@ -599,6 +725,13 @@ async function renderListScreen(screen, root) {
     table.appendChild(el("thead", {}, theadRows));
 
     const tbody = el("tbody", {}, []);
+    // Staggered entrance (`--stagger-ms` -- `DesignSpec.motion`'s own
+    // per-item list delay, protobox's own React convention for the same
+    // thing: `animationDelay: index * stagger_ms`, ported here as an
+    // inline style on each `<tr>`). `--stagger-ms` has no unit (it's a
+    // bare number, `theme_override_css`'s own choice) since it's only
+    // ever multiplied here, not used as a CSS length directly.
+    let rowIndex = 0;
     for (const row of list) {
       const tds = visibleFields.map((f) => el("td", { text: cellText(f, row) }));
       const colspan = visibleFields.length + (updateAction ? 1 : 0) + (deleteAction ? 1 : 0) + customActions.length;
@@ -641,7 +774,8 @@ async function renderListScreen(screen, root) {
         });
         tds.push(el("td", {}, [btn]));
       }
-      tr = el("tr", {}, tds);
+      tr = el("tr", { class: "row-enter", style: `animation-delay: calc(var(--stagger-ms) * ${rowIndex} * 1ms)` }, tds);
+      rowIndex++;
       tbody.appendChild(tr);
     }
     table.appendChild(tbody);
@@ -772,15 +906,27 @@ async function renderDashboard() {
   }
 }
 
+// Forces a CSS animation to replay from its start -- removing then
+// re-adding a class doesn't restart the animation on its own (the
+// browser doesn't see a class-list change as "new," since the class was
+// never actually absent between two paints); reading `offsetWidth` in
+// between forces a synchronous layout, which does.
+function replayAnimation(node, cls) {
+  node.classList.remove(cls);
+  void node.offsetWidth;
+  node.classList.add(cls);
+}
+
 function renderScreen(screen) {
   const content = document.getElementById("content");
   content.textContent = "";
+  replayAnimation(content, "screen-enter");
   content.appendChild(el("h1", { class: "screen-title", text: screen.title }));
   const sub = el("p", { class: "screen-sub", text: screen.singular ? "Single record" : "Records" }, []);
   const uniqueBadges = [...new Set(screen.actions.flatMap((a) => a.badges || []))];
   for (const b of uniqueBadges) sub.appendChild(el("span", { class: "badge", text: b }));
   content.appendChild(sub);
-  if (screen.actions.some((a) => a.requiresLogin)) {
+  if (!IDENTITY_BASE && screen.actions.some((a) => a.requiresLogin)) {
     content.appendChild(el("div", { class: "stub-note",
       text: "Sign-in on this page is a generated stub (localStorage identity), not real token verification -- wire it to your own auth once a backend exists." }));
   }
@@ -827,11 +973,18 @@ function renderLogin() {
       try {
         const res = await fetch(`${IDENTITY_BASE}/api/login`, {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ subject: subject.value || "user", role: roles.value }),
+          body: JSON.stringify({ subject: { value: subject.value || "user" }, role: roles.value }),
         });
         const body = await res.json();
-        if (body && body.err) { showSnackbar(String(body.err), true); return; }
-        const token = body.ok;
+        // `login`'s declared return is `Result(Text, Text)` (the str-ban's
+        // wrapper struct), so a real `Err(Text)`/`Ok(Text)` payload is
+        // `{value: "..."}`, not a bare string -- but a decode-level failure
+        // (e.g. a malformed request body) is `serve.rs`'s own plain-string
+        // `err`, not this fn's declared type. Unwrap `.value` when present,
+        // fall back to the raw value otherwise, so both shapes render/work.
+        const textValue = (x) => (x && typeof x === "object" && "value" in x) ? x.value : x;
+        if (body && body.err) { showSnackbar(String(textValue(body.err)), true); return; }
+        const token = textValue(body.ok);
         const claims = decodeJwtPayload(token);
         setIdentity({ subject: claims.sub || subject.value, roles: claims.roles || [], claims, token });
         showSnackbar("Signed in.");

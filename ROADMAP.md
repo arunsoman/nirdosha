@@ -195,6 +195,87 @@ messages.
   session — real schema design (the data-dictionary table shape, cache
   invalidation story) needed first, not something to bolt onto the
   Postgres work above.
+- **2026-08-24 — Field-level format validation: `pattern`/`format`/
+  `min`/`max` in the `screen` DSL.** `field <name> { pattern: "<regex>"
+  }` / `{ format: "email"|"phone"|"date"|"url"|"uuid" }` / `{ min: ...
+  }` / `{ max: ... }` — real client + server enforcement, same
+  architecture the earlier field-level RBAC work established
+  (typecheck the declaration's shape, carry a resolved value through
+  `ui_gen.rs`, enforce for real in `serve.rs`, mirror cosmetically via
+  native HTML5 input attributes client-side). New `regex` crate
+  dependency; new `ast::well_known_format_pattern` (the `format`
+  vocabulary's single source of truth, shared by `typeck.rs`/
+  `ui_gen.rs`); 5 new `TypeErrorKind` variants; new `ui_gen::
+  ValidatedField`/`field_validations_for_fn` (matches EITHER a struct's
+  `create` or `update` slot, unlike edit-gate enforcement which only
+  applies to `update`); `serve.rs::check_field_validations`, needing no
+  `--db` at all (checks only the incoming value, never a stored one).
+  20 new tests across `tests/screen_dsl.rs` (9), `src/ui_gen.rs`'s own
+  unit tests (7), `tests/emit_ui.rs` (1, plus 3 pre-existing exact-
+  substring assertions updated for the new JSON keys), and a new
+  `tests/field_validation.rs` real-server integration suite (6). Full
+  `cargo test` (every `tests/*.rs` file) reverified green. Full design
+  detail in `LANGUAGE.md` §11 and `compiler/UI_DSL_TODO.md`.
+- **2026-08-25 — General-purpose design-token theming + live reload.**
+  Mission: generalize the UI DSL beyond CRUD+dashboard with a real
+  design system (animations, hover/press states, layout variants),
+  tightly integrated with protobox's existing `DesignSpec`/
+  `resolve_design_tokens()` rather than inventing a competing format.
+  `ui_gen::Theme` redesigned as a 1:1 mirror of `resolve_design_
+  tokens()`'s JSON shape (was a narrow 12-field color/radius/font
+  subset); `ui_gen_template.html` went from 1 `:hover` rule and 0
+  animations to a real interaction system (4 named `@keyframes`,
+  `transition`/`:hover`/`:focus-visible`/`:active`/`:disabled` on every
+  interactive element, screen-entrance + staggered-list-row animation,
+  global `prefers-reduced-motion`, CSS-only `app_shell`/`content_width`
+  layout variants); `serve.rs::ThemeCache` makes `--theme` reload live
+  (30s TTL, same pattern `RoleMappingCache` established) instead of
+  requiring a server restart; protobox's `nirdosha.py::_theme_json_
+  from_design_spec` now directly returns `resolve_design_tokens(spec)`
+  (was a hand-picked, driftable subset) — verified with real protobox
+  code through `be-v2`'s own `.venv`, not mocked, including
+  `test_nirdosha.py`'s theme assertions updated and passing (18/18).
+  Full `cargo test` (51 test binaries) green; live browser + curl
+  verification against a real `.nir` app. Full design detail in
+  `LANGUAGE.md` §11b and `compiler/UI_DSL_TODO.md`. **Deliberately not
+  touched this pass** (explicitly gated by the user until this landed):
+  `protobox/be-v2/src/plugins/languages/nirdosha_direct_codegen.py` —
+  a real, confirmed-broken file (undefined `NirdoshaStoryCode` name,
+  malformed `subprocess` arg, never successfully imported) — tracked as
+  the next mission, to delete-and-rewrite from scratch.
+- **2026-08-25 — protobox's `nirdosha_direct_codegen.py`: deleted and
+  rewritten (mission phase 2).** The previous file (untracked in
+  protobox's own git — never committed) had never once successfully
+  imported: `NirdoshaStoryRepairPrompt(Prompt[NirdoshaStoryCode])`
+  referenced a name defined nowhere in the file, a `NameError` at
+  class-definition (i.e. module-import) time; both `LlmAgent`s were
+  constructed with `output_type=None` despite the code accessing
+  `out.code`/`repaired.code`; `_compile_check` invoked `emit-ast -o `
+  (`-o` isn't even a real `emit-ast` flag) as one malformed, never-split
+  argument. Read `docs/code-gen-repair-design.md` in full before
+  rewriting — deliberately did NOT adopt its PassInfo/EditBlock/
+  CodebaseSnapshot machinery (that design targets the classic multi-
+  file, multi-language, brownfield-capable pipeline; nirdosha's lane has
+  no equivalent shape — one file, one language, append-only, the real
+  compiler as ground truth) — the one piece that *does* generalize,
+  plateau detection, was adopted. `_compile_check` switched from
+  `emit-ast` (lex+parse only — confirmed by reading `main.rs` directly:
+  the previous check would have silently accepted real type errors,
+  `str`-signature violations, and ownership mistakes as "success") to
+  `emit-ui` (typecheck + ownership too, no extra z3/clang toolchain
+  dependency). Verified for real: the rewritten module now imports and
+  constructs both agents correctly; `_compile_check` demonstrated
+  catching a genuine type error it would have missed before; a new
+  `tests/plugins/languages/test_nirdosha_direct_codegen.py` (11 tests —
+  mocked-LLM repair-loop behavior incl. plateau detection, the full
+  `generate_all_from_stories` pipeline, and real-compiler `_compile_
+  check` cases) all green through `be-v2`'s own `.venv`. Full
+  `tests/plugins/languages/` (90 tests) green. Found, and left alone as
+  explicitly out of scope, 6 pre-existing failures elsewhere in
+  protobox's `tests/forge_repair/` (a different feature area's classic-
+  pipeline tests, unrelated to this file — confirmed by direct
+  inspection, not assumed) and 2 pre-existing unrelated collection
+  errors — none caused by, or fixed by, this rewrite.
 
 ---
 
@@ -265,7 +346,17 @@ of Track B has landed.*
   handling; this is buildable now, independent of Track B.
 - `[OPEN]` **A3. Observability wired to something real** — the OTel
   tracer (`observability.rs`) exists; connect it to an actual
-  collector/backend for a real deployment.
+  collector/backend for a real deployment. Layer 2a is now done:
+  `nirdosha serve --otel-port P --otel-token T` opens a second,
+  loopback-only listener that dynamically enables/disables tracing based
+  on whether an APM client is actually connected (`Tracer::enabled()`,
+  gated one atomic-load check past layer 1's existing `Option` check) —
+  zero-overhead when nobody's watching, live JSON-line spans streamed to
+  every connected client while someone is. Still open: layer 2b (the
+  real OTLP/collector wire format over that transport — today's feed is
+  this project's own JSON-lines shape, not OTLP), layer 3 (real
+  metrics), layer 4 (blocking-op watchdog) — see `observability.rs`'s
+  module doc, "Rollout layers 2-4" section, for the full breakdown.
 - `[OPEN]` **A4. Compatibility/versioning policy.** The str-ban
   (2026-08-23) was a breaking language change shipped in one session —
   need a real policy before a deployed critical app can trust future
@@ -286,40 +377,52 @@ of Track B has landed.*
   each `nirdosha:push:<subject>` channel to relay to the right live
   connection. `send_email`/`send_sms`/`send_push` and every other part
   of `workflow` are unaffected and fully functional without this.
-- `[OPEN]` **A6. Identity admin console: multi-IdP registry, role
+- `[PARTIAL]` **A6. Identity admin console: multi-IdP registry, role
   mapping + cache, roles/ACL introspection, opt-in scaffolding.**
   Prompted by a real gap: `requires(role: "compliance_officer")` and a
-  `screen` field's `view`/`edit` role gates only work today if the
-  string literal in `.nir` source is byte-identical to whatever the
-  connected IdP actually puts in the token's roles claim — no
-  translation layer, and a renamed IdP group silently breaks every
-  check it gated (no error, the check just stops matching). Design,
-  not yet built:
-  - **Role mapping** — a per-project, admin-editable `RoleMapping
-    { app_role: str, idp_role: str }` table (same "ordinary struct,
-    free CRUD screen" convention `EmailProviderConfig` already
-    established for the communications panel) translating the app's
-    canonical role vocabulary into whatever the connected IdP actually
-    emits.
-  - **In-memory cache, not a DB read per request** — load the mapping
-    (and the IdP registry below) once into a long-lived, shared
-    structure at `serve::run` startup (the same pattern `table_db`/
-    `table_catalog` already use — built once, shared across every
-    request's own fresh `Interpreter`), refreshed on a short TTL
-    (~30-60s) rather than re-queried per auth check. Bounded staleness
-    (an admin's edit takes up to one TTL window to take effect) is an
-    accepted, disclosed tradeoff, not a correctness bug — the same
+  `screen` field's `view`/`edit` role gates only worked, historically,
+  if the string literal in `.nir` source was byte-identical to whatever
+  the connected IdP actually puts in the token's roles claim — no
+  translation layer, and a renamed IdP group silently broke every check
+  it gated (no error, the check just stopped matching).
+  - **2026-08-24 — Role mapping + in-memory cache: `[DONE]`.** A
+    per-project, admin-editable `RoleMapping { app_role: str, idp_role:
+    str }` table (same "ordinary struct, free CRUD screen" convention
+    `EmailProviderConfig` already established for the communications
+    panel — both now standing fixtures in `scratch/
+    nirdosha_llm_prompt.md`, emitted once per generated project rather
+    than hand-typed per app), translating the app's canonical role
+    vocabulary into whatever the connected IdP actually emits. Loaded
+    once into a long-lived, shared `RoleMappingCache` at `serve::run`
+    startup (eagerly, not just lazily on first request — a mapping
+    already in the DB before the process started needs to be live
+    immediately, not after one TTL window), refreshed on a 30s TTL
+    rather than re-queried per auth check — bounded staleness (an
+    admin's edit takes up to one TTL window to take effect) is an
+    accepted, disclosed tradeoff, not a correctness bug, the same
     category of real-clock/real-world exception `resolve_identity`'s
-    existing token-`expires_at` check already is, not a new violation
-    of `.nir`'s own determinism story. Also fixes an existing
-    inefficiency: `identity_directory` currently reopens a fresh
-    SQLite connection on every single `resolve_identity` call.
-  - **Multi-IdP registry** — today `nirdosha serve` takes exactly one
+    own token-`expires_at` check already is. Every `requires(role:
+    ...)` check and every `screen` field's `view`/`edit` gate now goes
+    through `identity_has_mapped_role` (literal match first, so a
+    program with no mapping configured is unaffected; falls back to the
+    cache otherwise). Verified live end-to-end (curl, not just unit
+    tests: a raw-IdP-role-only token is rejected before any mapping
+    exists, still rejected within the TTL window right after the
+    mapping is created, then accepted once the TTL refreshes) plus 4
+    new `tests/role_mapping.rs` integration tests (real server, TTL
+    overridable via `NIRDOSHA_TEST_ROLE_MAPPING_TTL_MS` so the boundary
+    is proven with a real short wait, not a 30s tax per test run or a
+    faked clock). Full detail in `LANGUAGE.md` §11a. **Not fixed
+    alongside this**, still a real, disclosed inefficiency: the
+    unrelated `identity_directory` table still reopens a fresh SQLite
+    connection on every single `resolve_identity` call — this session's
+    cache only covers `role_mapping` reads, not that.
+  - `[OPEN]` **Multi-IdP registry** — today `nirdosha serve` takes exactly one
     fixed `--jwks-file`/`--issuer`/`--audience` triple (`AuthConfig`).
     An admin-editable `IdentityProviderConfig` list (mirroring the
     provider-config struct pattern again) would let `resolve_identity`
     pick the right provider by the token's own issuer claim.
-  - **Roles → functions/fields report** — pure static analysis, no new
+  - `[OPEN]` **Roles → functions/fields report** — pure static analysis, no new
     runtime concept: walk `program.fns`' `requires(role: ...)` and
     `ui_gen::field_gates_for_struct`'s already-computed table/field ACL
     gates (that data already exists, just isn't surfaced as a page),
