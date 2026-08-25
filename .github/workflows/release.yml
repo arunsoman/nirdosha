@@ -2,15 +2,21 @@ name: release
 
 # Builds prebuilt `nirdosha` binaries and attaches them to a GitHub
 # Release whenever a `v*` tag is pushed. Z3 is statically vendored (the
-# `dist` feature, see compiler/Cargo.toml) so the shipped binary needs no
-# system `libz3` — `clang` is still required on the *user's* machine at
-# runtime, but only for `nirdosha build`/`emit-llvm` (native codegen);
-# interpreting, `emit-ast`, `emit-ui`, and `serve` all work with zero
-# extra system deps.
+# `dist` feature, see compiler/Cargo.toml) on Linux/Windows, so those
+# binaries need no system `libz3` — `clang` is still required on the
+# *user's* machine at runtime, but only for `nirdosha build`/`emit-llvm`
+# (native codegen); interpreting, `emit-ast`, `emit-ui`, and `serve` all
+# work with zero extra system deps.
 #
-# macOS and Windows jobs are unverified until this workflow's first real
-# run on a tag — only the Linux x86_64 build has been smoke-tested
-# locally (a `cargo build --release --features dist` on this machine).
+# macOS is the one disclosed exception: `z3-src` 416.0.2 (the version
+# the current `z3` 0.20.2 crate pulls) fails to compile against the
+# AppleClang shipped on GitHub's macos-13/macos-14 runners (a real
+# upstream `obj_hashtable.h` constructor-strictness incompatibility,
+# confirmed 2026-08-25 on this workflow's first real run — not a config
+# mistake). Until a newer `z3`/`z3-src` release fixes this upstream,
+# macOS builds link the *system* Z3 (via Homebrew) instead of vendoring
+# it — so the macOS binary needs `brew install z3` on the machine that
+# runs it, same as building from source would. Documented, not silent.
 
 on:
   push:
@@ -57,9 +63,19 @@ jobs:
             compiler/target
           key: ${{ matrix.target }}-cargo-${{ hashFiles('compiler/Cargo.lock') }}
 
+      - name: Install system Z3 (macOS only — see workflow header)
+        if: runner.os == 'macOS'
+        run: brew install z3
+
       - name: Build (Z3 vendored, no system libz3 dependency)
+        if: runner.os != 'macOS'
         working-directory: compiler
         run: cargo build --release --features dist --target ${{ matrix.target }}
+
+      - name: Build (macOS — system Z3, see workflow header)
+        if: runner.os == 'macOS'
+        working-directory: compiler
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -67,7 +83,11 @@ jobs:
         run: |
           tar czf ../${{ matrix.asset }} -C target/${{ matrix.target }}/release nirdosha
           cd ..
-          sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          else
+            shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          fi
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
