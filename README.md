@@ -72,7 +72,7 @@ here is simulated — see §6, §7, §11.*
 6. [Features](#6-features)
 7. [The UI engine](#7-the-ui-engine)
 8. [Benchmarks](#8-benchmarks)
-9. [LLM integration](#9-llm-integration)
+9. [LLM integration — code in Nirdosha without learning Nirdosha](#9-llm-integration)
 10. [Try it out today](#10-try-it-out-today)
 11. [Honest scope](#11-honest-scope)
 
@@ -504,6 +504,35 @@ feeds each attempt's structured `Diagnostic` back in as the next attempt's
 context — the same re-prompt loop a real self-repair integration would use.
 It ships mock models today; wiring a real LLM API is a distinct, separate
 piece of work the harness is built to plug into.
+
+### Agent skills — try Nirdosha without learning Nirdosha
+You don't need to read `LANGUAGE.md` or learn a new syntax to build
+something real in Nirdosha — describe what you want in plain English to
+an LLM and let it write the `.nir` code. [`agent-skills/nirdosha/`](./agent-skills/nirdosha/)
+packages the rules an LLM needs to get that code right on the first
+try — no GBNF sampler required, just a markdown file most agentic
+tools already know how to read: a Claude Code Skill, an `AGENTS.md`
+(Codex CLI, Amp, and other tools that read that convention), Cursor
+rules, GitHub Copilot instructions, Windsurf, Cline, and — for the
+true zero-install path — [`paste-anywhere-prompt.md`](./agent-skills/nirdosha/paste-anywhere-prompt.md),
+a self-contained prompt you paste into any chat LLM (ChatGPT, Claude.ai,
+Gemini, ...) with no file access or tool use needed. Every variant is
+the same content verified against the real compiler — install one in
+~10 seconds and an agent that has never seen Nirdosha before can write
+it correctly.
+
+This isn't a claim taken on faith: the prompt has been used, unmodified,
+to generate several full working applications end to end — an
+e-commerce store, a food-delivery platform, a telecom revenue-assurance
+system, an online trading platform — each hundreds of lines, each
+written by an LLM with no prior Nirdosha exposure from nothing but a
+plain-English description. Every real compiler error the exercise
+turned up (an ownership edge case, a silent JSON-unwrap footgun, a
+markdown-fence copy/paste artifact) was folded back into `core.md` and
+propagated to all seven derived files, so the next model to use the
+prompt doesn't repeat it. The loop — generate, compile, fix, feed the
+fix back into the prompt — is how this guide gets better, not a one-time
+write-up.
 
 ## 10. Try it out today
 

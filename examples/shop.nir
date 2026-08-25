@@ -1,0 +1,893 @@
+enum ErrorCode {
+    DbError(str),
+    NotFound(str),
+    InvalidInput(str),
+    OutOfStock(str),
+    EmptyCart(str),
+    OrderError(str)
+}
+
+enum OrderStatus {
+    Pending,
+    Confirmed,
+    Packed,
+    Shipped,
+    Delivered,
+    Cancelled
+}
+
+struct Category {
+    id: i64,
+    name: str
+}
+
+struct Product {
+    id: i64,
+    category_id: i64,
+    name: str,
+    description: str,
+    price_cents: i64,
+    stock: i64,
+    active: bool
+}
+
+struct Cart {
+    id: i64,
+    customer_id: i64
+}
+
+struct CartItem {
+    id: i64,
+    cart_id: i64,
+    product_id: i64,
+    quantity: i64
+}
+
+struct Order {
+    id: i64,
+    customer_id: i64,
+    status: str,
+    total_cents: i64
+}
+
+struct OrderItem {
+    id: i64,
+    order_id: i64,
+    product_id: i64,
+    quantity: i64,
+    price_cents: i64
+}
+
+struct Customer {
+    id: i64,
+    name: str,
+    email: str
+}
+
+
+fn initialize_database() -> Result(i64, ErrorCode) {
+
+    return match db_connect("shop.db") {
+
+        Ok(conn) => {
+
+            let categories: Result(i64, str) = db_execute(
+                conn,
+                "CREATE TABLE IF NOT EXISTS category (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL
+                )"
+            )
+
+            let products: Result(i64, str) = db_execute(
+                conn,
+                "CREATE TABLE IF NOT EXISTS product (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    price_cents INTEGER NOT NULL,
+                    stock INTEGER NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1
+                )"
+            )
+
+            let customers: Result(i64, str) = db_execute(
+                conn,
+                "CREATE TABLE IF NOT EXISTS customer (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    email TEXT NOT NULL
+                )"
+            )
+
+            let carts: Result(i64, str) = db_execute(
+                conn,
+                "CREATE TABLE IF NOT EXISTS cart (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    customer_id INTEGER NOT NULL
+                )"
+            )
+
+            let cart_items: Result(i64, str) = db_execute(
+                conn,
+                "CREATE TABLE IF NOT EXISTS cart_item (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cart_id INTEGER NOT NULL,
+                    product_id INTEGER NOT NULL,
+                    quantity INTEGER NOT NULL
+                )"
+            )
+
+            let orders: Result(i64, str) = db_execute(
+                conn,
+                "CREATE TABLE IF NOT EXISTS orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    customer_id INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    total_cents INTEGER NOT NULL
+                )"
+            )
+
+            let order_items: Result(i64, str) = db_execute(
+                conn,
+                "CREATE TABLE IF NOT EXISTS order_item (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id INTEGER NOT NULL,
+                    product_id INTEGER NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    price_cents INTEGER NOT NULL
+                )"
+            )
+
+            stop(conn)
+
+            match categories {
+                Ok(n) => Ok(n),
+                Err(e) => Err(DbError(e))
+            }
+        }
+
+        Err(e) => Err(DbError(e))
+    }
+}
+
+
+fn list_category() -> Result(json, ErrorCode) {
+
+    return match db_connect("shop.db") {
+
+        Ok(conn) => {
+
+            let result: Result(json, str) = db_query(
+                conn,
+                "SELECT id, name FROM category ORDER BY name"
+            )
+
+            stop(conn)
+
+            match result {
+                Ok(rows) => Ok(rows),
+                Err(e) => Err(DbError(e))
+            }
+        }
+
+        Err(e) => Err(DbError(e))
+    }
+}
+
+
+fn create_category(c: Category) -> Result(i64, ErrorCode)
+requires(role: "admin") {
+
+    return match db_connect("shop.db") {
+
+        Ok(conn) => {
+
+            let result: Result(i64, str) = db_execute(
+                conn,
+                "INSERT INTO category (name) VALUES (?)",
+                c.name
+            )
+
+            stop(conn)
+
+            match result {
+                Ok(n) => Ok(n),
+                Err(e) => Err(DbError(e))
+            }
+        }
+
+        Err(e) => Err(DbError(e))
+    }
+}
+
+
+fn list_product() -> Result(json, ErrorCode) {
+
+    return match db_connect("shop.db") {
+
+        Ok(conn) => {
+
+            let result: Result(json, str) = db_query(
+                conn,
+                "SELECT
+                    id,
+                    category_id,
+                    name,
+                    description,
+                    price_cents,
+                    stock,
+                    active
+                 FROM product
+                 WHERE active = 1
+                 ORDER BY id DESC"
+            )
+
+            stop(conn)
+
+            match result {
+                Ok(rows) => Ok(rows),
+                Err(e) => Err(DbError(e))
+            }
+        }
+
+        Err(e) => Err(DbError(e))
+    }
+}
+
+
+fn create_product(p: Product) -> Result(i64, ErrorCode)
+requires(role: "admin") {
+
+    return match db_connect("shop.db") {
+
+        Ok(conn) => {
+
+            let result: Result(i64, str) = db_execute(
+                conn,
+                "INSERT INTO product
+                 (category_id, name, description, price_cents, stock, active)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                p.category_id,
+                p.name,
+                p.description,
+                p.price_cents,
+                p.stock,
+                p.active
+            )
+
+            stop(conn)
+
+            match result {
+                Ok(n) => Ok(n),
+                Err(e) => Err(DbError(e))
+            }
+        }
+
+        Err(e) => Err(DbError(e))
+    }
+}
+
+
+fn update_product(p: Product) -> Result(i64, ErrorCode)
+requires(role: "admin") {
+
+    return match db_connect("shop.db") {
+
+        Ok(conn) => {
+
+            let result: Result(i64, str) = db_execute(
+                conn,
+                "UPDATE product
+                 SET category_id = ?,
+                     name = ?,
+                     description = ?,
+                     price_cents = ?,
+                     stock = ?,
+                     active = ?
+                 WHERE id = ?",
+                p.category_id,
+                p.name,
+                p.description,
+                p.price_cents,
+                p.stock,
+                p.active,
+                p.id
+            )
+
+            stop(conn)
+
+            match result {
+                Ok(n) => Ok(n),
+                Err(e) => Err(DbError(e))
+            }
+        }
+
+        Err(e) => Err(DbError(e))
+    }
+}
+
+
+fn list_customer() -> Result(json, ErrorCode) {
+
+    return match db_connect("shop.db") {
+
+        Ok(conn) => {
+
+            let result: Result(json, str) = db_query(
+                conn,
+                "SELECT id, name, email
+                 FROM customer
+                 ORDER BY id DESC"
+            )
+
+            stop(conn)
+
+            match result {
+                Ok(rows) => Ok(rows),
+                Err(e) => Err(DbError(e))
+            }
+        }
+
+        Err(e) => Err(DbError(e))
+    }
+}
+
+
+fn create_customer(c: Customer) -> Result(i64, ErrorCode) {
+
+    return match db_connect("shop.db") {
+
+        Ok(conn) => {
+
+            let result: Result(i64, str) = db_execute(
+                conn,
+                "INSERT INTO customer (name, email)
+                 VALUES (?, ?)",
+                c.name,
+                c.email
+            )
+
+            stop(conn)
+
+            match result {
+                Ok(n) => Ok(n),
+                Err(e) => Err(DbError(e))
+            }
+        }
+
+        Err(e) => Err(DbError(e))
+    }
+}
+
+
+fn create_cart(c: Cart) -> Result(i64, ErrorCode) {
+
+    return match db_connect("shop.db") {
+
+        Ok(conn) => {
+
+            let result: Result(i64, str) = db_execute(
+                conn,
+                "INSERT INTO cart (customer_id)
+                 VALUES (?)",
+                c.customer_id
+            )
+
+            stop(conn)
+
+            match result {
+                Ok(n) => Ok(n),
+                Err(e) => Err(DbError(e))
+            }
+        }
+
+        Err(e) => Err(DbError(e))
+    }
+}
+
+
+fn create_cart_item(item: CartItem) -> Result(i64, ErrorCode) {
+
+    return match db_connect("shop.db") {
+
+        Ok(conn) => {
+
+            let product: Result(json, str) = db_query(
+                conn,
+                "SELECT stock
+                 FROM product
+                 WHERE id = ? AND active = 1",
+                item.product_id
+            )
+
+            let result: Result(i64, str) = match product {
+
+                Ok(rows) => {
+
+                    let count: i64 = json_array_len(rows)
+
+                    if count == 0 {
+
+                        Err("product not found")
+
+                    } else {
+
+                        let row: Result(json, str) = json_array_get(rows, 0)
+
+                        match row {
+
+                            Ok(r) => {
+
+                                match json_get_i64(r, "stock") {
+
+                                    Ok(stock) => {
+
+                                        if item.quantity <= 0 {
+
+                                            Err("quantity must be positive")
+
+                                        } else {
+                                            if item.quantity > stock {
+
+                                                Err("insufficient stock")
+
+                                            } else {
+
+                                                db_execute(
+                                                    conn,
+                                                    "INSERT INTO cart_item
+                                                     (cart_id, product_id, quantity)
+                                                     VALUES (?, ?, ?)",
+                                                    item.cart_id,
+                                                    item.product_id,
+                                                    item.quantity
+                                                )
+                                            }
+                                        }
+                                    }
+
+                                    Err(e) => Err(e)
+                                }
+                            }
+
+                            Err(e) => Err(e)
+                        }
+                    }
+                }
+
+                Err(e) => Err(e)
+            }
+
+            stop(conn)
+
+            match result {
+                Ok(n) => Ok(n),
+                Err(e) => Err(InvalidInput(e))
+            }
+        }
+
+        Err(e) => Err(DbError(e))
+    }
+}
+
+
+fn list_cart_items(cart_id: i64) -> Result(json, ErrorCode) {
+
+    return match db_connect("shop.db") {
+
+        Ok(conn) => {
+
+            let result: Result(json, str) = db_query(
+                conn,
+                "SELECT
+                    ci.id,
+                    ci.cart_id,
+                    ci.product_id,
+                    p.name,
+                    ci.quantity,
+                    p.price_cents,
+                    ci.quantity * p.price_cents AS line_total
+                 FROM cart_item ci
+                 JOIN product p ON p.id = ci.product_id
+                 WHERE ci.cart_id = ?
+                 ORDER BY ci.id",
+                cart_id
+            )
+
+            stop(conn)
+
+            match result {
+                Ok(rows) => Ok(rows),
+                Err(e) => Err(DbError(e))
+            }
+        }
+
+        Err(e) => Err(DbError(e))
+    }
+}
+
+
+fn remove_cart_item(item_id: i64) -> Result(i64, ErrorCode) {
+
+    return match db_connect("shop.db") {
+
+        Ok(conn) => {
+
+            let result: Result(i64, str) = db_execute(
+                conn,
+                "DELETE FROM cart_item
+                 WHERE id = ?",
+                item_id
+            )
+
+            stop(conn)
+
+            match result {
+                Ok(n) => Ok(n),
+                Err(e) => Err(DbError(e))
+            }
+        }
+
+        Err(e) => Err(DbError(e))
+    }
+}
+
+
+fn create_order(customer_id: i64, cart_id: i64) -> Result(i64, ErrorCode) {
+
+    return match db_connect("shop.db") {
+
+        Ok(conn) => {
+
+            let cart: Result(json, str) = db_query(
+                conn,
+                "SELECT
+                    ci.product_id,
+                    ci.quantity,
+                    p.price_cents,
+                    p.stock
+                 FROM cart_item ci
+                 JOIN product p ON p.id = ci.product_id
+                 WHERE ci.cart_id = ?",
+                cart_id
+            )
+
+            let result: Result(i64, str) = match cart {
+
+                Ok(rows) => {
+
+                    let count: i64 = json_array_len(rows)
+
+                    if count == 0 {
+
+                        Err("cart is empty")
+
+                    } else {
+
+                        let order_result: Result(i64, str) = db_execute(
+                            conn,
+                            "INSERT INTO orders
+                             (customer_id, status, total_cents)
+                             VALUES (?, ?, 0)",
+                            customer_id,
+                            "Pending"
+                        )
+
+                        match order_result {
+
+                            Ok(order_id) => {
+
+                                let index: i64 = 0
+
+                                let total: i64 = 0
+
+                                while index < count {
+
+                                    let row_result: Result(json, str) =
+                                        json_array_get(rows, index)
+
+                                    match row_result {
+
+                                        Ok(row) => {
+
+                                            let product_result: Result(i64, str) =
+                                                json_get_i64(row, "product_id")
+
+                                            let quantity_result: Result(i64, str) =
+                                                json_get_i64(row, "quantity")
+
+                                            let price_result: Result(i64, str) =
+                                                json_get_i64(row, "price_cents")
+
+                                            match product_result {
+
+                                                Ok(product_id) => {
+
+                                                    match quantity_result {
+
+                                                        Ok(quantity) => {
+
+                                                            match price_result {
+
+                                                                Ok(price) => {
+
+                                                                    let line_total: i64 =
+                                                                        quantity * price
+
+                                                                    let inserted:
+                                                                        Result(i64, str) =
+                                                                        db_execute(
+                                                                            conn,
+                                                                            "INSERT INTO order_item
+                                                                             (order_id,
+                                                                              product_id,
+                                                                              quantity,
+                                                                              price_cents)
+                                                                             VALUES (?, ?, ?, ?)",
+                                                                            order_id,
+                                                                            product_id,
+                                                                            quantity,
+                                                                            price
+                                                                        )
+
+                                                                    match inserted {
+
+                                                                        Ok(n) => {
+
+                                                                            let stock_update:
+                                                                                Result(i64, str) =
+                                                                                db_execute(
+                                                                                    conn,
+                                                                                    "UPDATE product
+                                                                                     SET stock = stock - ?
+                                                                                     WHERE id = ?
+                                                                                     AND stock >= ?",
+                                                                                    quantity,
+                                                                                    product_id,
+                                                                                    quantity
+                                                                                )
+
+                                                                            match stock_update {
+
+                                                                                Ok(updated) => {
+
+                                                                                    if updated == 1 {
+
+                                                                                        index = index + 1
+
+                                                                                        total =
+                                                                                            total + line_total
+                                                                                    } else {
+
+                                                                                        stop(conn)
+
+                                                                                        return Err(
+                                                                                            OutOfStock(
+                                                                                                "product stock changed"
+                                                                                            )
+                                                                                        )
+                                                                                    }
+                                                                                }
+
+                                                                                Err(e) => {
+
+                                                                                    stop(conn)
+
+                                                                                    return Err(
+                                                                                        DbError(e)
+                                                                                    )
+                                                                                }
+                                                                            }
+                                                                        }
+
+                                                                        Err(e) => {
+
+                                                                            stop(conn)
+
+                                                                            return Err(
+                                                                                OrderError(e)
+                                                                            )
+                                                                        }
+                                                                    }
+                                                                }
+
+                                                                Err(e) => {
+
+                                                                    stop(conn)
+
+                                                                    return Err(
+                                                                        OrderError(e)
+                                                                    )
+                                                                }
+                                                            }
+                                                        }
+
+                                                        Err(e) => {
+
+                                                            stop(conn)
+
+                                                            return Err(
+                                                                OrderError(e)
+                                                            )
+                                                        }
+                                                    }
+                                                }
+
+                                                Err(e) => {
+
+                                                    stop(conn)
+
+                                                    return Err(
+                                                        OrderError(e)
+                                                    )
+                                                }
+                                            }
+                                        }
+
+                                        Err(e) => {
+
+                                            stop(conn)
+
+                                            return Err(
+                                                OrderError(e)
+                                            )
+                                        }
+                                    }
+                                }
+
+                                let updated_order: Result(i64, str) =
+                                    db_execute(
+                                        conn,
+                                        "UPDATE orders
+                                         SET total_cents = ?,
+                                             status = ?
+                                         WHERE id = ?",
+                                        total,
+                                        "Confirmed",
+                                        order_id
+                                    )
+
+                                match updated_order {
+
+                                    Ok(n) => {
+
+                                        let cleared: Result(i64, str) =
+                                            db_execute(
+                                                conn,
+                                                "DELETE FROM cart_item
+                                                 WHERE cart_id = ?",
+                                                cart_id
+                                            )
+
+                                        match cleared {
+                                            Ok(x) => Ok(order_id),
+                                            Err(e) => Err(OrderError(e))
+                                        }
+                                    }
+
+                                    Err(e) => Err(OrderError(e))
+                                }
+                            }
+
+                            Err(e) => Err(OrderError(e))
+                        }
+                    }
+                }
+
+                Err(e) => Err(DbError(e))
+            }
+
+            stop(conn)
+
+            result
+        }
+
+        Err(e) => Err(DbError(e))
+    }
+}
+
+
+fn list_order() -> Result(json, ErrorCode) {
+
+    return match db_connect("shop.db") {
+
+        Ok(conn) => {
+
+            let result: Result(json, str) = db_query(
+                conn,
+                "SELECT
+                    id,
+                    customer_id,
+                    status,
+                    total_cents
+                 FROM orders
+                 ORDER BY id DESC"
+            )
+
+            stop(conn)
+
+            match result {
+                Ok(rows) => Ok(rows),
+                Err(e) => Err(DbError(e))
+            }
+        }
+
+        Err(e) => Err(DbError(e))
+    }
+}
+
+
+fn list_order_item() -> Result(json, ErrorCode) {
+
+    return match db_connect("shop.db") {
+
+        Ok(conn) => {
+
+            let result: Result(json, str) = db_query(
+                conn,
+                "SELECT
+                    id,
+                    order_id,
+                    product_id,
+                    quantity,
+                    price_cents
+                 FROM order_item
+                 ORDER BY order_id DESC, id",
+            )
+
+            stop(conn)
+
+            match result {
+                Ok(rows) => Ok(rows),
+                Err(e) => Err(DbError(e))
+            }
+        }
+
+        Err(e) => Err(DbError(e))
+    }
+}
+
+
+fn update_order_status(order_id: i64, status: str)
+    -> Result(i64, ErrorCode)
+requires(role: "admin") {
+
+    return match db_connect("shop.db") {
+
+        Ok(conn) => {
+
+            let result: Result(i64, str) = db_execute(
+                conn,
+                "UPDATE orders
+                 SET status = ?
+                 WHERE id = ?",
+                status,
+                order_id
+            )
+
+            stop(conn)
+
+            match result {
+                Ok(n) => Ok(n),
+                Err(e) => Err(DbError(e))
+            }
+        }
+
+        Err(e) => Err(DbError(e))
+    }
+}
+
+
+fn main() {
+
+    let result: Result(i64, ErrorCode) = initialize_database()
+
+    match result {
+
+        Ok(n) => print("shopping database ready"),
+
+        Err(e) => print("shopping database initialization failed")
+    }
+}

@@ -532,7 +532,19 @@ function buildFieldControl(f, value, isEdit, topLevel) {
   if (f.min !== undefined && f.min !== null) input.setAttribute("min", f.min);
   if (f.max !== undefined && f.max !== null) input.setAttribute("max", f.max);
   const wrap = el("div", { class: "field" }, [el("label", { text: fieldLabel(f) + (f.required ? " *" : "") }), input]);
-  return { el: wrap, getValue: () => (f.control === "number" ? Number(input.value) : input.value) };
+  // `label === "Text"` marks the enum-favoring-`str`-ban free-text carrier
+  // (`struct Text { value: str }`, `ui_gen.rs::build_field`'s doc comment)
+  // -- it renders as this same flat text box, but `serve.rs::decode_value`
+  // still decodes it via the generic one-field-struct rule, which expects
+  // a JSON object (`{"value": "..."}"`), not a bare string. Wrap on submit
+  // to match; the display side needs no corresponding unwrap since a
+  // `Text` field's value comes back from SQL storage as a plain string
+  // already (the struct is a single flat TEXT column, never JSON there).
+  return { el: wrap, getValue: () => {
+    if (f.control === "number") return Number(input.value);
+    if (f.control === "text" && f.label === "Text") return { value: input.value };
+    return input.value;
+  }};
 }
 
 // ---- generic field-list -> form ----

@@ -16,9 +16,9 @@ cargo test                                # full suite (unit + compiler/tests/*.
 cargo test --test <name>                  # one integration test file
 cargo run -- <file.nir>                   # interpret
 cargo run -- build <file.nir> -o <out>    # compile to a native binary (LLVM, -O2)
-cargo run -- emit-ast <file.nir>          # parsed AST as JSON (also the fastest typecheck-only smoke test)
-cargo run -- emit-ui <file.nir> -o out.html   # derive a web UI from struct/fn conventions
-cargo run -- serve <file.nil> --port 8080     # run as a real HTTP service
+cargo run -- emit-ast <file.nir>          # parsed AST as JSON -- lex+parse ONLY, does NOT typecheck (by design: an ill-typed program is still inspectable)
+cargo run -- emit-ui <file.nir> -o out.html   # derive a web UI from struct/fn conventions -- full typecheck+ownership pass, no side effects; the actual fastest typecheck-only smoke test
+cargo run -- serve <file.nir> --port 8080     # run as a real HTTP service
 ```
 
 ## Facts that will cost you real time to rediscover — read these once

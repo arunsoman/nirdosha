@@ -1,0 +1,228 @@
+// Online trading platform (SQLite)
+// Tables: asset, account, orders
+// Naming follows list_/create_ so emit-ui can generate a basic CRUD UI.
+
+enum ErrorCode {
+    DbError(str),
+    NotFound(str),
+    InsufficientFunds(str),
+    InvalidOrder(str),
+}
+
+struct Text {
+    value: str,
+}
+
+struct Asset {
+    id: i64,
+    symbol: str,
+    name: str,
+    price_cents: i64,
+}
+
+struct Account {
+    id: i64,
+    owner: str,
+    cash_cents: i64,
+}
+
+struct Order {
+    id: i64,
+    account_id: i64,
+    asset_id: i64,
+    side: str,
+    quantity: i64,
+    price_cents: i64,
+    status: str,
+}
+
+fn setup_tables_inner(conn: db) -> Result(i64, ErrorCode) {
+    let r1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS asset (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT UNIQUE, name TEXT, price_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let r2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT UNIQUE, cash_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let r3: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER, asset_id INTEGER, side TEXT, quantity INTEGER, price_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let all_ok: bool = r1 >= 0 && r2 >= 0 && r3 >= 0
+    let result: Result(i64, ErrorCode) = if all_ok {
+        Ok(0)
+    } else {
+        Err(DbError("setup failed"))
+    }
+    stop(conn)
+    return result
+}
+
+fn setup_tables() -> Result(i64, ErrorCode) {
+    return match db_connect("trading.db") {
+        Ok(conn) => setup_tables_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn list_asset_inner(conn: db) -> Result(json, ErrorCode) {
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, symbol, name, price_cents FROM asset ORDER BY id") {
+        Ok(r) => Ok(r),
+        Err(e) => Err(DbError(e)),
+    }
+    stop(conn)
+    return rows
+}
+
+fn list_asset() -> Result(json, ErrorCode) {
+    return match db_connect("trading.db") {
+        Ok(conn) => list_asset_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn create_asset(a: Asset) -> Result(i64, ErrorCode) {
+    return match db_connect("trading.db") {
+        Ok(conn) => match db_execute(conn, "INSERT INTO asset (symbol, name, price_cents) VALUES (?, ?, ?)", a.symbol, a.name, a.price_cents) {
+            Ok(n) => Ok(n),
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn list_account_inner(conn: db) -> Result(json, ErrorCode) {
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, owner, cash_cents FROM account ORDER BY id") {
+        Ok(r) => Ok(r),
+        Err(e) => Err(DbError(e)),
+    }
+    stop(conn)
+    return rows
+}
+
+fn list_account() -> Result(json, ErrorCode) {
+    return match db_connect("trading.db") {
+        Ok(conn) => list_account_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn create_account(acc: Account) -> Result(i64, ErrorCode) {
+    return match db_connect("trading.db") {
+        Ok(conn) => match db_execute(conn, "INSERT INTO account (owner, cash_cents) VALUES (?, ?)", acc.owner, acc.cash_cents) {
+            Ok(n) => Ok(n),
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn list_order_inner(conn: db) -> Result(json, ErrorCode) {
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, account_id, asset_id, side, quantity, price_cents, status FROM orders ORDER BY id") {
+        Ok(r) => Ok(r),
+        Err(e) => Err(DbError(e)),
+    }
+    stop(conn)
+    return rows
+}
+
+fn list_order() -> Result(json, ErrorCode) {
+    return match db_connect("trading.db") {
+        Ok(conn) => list_order_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+// Place a simple market-style order (no matching engine; just records + adjusts cash on buy)
+// Pure input validation -- no `conn` involved, so it happens before a
+// connection is even opened (see the Ownership section on why an early
+// `stop(conn)` inside a validation guard would otherwise poison every
+// later use of `conn` on the fall-through path).
+fn validate_order(o: Order) -> Result(i64, ErrorCode) {
+    let side_ok: bool = if o.side == "buy" {
+        true
+    } else {
+        if o.side == "sell" {
+            true
+        } else {
+            false
+        }
+    }
+    return if side_ok == false {
+        Err(InvalidOrder("side must be buy or sell"))
+    } else {
+        if o.quantity <= 0 {
+            Err(InvalidOrder("quantity must be positive"))
+        } else {
+            Ok(1)
+        }
+    }
+}
+
+fn place_order_inner(conn: db, o: Order) -> Result(i64, ErrorCode) {
+    let cost: i64 = o.quantity * o.price_cents
+    // For buy: check cash
+    let cash_check: Result(i64, ErrorCode) = if o.side == "buy" {
+        match db_query(conn, "SELECT cash_cents FROM account WHERE id = ?", o.account_id) {
+            Ok(rows) => match json_array_get(rows, 0) {
+                Ok(row) => match json_get_i64(row, "cash_cents") {
+                    Ok(cash) => if cash >= cost {
+                        Ok(cash)
+                    } else {
+                        Err(InsufficientFunds("not enough cash"))
+                    },
+                    Err(e) => Err(DbError(e)),
+                },
+                Err(e) => Err(NotFound("account")),
+            },
+            Err(e) => Err(DbError(e)),
+        }
+    } else {
+        Ok(0)
+    }
+    let after_cash: Result(i64, ErrorCode) = match cash_check {
+        Ok(c) => if o.side == "buy" {
+            match db_execute(conn, "UPDATE account SET cash_cents = cash_cents - ? WHERE id = ?", cost, o.account_id) {
+                Ok(n) => Ok(n),
+                Err(e) => Err(DbError(e)),
+            }
+        } else {
+            // sell: credit cash (simplified, no inventory check)
+            match db_execute(conn, "UPDATE account SET cash_cents = cash_cents + ? WHERE id = ?", cost, o.account_id) {
+                Ok(n) => Ok(n),
+                Err(e) => Err(DbError(e)),
+            }
+        },
+        Err(e) => Err(e),
+    }
+    let insert_res: Result(i64, ErrorCode) = match after_cash {
+        Ok(_) => match db_execute(conn, "INSERT INTO orders (account_id, asset_id, side, quantity, price_cents, status) VALUES (?, ?, ?, ?, ?, ?)", o.account_id, o.asset_id, o.side, o.quantity, o.price_cents, "filled") {
+            Ok(n) => Ok(n),
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(e),
+    }
+    stop(conn)
+    return insert_res
+}
+
+fn place_order(o: Order) -> Result(i64, ErrorCode) {
+    return match validate_order(o) {
+        Ok(_) => match db_connect("trading.db") {
+            Ok(conn) => place_order_inner(conn, o),
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+fn main() {
+    // Optional one-time setup
+    let setup: Result(i64, ErrorCode) = setup_tables()
+    match setup {
+        Ok(n) => print("tables ready"),
+        Err(e) => print("setup error"),
+    }
+    print("trading platform ready")
+}
