@@ -63,6 +63,7 @@ fn main() -> ExitCode {
     };
 
     match first.as_str() {
+        "init" => cmd_init(args),
         "build" => cmd_build(args),
         "emit-llvm" => cmd_emit_llvm(args),
         "emit-ast" => cmd_emit_ast(args),
@@ -80,6 +81,11 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     eprintln!("usage:");
+    eprintln!("  nirdosha init <project-name> [--dest <path>] [--no-email] [--no-roles] [--sms] [--push] [--force]");
+    eprintln!("                                      scaffold a self-contained project folder: a starter");
+    eprintln!("                                      <project-name>.nir (with the standing Email/RoleMapping");
+    eprintln!("                                      admin-panel fixtures, unless disabled), a bundled copy of");
+    eprintln!("                                      this executable, and a run.sh/run.bat launcher");
     eprintln!("  nirdosha <file.nir> [--format=json] [--otel-console]");
     eprintln!("                                      interpret");
     eprintln!("                                      (--format=json: structured diagnostics on failure)");
@@ -170,14 +176,6 @@ fn cmd_interpret(
             Some(workflow_log),
         ) {
             Ok(v) => print_value(&v),
-            // Lex/parse errors aren't part of `Diagnostic` yet (see
-            // `lib.rs`'s doc comment) — they stay plain text even under
-            // `--format=json`, an honest, documented gap rather than a
-            // silently-inconsistent flag.
-            Err(nirdosha::RunFailure::Lex(msg)) | Err(nirdosha::RunFailure::Parse(msg)) => {
-                eprintln!("{msg}");
-                ExitCode::FAILURE
-            }
             Err(nirdosha::RunFailure::Diagnostics(diags)) => {
                 let json = serde_json::to_string(&diags).expect("Diagnostic always serializes");
                 eprintln!("{json}");
@@ -243,6 +241,126 @@ fn load_theme(path: Option<&str>) -> Result<Option<nirdosha::ui_gen::Theme>, Str
     serde_json::from_str(&text)
         .map(Some)
         .map_err(|e| format!("error parsing {path} as a theme JSON object: {e}"))
+}
+
+/// `nirdosha init <project-name> [--dest <path>] [--no-email] [--no-roles]
+/// [--sms] [--push] [--force]` -- scaffolds `<dest>/<project-name>/`
+/// (default `<dest>`: current directory) containing a starter
+/// `<project-name>.nir` (`nirdosha::init::generate_source`), a bundled
+/// copy of this very executable (`std::env::current_exe()`, copied so the
+/// folder can be moved to another machine and run with no separate
+/// `nirdosha` install -- same-OS/arch as wherever `init` ran, no cross-
+/// compilation attempted), a `run.sh`/`run.bat` launcher for that copy
+/// (whichever matches the host OS -- never both, since the other one
+/// couldn't run against this binary anyway), and a placeholder
+/// `jwks.json` so the launcher's placeholder `--jwks-file`/`--issuer`/
+/// `--audience` flags start successfully with every `requires(role: ...)`
+/// route still honestly 401ing until real IdP values replace them. This
+/// is tooling-level, not a compiler concept: `typeck`/`codegen`/`serve`
+/// still only ever know about the one `.nir` file this writes.
+fn cmd_init(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut project_name: Option<String> = None;
+    let mut dest = ".".to_string();
+    let mut opts = nirdosha::init::InitOptions::default();
+    let mut force = false;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--dest" => dest = args.next().unwrap_or(dest),
+            "--no-email" => opts.email = false,
+            "--no-roles" => opts.roles = false,
+            "--sms" => opts.sms = true,
+            "--push" => opts.push = true,
+            "--force" => force = true,
+            other => project_name = Some(other.to_string()),
+        }
+    }
+    let Some(name) = project_name else {
+        eprintln!(
+            "usage: nirdosha init <project-name> [--dest <path>] [--no-email] [--no-roles] [--sms] [--push] [--force]"
+        );
+        return ExitCode::FAILURE;
+    };
+    let source = match nirdosha::init::generate_source(&name, &opts) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let project_dir = std::path::Path::new(&dest).join(&name);
+    if let Err(e) = std::fs::create_dir_all(&project_dir) {
+        eprintln!("error creating {}: {e}", project_dir.display());
+        return ExitCode::FAILURE;
+    }
+
+    let nir_path = project_dir.join(format!("{name}.nir"));
+    let jwks_path = project_dir.join("jwks.json");
+    let exe_dest = project_dir.join(format!("nirdosha{}", std::env::consts::EXE_SUFFIX));
+    // The bundled binary only ever works on the host's own OS/arch, so
+    // only the launcher that could actually run against it is written --
+    // a `run.bat` next to a Linux ELF binary would just be a trap.
+    let (launcher_name, launcher_body) = if cfg!(windows) {
+        ("run.bat", nirdosha::init::render_launcher_windows(&name))
+    } else {
+        ("run.sh", nirdosha::init::render_launcher_unix(&name))
+    };
+    let launcher_path = project_dir.join(launcher_name);
+
+    if !force {
+        let conflicts: Vec<String> = [&nir_path, &exe_dest, &launcher_path, &jwks_path]
+            .into_iter()
+            .filter(|p| p.exists())
+            .map(|p| p.display().to_string())
+            .collect();
+        if !conflicts.is_empty() {
+            eprintln!("refusing to overwrite existing file(s): {} (pass --force to overwrite)", conflicts.join(", "));
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let current_exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error locating the running nirdosha executable to bundle: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = std::fs::copy(&current_exe, &exe_dest) {
+        eprintln!("error copying {} to {}: {e}", current_exe.display(), exe_dest.display());
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = std::fs::write(&nir_path, &source) {
+        eprintln!("error writing {}: {e}", nir_path.display());
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = std::fs::write(&jwks_path, nirdosha::init::placeholder_jwks()) {
+        eprintln!("error writing {}: {e}", jwks_path.display());
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = std::fs::write(&launcher_path, &launcher_body) {
+        eprintln!("error writing {}: {e}", launcher_path.display());
+        return ExitCode::FAILURE;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // `fs::write` doesn't set the exec bit -- `fs::copy` above
+        // already preserved it on the bundled binary, but the launcher
+        // script is brand new content and needs it set explicitly.
+        if let Err(e) = std::fs::set_permissions(&launcher_path, std::fs::Permissions::from_mode(0o755)) {
+            eprintln!("error making {} executable: {e}", launcher_path.display());
+            return ExitCode::FAILURE;
+        }
+    }
+
+    println!("wrote {}/", project_dir.display());
+    if cfg!(windows) {
+        println!("run it: cd {} && {launcher_name}", project_dir.display());
+    } else {
+        println!("run it: cd {} && ./{launcher_name}", project_dir.display());
+    }
+    ExitCode::SUCCESS
 }
 
 fn cmd_build(mut args: impl Iterator<Item = String>) -> ExitCode {

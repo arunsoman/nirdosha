@@ -2,6 +2,7 @@ pub mod ast;
 pub mod codegen;
 pub mod dbconn;
 pub mod effects;
+pub mod init;
 pub mod interpreter;
 pub mod migrate;
 pub mod observability;
@@ -134,18 +135,21 @@ pub fn run_with_tracer_transact_and_workflow_log(
 /// goal.md row 9's actual content: a caller that wants the structured
 /// `span`/`kind` data behind each stage's error, not `run()`'s single
 /// printable string, drives this instead. One shape (`Diagnostic`) across
-/// all three stages that can fail *after* parsing — typecheck, ownership,
+/// every stage that can fail — lex, parse, typecheck, ownership,
 /// interpretation — each already carrying `#[derive(Serialize,
 /// Deserialize)]` all the way down to `Ty` (see `ast.rs::Ty`'s doc
-/// comment for why `Deserialize` had to come this early). Lex/parse
-/// errors are deliberately **not** folded into `Diagnostic`: neither
-/// `LexError` nor `ParseError` has a `kind` enum the way the three later
-/// stages do (just a plain message), so structuring them is honestly a
-/// separate, not-yet-done increment, not silently pretended away here —
-/// `RunFailure::Lex`/`Parse` stay plain strings.
+/// comment for why `Deserialize` had to come this early). `Lex`/`Parse`
+/// carry `LexError`/`ParseError` directly (`message` + `span`, no `kind`
+/// enum the way the three later stages have — a flatter shape, not a
+/// missing one) — previously excluded here and left as plain strings on
+/// `RunFailure::Lex`/`Parse`; a self-repair loop hitting a syntax error
+/// got exactly the prose `--format=json` exists to avoid, an honest gap
+/// this closes rather than documents.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "stage", content = "diagnostic")]
 pub enum Diagnostic {
+    Lex(token::LexError),
+    Parse(parser::ParseError),
     Type(typeck::TypeError),
     Ownership(ownership::OwnershipError),
     Runtime(interpreter::RuntimeError),
@@ -154,6 +158,8 @@ pub enum Diagnostic {
 impl Diagnostic {
     pub fn span(&self) -> token::Span {
         match self {
+            Diagnostic::Lex(e) => e.span,
+            Diagnostic::Parse(e) => e.span,
             Diagnostic::Type(e) => e.span,
             Diagnostic::Ownership(e) => e.span,
             Diagnostic::Runtime(e) => e.span,
@@ -163,8 +169,6 @@ impl Diagnostic {
 
 #[derive(Debug, Clone)]
 pub enum RunFailure {
-    Lex(String),
-    Parse(String),
     Diagnostics(Vec<Diagnostic>),
 }
 
@@ -206,12 +210,9 @@ pub fn run_diagnostic_with_tracer_transact_and_workflow_log(
     transact_log_path: Option<std::path::PathBuf>,
     workflow_log_path: Option<std::path::PathBuf>,
 ) -> Result<Value, RunFailure> {
-    let toks = Lexer::new(src).tokenize().map_err(|e| {
-        RunFailure::Lex(format!("lex error at {}:{}: {}", e.span.line, e.span.col, e.message))
-    })?;
-    let program = Parser::new(toks).parse_program().map_err(|e| {
-        RunFailure::Parse(format!("parse error at {}:{}: {}", e.span.line, e.span.col, e.message))
-    })?;
+    let toks = Lexer::new(src).tokenize().map_err(|e| RunFailure::Diagnostics(vec![Diagnostic::Lex(e)]))?;
+    let program =
+        Parser::new(toks).parse_program().map_err(|e| RunFailure::Diagnostics(vec![Diagnostic::Parse(e)]))?;
     if let Err(errors) = typeck::typecheck(&program) {
         return Err(RunFailure::Diagnostics(errors.into_iter().map(Diagnostic::Type).collect()));
     }

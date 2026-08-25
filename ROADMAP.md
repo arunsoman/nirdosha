@@ -276,8 +276,80 @@ messages.
   pipeline tests, unrelated to this file — confirmed by direct
   inspection, not assumed) and 2 pre-existing unrelated collection
   errors — none caused by, or fixed by, this rewrite.
+- **2026-08-25 — UI DSL "Deliberate non-goals" documented.** No code
+  change: the three closed sets (one inline-SVG bar chart type, four
+  fixed `@keyframes` animations, seven fixed form-control kinds) already
+  existed exactly this way in `ui_gen.rs`/`ui_gen_template.html`; they
+  just weren't stated anywhere as *intentional* boundaries versus
+  unbuilt gaps. Added a "Deliberate non-goals" section to
+  `compiler/UI_DSL_TODO.md` (the source of truth, same heading MOBILE.md
+  already uses), with pointers/summaries in `LANGUAGE.md` §11,
+  `README.md`'s screen/dashboard section, and `MOBILE.md`'s own non-goals
+  list (native inherits the same closed sets, not a separate mobile
+  gap).
 
 ---
+
+## Standards & compliance posture
+
+Added 2026-08-25, after a launch-prep session surfaced several claims
+("we support FAPI," "audit trail included," "JWT support") that turned
+out to be overstated once checked against real code — see that
+session's core-review notes for the methodology. Same discipline as
+this file's `[DONE]`/`[PARTIAL]`/`[OPEN]` tags above, plus one more:
+`[N/A]` for a standard that's organizational/certification-level (an
+ISMS, a legal compliance program, a business-continuity plan) rather
+than something a compiler or language runtime can itself implement —
+marking those `[OPEN]` would misleadingly imply "buildable, not yet
+built," when the honest answer is "not the kind of thing this project's
+code would ever contain." Every `[DONE]`/`[PARTIAL]`/`[OPEN]` row below
+was checked against real source (file:line) or an actual grep/run, not
+assumed from a doc comment.
+
+| Area | Standard/protocol | Status | Evidence |
+|---|---|---|---|
+| Secure development | OWASP Top 10 | `[PARTIAL]` | Real: injection prevented structurally (`db_execute`/`db_query`'s `?`-bound params, no string-built SQL is even possible — `str` has no concatenation), broken access control mitigated by `requires(role/claim:...)` (server-enforced, `serve.rs`) and field-level `view`/`edit` gates (`ui_gen.rs:61-121`). Open: no rate limiting anywhere in `serve.rs` (checked, zero matches) — a real security-misconfiguration/DoS-adjacent gap. |
+| Secure development | OWASP ASVS | `[N/A]` | A verification checklist you self-assess or get audited against — no formal ASVS pass has been run. |
+| Secure development | OWASP SAMM | `[N/A]` | An org-level SDLC maturity model, not a codebase property. |
+| Secure development | ISO/IEC 27034 | `[N/A]` | Application-security process standard, not code-assessable. |
+| Information security | ISO/IEC 27001 | `[N/A]` | ISMS certification — an organizational program, not something a repo has. |
+| Information security | ISO/IEC 27002 | `[N/A]` | Companion controls catalogue to 27001, same reasoning. |
+| Information security | NIST CSF | `[N/A]` | Organizational risk-management framework. |
+| Information security | CIS Controls | `[N/A]` | Organizational hardening/controls checklist. |
+| Cloud security | ISO/IEC 27017 | `[N/A]` | Cloud-provider/tenant responsibility standard — depends on who's hosting `nirdosha serve`, not on the language. |
+| Cloud security | CSA CCM | `[N/A]` | Cloud controls matrix, organizational. |
+| Cloud security | CSA STAR | `[N/A]` | A registry/attestation program, organizational. |
+| Cloud security | SOC 2 | `[N/A]` | Third-party audit of an organization's controls over time — nothing a codebase alone satisfies. |
+| Privacy | ISO/IEC 27701 | `[N/A]` | Privacy-information-management extension to 27001, organizational. |
+| Privacy | GDPR | `[N/A]` | Law, not a code property — no built-in "right to erasure"/consent-management tooling exists today (additive-only schema migrations, `migrate.rs`, is the closest adjacent primitive, and it's about schema evolution, not data-subject rights). |
+| Privacy | India DPDP Act | `[N/A]` | Same reasoning as GDPR. |
+| Privacy | CCPA/CPRA | `[N/A]` | Same reasoning as GDPR. |
+| Identity and access | OAuth 2.0 | `[PARTIAL]` | No authorization-code/client-credentials grant flow (zero matches for `/authorize`, `redirect_uri`, `grant_type`). What's real: a session layer on top of OIDC token validation — `create_application_session`/`session_cookie`/`new_refresh_token`/`exchange_refresh_token`/`check_revocation` (`interpreter.rs:2580+`), unpredictable session IDs (`interpreter.rs:1474`), real revocation checking (`:2649`). This is "validate a token and manage sessions," not "be an OAuth2 authorization server or client." |
+| Identity and access | OpenID Connect | `[PARTIAL]` | Real ID-token validation (`validate_oidc_token`, `interpreter.rs:1085`, real JWKS lookup `:1168`) — but signature verification is **HS256-only** (`:1241`), no RS256, which is what most real IdPs (Auth0/Okta/Keycloak/Azure AD) issue by default. No discovery endpoint, no `/userinfo`. |
+| Identity and access | SAML 2.0 | `[OPEN]` | Zero matches repo-wide. |
+| Identity and access | SCIM | `[OPEN]` | Zero matches repo-wide (no user/group provisioning protocol). |
+| Identity and access | FIDO2/WebAuthn | `[OPEN]` | Zero matches repo-wide (no passkey/phishing-resistant login). |
+| Network security | TLS 1.2/1.3, HTTPS (outbound) | `[DONE]` | `https_get`/`https_post` (`interpreter.rs:2503-2509`) use real `native_tls::TlsConnector` (`:1022`, `:1765`). |
+| Network security | TLS 1.2/1.3, HTTPS (`nirdosha serve` itself) | `[OPEN]` | `serve.rs:267` calls `tiny_http::Server::http(...)` — plain HTTP only. Production HTTPS needs a reverse proxy in front; the server doesn't terminate TLS itself. |
+| Network security | SSH | `[N/A]` | Not something an application-level language runtime provides. |
+| Network security | IPsec, DNSSEC | `[N/A]` | OS/network-layer concerns, out of scope for a language runtime regardless of implementation state. |
+| Network security | mTLS | `[OPEN]` | Confirmed absent — also the FAPI blocker (`compiler/UI_DSL_TODO.md:353-357` lists it as "still owed"). |
+| API security | OpenAPI | `[OPEN]` | No spec generation anywhere for `nirdosha serve`'s `POST /api/<fn>` routes. |
+| API security | OAuth 2.0, JWT, mTLS | — | See Identity/access and Network security rows above. |
+| API security | OWASP API Security Top 10 | `[PARTIAL]` | Real: parameterized queries everywhere, a real 1 MiB request-body cap (`serve.rs:82-99`, `MAX_BODY_BYTES`), field-level object authorization via `view`/`edit` gates (not just whole-endpoint gating). Open: no rate limiting, no OpenAPI contract to validate requests against. |
+| Logging | Syslog | `[OPEN]` | Zero matches repo-wide. |
+| Logging | OpenTelemetry | `[PARTIAL]` | Real local tracer with a console/file exporter, zero-cost-when-disabled design, fail-open channel (`observability.rs`). The module's own doc comment says real OTLP export to an actual collector, and real metrics, aren't built yet (Track A3 above tracks this). |
+| Logging | CEF, ECS | `[OPEN]` | Zero matches repo-wide. |
+| Availability | ISO 22301 | `[N/A]` | Business-continuity-management certification, organizational. |
+| Availability | SRE practices | `[PARTIAL]` | Real durability primitives exist and are load-bearing (`transact`'s WAL + crash replay + retry/timeout, `workflow`'s durable state machine) — genuinely SRE-adjacent reliability engineering, not just a claim. No formal SLOs/error budgets/on-call tooling. |
+| Availability | RTO/RPO | `[PARTIAL]` | `transact`'s durability log gives a real, low RPO for in-flight transactions specifically — but no formal RTO/RPO targets are defined anywhere for a `nirdosha serve` deployment as a whole, and no DR runbook exists. |
+| Availability | Backup standards | `[OPEN]` | No built-in backup/restore tooling — a SQLite-backed deployment's backups are entirely the operator's own responsibility today. |
+| Accessibility | WCAG 2.2 | `[OPEN]` | `ui_gen.rs`/`ui_gen_template.html`: zero `aria-` attributes anywhere. Whatever accessibility exists is incidental to using native HTML form elements plus Material CSS, not an explicit feature, audit, or test. |
+| Accessibility | EN 301 549 | `[OPEN]` | Largely references WCAG; same gap. |
+| Accessibility | Section 508 | `[OPEN]` | Same — references WCAG-equivalent criteria. |
+| Accessibility | India GIGW | `[OPEN]` | Same — includes WCAG-aligned accessibility criteria. |
+| Quality management | ISO 9001 | `[N/A]` | Organizational quality-management-system certification. |
+| Quality management | ISO/IEC 25010 | `[N/A]` | No formal characteristic-by-characteristic assessment has been run — this file's own `[DONE]`/`[PARTIAL]`/`[OPEN]` discipline plus the compiler's test suite are the project's actual (informal) substitute today. |
 
 ## 0. Where the existing plan already stands
 
@@ -343,7 +415,11 @@ of Track B has landed.*
   crash-replay behaves, not just trust the existing test suite.
 - `[OPEN]` **A2. Deployment story for the interpreted path** —
   containerize `nirdosha serve` + source properly; secrets/JWKS
-  handling; this is buildable now, independent of Track B.
+  handling; this is buildable now, independent of Track B. The simple
+  case (copy a folder to a machine, run it, no orchestration) is now
+  covered by **A6**'s `nirdosha init` below — a bundled executable +
+  `run.sh`/`run.bat` launcher. Containerization/real secrets management
+  for an actual production deployment is still open here.
 - `[OPEN]` **A3. Observability wired to something real** — the OTel
   tracer (`observability.rs`) exists; connect it to an actual
   collector/backend for a real deployment. Layer 2a is now done:
@@ -431,14 +507,34 @@ of Track B has landed.*
     program that declares none of these marker structs renders none of
     this UI today, the same way a hello-world script that never
     declares `EmailProviderConfig` gets no communications panel:
-    `ui_gen`/`serve` only render screens for structs that exist. A
-    proposed `nirdosha init <project-name>` scaffolding command would
-    only be solving *ergonomics* (not hand-typing the marker structs),
-    not cost — worth keeping scoped as a text-generation convenience,
-    not a new "project manifest" concept the compiler itself needs to
-    understand (Nirdosha has no notion of "a project" beyond a source
-    file today, and this shouldn't quietly become the thing that
-    introduces one).
+    `ui_gen`/`serve` only render screens for structs that exist.
+  - **2026-08-25 — `nirdosha init <project-name>` scaffolding: `[DONE]`.**
+    Solves exactly the ergonomics this section named (not hand-typing the
+    marker structs), kept scoped as a text-generation convenience, not a
+    new "project manifest" concept the compiler itself needs to
+    understand — `typeck`/`codegen`/`serve` still only ever know about
+    one `.nir` file; `cmd_init`/`nirdosha::init` (`compiler/src/init.rs`)
+    just write one to disk. Emits `EmailProviderConfig`/`RoleMapping`
+    (default on) and `SmsProviderConfig`/`PushProviderConfig` (opt-in via
+    `--sms`/`--push`) verbatim from `scratch/nirdosha_llm_prompt.md`'s
+    standing-fixtures section, plus the `struct Text { value: str }`
+    wrapper their `Result(_, Text)` signatures need (the str-ban's
+    documented convention). Went one step further than "just a file,"
+    per a direct ask: `init` also writes a self-contained, runnable
+    project folder — `<name>.nir`, a bundled copy of the running
+    `nirdosha` executable (`std::env::current_exe()`, same-OS/arch only),
+    a `run.sh`/`run.bat` launcher wired to `nirdosha serve` with
+    placeholder `--jwks-file`/`--issuer`/`--audience` (visible/
+    discoverable rather than silently absent — every `requires(role:
+    ...)` route honestly 401s until real IdP values replace them), and a
+    placeholder `jwks.json` (`{"keys": []}`) so that launcher runs with
+    zero manual setup. This is the simple, self-contained-folder answer
+    to **A2**'s "deployment story for the interpreted path" below —
+    containerization for a real production deployment is still open.
+    Verified: `compiler/tests/init.rs` (generator-half lex/parse/
+    typecheck/ownership-check on every fixture combination, plus a
+    CLI-half spawning the real binary to check the written folder,
+    the overwrite guard, and `--dest` directory creation).
 - `[OPEN]` **A7. Real Windows verification.** The `v0.1.0-alpha.1`
   release run (2026-08-25) found `runtime_kernels.rs`'s `tcp`/
   `tcp_listener` codegen backend used Unix-only `std::os::fd`

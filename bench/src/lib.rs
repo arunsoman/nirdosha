@@ -120,9 +120,6 @@ pub fn score_task(model: &mut dyn Model, task: &Task, max_attempts: usize) -> Ta
             Ok(_) => {
                 prior_failure = Some("the program ran to completion but returned the wrong value".to_string());
             }
-            Err(nirdosha::RunFailure::Lex(msg)) | Err(nirdosha::RunFailure::Parse(msg)) => {
-                prior_failure = Some(msg);
-            }
             Err(nirdosha::RunFailure::Diagnostics(diags)) => {
                 prior_failure = Some(serde_json::to_string(&diags).unwrap_or_default());
             }

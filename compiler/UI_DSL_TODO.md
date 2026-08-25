@@ -359,6 +359,52 @@ invention. Full design in `LANGUAGE.md` §11b.
   stance (matching `oidc_validate_token`) is to be a correct relying
   party, never the IdP itself.
 
+## Deliberate non-goals (disclosed, not silently dropped)
+
+Same discipline `MOBILE.md`'s own "Deliberate non-goals" section
+established: these are closed by design, not gaps waiting on a future
+session — a request to widen any of them is a request for a different
+DSL, not a bug report against this one.
+
+- **One chart type, permanently: the inline-SVG bar chart.**
+  `chart_<name>()` (naming-convention inference) and a declared
+  `dashboard { chart "..." -> ... }` entry both render through the same
+  `renderChart` in `ui_gen_template.html`, which draws one shape — a
+  horizontal bar per `{label, value}` pair — from whatever `chart_<name>`
+  resolved to. No line/scatter/heatmap/treemap/geo/3D chart exists or is
+  planned, and no charting library dependency (Recharts, D3, Victory, or
+  anything else) ever gets pulled in — `ui_gen.rs`'s own doc comment
+  already calls this out as "self-contained, no external charting
+  library." A `chart_<name>` fn that wants a different visual shape has
+  no DSL escape hatch for it.
+- **Four built-in animations, fixed, nothing else.** `fade-in`/
+  `slide-up`/`scale-in`/`pop` (LANGUAGE.md §11b) are the entire
+  `@keyframes` vocabulary `ui_gen_template.html` ships — a screen's
+  entrance animation and a table's staggered-row entrance both pick from
+  this same closed set, nothing else. There's no per-project custom
+  `@keyframes`, no gesture-driven or physics-based motion (spring/
+  inertia), nothing like Framer Motion. `--theme`'s `motion` section
+  tunes duration/easing/lift/scale *on* these four; it can't add a
+  fifth.
+- **Form controls are a fixed seven-kind set:** `text` / `number` /
+  `checkbox` / `select` / `struct` (one-level nested) / `readonly` /
+  `date`. `build_field` (`ui_gen.rs`) maps every Nirdosha type to
+  exactly one of these seven, with `readonly` as the deliberate fallback
+  for anything that doesn't fit (a payload-carrying enum, an affine
+  handle, deeper-than-two-level nesting) rather than an eighth kind
+  invented to cover it. No rich text editor, no color picker, no
+  drag-drop file upload with preview, no autocomplete/typeahead, no
+  calendar/scheduler widget (`date` is a plain HTML5 date input, not a
+  scheduler), no signature pad.
+
+This DSL stays a naming-convention-driven CRUD+dashboard generator with
+one small, closed set of extension points (`screen`/`dashboard`/
+`field`/`action`, `--theme`) — not a general component library growing
+toward one. An app that needs a chart type, animation, or form control
+outside these closed sets is a "write your own frontend against the
+JSON API" case (`README.md`'s "Serving" section), not a `ui_gen.rs`
+feature request.
+
 ## Investigated, found out of scope: `grammar_export`/`grammar_check`
 
 Per this session's plan, checked what these two repo-root crates

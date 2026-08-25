@@ -25,3 +25,14 @@ regex = "1.13.1"
 # system z3 via pkg-config since the vendored build is much slower.
 [features]
 dist = ["z3/vendored"]
+
+# Rust's own integer-overflow panic is `nirdosha`'s only runtime guard
+# for i64 arithmetic (there's no dynamic `OutOfRange` check for it, see
+# `scalar_binop`/`eval_binary` in src/interpreter.rs) -- `spawn`/`join`
+# catches that panic via `catch_unwind` and reports `ThreadPanicked`.
+# Cargo's default release profile disables overflow checks, which would
+# silently make every distributed `nirdosha` binary wrap i64 overflow
+# instead of erroring -- directly contradicting the project's overflow-
+# safety guarantees. Keep this on in release builds.
+[profile.release]
+overflow-checks = true

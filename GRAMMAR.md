@@ -104,7 +104,24 @@ program     ::= item*
 
 item        ::= fn_decl | struct_decl | enum_decl | screen_decl | dashboard_decl | module_decl | workflow_decl
 
-fn_decl     ::= "fn" ident "(" params? ")" ("->" type)? block
+fn_decl     ::= "fn" ident "(" params? ")" ("->" type)? effect_annotation? requires_annotation? block
+
+// `effect(pure)` / `effect(io, network, ...)` -- `None` (fully inferred,
+// the common case) if absent. `parser.rs::parse_effect_annotation`:
+// `pure` denotes the empty effect set and can't be combined with any
+// other name (`effect(pure, io)` is a parse error, not silently "just
+// `io`") -- not expressible in this EBNF shape (a semantic check, same
+// class of thing `match`'s "at most one literal domain" rule already
+// isn't), enforced by the parser instead.
+effect_annotation ::= "effect" "(" effect_name ("," effect_name)* ")"
+effect_name ::= "pure" | "rng" | "io" | "concurrent" | "network"
+
+// `requires(role: "admin")` / `requires(claim: "department",
+// "cardiology")` -- `None` (ungated, the common case) if absent.
+// `role`/`claim` are matched by identifier text only in this one slot,
+// same "keyword only within this one leading position" treatment
+// `screen_decl`'s own `field`/`action`/`paginate` names get (see below).
+requires_annotation ::= "requires" "(" ("role" ":" str | "claim" ":" str "," str) ")"
 
 // Row 11 (`nirdosha_row11_amendment.md`) — product and sum types.
 // `type_params` (layer 6, generics) is an optional bare-name list, empty
@@ -143,10 +160,9 @@ variant     ::= ident ("(" type ("," type)* ")")?
 // globally. They're matched by identifier text only in this one leading
 // position of their own body -- exactly the precedent `requires(role:
 // ...)`'s own `role`/`claim` names already set in the real grammar
-// (`parser.rs::parse_requires_annotation`; `requires(...)`/`effect(...)`
-// itself isn't yet reflected in this file's own `fn_decl` production --
-// a pre-existing gap, not one this session introduced or is fixing) --
-// so LL(1) holds with no
+// (`parser.rs::parse_requires_annotation`, now reflected in `fn_decl`
+// above alongside `effect_annotation` -- previously a documented gap in
+// this file only, not in the real parser) -- so LL(1) holds with no
 // second-token lookahead (dispatch is on the first token's text alone),
 // and `action` stays free to be an ordinary struct field/param name
 // everywhere else (`examples/trade-finance/trade_finance.nir` already
@@ -271,6 +287,13 @@ param       ::= ident ":" type
 // `TypeErrorKind::UnknownType`, and a real one applied to the wrong
 // number of type arguments is `TypeErrorKind::WrongTypeArity` — both
 // caught by `typeck.rs`, not this grammar.
+// `fn(T1, T2) -> R` (last alternative) -- a first-class function value's
+// type, e.g. `apply(f: fn(i64) -> i64, x: i64)` (`examples/
+// privileged_fn.nir`). Reuses the `"fn"` keyword rather than a second
+// dedicated token — never ambiguous with a declaration's own `"fn"
+// ident (...)`, since a type position never expects a name next.
+// `parser.rs::expect_type`; previously missing from this file, not from
+// the real parser.
 type        ::= "&" type
               | "box" type
               | "thread" type
@@ -282,6 +305,7 @@ type        ::= "&" type
               | "u8" | "u16" | "u32" | "u64" | "usize" | "f64"
               | "bool" | "unit" | "str" | "tcp" | "tcp_listener"
               | ident ("(" type ("," type)* ")")?
+              | "fn" "(" (type ("," type)*)? ")" ("->" type)?
 
 // A block's *value* (relevant wherever a block sits in an expression
 // position — an `if`'s branches, most concretely) is its last
@@ -347,7 +371,13 @@ if_expr     ::= "if" expr block ("else" (block | if_expr))?
 //     no way to prove coverage without one.
 match_expr  ::= "match" expr "{" match_arm ("," match_arm)* ","? "}"
 match_arm   ::= variant_arm | literal_arm
-variant_arm ::= ident ("(" ident ("," ident)* ")")? "=>" expr
+// A zero-payload variant's pattern still takes `()`, same as its own
+// construction does (`enum_decl`'s doc comment above) — the binding
+// list inside is what's optional, not the parens themselves (checked
+// directly against `parser.rs::parse_match_expr`: `admin()` in a match
+// arm is `Tok::LParen` immediately followed by `Tok::RParen`, previously
+// undocumented here).
+variant_arm ::= ident ("(" (ident ("," ident)*)? ")")? "=>" expr
 literal_arm ::= (str | int | "true" | "false" | "_") "=>" expr
 
 // `TRANSACT.md`'s durable-effect construct — all five layers are
@@ -506,6 +536,15 @@ unary       ::= ("!" | "-" | "*" | "box" | "&") unary
               // accepts many connections over its lifetime.
               | "listen" "(" expr ")"
               | "accept" "(" expr ")"
+              // `acquire transfer_funds(proof)` -- the only way to obtain a
+              // `requires`-gated function's *value* (row 12): the
+              // externally-issued `RoleView`/`ClaimView` proof is the
+              // argument. Same "parse a call, then restrict what came out"
+              // technique `spawn`/`sandbox` use above, additionally
+              // requiring exactly one argument (`parser.rs`'s own
+              // `Tok::Acquire` arm) -- previously missing from this file,
+              // not from the real parser (`examples/privileged_fn.nir`).
+              | "acquire" call
               | call
 
 // Exactly zero or one call, not "zero or more" — `f()()` is a **parse

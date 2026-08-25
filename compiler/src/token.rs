@@ -183,7 +183,7 @@ const TYPE_NAMES: &[&str] = &[
     "tcp", "tcp_listener", "file", "json", "db", "mq",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LexError {
     pub message: String,
     pub span: Span,

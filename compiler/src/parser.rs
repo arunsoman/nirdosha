@@ -9,7 +9,7 @@
 use crate::ast::*;
 use crate::token::{Span, Tok, Token};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ParseError {
     pub message: String,
     pub span: Span,

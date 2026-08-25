@@ -409,6 +409,15 @@ dashboard {
   the client-side version is cosmetic convenience only.
 - Tracked-but-not-wired (see [`compiler/UI_DSL_TODO.md`](./compiler/UI_DSL_TODO.md)):
   `paginate`, `searchable`/`sortable`.
+- Deliberately closed, not gaps: one chart type (inline-SVG bar chart,
+  no line/scatter/heatmap/treemap/geo/3D, no Recharts/D3/Victory
+  dependency), four fixed built-in animations (`fade-in`/`slide-up`/
+  `scale-in`/`pop`, no custom transitions or Framer-Motion-style
+  gesture/physics motion), and a fixed seven-kind form-control set
+  (text/number/checkbox/select/struct/readonly/date — no rich text
+  editor, color picker, drag-drop upload preview, autocomplete,
+  calendar/scheduler, or signature pad). See `compiler/UI_DSL_TODO.md`'s
+  "Deliberate non-goals" section for the full rationale.
 
 ### Design tokens: `--theme`
 `nirdosha emit-ui`/`serve --theme theme.json` layers a full design
@@ -596,6 +605,17 @@ report an issue if something doesn't work on Windows — it's the one
 platform here running on belief that the port is correct, not on a
 real end-to-end test.
 
+### Get the examples
+
+The commands below (and "build from source") reference `examples/*.nir`
+by path — that's this repo, not something the installer above downloads
+on its own:
+
+```sh
+git clone https://github.com/arunsoman/nirdosha.git
+cd nirdosha
+```
+
 ### Or build from source (for contributors)
 
 ```sh
@@ -633,13 +653,39 @@ which vendors Z3 from source instead — see
 nirdosha examples/hello.nir
 
 # Compile to a native binary (subset — see LANGUAGE.md §10)
-nirdosha build examples/matrices.nir -o matrices
-./matrices
+nirdosha build examples/factorial.nir -o factorial
+./factorial
 
 # Inspect the program
-nirdosha emit-llvm examples/matrices.nir   # print LLVM IR
-nirdosha emit-ast  examples/matrices.nir  # print AST as JSON
+nirdosha emit-llvm examples/factorial.nir   # print LLVM IR
+nirdosha emit-ast  examples/matrices.nir    # print AST as JSON
 ```
+
+### Scaffold a new project
+
+```sh
+nirdosha init shop
+# writes ./shop/:
+#   shop.nir      -- starter source (Email/RoleMapping admin-panel
+#                     fixtures by default; --no-email/--no-roles/--sms/
+#                     --push to change which ones)
+#   nirdosha      -- a copy of this executable, so the folder can be
+#                     moved to another machine and run standalone (same
+#                     OS/arch only -- no cross-compilation)
+#   run.sh        -- launches it: nirdosha serve shop.nir ... (run.bat
+#                     on Windows)
+#   jwks.json     -- an empty placeholder key set so run.sh works out of
+#                     the box; requires(role: ...) routes 401 until real
+#                     identity-provider values replace the placeholder
+#                     --jwks-file/--issuer/--audience in run.sh
+
+cd shop && ./run.sh
+```
+
+`--dest <path>` puts the `shop/` folder under `<path>` instead of the
+current directory; `--force` overwrites an existing one. This is tooling
+convenience only — Nirdosha has no compiler-level notion of "a project"
+beyond the one `.nir` file inside the folder.
 
 ### Generate / serve a UI
 
@@ -679,7 +725,8 @@ notes):
   `Option`/`Result` prelude, `Vector`/`Matrix` linalg (compiled), `str`/
   `tcp`/`connect`/`listen`/`accept` (compiled), `box`/`&`/`*` (compiled),
   deterministic RNG, identity/role/claim, structured diagnostics, the UI
-  engine (`emit-ui`/`serve`), the GBNF artifact, the benchmark harness.
+  engine (`emit-ui`/`serve`), project scaffolding (`init`), the GBNF
+  artifact, the benchmark harness.
 - **Interpreter-only (rejected at compile time, not mis-compiled)**:
   `spawn`/`join`/`thread`/`chan`/`send`/`recv`, `sandbox`, and
   `struct`/`enum`/`match` over *affine-containing* payloads, plus every

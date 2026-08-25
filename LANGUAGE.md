@@ -678,6 +678,17 @@ UI**: `paginate { page_size, total }`, `field { searchable, sortable }`,
 form insert-vs-update auto-hide-primary-key behavior. Tracked, with the
 reason each is still open, in `compiler/UI_DSL_TODO.md`.
 
+**Deliberate non-goals, closed by design**: exactly one chart type (an
+inline-SVG bar chart — no line/scatter/heatmap/treemap/geo/3D, no
+Recharts/D3/Victory-style dependency); exactly four built-in animations,
+fixed (§11b's `fade-in`/`slide-up`/`scale-in`/`pop` — no custom
+`@keyframes`, no gesture/physics-based motion, nothing like Framer
+Motion); and a fixed seven-kind form-control set (`text`/`number`/
+`checkbox`/`select`/`struct`/`readonly`/`date` — no rich text editor,
+color picker, drag-drop upload with preview, autocomplete/typeahead,
+calendar/scheduler, or signature pad). Full rationale in
+`compiler/UI_DSL_TODO.md`'s "Deliberate non-goals" section.
+
 ### 11a. Identity role-mapping cache (`ROADMAP.md` Track A item A6)
 
 `requires(role: "compliance_officer")` and every `screen` field's

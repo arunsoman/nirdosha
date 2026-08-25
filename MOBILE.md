@@ -262,7 +262,14 @@ exactly-once guarantee).
   stays exactly as unrenderable on native — this doc doesn't expand
   `build_field`'s control-kind coverage, a native-specific field type
   would need its own change to `ui_gen.rs` first, shared by both
-  renderers, not forked.
+  renderers, not forked. That coverage is itself closed by design, not
+  a native-vs-web gap: the fixed seven-kind form-control set, the one
+  inline-SVG bar chart type, and the fixed four-animation vocabulary
+  (`compiler/UI_DSL_TODO.md`'s own "Deliberate non-goals" section) apply
+  identically to whatever a native renderer eventually builds — a Rich
+  profile adding a native calendar picker or a line chart would be
+  widening `ui_gen.rs`'s own closed sets, not a mobile-specific
+  addition.
 - **No vendor/cert/provisioning decisions made here.** Which push
   provider, whether to self-host FCM/APNs credentials or take an admin
   config row per deployment, code-signing/provisioning-profile
