@@ -519,13 +519,27 @@ curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/arunsoman
 irm https://raw.githubusercontent.com/arunsoman/nirdosha/main/scripts/install.ps1 | iex
 ```
 
-Prebuilt binaries (Linux x86_64, macOS Intel/Apple Silicon, Windows
-x86_64) have Z3 statically vendored — nothing to install first, no
-linker errors. `clang` is only needed later, and only on the machine
-running `nirdosha build`/`emit-llvm` (native codegen); interpreting,
-`emit-ui`, and `serve` all work straight out of the download. See
+Prebuilt binaries: Linux x86_64 and Windows x86_64 have Z3 statically
+vendored — nothing to install first, no linker errors. macOS binaries
+link the *system* Z3 instead (`brew install z3` first) — `z3-src`
+416.0.2 doesn't compile against the AppleClang on current macOS
+toolchains, a real upstream incompatibility, not a packaging choice;
+tracked in [`PUBLIC_ROADMAP.md`](./PUBLIC_ROADMAP.md). `clang` is only
+needed later, and only on the machine running `nirdosha build`/
+`emit-llvm` (native codegen); interpreting, `emit-ui`, and `serve` all
+work straight out of the download on every platform. See
 [GitHub Releases](https://github.com/arunsoman/nirdosha/releases) to
 download a binary directly instead of piping the script.
+
+**Windows is untested.** The compiled `tcp`/`tcp_listener` runtime was
+ported to Windows' socket API (`RawSocket` vs. Unix's `RawFd`) but has
+not been verified against a real Windows machine — no Windows
+environment was available to this project at the time of this release.
+Everything else (interpret, `emit-ui`, `serve`, the rest of native
+codegen) doesn't touch that code path and should be unaffected. Please
+report an issue if something doesn't work on Windows — it's the one
+platform here running on belief that the port is correct, not on a
+real end-to-end test.
 
 ### Or build from source (for contributors)
 

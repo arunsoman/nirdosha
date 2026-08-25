@@ -439,6 +439,37 @@ of Track B has landed.*
     understand (Nirdosha has no notion of "a project" beyond a source
     file today, and this shouldn't quietly become the thing that
     introduces one).
+- `[OPEN]` **A7. Real Windows verification.** The `v0.1.0-alpha.1`
+  release run (2026-08-25) found `runtime_kernels.rs`'s `tcp`/
+  `tcp_listener` codegen backend used Unix-only `std::os::fd`
+  (`RawFd`/`IntoRawFd`/`FromRawFd`) unconditionally — fails to compile
+  at all on Windows. Ported (`v0.1.0-alpha.3`) to a `#[cfg(unix)]`/
+  `#[cfg(windows)]` split using `std::os::windows::io::{RawSocket,
+  IntoRawSocket, FromRawSocket, OwnedSocket}` on the Windows side, with
+  the existing Unix-path integration tests
+  (`compiled_connect_send_recv_stop_round_trips_real_bytes`,
+  `compiled_listen_accept_serves_a_real_client`,
+  `connecting_to_a_closed_port_traps_at_runtime` in
+  `compiler/tests/codegen.rs`) re-verified green after the change. The
+  Windows path itself has **never run on a real Windows machine** — no
+  Windows environment was available; it's a believed-correct port by
+  API-equivalence, not an end-to-end-tested one. Needs someone with
+  Windows access to actually run the release binary and, ideally, add
+  a CI job that exercises real Windows TCP.
+- `[OPEN]` **A8. macOS Z3 vendoring.** `z3-src` 416.0.2 (pulled by the
+  current `z3` 0.20.2 crate) fails to compile against the AppleClang on
+  GitHub's `macos-13`/`macos-14` runners — a real `obj_hashtable.h`
+  constructor-strictness incompatibility, confirmed via the
+  `v0.1.0-alpha.1` release run's build log, not a config mistake.
+  Worked around (`v0.1.0-alpha.2`) by linking system Z3 via Homebrew on
+  macOS instead of vendoring it — the macOS release binary needs
+  `brew install z3` on the machine running it, unlike Linux/Windows.
+  Revisit once a `z3`/`z3-src` release ships that fixes the upstream
+  incompatibility (latest known `z3-src` is 500.0.0, but the `z3` crate
+  itself hard-pins `z3-sys = "0.11.0"`, which itself hard-pins
+  `z3-src = "416"` — upgrading requires either a new `z3` crate release
+  or a `[patch]` override, not just a version bump in this repo's own
+  `Cargo.toml`).
 
 ---
 

@@ -72,6 +72,13 @@ critical apps on the interpreted path)
   language change
 - [PARTIAL] Identity admin console — role-mapping cache is done;
   multi-IdP registry and a roles→functions/fields report are open
+- [OPEN] Real Windows verification — the compiled `tcp`/`tcp_listener`
+  runtime was ported to Windows' `RawSocket` API (v0.1.0-alpha.3) but
+  has never run on a real Windows machine; needs an actual test pass
+- [OPEN] macOS binaries link system Z3 instead of vendoring it —
+  `z3-src` 416.0.2 fails to build against current AppleClang (a real
+  upstream incompatibility); revisit once a fixed `z3`/`z3-src` release
+  ships
 
 **Track B — Full compilation** (currently 100% interpreter-only for
 `db`/`json`/`http`/`mq`/identity/`transact`/concurrency; native codegen

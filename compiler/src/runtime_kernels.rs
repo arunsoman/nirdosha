@@ -536,25 +536,77 @@ pub unsafe extern "C" fn nir_str_eq(a: *const u8, a_len: i64, b: *const u8, b_le
 
 // ---- tcp/tcp_listener kernels --------------------------------------------
 //
-// A `tcp`/`tcp_listener` handle is a raw OS file descriptor, not a Rust
+// A `tcp`/`tcp_listener` handle is a raw OS socket handle, not a Rust
 // `TcpStream`/`TcpListener` kept alive across calls the way
 // `interpreter.rs`'s `Value::Tcp`'s `Arc<Mutex<Option<..>>>` does — the
 // kernel already tracks everything a "handle" needs, so `codegen.rs`
 // lowers `Ty::Tcp`/`Ty::TcpListener` straight to `i64`. Every kernel below
-// reconstructs a `std`-level view of that fd for the duration of one call
-// via `from_raw_fd`, wrapped in `ManuallyDrop` wherever the fd must stay
-// open afterward (only `nir_tcp_stop` actually wants the real `Drop`/close
-// to run). This mirrors `interpreter.rs`'s exact error/port-validation
-// behavior (`Expr::Connect`/`Expr::Listen`/`read_tcp`/`write_tcp`) — see
-// each fn's doc comment for the specific line it matches.
+// reconstructs a `std`-level view of that handle for the duration of one
+// call via the platform's own `from_raw_*`, wrapped in `ManuallyDrop`
+// wherever the handle must stay open afterward (only `nir_tcp_stop`
+// actually wants the real `Drop`/close to run). This mirrors
+// `interpreter.rs`'s exact error/port-validation behavior
+// (`Expr::Connect`/`Expr::Listen`/`read_tcp`/`write_tcp`) — see each fn's
+// doc comment for the specific line it matches.
+//
+// Unix represents a socket as a `RawFd` (`i32`); Windows represents it as
+// a `RawSocket` (`u64`), a structurally different type with a differently
+// named conversion trait (`IntoRawSocket`/`FromRawSocket` vs.
+// `IntoRawFd`/`FromRawFd`). The four tiny `handle_*` helpers below are the
+// only platform-conditional surface — every kernel fn's own body is
+// platform-agnostic, calling only these. **The Windows path is untested**
+// (no Windows machine available to this project — see README.md's
+// "Honest scope"): it's a direct, believed-correct port of the Unix path
+// using the equivalent stdlib API, not verified end-to-end against a real
+// Windows TCP round-trip. Report a bug if it doesn't work.
 
 use std::io::{Read, Write};
 use std::mem::ManuallyDrop;
 use std::net::{TcpListener, TcpStream};
+
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{FromRawSocket, IntoRawSocket, OwnedSocket, RawSocket};
+
+#[cfg(unix)]
+fn handle_of_stream(s: TcpStream) -> i64 {
+    s.into_raw_fd() as i64
+}
+#[cfg(windows)]
+fn handle_of_stream(s: TcpStream) -> i64 {
+    s.into_raw_socket() as i64
+}
+
+#[cfg(unix)]
+fn handle_of_listener(l: TcpListener) -> i64 {
+    l.into_raw_fd() as i64
+}
+#[cfg(windows)]
+fn handle_of_listener(l: TcpListener) -> i64 {
+    l.into_raw_socket() as i64
+}
+
+#[cfg(unix)]
+unsafe fn stream_from_handle(h: i64) -> TcpStream {
+    unsafe { TcpStream::from_raw_fd(h as RawFd) }
+}
+#[cfg(windows)]
+unsafe fn stream_from_handle(h: i64) -> TcpStream {
+    unsafe { TcpStream::from_raw_socket(h as RawSocket) }
+}
+
+#[cfg(unix)]
+unsafe fn listener_from_handle(h: i64) -> TcpListener {
+    unsafe { TcpListener::from_raw_fd(h as RawFd) }
+}
+#[cfg(windows)]
+unsafe fn listener_from_handle(h: i64) -> TcpListener {
+    unsafe { TcpListener::from_raw_socket(h as RawSocket) }
+}
 
 /// Connects to `host:port` (`host` a `{ptr, len}` UTF-8 buffer). Returns
-/// the new connection's fd on success, `-1` on failure — mirrors
+/// the new connection's handle on success, `-1` on failure — mirrors
 /// `interpreter.rs`'s `Expr::Connect`: `u16::try_from(port)` (an
 /// out-of-range port is a failure, not a silent truncation) then
 /// `TcpStream::connect`.
@@ -564,44 +616,45 @@ pub unsafe extern "C" fn nir_tcp_connect(host_ptr: *const u8, host_len: i64, por
     let Ok(host) = std::str::from_utf8(host) else { return -1 };
     let Ok(port) = u16::try_from(port) else { return -1 };
     match TcpStream::connect((host, port)) {
-        Ok(stream) => stream.into_raw_fd() as i64,
+        Ok(stream) => handle_of_stream(stream),
         Err(_) => -1,
     }
 }
 
 /// Binds `0.0.0.0:port` (all interfaces, matching `interpreter.rs`'s
-/// `Expr::Listen` — not just loopback). Returns the listener's fd on
+/// `Expr::Listen` — not just loopback). Returns the listener's handle on
 /// success, `-1` on failure (including an out-of-range port).
 #[unsafe(no_mangle)]
 pub extern "C" fn nir_tcp_listen(port: i64) -> i64 {
     let Ok(port) = u16::try_from(port) else { return -1 };
     match TcpListener::bind(("0.0.0.0", port)) {
-        Ok(listener) => listener.into_raw_fd() as i64,
+        Ok(listener) => handle_of_listener(listener),
         Err(_) => -1,
     }
 }
 
-/// Blocks for the next connection on `listener_fd`. Returns the accepted
-/// connection's own fd on success, `-1` on failure. `listener_fd` itself
-/// is left open and reusable (`accept` doesn't consume the listener,
-/// `ownership.rs`'s `touch_expr(listener, false)`) — `ManuallyDrop` stops
-/// the temporary `TcpListener` view constructed here from closing it.
+/// Blocks for the next connection on `listener_handle`. Returns the
+/// accepted connection's own handle on success, `-1` on failure.
+/// `listener_handle` itself is left open and reusable (`accept` doesn't
+/// consume the listener, `ownership.rs`'s `touch_expr(listener, false)`)
+/// — `ManuallyDrop` stops the temporary `TcpListener` view constructed
+/// here from closing it.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nir_tcp_accept(listener_fd: i64) -> i64 {
-    let listener = ManuallyDrop::new(unsafe { TcpListener::from_raw_fd(listener_fd as RawFd) });
+pub unsafe extern "C" fn nir_tcp_accept(listener_handle: i64) -> i64 {
+    let listener = ManuallyDrop::new(unsafe { listener_from_handle(listener_handle) });
     match listener.accept() {
-        Ok((stream, _addr)) => stream.into_raw_fd() as i64,
+        Ok((stream, _addr)) => handle_of_stream(stream),
         Err(_) => -1,
     }
 }
 
-/// Sends `buf` in full over `fd` — `write_all`, matching
+/// Sends `buf` in full over `handle` — `write_all`, matching
 /// `interpreter.rs`'s `write_tcp` exactly (it loops internally until
 /// every byte is written, not a single partial-write return). Returns
 /// `buf_len` on success, `-1` on failure.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nir_tcp_send(fd: i64, buf_ptr: *const u8, buf_len: i64) -> i64 {
-    let mut stream = ManuallyDrop::new(unsafe { TcpStream::from_raw_fd(fd as RawFd) });
+pub unsafe extern "C" fn nir_tcp_send(handle: i64, buf_ptr: *const u8, buf_len: i64) -> i64 {
+    let mut stream = ManuallyDrop::new(unsafe { stream_from_handle(handle) });
     let buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len as usize) };
     match stream.write_all(buf) {
         Ok(()) => buf_len,
@@ -617,8 +670,8 @@ pub unsafe extern "C" fn nir_tcp_send(fd: i64, buf_ptr: *const u8, buf_len: i64)
 /// on `<= 0` the same way `read_tcp` treats `n == 0` as an error, not a
 /// valid empty read.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nir_tcp_recv(fd: i64, buf_ptr: *mut u8, buf_cap: i64) -> i64 {
-    let mut stream = ManuallyDrop::new(unsafe { TcpStream::from_raw_fd(fd as RawFd) });
+pub unsafe extern "C" fn nir_tcp_recv(handle: i64, buf_ptr: *mut u8, buf_cap: i64) -> i64 {
+    let mut stream = ManuallyDrop::new(unsafe { stream_from_handle(handle) });
     let buf = unsafe { std::slice::from_raw_parts_mut(buf_ptr, buf_cap as usize) };
     match stream.read(buf) {
         Ok(n) => n as i64,
@@ -626,16 +679,19 @@ pub unsafe extern "C" fn nir_tcp_recv(fd: i64, buf_ptr: *mut u8, buf_cap: i64) -
     }
 }
 
-/// Closes `fd` — serves both `tcp` and `tcp_listener` uniformly (both are
-/// plain sockets at the OS level, so one raw-fd close path is correct for
-/// either). `ownership.rs`'s affine-typing already proves this runs at
-/// most once per handle in a well-typed program (this file's module doc's
-/// "the checker is the real gate" convention) — reconstructing an
-/// *owned* `OwnedFd` (not `ManuallyDrop`) and letting it drop is what
-/// actually closes the socket.
+/// Closes `handle` — serves both `tcp` and `tcp_listener` uniformly (both
+/// are plain sockets at the OS level, so one raw-handle close path is
+/// correct for either). `ownership.rs`'s affine-typing already proves
+/// this runs at most once per handle in a well-typed program (this
+/// file's module doc's "the checker is the real gate" convention) —
+/// reconstructing an *owned* handle (not `ManuallyDrop`) and letting it
+/// drop is what actually closes the socket.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nir_tcp_stop(fd: i64) -> i32 {
-    drop(unsafe { OwnedFd::from_raw_fd(fd as RawFd) });
+pub unsafe extern "C" fn nir_tcp_stop(handle: i64) -> i32 {
+    #[cfg(unix)]
+    drop(unsafe { OwnedFd::from_raw_fd(handle as RawFd) });
+    #[cfg(windows)]
+    drop(unsafe { OwnedSocket::from_raw_socket(handle as RawSocket) });
     0
 }
 
