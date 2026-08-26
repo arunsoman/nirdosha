@@ -402,6 +402,8 @@ fn replay_honors_the_captured_retry_budget_for_a_pending_network_row() {
         "check",
         &["network"],
         "update_db",
+        &["opaque"],
+        None,
         None,
     )
     .expect("begin_pending should succeed");
@@ -483,6 +485,8 @@ fn replay_resumes_a_commit_pending_row_to_committed() {
         "check",
         &["network"],
         "update_db",
+        &["opaque"],
+        None,
         None,
     )
     .expect("begin_pending should succeed");
@@ -517,7 +521,9 @@ fn replay_resumes_a_compensate_pending_row_to_compensated() {
         "check",
         &["network"],
         "update_db",
+        &["opaque"],
         Some("refund"),
+        Some(&["opaque"]),
     )
     .expect("begin_pending should succeed");
     tlog.record_network_result("txn-2", &Value::Int(-5)).expect("record_network_result should succeed");
@@ -558,6 +564,8 @@ fn replay_resumes_network_from_pending_but_reports_stuck_when_commit_args_were_n
         "check",
         &["network"],
         "update_db",
+        &["opaque"],
+        None,
         None,
     )
     .expect("begin_pending should succeed");
@@ -579,6 +587,210 @@ fn replay_resumes_network_from_pending_but_reports_stuck_when_commit_args_were_n
     // couldn't finish -- the highest-stakes ambiguity (did the real
     // side effect happen) is resolved even when the rest isn't.
     assert_eq!(tlog.state_of("txn-3").unwrap(), Some("network_done".to_string()));
+}
+
+// ---- the real gap `tests/transact_process_kill.rs` found: a crash right --
+// ---- between `record_verify` and `mark_commit_pending` ---------------------
+
+/// Same crash window as `commit_that_always_fails_traps_with_commit_pending_
+/// not_a_silent_true_or_false`'s sibling tests above -- but here the crash
+/// (simulated the same way every other row in this file is: `begin_pending`
+/// plus whichever of `record_network_result`/`record_verify`/
+/// `mark_commit_pending` a real process would have reached) lands *between*
+/// `record_verify` and `mark_commit_pending`: `verify` already succeeded,
+/// but `commit`'s own arguments were never durably captured. Unlike
+/// `replay_resumes_network_from_pending_but_reports_stuck_when_commit_args_
+/// were_never_captured` above, `commit`'s arguments here are declared
+/// exactly `network`/`txn_id` (`commit_arg_kinds`) -- the same always-safe
+/// shape `verify`'s own arguments are statically restricted to -- so this
+/// must resolve to `committed`, not `Stuck`. A real `nirdosha serve`
+/// process SIGKILLed under real concurrent load
+/// (`tests/transact_process_kill.rs`) hit this exact row shape before this
+/// fix existed.
+#[test]
+fn replay_reconstructs_commit_args_from_network_and_txn_id_when_the_crash_landed_after_verify_but_before_mark_commit_pending(
+) {
+    let log_path = temp_path("replay-verify-done-commit-args-missing");
+    let src = r#"
+        fn call_api(txn_id: str, amount: i64) -> i64 { return amount }
+        fn check(resp: i64) -> bool { return resp > 0 }
+        fn apply_ledger(txn_id: str, amount: i64) -> i64 { return amount }
+        fn main() -> unit {}
+    "#;
+    let program = build_program(src);
+    let tlog = TransactLog::open(&log_path).expect("open should succeed");
+    tlog.begin_pending(
+        "txn-6",
+        "call_api",
+        &[Value::Str(Arc::from("txn-6")), Value::Int(9)],
+        None,
+        None,
+        "check",
+        &["network"],
+        "apply_ledger",
+        &["txn_id", "network"],
+        None,
+        None,
+    )
+    .expect("begin_pending should succeed");
+    tlog.record_network_result("txn-6", &Value::Int(9)).expect("record_network_result should succeed");
+    tlog.record_verify("txn-6", &[Value::Int(9)], true).expect("record_verify should succeed");
+    // Deliberately no `mark_commit_pending` -- this row is exactly where a
+    // crash right after `record_verify` (but before `commit`'s own
+    // arguments were durably captured) would leave it.
+
+    let interp = Interpreter::new(Arc::new(program), Arc::from(src)).with_transact_log_path(log_path.clone());
+    let outcomes = interp.replay_pending_transactions().expect("replay should succeed");
+    assert_eq!(
+        outcomes,
+        vec![ReplayOutcome::Resolved { txn_id: "txn-6".to_string(), committed: true }],
+        "commit's args are exactly network/txn_id -- replay must reconstruct them, not report Stuck"
+    );
+    assert_eq!(tlog.state_of("txn-6").unwrap(), Some("committed".to_string()));
+}
+
+/// Same reconstruction, but for `compensate` instead of `commit` -- the
+/// `verify == false` sibling of the test just above, proving the fallback
+/// in `replay_one`'s other branch too.
+#[test]
+fn replay_reconstructs_compensate_args_from_network_and_txn_id_when_the_crash_landed_after_verify_but_before_mark_compensate_pending(
+) {
+    let log_path = temp_path("replay-verify-false-compensate-args-missing");
+    let src = r#"
+        fn call_api(txn_id: str, amount: i64) -> i64 { return amount }
+        fn check(resp: i64) -> bool { return resp > 0 }
+        fn update_db(amount: i64) -> i64 { return amount }
+        fn refund(txn_id: str, amount: i64) -> i64 { return amount }
+        fn main() -> unit {}
+    "#;
+    let program = build_program(src);
+    let tlog = TransactLog::open(&log_path).expect("open should succeed");
+    tlog.begin_pending(
+        "txn-7",
+        "call_api",
+        &[Value::Str(Arc::from("txn-7")), Value::Int(-3)],
+        None,
+        None,
+        "check",
+        &["network"],
+        "update_db",
+        &["opaque"],
+        Some("refund"),
+        Some(&["txn_id", "network"]),
+    )
+    .expect("begin_pending should succeed");
+    tlog.record_network_result("txn-7", &Value::Int(-3)).expect("record_network_result should succeed");
+    tlog.record_verify("txn-7", &[Value::Int(-3)], false).expect("record_verify should succeed");
+    // Deliberately no `mark_compensate_pending`.
+
+    let interp = Interpreter::new(Arc::new(program), Arc::from(src)).with_transact_log_path(log_path.clone());
+    let outcomes = interp.replay_pending_transactions().expect("replay should succeed");
+    assert_eq!(
+        outcomes,
+        vec![ReplayOutcome::Resolved { txn_id: "txn-7".to_string(), committed: false }],
+        "compensate's args are exactly network/txn_id -- replay must reconstruct them, not report Stuck"
+    );
+    assert_eq!(tlog.state_of("txn-7").unwrap(), Some("compensated".to_string()));
+}
+
+// ---- schema migration: a log file from before `commit_arg_kinds`/ ---------
+// ---- `compensate_arg_kinds` existed must still open, and a legacy row -----
+// ---- must still behave exactly the old (safe) way -------------------------
+
+/// Builds a `transact_log` table matching the *pre-fix* schema (no
+/// `commit_arg_kinds`/`compensate_arg_kinds` columns at all) directly with
+/// `rusqlite`, bypassing `TransactLog::open` entirely -- standing in for a
+/// real durability-log file left on disk by a `nirdosha` binary from
+/// before this session's fix. `TransactLog::open`'s own `ALTER TABLE`
+/// backfill (`transact_log.rs`) is what a real binary upgrade across a
+/// real restart depends on; this proves that path directly instead of
+/// only having discovered it worked by incidentally hitting a stale
+/// `/tmp` file during this same session's own full-suite run.
+fn write_pre_migration_schema_log(path: &std::path::Path, txn_id: &str, verify_result: bool) {
+    let conn = rusqlite::Connection::open(path).expect("opening a fresh sqlite file should never fail");
+    conn.execute(
+        "CREATE TABLE transact_log (
+            txn_id           TEXT PRIMARY KEY,
+            state            TEXT NOT NULL,
+            network_fn       TEXT NOT NULL,
+            network_args     TEXT NOT NULL,
+            network_retry    INTEGER,
+            network_timeout  INTEGER,
+            network_result   TEXT,
+            verify_fn        TEXT NOT NULL,
+            verify_arg_kinds TEXT NOT NULL,
+            verify_args      TEXT,
+            verify_result    INTEGER,
+            commit_fn        TEXT NOT NULL,
+            commit_args      TEXT,
+            compensate_fn    TEXT,
+            compensate_args  TEXT,
+            attempts         INTEGER NOT NULL DEFAULT 0,
+            created_at       TEXT NOT NULL,
+            updated_at       TEXT NOT NULL
+        )",
+        [],
+    )
+    .expect("creating the pre-fix schema should succeed");
+    // A row shaped exactly like the crash window this session's fix
+    // targets (`verify` already ran and recorded, `commit`'s own
+    // arguments never captured) -- but written by "a pre-fix binary,"
+    // i.e. with no `commit_arg_kinds` value to fall back on at all.
+    conn.execute(
+        "INSERT INTO transact_log
+             (txn_id, state, network_fn, network_args, network_result, verify_fn, verify_arg_kinds,
+              verify_args, verify_result, commit_fn, attempts, created_at, updated_at)
+         VALUES (?1, 'network_done', 'call_api', '[]', '{\"t\":\"i\",\"v\":9}', 'check', '[\"network\"]',
+                 '[{\"t\":\"i\",\"v\":9}]', ?2, 'apply_ledger', 0, '0', '0')",
+        rusqlite::params![txn_id, verify_result],
+    )
+    .expect("inserting the legacy row should succeed");
+}
+
+#[test]
+fn a_pre_fix_log_file_missing_commit_arg_kinds_still_opens_and_migrates_cleanly() {
+    let log_path = temp_path("pre-migration-schema");
+    write_pre_migration_schema_log(&log_path, "txn-legacy", true);
+
+    // `TransactLog::open` must not error out on a file that predates
+    // `commit_arg_kinds`/`compensate_arg_kinds` -- this is the exact
+    // failure this session's own full-suite run hit once ("no such
+    // column: commit_arg_kinds") before the `ALTER TABLE` backfill existed.
+    let tlog = TransactLog::open(&log_path).expect("opening a pre-fix log file must succeed, not error");
+    let unresolved = tlog.list_unresolved().expect("list_unresolved must succeed against the migrated schema");
+    assert_eq!(unresolved.len(), 1);
+    assert_eq!(unresolved[0].txn_id, "txn-legacy");
+    // The backfilled default must read back as "opaque" -- i.e. exactly
+    // the pre-fix behavior for a row nobody can retroactively know the
+    // real argument shape of.
+    assert_eq!(unresolved[0].commit_arg_kinds, vec!["opaque".to_string()]);
+    assert!(unresolved[0].compensate_arg_kinds.is_none());
+}
+
+/// The behavioral half of the migration guarantee: replaying a legacy row
+/// (verify already succeeded, `commit`'s arguments never captured, no
+/// `commit_arg_kinds` to fall back on) must still report `Stuck` -- the
+/// same safe, honest outcome it would have gotten from the pre-fix binary
+/// -- never a crash, and never a wrong guess just because the column now
+/// exists.
+#[test]
+fn a_pre_fix_log_files_legacy_row_still_replays_to_stuck_not_a_wrong_guess() {
+    let log_path = temp_path("pre-migration-replay");
+    write_pre_migration_schema_log(&log_path, "txn-legacy-2", true);
+
+    let src = r#"
+        fn call_api(txn_id: str, amount: i64) -> i64 { return amount }
+        fn check(resp: i64) -> bool { return resp > 0 }
+        fn apply_ledger(txn_id: str, amount: i64) -> i64 { return amount }
+        fn main() -> unit {}
+    "#;
+    let program = build_program(src);
+    let interp = Interpreter::new(Arc::new(program), Arc::from(src)).with_transact_log_path(log_path.clone());
+    let outcomes = interp.replay_pending_transactions().expect("replay should succeed");
+    match &outcomes[0] {
+        ReplayOutcome::Stuck { txn_id, .. } => assert_eq!(txn_id, "txn-legacy-2"),
+        other => panic!("expected Stuck (no commit_arg_kinds to fall back on for a pre-fix row), got {other:?}"),
+    }
 }
 
 /// `state = "pending"` with no `compensate` slot and `verify` false: fully
@@ -604,6 +816,8 @@ fn replay_resumes_pending_straight_to_compensated_when_verify_is_false_and_no_co
         "check",
         &["network"],
         "update_db",
+        &["opaque"],
+        None,
         None,
     )
     .expect("begin_pending should succeed");
@@ -636,6 +850,8 @@ fn replay_leaves_a_still_failing_network_at_pending_for_the_next_attempt() {
         "check",
         &["network"],
         "update_db",
+        &["opaque"],
+        None,
         None,
     )
     .expect("begin_pending should succeed");

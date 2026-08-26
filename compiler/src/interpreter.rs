@@ -1301,6 +1301,23 @@ fn is_result_err(v: &Value) -> bool {
     matches!(v, Value::Enum(name, variant, _) if name.as_ref() == "Result" && variant.as_ref() == "Err")
 }
 
+/// Rebuilds a `commit`/`compensate` slot's arguments from its
+/// `*_arg_kinds` classification alone (`PendingTxn::commit_arg_kinds`'s own
+/// doc comment) -- `None` the instant any kind is `"opaque"`, since that
+/// argument genuinely can't be recovered from `network_result`/`txn_id`
+/// alone. Mirrors `replay_one`'s `verify_args` reconstruction, generalized
+/// to a fallible (rather than statically-guaranteed) classification.
+fn reconstruct_transact_args(kinds: &[String], network_result: &Value, txn_id: &str) -> Option<Vec<Value>> {
+    kinds
+        .iter()
+        .map(|k| match k.as_str() {
+            "network" => Some(network_result.clone()),
+            "txn_id" => Some(Value::Str(Arc::from(txn_id))),
+            _ => None,
+        })
+        .collect()
+}
+
 /// `Err(WorkflowActionError::<variant>(payload))` as a real Nirdosha
 /// `Result(_, WorkflowActionError)` value — every `send_email`/`send_sms`/
 /// `send_push`/`notify`/`__workflow_*` builtin's `.nir`-visible failure
@@ -3800,25 +3817,51 @@ impl Interpreter {
         let _ = tlog.record_verify(&txn_id, &verify_args, verified);
 
         if verified {
-            let Some(commit_args) = txn.commit_args else {
-                return ReplayOutcome::Stuck {
-                    txn_id,
-                    reason: "verify succeeded but commit's arguments were never durably captured before the crash \
-                             (they may reference outer-scope variables only the original call had) -- this needs \
-                             the original request's context, not more replay"
-                        .to_string(),
-                };
+            let commit_args = match txn.commit_args {
+                Some(a) => a,
+                // A crash landing between `record_verify` and
+                // `mark_commit_pending` leaves exactly this gap -- but if
+                // every one of `commit`'s arguments is textually just
+                // `network`/`txn_id` (`commit_arg_kinds`, captured
+                // up front at `begin_pending` time, before either crash
+                // window could even open), replay can rebuild them the
+                // same way it already rebuilds `verify_args` above,
+                // instead of giving up.
+                None => match reconstruct_transact_args(&txn.commit_arg_kinds, &network_result, &txn_id) {
+                    Some(args) => args,
+                    None => {
+                        return ReplayOutcome::Stuck {
+                            txn_id,
+                            reason: "verify succeeded but commit's arguments were never durably captured before \
+                                     the crash, and at least one of them isn't reconstructable from `network`/ \
+                                     `txn_id` alone (it references outer-scope data only the original call had) \
+                                     -- this needs the original request's context, not more replay"
+                                .to_string(),
+                        }
+                    }
+                },
             };
             self.replay_write(tlog, txn_id, &txn.commit_fn, &commit_args, span, "committed", true)
         } else if let Some(compensate_fn) = txn.compensate_fn {
-            let Some(compensate_args) = txn.compensate_args else {
-                return ReplayOutcome::Stuck {
-                    txn_id,
-                    reason: "verify returned false but compensate's arguments were never durably captured before \
-                             the crash (they may reference outer-scope variables only the original call had) -- \
-                             this needs the original request's context, not more replay"
-                        .to_string(),
-                };
+            let compensate_args = match txn.compensate_args {
+                Some(a) => a,
+                None => match txn
+                    .compensate_arg_kinds
+                    .as_deref()
+                    .and_then(|kinds| reconstruct_transact_args(kinds, &network_result, &txn_id))
+                {
+                    Some(args) => args,
+                    None => {
+                        return ReplayOutcome::Stuck {
+                            txn_id,
+                            reason: "verify returned false but compensate's arguments were never durably captured \
+                                     before the crash, and at least one of them isn't reconstructable from \
+                                     `network`/`txn_id` alone (it references outer-scope data only the original \
+                                     call had) -- this needs the original request's context, not more replay"
+                                .to_string(),
+                        }
+                    }
+                },
             };
             self.replay_write(tlog, txn_id, &compensate_fn, &compensate_args, span, "compensated", false)
         } else {
@@ -5202,6 +5245,23 @@ impl Interpreter {
                         ),
                     })
                     .collect();
+                // `commit`/`compensate` have no static restriction on
+                // their own arguments (unlike `verify`'s), so this is a
+                // best-effort per-argument classification, not a proof —
+                // "opaque" just means "not textually the `network`/
+                // `txn_id` implicit binding," which `replay_one` treats
+                // as unreconstructable. See `PendingTxn::commit_arg_kinds`'s
+                // own doc comment for exactly what this closes.
+                let transact_arg_kind = |a: &Expr| -> &'static str {
+                    match a {
+                        Expr::Ident(name, _) if name == "network" => "network",
+                        Expr::Ident(name, _) if name == "txn_id" => "txn_id",
+                        _ => "opaque",
+                    }
+                };
+                let commit_arg_kinds: Vec<&str> = commit.args.iter().map(transact_arg_kind).collect();
+                let compensate_arg_kinds: Option<Vec<&str>> =
+                    compensate.as_ref().map(|c| c.args.iter().map(transact_arg_kind).collect());
                 tlog.begin_pending(
                     &txn_id,
                     &network.name,
@@ -5211,7 +5271,9 @@ impl Interpreter {
                     &verify.name,
                     &verify_arg_kinds,
                     &commit.name,
+                    &commit_arg_kinds,
                     compensate.as_ref().map(|c| c.name.as_str()),
+                    compensate_arg_kinds.as_deref(),
                 )
                 .map_err(|e| self.transact_log_err(e, *span))?;
                 let network_val = self

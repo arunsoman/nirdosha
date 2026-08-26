@@ -439,9 +439,44 @@ soon — independent of Track B, since the interpreter path
 (`nirdosha serve`) is what will run those apps regardless of how much
 of Track B has landed.*
 
-- `[OPEN]` **A1. `transact` durability under real failure conditions** —
+- `[DONE]` **A1. `transact` durability under real failure conditions** —
   actually kill the process mid-transaction under load and confirm
   crash-replay behaves, not just trust the existing test suite.
+
+  **2026-08-26 — done, and it found a real bug.** New `tests/
+  transact_process_kill.rs`: spawns a real `nirdosha serve` child process
+  (not the in-process simulation `tests/transact_durability.rs` already
+  had), throws real concurrent HTTP load at it (12 client threads, 240
+  `transact`-wrapped requests per round), `SIGKILL`s it mid-flight
+  (`Child::kill`, a real signal to a real PID) twice across two
+  restart-and-reload cycles, and confirms afterward that: the durability
+  log has zero unresolved rows; the real business side effect (a separate
+  SQLite "ledger" table standing in for whatever a real `commit` durably
+  writes) has exactly one row per committed transaction (no lost writes,
+  no double-applies); and every response a client actually saw as `true`
+  before the kill is durably reflected in the ledger. Verified across
+  repeated runs, not just once.
+
+  This surfaced a real, previously-undiscovered gap on the very first run
+  (not a hypothetical): a crash landing between `record_verify` and
+  `mark_commit_pending` left rows unconditionally `Stuck`, even when
+  `commit`'s arguments were exactly `network`/`txn_id` — the same
+  always-safe shape every worked example in `TRANSACT.md` already uses.
+  Fixed same-session (`TRANSACT.md`'s "recoverability boundary" section
+  has the full writeup): `commit`/`compensate`'s arguments are now
+  classified per-argument at `begin_pending` time
+  (`commit_arg_kinds`/`compensate_arg_kinds`), and `replay_one`
+  reconstructs them from `network`/`txn_id` when the durably-captured
+  arguments are missing, falling back to `Stuck` only for a genuine
+  outer-scope reference (the gap that's still honestly open). Includes an
+  `ALTER TABLE` backfill in `TransactLog::open` so a pre-existing log file
+  from before this fix still opens correctly after a binary upgrade — a
+  real concern this same session's full-suite run actually hit (a
+  temp-file durability log from an older test binary, reused via
+  OS port-number reuse, failed to open with a "no such column" error
+  before the backfill was added). Two new in-process reproduction tests
+  in `tests/transact_durability.rs` plus the two now-passing existing
+  negative controls. Full `cargo test` (700+ tests) reverified green.
 - `[OPEN]` **A2. Deployment story for the interpreted path** —
   containerize `nirdosha serve` + source properly; secrets/JWKS
   handling; this is buildable now, independent of Track B. The simple
@@ -1099,13 +1134,13 @@ capability, per `MOBILE.md`'s own archetype ranking.*
 
 ## Suggested near-term order
 
-Given "critical apps soon": the security review (now `[DONE]`) and the
-systematic correctness-gap sweep (now `[DONE]`) have both landed;
-**A1 (`transact` durability under real failure conditions) is the next
-concrete blocking work**, since it closes the largest remaining
-interpreted-path correctness risk. A2–A4 and C1 can run in parallel with
-each other and with the start of B1. B1–B9 is the long track — pick up
-items as they become relevant to what's actually being built, not in
-lockstep. Track D runs independently of all of the above — D1 can start
-whenever native app delivery actually becomes a priority, without waiting
-on A/B/C.
+Given "critical apps soon": the security review, the systematic
+correctness-gap sweep, and now A1 (`transact` durability under real
+failure conditions) are all `[DONE]` — the largest remaining
+interpreted-path correctness risks have been closed and verified against
+real process kills, not just trusted from the existing test suite. A2–A4
+and C1 can run in parallel with each other and with the start of B1.
+B1–B9 is the long track — pick up items as they become relevant to what's
+actually being built, not in lockstep. Track D runs independently of all
+of the above — D1 can start whenever native app delivery actually becomes
+a priority, without waiting on A/B/C.

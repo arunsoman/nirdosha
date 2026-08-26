@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod codegen;
 pub mod contract_check;
+pub mod crud_gen;
 pub mod dbconn;
 pub mod effects;
 pub mod extraction_schema;

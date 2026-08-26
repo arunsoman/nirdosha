@@ -64,6 +64,7 @@ fn main() -> ExitCode {
 
     match first.as_str() {
         "init" => cmd_init(args),
+        "gen-crud" => cmd_gen_crud(args),
         "build" => cmd_build(args),
         "emit-llvm" => cmd_emit_llvm(args),
         "emit-ast" => cmd_emit_ast(args),
@@ -93,6 +94,11 @@ fn print_usage() {
     eprintln!("                                       effectful call to stdout -- layer 1, see");
     eprintln!("                                       the observability design plan; --otel/");
     eprintln!("                                       --otel-endpoint aren't implemented until layer 2)");
+    eprintln!("  nirdosha gen-crud <plan.json> --db <db_connect literal> [-o out.nir]");
+    eprintln!("                                      deterministic struct+CRUD .nir source from a JSON");
+    eprintln!("                                      entity plan (struct_name/fields/crud_slots/screen_title/");
+    eprintln!("                                      field_labels per entity, plus a flat kpis list) --");
+    eprintln!("                                      real db_connect/db_execute/db_query bodies, no LLM");
     eprintln!("  nirdosha build <file.nir> -o <out> [--opt0]");
     eprintln!("                                      compile to a native binary (LLVM, -O2 by default)");
     eprintln!("  nirdosha emit-llvm <file.nir>       print the generated LLVM IR");
@@ -500,6 +506,58 @@ fn cmd_emit_ast(mut args: impl Iterator<Item = String>) -> ExitCode {
 /// program (`typecheck_and_own`, same gate `build`/`emit-llvm` use) —
 /// screen inference reads resolved struct fields and function
 /// signatures, not raw syntax.
+/// `nirdosha gen-crud <plan.json> --db <literal> [-o out.nir]` — see
+/// `crud_gen`'s module doc for why this exists (replaces protobox's
+/// placeholder-only Python `_stub_fns` with real, compiling persistence
+/// bodies, deterministically, no LLM call).
+fn cmd_gen_crud(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut plan_path: Option<String> = None;
+    let mut db: Option<String> = None;
+    let mut out: Option<String> = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--db" => db = args.next(),
+            "-o" => out = args.next(),
+            other => plan_path = Some(other.to_string()),
+        }
+    }
+    let (Some(plan_path), Some(db)) = (plan_path, db) else {
+        eprintln!("usage: nirdosha gen-crud <plan.json> --db <db_connect literal> [-o out.nir]");
+        return ExitCode::FAILURE;
+    };
+    let text = match std::fs::read_to_string(&plan_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error reading {plan_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let plan: nirdosha::crud_gen::ScreenPlan = match serde_json::from_str(&text) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error parsing {plan_path} as a screen plan: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let source = match nirdosha::crud_gen::render_plan(&plan, &db, "") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match out {
+        Some(path) => {
+            if let Err(e) = std::fs::write(&path, &source) {
+                eprintln!("error writing {path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        None => print!("{source}"),
+    }
+    ExitCode::SUCCESS
+}
+
 fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;

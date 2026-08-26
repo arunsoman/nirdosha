@@ -75,16 +75,39 @@ pub struct PendingTxn {
     pub verify_args: Option<Vec<Value>>,
     pub verify_result: Option<bool>,
     pub commit_fn: String,
+    /// Each element is `"network"`, `"txn_id"`, or `"opaque"` — unlike
+    /// `verify_arg_kinds`, this is *not* a static guarantee (`commit`'s
+    /// arguments are never restricted the way `verify`'s are), just a
+    /// best-effort per-argument classification captured up front
+    /// (`begin_pending` time, purely syntactic — no evaluation needed):
+    /// an argument that's textually exactly the `network`/`txn_id`
+    /// implicit binding is reconstructable from those two always-known
+    /// values alone; anything else (an outer-scope variable, a computed
+    /// expression) is `"opaque"`. What this closes: a crash landing
+    /// between `record_verify` and `mark_commit_pending` (i.e., after
+    /// `verify` succeeded but before `commit`'s own arguments were
+    /// durably captured) used to be an unconditional `Stuck` even when
+    /// `commit`'s arguments were exactly the same safe `network`/`txn_id`
+    /// shape `verify`'s always are — this lets `Interpreter::replay_one`
+    /// reconstruct them the same way it already reconstructs
+    /// `verify_args`, instead of guessing or giving up.
+    pub commit_arg_kinds: Vec<String>,
     /// `Some` only once `commit` has actually been *reached* (`verify`
     /// ran and returned `true`) — unlike `verify_fn`, `commit`'s
     /// arguments can freely reference outer-scope variables from the
     /// enclosing function (`amount`, e.g.), which replay has no way to
-    /// reconstruct on its own. `None` here from a crash that preempted
-    /// `commit` ever being reached is a real, honest gap — see
-    /// `Interpreter::replay_pending_transactions`'s own doc comment.
+    /// reconstruct on its own unless `commit_arg_kinds` (above) says
+    /// every argument is reconstructable anyway. `None` here from a
+    /// crash that preempted `commit` ever being reached, combined with
+    /// at least one genuinely `"opaque"` argument, is a real, honest gap
+    /// — see `Interpreter::replay_pending_transactions`'s own doc comment.
     pub commit_args: Option<Vec<Value>>,
     /// `None` when the `transact` block has no `compensate` slot at all.
     pub compensate_fn: Option<String>,
+    /// Same shape and same purpose as `commit_arg_kinds`, for
+    /// `compensate`'s arguments — `None` exactly when `compensate_fn` is
+    /// `None` (no `compensate` slot declared at all).
+    pub compensate_arg_kinds: Option<Vec<String>>,
     pub compensate_args: Option<Vec<Value>>,
 }
 
@@ -155,8 +178,10 @@ impl TransactLog {
                 verify_args      TEXT,
                 verify_result    INTEGER,
                 commit_fn        TEXT NOT NULL,
+                commit_arg_kinds TEXT NOT NULL,
                 commit_args      TEXT,
                 compensate_fn    TEXT,
+                compensate_arg_kinds TEXT,
                 compensate_args  TEXT,
                 attempts         INTEGER NOT NULL DEFAULT 0,
                 created_at       TEXT NOT NULL,
@@ -164,6 +189,31 @@ impl TransactLog {
             )",
             [],
         )?;
+        // A durability log is exactly the kind of file that has to
+        // survive a `nirdosha` binary upgrade across a real restart --
+        // `CREATE TABLE IF NOT EXISTS` alone leaves an *existing* log
+        // file (opened by a pre-upgrade binary) missing whatever columns
+        // a later version added, since it only ever creates the table
+        // fresh, never alters one that's already there. `commit_arg_kinds`/
+        // `compensate_arg_kinds` (added alongside the fix that lets
+        // replay reconstruct `commit`/`compensate`'s arguments from
+        // `network`/`txn_id` alone -- see `PendingTxn::commit_arg_kinds`'s
+        // own doc comment) are backfilled here, defaulted to a value that
+        // always reads back as `"opaque"` -- exactly the pre-fix behavior
+        // (fall back to `Stuck` rather than guess) for whatever a
+        // pre-upgrade row already had logged, since there's no way to
+        // know, after the fact, what a *pre-existing* row's real argument
+        // shape was.
+        let existing_columns: std::collections::HashSet<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('transact_log')")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !existing_columns.contains("commit_arg_kinds") {
+            conn.execute("ALTER TABLE transact_log ADD COLUMN commit_arg_kinds TEXT NOT NULL DEFAULT '[\"opaque\"]'", [])?;
+        }
+        if !existing_columns.contains("compensate_arg_kinds") {
+            conn.execute("ALTER TABLE transact_log ADD COLUMN compensate_arg_kinds TEXT", [])?;
+        }
         Ok(TransactLog { conn: Mutex::new(conn) })
     }
 
@@ -188,16 +238,23 @@ impl TransactLog {
         verify_fn: &str,
         verify_arg_kinds: &[&str],
         commit_fn: &str,
+        commit_arg_kinds: &[&str],
         compensate_fn: Option<&str>,
+        compensate_arg_kinds: Option<&[&str]>,
     ) -> rusqlite::Result<()> {
         let now = now_rfc3339();
-        let kinds_json =
+        let verify_kinds_json =
             serde_json::to_string(verify_arg_kinds).expect("verify_arg_kinds is always a plain string slice");
+        let commit_kinds_json =
+            serde_json::to_string(commit_arg_kinds).expect("commit_arg_kinds is always a plain string slice");
+        let compensate_kinds_json = compensate_arg_kinds
+            .map(|k| serde_json::to_string(k).expect("compensate_arg_kinds is always a plain string slice"));
         self.conn.lock().unwrap().execute(
             "INSERT INTO transact_log
                  (txn_id, state, network_fn, network_args, network_retry, network_timeout, verify_fn,
-                  verify_arg_kinds, commit_fn, compensate_fn, attempts, created_at, updated_at)
-             VALUES (?1, 'pending', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?10)",
+                  verify_arg_kinds, commit_fn, commit_arg_kinds, compensate_fn, compensate_arg_kinds,
+                  attempts, created_at, updated_at)
+             VALUES (?1, 'pending', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?12)",
             params![
                 txn_id,
                 network_fn,
@@ -205,9 +262,11 @@ impl TransactLog {
                 network_retry,
                 network_timeout,
                 verify_fn,
-                kinds_json,
+                verify_kinds_json,
                 commit_fn,
+                commit_kinds_json,
                 compensate_fn,
+                compensate_kinds_json,
                 now
             ],
         )?;
@@ -292,7 +351,8 @@ impl TransactLog {
         let mut stmt = conn.prepare(
             "SELECT txn_id, state, network_fn, network_args, network_retry, network_timeout, network_result,
                     verify_fn, verify_arg_kinds, verify_args, verify_result,
-                    commit_fn, commit_args, compensate_fn, compensate_args
+                    commit_fn, commit_arg_kinds, commit_args,
+                    compensate_fn, compensate_arg_kinds, compensate_args
              FROM transact_log
              WHERE state NOT IN ('committed', 'compensated')",
         )?;
@@ -301,8 +361,10 @@ impl TransactLog {
             let network_result_json: Option<String> = row.get(6)?;
             let verify_arg_kinds_json: String = row.get(8)?;
             let verify_args_json: Option<String> = row.get(9)?;
-            let commit_args_json: Option<String> = row.get(12)?;
-            let compensate_args_json: Option<String> = row.get(14)?;
+            let commit_arg_kinds_json: String = row.get(12)?;
+            let commit_args_json: Option<String> = row.get(13)?;
+            let compensate_arg_kinds_json: Option<String> = row.get(15)?;
+            let compensate_args_json: Option<String> = row.get(16)?;
             Ok(PendingTxn {
                 txn_id: row.get(0)?,
                 state: row.get(1)?,
@@ -318,8 +380,12 @@ impl TransactLog {
                 verify_args: verify_args_json.as_deref().map(args_from_json),
                 verify_result: row.get(10)?,
                 commit_fn: row.get(11)?,
+                commit_arg_kinds: serde_json::from_str(&commit_arg_kinds_json).expect("begin_pending's own format"),
                 commit_args: commit_args_json.as_deref().map(args_from_json),
-                compensate_fn: row.get(13)?,
+                compensate_fn: row.get(14)?,
+                compensate_arg_kinds: compensate_arg_kinds_json
+                    .as_deref()
+                    .map(|s| serde_json::from_str(s).expect("begin_pending's own format")),
                 compensate_args: compensate_args_json.as_deref().map(args_from_json),
             })
         })?;

@@ -256,6 +256,42 @@ avoid this) — deliberately not "solved" by also restricting `commit`'s
 arguments, which would break the entire point of `commit` (it's supposed
 to finish the business operation, not just re-inspect `network`).
 
+**2026-08-26 — a real, narrower sub-case of this gap found and closed**
+(`ROADMAP.md` Track A1's real-process-kill test, `tests/
+transact_process_kill.rs`): a crash landing in the short window *between*
+`record_verify` and `mark_commit_pending` (verify already succeeded, but
+`commit`'s arguments hadn't been durably captured yet) used to be an
+unconditional `Stuck` even when `commit`'s arguments happened to be
+exactly `network`/`txn_id` — the same always-safe shape `verify`'s own
+arguments are statically restricted to, and the shape every worked example
+in this file already uses (`update_db(network)`, `refund(amount)`'s
+`amount` being `network`, etc.). A real `nirdosha serve` process, SIGKILLed
+under real concurrent HTTP load (not the in-process simulation `tests/
+transact_durability.rs` already had), hit this exact row shape on the first
+try. Fixed: `commit`/`compensate`'s arguments are now also classified
+per-argument at `begin_pending` time (`commit_arg_kinds`/
+`compensate_arg_kinds` — `"network"`, `"txn_id"`, or `"opaque"` for
+anything else), the same static-but-optional bookkeeping `verify_arg_kinds`
+already does, just without `verify`'s compile-time guarantee that every
+argument qualifies. `Interpreter::replay_one` now reconstructs `commit`/
+`compensate`'s arguments from this classification (mirroring how it
+already reconstructs `verify_args`) whenever the durably-captured
+`commit_args`/`compensate_args` are missing — falling back to `Stuck` only
+when at least one argument is genuinely `"opaque"` (a real outer-scope
+reference), which is exactly the gap this section describes and is still,
+correctly, unclosed. `TransactLog::open` backfills the two new columns via
+`ALTER TABLE` for a pre-existing log file (defaulted to always-`"opaque"`,
+i.e. exactly the old, safe-but-`Stuck` behavior for whatever a pre-upgrade
+row already had logged) — a durability log has to survive a binary
+upgrade across a real restart, not just a fresh file. See `tests/
+transact_durability.rs`'s `replay_reconstructs_commit_args_from_network_
+and_txn_id_when_the_crash_landed_after_verify_but_before_mark_commit_
+pending` (and its `compensate` sibling) for the in-process reproduction,
+and the negative control (`replay_resumes_network_from_pending_but_
+reports_stuck_when_commit_args_were_never_captured`, unchanged) for
+confirmation the genuine outer-scope-reference gap is still honestly
+`Stuck`, not silently papered over.
+
 ## How we're going to get there — layers, not a syntax spec
 
 Same discipline `SANDBOXING.md` already committed to: each layer ships,
