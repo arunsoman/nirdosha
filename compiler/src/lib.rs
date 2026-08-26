@@ -11,6 +11,7 @@ pub mod migrate;
 pub mod observability;
 pub mod ownership;
 pub mod parser;
+pub mod pool;
 pub mod refine;
 pub mod serve;
 pub mod smt;
