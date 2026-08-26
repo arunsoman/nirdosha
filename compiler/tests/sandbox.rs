@@ -39,11 +39,30 @@ fn first_ownership_error(src: &str) -> OwnershipErrorKind {
 /// still exists (and this user has permission to signal it). Shelling out
 /// rather than pulling in a `libc`/`nix` dependency for one liveness
 /// check.
+#[cfg(unix)]
 fn process_exists(pid: u32) -> bool {
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()
         .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Windows has no `kill -0` equivalent as a shell command; `tasklist`
+/// filtered to the target PID is the same "shell out, don't pull in a
+/// dependency for one liveness check" approach as the Unix side above —
+/// it prints the process's row (containing its own PID as a decimal
+/// string) if it still exists, or an "INFO: No tasks..." message if not.
+/// Found missing on real Windows CI: without this arm the Unix-only
+/// version above always failed to spawn `kill` at all, so this check
+/// silently read as "never running," even immediately after a real
+/// spawn.
+#[cfg(windows)]
+fn process_exists(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()))
         .unwrap_or(false)
 }
 

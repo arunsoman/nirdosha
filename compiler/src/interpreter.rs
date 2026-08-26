@@ -880,15 +880,31 @@ impl SandboxChild {
     /// Kills the process if it's still running, waits on it (reaping it
     /// either way — a `Child` that's never `wait()`-ed leaks a zombie
     /// entry in the OS process table even after it exits), and cleans up
-    /// its temp source file. Returns the OS exit code, or `-1` if it
-    /// exited via a signal (including this same call's own `kill()` —
-    /// SIGKILL termination has no exit code to report) or if the wait
-    /// itself failed.
+    /// its temp source file. Returns the OS exit code, or `-1` if this
+    /// call is the one that killed it, or if the wait itself failed.
+    ///
+    /// The "did we kill it" case is tracked explicitly (`killed_by_us`)
+    /// rather than inferred from `status.code()`, because that inference
+    /// is platform-dependent: on Unix, `kill()` sends `SIGKILL`, and a
+    /// signal-terminated process has no exit code at all
+    /// (`status.code()` is `None`), so falling back to `-1` happened to
+    /// work. On Windows, `Child::kill()` is `TerminateProcess(handle,
+    /// 1)` — a *real* exit code of `1`, indistinguishable from a process
+    /// that legitimately called `exit(1)` if you only look at
+    /// `status.code()`. Found on real Windows CI: this returned `Int(1)`
+    /// instead of the documented `Int(-1)` for a process this same call
+    /// killed.
     fn stop(&mut self) -> i64 {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-        }
+        let killed_by_us = if self.child.try_wait().ok().flatten().is_none() {
+            self.child.kill().is_ok()
+        } else {
+            false
+        };
         let code = match self.child.wait() {
+            Ok(status) if killed_by_us => {
+                let _ = status; // exit code is meaningless when we killed it
+                -1
+            }
             Ok(status) => status.code().unwrap_or(-1) as i64,
             Err(_) => -1,
         };

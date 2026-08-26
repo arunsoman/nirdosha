@@ -633,18 +633,42 @@ of Track B has landed.*
   `compiled_connect`/`compiled_listen`/`compiled_recv`/
   `connecting_to_a_closed_port_traps_at_runtime`/`tcp_client_example`
   subset of `codegen.rs` for the native-codegen `RawSocket` path.
-  **Still open, not glossed over**: as of this note the job has never
-  actually run — the fix landed on a side branch
-  (`fix/windows-ci-sandbox-channel`) not yet merged/pushed to `main`,
-  so this is still a believed-correct port, now with a real CI job
-  waiting to prove or disprove it on the next push, not yet an
-  observed-green one. Per this file's own "checked off only once
-  actually run/verified" rule, this stays `[PARTIAL]` — flip to
-  `[DONE]` only once a real `build-windows` run is confirmed green.
-  Also still open: this proves the *compiler and its test suite* build
-  and run on Windows CI, not that a shipped end-user release binary has
-  been run on someone's own Windows machine outside CI — a narrower
-  remaining gap than before, but a real one.
+  **2026-08-26 — the `build-windows` job ran for real (merged to
+  `main`, run `32973021409`) and found two more real bugs, both
+  fixed.** `tcp`/`channels` and most of `sandbox` passed outright; two
+  `sandbox.rs` tests failed on real Windows:
+  - `stopping_a_still_running_sandbox_kills_it_and_returns_negative_one`
+    got `Int(1)` instead of the documented `Int(-1)`. Root cause:
+    `SandboxChild::stop` inferred "was this process killed by us" from
+    `status.code().is_none()` — true on Unix (`SIGKILL` termination has
+    no exit code), but false on Windows, where `Child::kill()` is
+    `TerminateProcess(handle, 1)`, a *real* exit code of `1`
+    indistinguishable from a process that legitimately called
+    `exit(1)`. Fixed by tracking `killed_by_us` explicitly at the call
+    site instead of inferring it from the exit status afterward
+    (`interpreter.rs::SandboxChild::stop`) — returns `-1`
+    unconditionally when this call is the one that killed the process,
+    on both platforms.
+  - `dropping_a_sandbox_handle_without_stopping_it_still_kills_the_process`
+    panicked with "the sandboxed process should be running before
+    drop" — immediately after a real spawn, not a timing race. Root
+    cause: the test's own `process_exists` helper shelled out to
+    `kill -0 <pid>`, a Unix-only command with no Windows equivalent, so
+    it always failed to even run there and silently read as "not
+    running." Fixed with a `#[cfg(windows)]` counterpart using
+    `tasklist /FI "PID eq <pid>"` (`compiler/tests/sandbox.rs`) — same
+    "shell out, no new dependency" approach the Unix version already
+    documents.
+
+  Both fixes verified: full local suite (`cargo test`, every
+  `tests/*.rs`) green on Linux, no regressions; pushed to `main` for
+  `build-windows` to confirm on real Windows CI. Flips to `[DONE]` once
+  that run is observed green — per this file's own "checked off only
+  once actually run/verified" rule, not on "believed fixed."
+  Still open, narrower than before: this proves the *compiler and its
+  test suite* build and run on Windows CI, not that a shipped end-user
+  release binary has been run on someone's own Windows machine outside
+  CI.
 - `[OPEN]` **A8. macOS Z3 vendoring.** `z3-src` 416.0.2 (pulled by the
   current `z3` 0.20.2 crate) fails to compile against the AppleClang on
   GitHub's `macos-13`/`macos-14` runners — a real `obj_hashtable.h`
