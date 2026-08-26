@@ -282,11 +282,70 @@ pub struct ChannelInner {
     not_empty: Condvar,
 }
 
+// The sandbox channel's cross-process transport (SANDBOXING.md layer 2):
+// a Unix domain socket bound at a temp-file path on Unix, since std only
+// exposes `std::os::unix::net::{UnixListener, UnixStream}` under
+// `cfg(unix)` — there's no portable stdlib abstraction over "local
+// socket" that also covers Windows (Windows *does* support `AF_UNIX` at
+// the OS level since 10 1803+, but Rust's std doesn't wrap it for the
+// `windows` target). `ChanListener`/`ChanStream` swap in a TCP listener
+// bound to `127.0.0.1:0` (an OS-assigned ephemeral port) on Windows
+// instead — same "one accept, exactly one child" shape, just addressed
+// by `host:port` instead of a filesystem path. `bind_chan_listener`/
+// `connect_chan` are the only platform-conditional surface; every other
+// method on `ChannelInner` (and `write_value`/`read_value`, generic over
+// `Read`/`Write`) is platform-agnostic.
+#[cfg(unix)]
+type ChanListener = std::os::unix::net::UnixListener;
+#[cfg(unix)]
+type ChanStream = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+type ChanListener = std::net::TcpListener;
+#[cfg(windows)]
+type ChanStream = std::net::TcpStream;
+
+/// Binds a fresh listener for a `chan` about to be handed to `sandbox`,
+/// returning it alongside the address string the spawned child should be
+/// given (via argv) to connect back — a filesystem path on Unix, a
+/// `127.0.0.1:<port>` string on Windows. Both are just opaque strings as
+/// far as the caller (`prepare_for_sandbox`) and `connect_chan` below are
+/// concerned.
+#[cfg(unix)]
+fn bind_chan_listener() -> std::io::Result<(ChanListener, std::path::PathBuf)> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut path = std::env::temp_dir();
+    path.push(format!("nirdosha_sandbox_chan_{}_{n}.sock", std::process::id()));
+    let listener = ChanListener::bind(&path)?;
+    Ok((listener, path))
+}
+#[cfg(windows)]
+fn bind_chan_listener() -> std::io::Result<(ChanListener, std::path::PathBuf)> {
+    let listener = ChanListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    Ok((listener, std::path::PathBuf::from(format!("127.0.0.1:{port}"))))
+}
+
+/// The child side's connect, matching whichever address form
+/// `bind_chan_listener` handed the parent to pass along (a Unix socket
+/// path, or a `host:port` string on Windows).
+#[cfg(unix)]
+pub fn connect_chan(addr: &std::path::Path) -> std::io::Result<ChanStream> {
+    ChanStream::connect(addr)
+}
+#[cfg(windows)]
+pub fn connect_chan(addr: &std::path::Path) -> std::io::Result<ChanStream> {
+    // `addr` is always valid UTF-8 here -- `bind_chan_listener` built it
+    // from a `format!("{host}:{port}")` string, never arbitrary OS bytes.
+    let addr = addr.to_str().ok_or_else(|| std::io::Error::other("sandbox channel address is not valid UTF-8"))?;
+    ChanStream::connect(addr)
+}
+
 #[derive(Debug)]
 enum TransportState {
     InMemory(VecDeque<Value>),
-    PendingListener(std::os::unix::net::UnixListener, std::path::PathBuf),
-    Socket(std::os::unix::net::UnixStream),
+    PendingListener(ChanListener, std::path::PathBuf),
+    Socket(ChanStream),
 }
 
 impl ChannelInner {
@@ -298,7 +357,7 @@ impl ChannelInner {
     /// from an already-connected socket, no `InMemory`/`PendingListener`
     /// detour — the child never creates a channel via `chan`, it's always
     /// handed one that's already meant to cross a process boundary.
-    pub fn from_socket(stream: std::os::unix::net::UnixStream) -> Self {
+    pub fn from_socket(stream: ChanStream) -> Self {
         ChannelInner { state: Mutex::new(TransportState::Socket(stream)), not_empty: Condvar::new() }
     }
 
@@ -309,11 +368,6 @@ impl ChannelInner {
     /// deferred to first use (see the type's doc comment) — so this never
     /// blocks.
     fn prepare_for_sandbox(&self) -> std::io::Result<std::path::PathBuf> {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!("nirdosha_sandbox_chan_{}_{n}.sock", std::process::id()));
-
         let mut state = self.state.lock().unwrap();
         match &*state {
             TransportState::InMemory(queue) if !queue.is_empty() => {
@@ -330,22 +384,25 @@ impl ChannelInner {
                 ));
             }
         }
-        let listener = std::os::unix::net::UnixListener::bind(&path)?;
-        *state = TransportState::PendingListener(listener, path.clone());
-        Ok(path)
+        let (listener, addr) = bind_chan_listener()?;
+        *state = TransportState::PendingListener(listener, addr.clone());
+        Ok(addr)
     }
 
     /// If still `PendingListener`, blocks until the child connects, then
     /// transitions to `Socket` — the one place this file's "sandbox
     /// spawning never blocks, only send/recv do" rule gets enforced for
-    /// the channel transport specifically. Unlinks the socket's path
-    /// immediately on a successful accept: once connected, a Unix domain
-    /// socket doesn't need its filesystem path anymore, and nothing else
-    /// will ever connect to it (exactly one child, exactly one accept).
+    /// the channel transport specifically. On Unix, unlinks the socket's
+    /// filesystem path immediately on a successful accept: once
+    /// connected, a Unix domain socket doesn't need its path anymore, and
+    /// nothing else will ever connect to it (exactly one child, exactly
+    /// one accept). No such cleanup on Windows — `addr` there is a
+    /// `host:port` string, not a filesystem path.
     fn ensure_connected(state: &mut TransportState) -> std::io::Result<()> {
-        if let TransportState::PendingListener(listener, path) = state {
-            let (stream, _addr) = listener.accept()?;
-            let _ = std::fs::remove_file(path);
+        if let TransportState::PendingListener(listener, _addr) = state {
+            let (stream, _peer) = listener.accept()?;
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(_addr);
             *state = TransportState::Socket(stream);
         }
         Ok(())
@@ -454,12 +511,18 @@ impl Drop for ChannelInner {
     /// it on the success path, so this only ever fires for a channel that
     /// was prepared for a sandbox but never actually used.
     fn drop(&mut self) {
-        let state = match self.state.get_mut() {
-            Ok(s) => s,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let TransportState::PendingListener(_, path) = state {
-            let _ = std::fs::remove_file(path);
+        // Windows' `addr` is a `host:port` string, not a filesystem path
+        // — nothing to unlink there, so this cleanup is Unix-only (see
+        // `ensure_connected`'s doc comment for the same split).
+        #[cfg(unix)]
+        {
+            let state = match self.state.get_mut() {
+                Ok(s) => s,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let TransportState::PendingListener(_, path) = state {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 }
@@ -683,8 +746,7 @@ impl DeadlockRegistry {
 /// formally-checked serialization boundary SANDBOXING.md's layer 3 is —
 /// this only has to be correct for the types layer 1 already proved safe
 /// to move across a process boundary at all.
-fn write_value(stream: &mut std::os::unix::net::UnixStream, v: &Value) -> std::io::Result<()> {
-    use std::io::Write;
+fn write_value(stream: &mut impl std::io::Write, v: &Value) -> std::io::Result<()> {
     match v {
         Value::Int(n) => {
             let mut buf = [0u8; 9];
@@ -697,8 +759,7 @@ fn write_value(stream: &mut std::os::unix::net::UnixStream, v: &Value) -> std::i
     }
 }
 
-fn read_value(stream: &mut std::os::unix::net::UnixStream) -> std::io::Result<Value> {
-    use std::io::Read;
+fn read_value(stream: &mut impl std::io::Read) -> std::io::Result<Value> {
     let mut tag = [0u8; 1];
     let result = stream.read_exact(&mut tag).and_then(|()| match tag[0] {
         0 => {

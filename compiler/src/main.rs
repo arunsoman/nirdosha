@@ -748,12 +748,14 @@ fn cmd_sandbox_worker(mut args: impl Iterator<Item = String>) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
-            // A `chan`-typed parameter's argv string is a Unix socket
-            // path (see interpreter.rs's `spawn_sandbox`), not a value to
+            // A `chan`-typed parameter's argv string is the parent's
+            // bound channel address (see interpreter.rs's
+            // `spawn_sandbox`/`connect_chan` -- a Unix socket path on
+            // Unix, a `host:port` string on Windows), not a value to
             // parse -- connect to the same socket the parent bound,
             // giving this side of the sandboxed process a live channel
             // to the parent, not a re-parsed literal.
-            Ty::Channel(_) => match std::os::unix::net::UnixStream::connect(&raw) {
+            Ty::Channel(_) => match nirdosha::interpreter::connect_chan(std::path::Path::new(&raw)) {
                 Ok(stream) => Value::Channel(Arc::new(nirdosha::interpreter::ChannelInner::from_socket(stream))),
                 Err(e) => {
                     eprintln!("sandbox worker: failed to connect channel `{}`: {e}", p.name);

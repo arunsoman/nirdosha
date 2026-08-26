@@ -24,3 +24,48 @@ jobs:
       - name: Build
         working-directory: compiler
         run: cargo build --release
+
+  # Windows didn't get a CI job of its own until now — the release
+  # workflow's `x86_64-pc-windows-msvc` leg was the only thing that ever
+  # actually compiled this crate for Windows, and it was failing outright
+  # (`std::os::unix::net::{UnixListener, UnixStream}` used unconditionally
+  # in `interpreter.rs`'s sandbox-channel transport — Unix-only in std,
+  # so it doesn't even exist on the `windows` target; the `tcp`/
+  # `tcp_listener` runtime's own `RawFd`→`RawSocket` port was already
+  # correct). See ROADMAP.md A7. Fixed by giving that transport a real
+  # `#[cfg(windows)]` leg (a loopback TCP socket, since std doesn't wrap
+  # `AF_UNIX` for Windows) instead of leaving Windows uncompilable — this
+  # job is what actually proves the fix, and what would have caught the
+  # original break before it shipped: build for real, then run every
+  # integration test that exercises the ported code end to end (`tcp`:
+  # the raw-handle codegen path from runtime_kernels.rs; `sandbox`/
+  # `sandbox_channels`/`channels`: the loopback-socket transport this fix
+  # added). `--features dist` vendors Z3 from source (same as
+  # release.yml) so this job needs no system `libz3` install on Windows.
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            compiler/target
+          key: windows-cargo-${{ hashFiles('compiler/Cargo.lock') }}
+      - name: Build (Z3 vendored, no system libz3 dependency)
+        working-directory: compiler
+        run: cargo build --release --features dist
+      - name: Run the tcp / sandbox-channel integration tests
+        working-directory: compiler
+        run: cargo test --release --features dist --test tcp --test sandbox --test sandbox_channels --test channels
+      - name: Run the compiled (native-codegen) tcp/tcp_listener tests
+        # These are the ones that actually exercise runtime_kernels.rs's
+        # RawSocket path -- they compile real .nir source to a native
+        # binary via `clang` (preinstalled on windows-latest) and run it,
+        # not just the interpreter. Filtered out of the rest of
+        # `codegen.rs`'s ~140 tests to keep this job fast; nothing else
+        # in that file touches the platform-conditional socket code.
+        working-directory: compiler
+        run: cargo test --release --features dist --test codegen -- compiled_connect compiled_listen compiled_recv connecting_to_a_closed_port_traps_at_runtime tcp_client_example

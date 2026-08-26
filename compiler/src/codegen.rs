@@ -5246,19 +5246,20 @@ pub fn build(
     std::fs::write(&runtime_lib_path, RUNTIME_KERNELS_LIB)
         .map_err(|e| format!("writing {}: {e}", runtime_lib_path.display()))?;
 
-    let result = std::process::Command::new("clang")
-        .arg(&ll_path)
-        .arg(&runtime_lib_path)
-        .arg(opt.clang_flag())
-        // Phase 4's `declare double @atan2(double, double)` (geometry
-        // builtins) has no LLVM intrinsic form, unlike `sqrt`/`sin`/`cos`
-        // — it's the plain libm function, so it needs to actually be
-        // linked. Harmless to pass unconditionally even for a program
-        // that never calls it.
-        .arg("-lm")
-        .arg("-o")
-        .arg(output_path)
-        .output();
+    let mut clang_cmd = std::process::Command::new("clang");
+    clang_cmd.arg(&ll_path).arg(&runtime_lib_path).arg(opt.clang_flag());
+    // Phase 4's `declare double @atan2(double, double)` (geometry
+    // builtins) has no LLVM intrinsic form, unlike `sqrt`/`sin`/`cos` —
+    // it's the plain libm function, so it needs to actually be linked.
+    // Harmless to pass unconditionally on Unix even for a program that
+    // never calls it. Windows has no separate `libm` to link against —
+    // math functions live in the C runtime clang already links by
+    // default — and passing `-lm` there makes the MSVC linker fail
+    // outright looking for a nonexistent `m.lib`, so this flag is
+    // Unix-only.
+    #[cfg(unix)]
+    clang_cmd.arg("-lm");
+    let result = clang_cmd.arg("-o").arg(output_path).output();
     let _ = std::fs::remove_file(&ll_path); // best-effort cleanup either way
     let _ = std::fs::remove_file(&runtime_lib_path);
 
