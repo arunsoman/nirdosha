@@ -599,7 +599,7 @@ of Track B has landed.*
     typecheck/ownership-check on every fixture combination, plus a
     CLI-half spawning the real binary to check the written folder,
     the overwrite guard, and `--dest` directory creation).
-- `[PARTIAL]` **A7. Real Windows verification.** The `v0.1.0-alpha.1`
+- `[DONE]` **A7. Real Windows verification.** The `v0.1.0-alpha.1`
   release run (2026-08-25) found `runtime_kernels.rs`'s `tcp`/
   `tcp_listener` codegen backend used Unix-only `std::os::fd`
   (`RawFd`/`IntoRawFd`/`FromRawFd`) unconditionally — fails to compile
@@ -697,15 +697,30 @@ of Track B has landed.*
   ordinary library flag, which skips that preflight check and does
   reach the linker's search path); the one non-`.lib` token
   (`/defaultlib:msvcrt`, already a raw linker flag) is forwarded
-  verbatim via `-Xlinker`. Verified locally against the exact captured
-  Windows token list (Python simulation of the new parsing logic) plus
-  `cargo build --release` + `cargo test --test codegen` (142 tests)
-  still green on Linux, unaffected (`#[cfg(windows)]`-gated). Pushed
-  again — not yet observed green. Flips `[DONE]` only once
-  `build-windows` is confirmed, per this file's own rule. Still open,
-  narrower than before: this proves the *compiler and its test suite*
-  build and run on Windows CI, not that a shipped end-user release
-  binary has been run on someone's own Windows machine outside CI.
+  verbatim via `-Xlinker`.
+
+  **2026-08-26 — `build-windows` run `32982218064` came back fully
+  green**: `Build`, the `tcp`/`sandbox`/`sandbox_channels`/`channels`
+  suite, and all 5 compiled-TCP `codegen.rs` tests (the ones that
+  actually exercise the `-lfoo` fix) all passed for real on a Windows
+  runner. Flipping to `[DONE]` now — per this file's own rule, on an
+  observed-green run, not a believed-correct port. Four real,
+  independent Windows-only bugs were found and fixed to get here, none
+  hypothetical, each caught by this same CI job on a real push: (1)
+  `SandboxChild::stop` returning `Int(1)` instead of `-1` for a killed
+  process (`Child::kill()`'s Windows semantics are `TerminateProcess`
+  with a real exit code, unlike Unix's signal termination); (2) the
+  Unix-only `kill -0` test helper always reading "not running" on
+  Windows; (3) the compiled `tcp` path failing to link at all
+  (`ws2_32.lib` and friends never passed to `clang`, since `codegen.rs`
+  links with a bare `clang` call, not `rustc`) — fixed by capturing
+  `rustc --print=native-static-libs` at build time; (4) that fix's own
+  bare `.lib` tokens rejected by Clang's positional-argument preflight
+  check — fixed by passing them as `-lfoo` instead. Still open, a
+  narrower gap than before: this proves the *compiler and its test
+  suite* build and run on Windows CI, not that a shipped end-user
+  release binary has been run on someone's own Windows machine outside
+  CI.
 - `[OPEN]` **A8. macOS Z3 vendoring.** `z3-src` 416.0.2 (pulled by the
   current `z3` 0.20.2 crate) fails to compile against the AppleClang on
   GitHub's `macos-13`/`macos-14` runners — a real `obj_hashtable.h`
