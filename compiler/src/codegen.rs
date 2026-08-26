@@ -5279,8 +5279,33 @@ pub fn build(
     // rustc-verified list is used instead of guessing which ones.
     // `NATIVE_STATIC_LIBS`'s doc comment on its declaration above has the
     // real failure this fixes.
+    //
+    // Can't pass rustc's tokens straight through as positional args:
+    // found on real Windows CI, a real second failure past the first —
+    // `clang: error: no such file or directory: 'kernel32.lib'`. Clang
+    // preflight-checks any *positional* (non-flag) argument as a literal
+    // path relative to the current directory, even though a plain
+    // `foo.lib` token is exactly what MSVC's own linker resolves via its
+    // library search path, never by looking in the cwd. `-lfoo` (Clang's
+    // ordinary, cross-target library flag) skips that preflight check
+    // entirely and does reach the linker's search path — so each
+    // `foo.lib` token here is stripped to `foo` and passed as `-lfoo`
+    // instead. rustc's list also has at least one token that isn't
+    // `.lib`-suffixed at all (`/defaultlib:msvcrt`, already a raw linker
+    // flag) — that one is forwarded verbatim via `-Xlinker`, which routes
+    // it straight to the linker unexamined, the same reason `-l` works
+    // for the others.
     #[cfg(windows)]
-    clang_cmd.args(NATIVE_STATIC_LIBS.split_whitespace());
+    for token in NATIVE_STATIC_LIBS.split_whitespace() {
+        match token.strip_suffix(".lib") {
+            Some(name) => {
+                clang_cmd.arg(format!("-l{name}"));
+            }
+            None => {
+                clang_cmd.arg("-Xlinker").arg(token);
+            }
+        }
+    }
     let result = clang_cmd.arg("-o").arg(output_path).output();
     let _ = std::fs::remove_file(&ll_path); // best-effort cleanup either way
     let _ = std::fs::remove_file(&runtime_lib_path);

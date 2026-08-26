@@ -685,12 +685,27 @@ of Track B has landed.*
   green on Linux with this change (the captured Unix list is `-lgcc_s
   -lutil -lrt -lpthread -lm -ldl -lc`, a superset of the old hardcoded
   `-lm`, applied only under `cfg(unix)` so behavior there is unchanged).
-  Pushed for `build-windows` to confirm the actual Windows list links
-  cleanly — not yet observed green. Flips `[DONE]` only once that run
-  is confirmed, per this file's own rule. Still open, narrower than
-  before: this proves the *compiler and its test suite* build and run
-  on Windows CI, not that a shipped end-user release binary has been
-  run on someone's own Windows machine outside CI.
+  That push (run `32979448313`) hit a **fourth** real bug, in the fix
+  itself: `clang: error: no such file or directory: 'kernel32.lib'` —
+  the real captured list (`kernel32.lib ntdll.lib userenv.lib
+  ws2_32.lib dbghelp.lib /defaultlib:msvcrt`) confirmed the mechanism
+  works, but Clang preflight-checks any *positional* argument as a
+  literal path relative to the working directory, even though a bare
+  `foo.lib` token is exactly what MSVC's linker resolves through its
+  own library search path, never by looking in the cwd. Fixed by
+  stripping each `.lib` suffix and passing `-lfoo` instead (Clang's
+  ordinary library flag, which skips that preflight check and does
+  reach the linker's search path); the one non-`.lib` token
+  (`/defaultlib:msvcrt`, already a raw linker flag) is forwarded
+  verbatim via `-Xlinker`. Verified locally against the exact captured
+  Windows token list (Python simulation of the new parsing logic) plus
+  `cargo build --release` + `cargo test --test codegen` (142 tests)
+  still green on Linux, unaffected (`#[cfg(windows)]`-gated). Pushed
+  again — not yet observed green. Flips `[DONE]` only once
+  `build-windows` is confirmed, per this file's own rule. Still open,
+  narrower than before: this proves the *compiler and its test suite*
+  build and run on Windows CI, not that a shipped end-user release
+  binary has been run on someone's own Windows machine outside CI.
 - `[OPEN]` **A8. macOS Z3 vendoring.** `z3-src` 416.0.2 (pulled by the
   current `z3` 0.20.2 crate) fails to compile against the AppleClang on
   GitHub's `macos-13`/`macos-14` runners — a real `obj_hashtable.h`
