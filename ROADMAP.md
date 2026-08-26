@@ -599,7 +599,7 @@ of Track B has landed.*
     typecheck/ownership-check on every fixture combination, plus a
     CLI-half spawning the real binary to check the written folder,
     the overwrite guard, and `--dest` directory creation).
-- `[OPEN]` **A7. Real Windows verification.** The `v0.1.0-alpha.1`
+- `[PARTIAL]` **A7. Real Windows verification.** The `v0.1.0-alpha.1`
   release run (2026-08-25) found `runtime_kernels.rs`'s `tcp`/
   `tcp_listener` codegen backend used Unix-only `std::os::fd`
   (`RawFd`/`IntoRawFd`/`FromRawFd`) unconditionally — fails to compile
@@ -610,12 +610,41 @@ of Track B has landed.*
   (`compiled_connect_send_recv_stop_round_trips_real_bytes`,
   `compiled_listen_accept_serves_a_real_client`,
   `connecting_to_a_closed_port_traps_at_runtime` in
-  `compiler/tests/codegen.rs`) re-verified green after the change. The
-  Windows path itself has **never run on a real Windows machine** — no
-  Windows environment was available; it's a believed-correct port by
-  API-equivalence, not an end-to-end-tested one. Needs someone with
-  Windows access to actually run the release binary and, ideally, add
-  a CI job that exercises real Windows TCP.
+  `compiler/tests/codegen.rs`) re-verified green after the change.
+
+  **2026-08-26 — a second real gap found and fixed the same way, plus
+  the CI job this entry asked for.** `interpreter.rs`'s sandbox-channel
+  transport used `std::os::unix::net::{UnixListener, UnixStream}`
+  unconditionally too — also uncompilable on Windows (`AF_UNIX` isn't
+  wrapped there), and also missed by the alpha.3 pass since it's a
+  different subsystem than `runtime_kernels.rs`'s TCP path. Fixed the
+  same way: a real `#[cfg(windows)]` leg, a loopback TCP socket instead
+  of a Unix domain socket (`write_value`/`read_value` generalized over
+  `Read`/`Write` so the wire format itself is unchanged). Same commit
+  also fixed `codegen.rs`'s unconditional `-lm` clang link flag, which
+  broke native codegen on Windows too (MSVC has no `m.lib`; libm lives
+  in the C runtime there) — now Unix-only. New `build-windows` job in
+  `.github/workflows/build.yml` (commit `4b535b0`) is the CI job this
+  entry named as still needed: runs on a real `windows-latest` GitHub
+  Actions runner, builds with `--features dist` (vendored Z3, no system
+  `libz3` install needed on Windows), then runs the tests that actually
+  exercise the ported code end to end — `tcp`/`sandbox`/
+  `sandbox_channels`/`channels` for the interpreter paths, plus the
+  `compiled_connect`/`compiled_listen`/`compiled_recv`/
+  `connecting_to_a_closed_port_traps_at_runtime`/`tcp_client_example`
+  subset of `codegen.rs` for the native-codegen `RawSocket` path.
+  **Still open, not glossed over**: as of this note the job has never
+  actually run — the fix landed on a side branch
+  (`fix/windows-ci-sandbox-channel`) not yet merged/pushed to `main`,
+  so this is still a believed-correct port, now with a real CI job
+  waiting to prove or disprove it on the next push, not yet an
+  observed-green one. Per this file's own "checked off only once
+  actually run/verified" rule, this stays `[PARTIAL]` — flip to
+  `[DONE]` only once a real `build-windows` run is confirmed green.
+  Also still open: this proves the *compiler and its test suite* build
+  and run on Windows CI, not that a shipped end-user release binary has
+  been run on someone's own Windows machine outside CI — a narrower
+  remaining gap than before, but a real one.
 - `[OPEN]` **A8. macOS Z3 vendoring.** `z3-src` 416.0.2 (pulled by the
   current `z3` 0.20.2 crate) fails to compile against the AppleClang on
   GitHub's `macos-13`/`macos-14` runners — a real `obj_hashtable.h`
