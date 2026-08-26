@@ -77,11 +77,48 @@ jobs:
         working-directory: compiler
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Assemble Nirdosha.app (macOS icon/file-association registrar)
+        # Only once, not once per macOS arch matrix leg — see
+        # assets/macos/Nirdosha.app/Contents/Info.plist's own comment for
+        # why this needs a real app bundle at all, and why `iconutil`/`cc`
+        # (native-macOS-only, unavailable in a Linux dev sandbox) are the
+        # reason this step lives here instead of being committed pre-built.
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          set -eu
+          bundle=Nirdosha.app
+          rm -rf "$bundle"
+          cp -R assets/macos/Nirdosha.app "$bundle"
+          mkdir -p "$bundle/Contents/Resources"
+          iconutil -c icns assets/brand/nirdosha.iconset -o "$bundle/Contents/Resources/nirdosha.icns"
+          cc -O2 -o "$bundle/Contents/MacOS/nirdosha-launcher" assets/macos/nirdosha-launcher.c
+          chmod +x "$bundle/Contents/MacOS/nirdosha-launcher"
+          plutil -lint "$bundle/Contents/Info.plist"
+          ditto -c -k --sequesterRsrc --keepParent "$bundle" nirdosha-icon-registrar-macos.zip
+          shasum -a 256 nirdosha-icon-registrar-macos.zip > nirdosha-icon-registrar-macos.zip.sha256
+
       - name: Package (Unix)
+        # Linux tarballs also carry the icon-theme PNGs + shared-mime-info
+        # XML (assets/linux/, assets/brand/linux-icons/) so
+        # scripts/install.sh's Linux branch can register the .nir file
+        # icon from what it already downloaded — the curl-one-liner
+        # install never clones this repo, so anything install.sh needs at
+        # install time has to ship IN the release asset, not just live in
+        # git. macOS gets no extra payload here — see the separate
+        # Nirdosha.app registrar asset/step above for how macOS gets its
+        # icon association instead (a different mechanism entirely,
+        # Launch Services, not an icon-theme directory).
         if: runner.os != 'Windows'
         working-directory: compiler
         run: |
-          tar czf ../${{ matrix.asset }} -C target/${{ matrix.target }}/release nirdosha
+          stage=$(mktemp -d)
+          cp target/${{ matrix.target }}/release/nirdosha "$stage/"
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cp -r ../assets/brand/linux-icons "$stage/linux-icons"
+            cp ../assets/linux/nirdosha-mime.xml "$stage/nirdosha-mime.xml"
+          fi
+          tar czf ../${{ matrix.asset }} -C "$stage" .
+          rm -rf "$stage"
           cd ..
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
@@ -90,11 +127,19 @@ jobs:
           fi
 
       - name: Package (Windows)
+        # Bundles nirdosha.ico alongside nirdosha.exe so
+        # scripts/install.ps1 can register the .nir file icon from what
+        # it already downloaded — same "install.ps1 never clones this
+        # repo" reasoning as the Unix step above.
         if: runner.os == 'Windows'
         working-directory: compiler
         shell: pwsh
         run: |
-          Compress-Archive -Path target/${{ matrix.target }}/release/nirdosha.exe -DestinationPath ../${{ matrix.asset }}
+          $stage = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "nirdosha-pkg-$([guid]::NewGuid())")
+          Copy-Item target/${{ matrix.target }}/release/nirdosha.exe $stage
+          Copy-Item ../assets/brand/nirdosha.ico $stage
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath ../${{ matrix.asset }}
+          Remove-Item -Recurse -Force $stage
           cd ..
           Get-FileHash ${{ matrix.asset }} -Algorithm SHA256 | Select-Object -ExpandProperty Hash | Out-File -Encoding ascii "${{ matrix.asset }}.sha256"
 
@@ -110,3 +155,11 @@ jobs:
           files: |
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
+
+      - name: Upload Nirdosha.app (icon/file-association registrar)
+        if: matrix.target == 'x86_64-apple-darwin'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            nirdosha-icon-registrar-macos.zip
+            nirdosha-icon-registrar-macos.zip.sha256

@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Nirdosha.app is NOT a real application. Its only job is to give
+  macOS's Launch Services database something to associate the ".nir"
+  file extension and the Nirdosha brand icon with, the same way
+  installing Xcode is what makes Finder show a distinct icon for
+  .c/.cpp/.m files: on macOS that association is always owned by a
+  registered *app bundle* declaring a UTI, never by a bare CLI binary
+  (there is no per-extension "just an icon" registration mechanism
+  outside Launch Services). This bundle is invisible in practice:
+  LSUIElement hides it from the Dock and Cmd-Tab, and LSBackgroundOnly
+  means it never even runs beyond the instant Finder double-clicks a
+  .nir file (see nirdosha-launcher.c next to this file; it prints one
+  line to stderr and exits 0).
+
+  Assembled for real (icns compiled via `iconutil`, the launcher
+  compiled via `cc`, both native macOS-only tools) by
+  .github/workflows/release.yml on the macOS runners; NOT buildable or
+  verifiable from a non-macOS sandbox, disclosed here rather than
+  shipping a fake bundle. See scripts/install.sh's Darwin branch for how
+  an end user's machine installs and registers (`lsregister -f`) the
+  assembled bundle.
+
+  NOTE: consecutive hyphens are not valid inside an XML comment and
+  silently break plist parsing (confirmed live with plistlib against an
+  earlier revision of this comment); keep this comment free of that
+  pattern if it's edited.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>dev.nirdosha.iconregistrar</string>
+	<key>CFBundleName</key>
+	<string>Nirdosha</string>
+	<key>CFBundleDisplayName</key>
+	<string>Nirdosha</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleSignature</key>
+	<string>nird</string>
+	<key>CFBundleExecutable</key>
+	<string>nirdosha-launcher</string>
+	<key>CFBundleIconFile</key>
+	<string>nirdosha.icns</string>
+
+	<!-- Invisible: never shows in the Dock, Cmd-Tab, or the menu bar. -->
+	<key>LSUIElement</key>
+	<true/>
+	<key>LSBackgroundOnly</key>
+	<true/>
+
+	<!-- The actual file-type <-> icon association. -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Nirdosha Source</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>CFBundleTypeIconFile</key>
+			<string>nirdosha.icns</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>dev.nirdosha.nir-source</string>
+			</array>
+		</dict>
+	</array>
+
+	<!-- Declares the .nir extension itself: CFBundleDocumentTypes alone
+	     only binds a UTI to an icon/role; something has to bind the UTI
+	     to the extension in the first place, and this app is the only
+	     thing on a fresh install that will ever do so. -->
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>dev.nirdosha.nir-source</string>
+			<key>UTTypeDescription</key>
+			<string>Nirdosha Source</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.source-code</string>
+				<string>public.plain-text</string>
+			</array>
+			<key>UTTypeIconFile</key>
+			<string>nirdosha.icns</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>nir</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
+</dict>
+</plist>

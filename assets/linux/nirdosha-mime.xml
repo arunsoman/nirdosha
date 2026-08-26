@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  freedesktop.org shared-mime-info package declaring the ".nir" file type,
+  so Nautilus/Dolphin/Thunar and friends show the Nirdosha icon (see
+  assets/brand/linux-icons/) instead of a generic text-file icon.
+  Installed by scripts/install.sh's Linux branch into
+  ~/.local/share/mime/packages/nirdosha.xml, then `update-mime-database
+  ~/.local/share/mime` registers it. Per-user (no root needed), same
+  install-dir posture as the rest of this installer. NOTE: consecutive
+  hyphens are not valid inside an XML comment and silently break
+  update-mime-database's parse (confirmed live: an earlier revision of
+  this exact comment had a pair of them and the mime type never
+  registered); keep this comment free of that pattern if it's edited.
+-->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="text/x-nirdosha-source">
+    <comment>Nirdosha source code</comment>
+    <glob pattern="*.nir"/>
+    <icon name="nirdosha"/>
+    <sub-class-of type="text/plain"/>
+  </mime-type>
+</mime-info>

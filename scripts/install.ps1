@@ -52,6 +52,34 @@ try {
     if (($env:Path -split ";") -notcontains $installDir) {
         Write-Host "Add it to your PATH: `$env:Path += \";$installDir\"`  (or add it permanently via System Properties)"
     }
+
+    # .nir file icon, so Explorer shows the Nirdosha mark instead of the
+    # generic "unknown file type" icon -- HKCU only (never HKLM/admin),
+    # same no-elevation posture as the rest of this installer. Best-effort:
+    # a corporate machine with Group Policy locking HKCU\Software\Classes
+    # just leaves nirdosha.exe installed and working, no icon, not fatal.
+    $icoSrc = Join-Path $tmp "nirdosha.ico"
+    if (Test-Path $icoSrc) {
+        try {
+            $icoDest = Join-Path $installDir "nirdosha.ico"
+            Copy-Item -Path $icoSrc -Destination $icoDest -Force
+            $progId = "Nirdosha.SourceFile"
+            New-Item -Path "HKCU:\Software\Classes\.nir" -Force | Out-Null
+            Set-ItemProperty -Path "HKCU:\Software\Classes\.nir" -Name "(Default)" -Value $progId
+            New-Item -Path "HKCU:\Software\Classes\$progId\DefaultIcon" -Force | Out-Null
+            Set-ItemProperty -Path "HKCU:\Software\Classes\$progId\DefaultIcon" -Name "(Default)" -Value "$icoDest,0"
+            New-Item -Path "HKCU:\Software\Classes\$progId" -Force | Out-Null
+            Set-ItemProperty -Path "HKCU:\Software\Classes\$progId" -Name "(Default)" -Value "Nirdosha Source"
+            # Nudge Explorer to actually redraw icons now, not just after
+            # the next login -- ie4uinit's -show flushes the icon cache;
+            # best-effort, older/locked-down Windows may not have it.
+            Start-Process -FilePath "ie4uinit.exe" -ArgumentList "-show" -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
+            Write-Host "Registered the .nir file icon (Explorer may need a restart to show it)."
+        } catch {
+            Write-Host "Note: couldn't register the .nir file icon ($_) -- nirdosha itself installed fine."
+        }
+    }
+
     Write-Host "Try it: nirdosha            # prints usage"
     Write-Host "        nirdosha hello.nir  # see README.md for a hello-world snippet to paste"
 } finally {

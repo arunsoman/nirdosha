@@ -79,5 +79,49 @@ case ":$PATH:" in
   *":$install_dir:"*) ;;
   *) echo "Add it to your PATH: export PATH=\"$install_dir:\$PATH\"" ;;
 esac
+
+# ── .nir file icon, so file managers show the Nirdosha mark instead of a
+# generic text-file icon the moment this install finishes — best-effort,
+# never fatal: a headless/server machine with no desktop environment (no
+# xdg-mime, no icon cache) just silently skips this, same posture as the
+# rest of this installer's optional steps.
+if [ "$os" = "Linux" ] && [ -d "$tmp/linux-icons" ]; then
+  icon_base="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
+  mime_dir="${XDG_DATA_HOME:-$HOME/.local/share}/mime/packages"
+  mkdir -p "$mime_dir"
+  cp "$tmp/nirdosha-mime.xml" "$mime_dir/nirdosha.xml" 2>/dev/null || true
+  for sizedir in "$tmp/linux-icons"/*/; do
+    size="$(basename "$sizedir")"
+    mkdir -p "$icon_base/$size/apps"
+    cp "$sizedir/apps/nirdosha.png" "$icon_base/$size/apps/nirdosha.png" 2>/dev/null || true
+  done
+  if command -v update-mime-database >/dev/null 2>&1; then
+    update-mime-database "${XDG_DATA_HOME:-$HOME/.local/share}/mime" >/dev/null 2>&1 || true
+  fi
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t "$icon_base" >/dev/null 2>&1 || true
+  fi
+  echo "Registered the .nir file icon (Nautilus/Dolphin/Thunar etc. — may need a restart to pick it up)."
+elif [ "$os" = "Darwin" ]; then
+  app_asset="nirdosha-icon-registrar-macos.zip"
+  app_url="https://github.com/$repo/releases/latest/download/$app_asset"
+  if [ "$version" != "latest" ]; then
+    app_url="https://github.com/$repo/releases/download/$version/$app_asset"
+  fi
+  apps_dir="${NIRDOSHA_APPS_DIR:-$HOME/Applications}"
+  mkdir -p "$apps_dir"
+  if curl --proto '=https' --tlsv1.2 -fsSL "$app_url" -o "$tmp/$app_asset" 2>/dev/null; then
+    rm -rf "$apps_dir/Nirdosha.app"
+    unzip -q "$tmp/$app_asset" -d "$tmp/app_extract" && cp -R "$tmp/app_extract/Nirdosha.app" "$apps_dir/Nirdosha.app"
+    lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+    if [ -x "$lsregister" ]; then
+      "$lsregister" -f "$apps_dir/Nirdosha.app" >/dev/null 2>&1 || true
+      echo "Registered the .nir file icon with Finder (Nirdosha.app installed to $apps_dir, not a real app — see its Info.plist)."
+    fi
+  else
+    echo "Note: couldn't fetch the Finder icon registrar ($app_asset) — nirdosha itself installed fine, .nir files just won't get a custom icon."
+  fi
+fi
+
 echo "Try it: nirdosha            # prints usage"
 echo "        nirdosha hello.nir  # see README.md for a hello-world snippet to paste"
