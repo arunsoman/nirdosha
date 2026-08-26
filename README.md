@@ -104,7 +104,7 @@ from the start**.
 |---|---|---|
 | 1 | No GC, no manual `free()` | proof (ownership / linear types) |
 | 2 | No data races | proof (type system rules out aliased mutation) |
-| 3 | No deadlocks | proof-by-construction (no blocking locks; concurrency = async messages) |
+| 3 | No deadlocks | lock-ordering deadlock: proof-by-construction (no mutex primitive exists to acquire out of order); `recv`/`join` deadlock: real runtime detection (a `join`-cycle or every live thread simultaneously blocked traps with a clear diagnostic instead of hanging — `interpreter::DeadlockRegistry`), not full static prevention |
 | 4 | No int / buffer overflow | SMT-discharged refinement types, tiered |
 | 5 | Native, hardware-speed codegen | engineering (AOT via LLVM/`clang`) |
 | 6 | No steep learning curve | measured (small, orthogonal grammar) |
@@ -139,9 +139,12 @@ The honest fit, not the marketing one.
   loop a structured proof obligation instead of a paragraph to guess at;
   `sandbox` is a real OS process and a language primitive, not a bolted-on
   Docker wrapper around output nobody trusts; and there is no mutex in the
-  language, so an agent literally cannot generate a deadlock. If you're
-  building an autonomous coding agent, or letting one operate against
-  production, this is the concrete gap Nirdosha targets.
+  language, so an agent literally cannot generate a lock-ordering deadlock —
+  and if generated code still manages a `recv`/`join` deadlock (still
+  possible; async messages don't make that vanish), the runtime traps it
+  with a clear diagnostic instead of silently hanging the process. If
+  you're building an autonomous coding agent, or letting one operate
+  against production, this is the concrete gap Nirdosha targets.
 - **Compliance-shaped CRUD systems** — trade finance, KYC/onboarding,
   anything where "who is allowed to call this" is part of the spec, not an
   afterthought. `requires(role: "admin")` / `requires(claim: "department",
@@ -175,7 +178,7 @@ unrepresentable rather than merely unlikely.
 | **Target use case** | Deterministic backend services, compliance CRUD, LLM-written agents | General-purpose systems: kernels, browsers, databases, embedded | Cloud-native services, DevOps tooling | AI/ML-first, Python-compatible kernels for CPU/GPU |
 | **Memory management** | Affine ownership (`box`/`&`), single-owner heap, no GC | Ownership + borrowing + lifetimes, no GC in safe code | Tracing GC | Ownership/borrowing (Rust-inspired) + Python dynamic layer |
 | **Data-race freedom** | Static — no shared mutable state, no aliasing | Static — borrow checker rules them out | Not statically guaranteed (`go test -race` is dynamic-only) | Not yet fully guaranteed |
-| **Deadlock freedom** | Proof-by-construction — no locks in the language at all | Possible — `Mutex`/`Condvar`/async can deadlock | Possible — channels + `sync.Mutex` can deadlock | Not a current guarantee |
+| **Deadlock freedom** | Lock-ordering: proof-by-construction (no mutex primitive at all). `recv`/`join`: real runtime detection — a `join`-cycle or every live thread simultaneously blocked traps immediately with a diagnostic, not full static prevention | Possible — `Mutex`/`Condvar`/async can deadlock | Possible — channels + `sync.Mutex` can deadlock; the runtime detects only the case where *every* goroutine is asleep, not a partial deadlock among some of them | Not a current guarantee |
 | **LLM writability** | LL(1) grammar exported to GBNF for constrained decoding; structured JSON diagnostics | LLMs default to Python 90–97% of the time; Rust's API churn compounds it | Easy to generate syntactically; no constrained decoding or proof obligations built in | Easy for Python-like snippets; no published GBNF/constrained-decoding integration |
 | **Maturity** | 2-day-old public research prototype | Production-ready, decade of hardening | Production-ready, huge ecosystem | Pre-1.0, stabilizing |
 
@@ -266,8 +269,19 @@ the planned answer).
   handle that goes out of scope unstopped still kills its process (no
   zombies) — deterministic cleanup, not discipline-dependent.
 
-There is no mutex in the language; a deadlock is not *expressible*. Hot
-paths that want shared-memory locks get re-cast as messages.
+There is no mutex in the language, so a *lock-ordering* deadlock is not
+expressible at all. Hot paths that want shared-memory locks get re-cast as
+messages — but messages have their own deadlock shape (a `recv` nobody
+ever `send`s to, two threads mutually `join`ing each other), and that one
+*is* expressible. `interpreter::DeadlockRegistry` catches it at runtime
+instead: a `join`-cycle is detected precisely (a real wait-for graph over
+`join` edges); a `recv` gets a coarser, still-sound fallback (every live
+thread simultaneously blocked — the same condition Go's own runtime
+deadlock detector checks, generalized to also catch a `join`-cycle
+mid-program, which Go's whole-process-only check misses). The one
+disclosed gap: a `recv` blocked forever while some *other*, unrelated
+thread stays busy on its own work is invisible to the coarse check — that
+would need real points-to tracking of channel handles, not attempted.
 
 ### Effects (rows 4, 9)
 `effect(...)` annotations are **fully inferred by default** (no notation

@@ -183,6 +183,27 @@ generate *valid* Nirdosha on the first try.
     stray `/` where a top-level item or expression was expected. Use
     `//` for every comment, including multi-line ones (one `//` per
     line — there's no multi-line comment syntax at all).
+12. **A `fn` with neither `requires(...)` nor a `VerifiedIdentity`
+    parameter compiles fine but now produces a warning** — `nirdosha
+    serve`/`emit-ui` will print
+    `warning: '<name>' has no requires(...) and takes no VerifiedIdentity
+    parameter — it will be callable by anyone with no token at all once
+    served` for every such function, because that's exactly what
+    happens once it's actually served. This is **not a compile error** —
+    the code still runs — but a clean paste-anywhere response shouldn't
+    produce unexplained warnings either. Two ways to make one go away,
+    depending on what you actually mean:
+    - It's genuinely meant to require a role/claim: add
+      `requires(role: "...")` / `requires(claim: "...", "...")` (rule 8's
+      `acquire`/privileged-function mechanism kicks in the moment you do).
+    - It's *meant* to be open to anyone with no token at all (a health
+      check, a public product catalog read): add `requires(public)` —
+      a third, real `requires(...)` kind that silences the warning
+      *without* gating the function the way `role`/`claim` do (it stays
+      exactly as directly callable as before; no `acquire` needed).
+      There is no default third option — every `fn` with no `requires(...)`
+      at all is exactly this "open" case, the warning just makes that
+      visible instead of silent.
 
 ## Quick reference: wrong vs. right
 
@@ -299,6 +320,16 @@ total = total + i
 /* a block comment */
 // RIGHT -- // is the only comment syntax, one per line
 // a comment
+```
+
+**Ungated function warning (rule 12 — not a compile error, but check it)**
+```nirdosha
+// COMPILES, BUT WARNS -- "callable by anyone with no token at all"
+fn list_product() -> Result(json, ErrorCode) { ... }
+// RIGHT -- say which one you meant
+fn list_product() -> Result(json, ErrorCode) requires(public) { ... }
+// or, if it should actually be restricted:
+fn list_product() -> Result(json, ErrorCode) requires(role: "staff") { ... }
 ```
 
 **`db_query`'s array result (a silent *runtime* bug, not a compile
@@ -476,7 +507,12 @@ let result: i64 = join(t)                 // blocks, consumes the handle
 
 let c: chan i64 = chan
 send(c, 42)                                // never blocks
-let v: i64 = recv(c)                       // blocks until a value arrives
+let v: i64 = recv(c)                       // blocks until a value arrives -- if
+                                            // it can PROVABLY never arrive (nothing
+                                            // left running to ever send, or two
+                                            // threads `join`-cycle each other), this
+                                            // traps with a clear deadlock error
+                                            // instead of hanging forever
 
 let s: sandbox = sandbox worker(args)      // real separate OS process
 let code: i64 = stop(s)                    // kills if still running
@@ -552,7 +588,11 @@ let price: i64 = match db_query(conn, "SELECT price_cents FROM item WHERE id = ?
 gates the function's *value*, not just its behavior — you cannot call
 it or take its value directly. The only way to get a callable value is
 `acquire transfer(proof)` where `proof` is a `RoleView`/`ClaimView`
-from `check_role`/`extract_claim`.
+from `check_role`/`extract_claim`. A third `requires(...)` kind,
+`requires(public)`, does the opposite — it does **not** gate the
+function (no `acquire` needed, callable exactly as normally) and exists
+purely to silence rule 12's warning on a `fn` you're deliberately
+leaving open to anyone.
 
 **Print**: `print(x)` — any number of args, any scalar type.
 
@@ -583,7 +623,9 @@ fn list_product_inner(conn: db) -> Result(json, ErrorCode) {
     return rows
 }
 
-fn list_product() -> Result(json, ErrorCode) {
+// requires(public) -- this is a deliberately open catalog read, not an
+// oversight; silences rule 12's warning without gating the function.
+fn list_product() -> Result(json, ErrorCode) requires(public) {
     return match db_connect("store.db") {
         Ok(conn) => list_product_inner(conn),
         Err(e) => Err(DbError(e)),
@@ -600,7 +642,11 @@ fn create_product(p: Product) -> Result(i64, ErrorCode) requires(role: "admin") 
     }
 }
 
-fn main() {
+// requires(public) here too -- main() itself is routable once served,
+// same rule 12 reasoning; it's a trivial placeholder in this example
+// (`build`/`run`/`serve` all need SOME fn main() to exist), not
+// something a real caller needs to invoke.
+fn main() requires(public) {
     print("ready")
 }
 ```
@@ -669,7 +715,12 @@ I'll describe what I want in plain language. Respond with:
    wrote any comments, confirm every single one uses `//` — no `/* */`
    anywhere. If you read a single row out of a `db_query` result,
    confirm you called `json_array_get(rows, 0)` before `json_get_*` —
-   skipping that compiles fine and fails silently.
+   skipping that compiles fine and fails silently. Go through every
+   `fn` you wrote and confirm each one has `requires(role/claim: ...)`,
+   `requires(public)`, or takes a `VerifiedIdentity` parameter — rule
+   12's warning, not a compile error, but every function in your output
+   should end up in exactly one of those three buckets on purpose, not
+   by omission.
 4. A one-line reminder that this hasn't been run through the real
    compiler — I should verify with
    `nirdosha emit-ui file.nir -o /tmp/out.html` (typecheck-only, no

@@ -822,15 +822,122 @@ of Track B has landed.*
     function's return value) — Tier 2b itself, the repair loop, and
     row-level ACL remain exactly as `[OPEN]` as before this item. Full
     design detail: `API_TRUST_MODEL.md` §7.5.
-- `[OPEN]` **A12a. Extend the extraction schema with `implements:
-  [fn_name, ...]` on a user story** — the single concrete next step for
-  user-story-level Tier 1 (parked here, not forgotten: A12 above
-  identified it as the one missing binding, not a `contract_check.rs`
-  design gap). Scope: one new field in
-  `scratch/prompt_v2.txt`/`extraction_schema::ExtractedUserStory`
-  (`#[serde(default)]` already in place on the Rust side, so this is a
-  prompt-side change plus dropping the default once real data flows) —
-  no compiler-side work beyond that field landing with real values.
+- `[DONE]` **A12a. Extend the extraction schema with `implements:
+  [fn_name, ...]` on a user story** — the concrete next step A12
+  identified, now shipped. `scratch/prompt_v2.txt`'s `UserStory` schema
+  gained `implements` (bound to a real `.nir` `fn`), plus, folded into
+  the same pass since A13 below needed related fields anyway:
+  `required_role` (a literal role token distinct from
+  `required_permission`'s prose label) and `input_fields` (typed
+  `{field, type}` entries — what makes a story renderable as an actual
+  form, mirroring `Workflow.data`'s existing shape).
+  `extraction_schema::ExtractedUserStory` updated to match, all three
+  fields `#[serde(default)]` so `scratch/extracted_typed_v1.json` (which
+  predates every one of them) still deserializes unchanged — verified by
+  `compiler/tests/extraction_schema_new_fields.rs`'s dedicated
+  backward-compatibility test, plus the existing
+  `extracted_typed_v1_verification.rs` suite reverified green with no
+  changes needed. Still `[OPEN]`, unchanged: nothing in `contract_check.rs`
+  consumes `implements` yet — the field exists and validates, but no
+  extraction has populated it with real data yet, so user-story-level
+  Tier 1 checking (§7.5) isn't exercised end-to-end.
+- `[OPEN]` **A13. Workflow state ownership + a generated "my queue" UI —
+  proposed, not built.** Surfaced by a direct question: does today's
+  `workflow`/extraction schema even carry *who owns a state* (e.g.
+  which users are the "two eyes" in six-eyes) or *where the UI is* for a
+  user to see/act on their pending items? Verified directly: no —
+  `ast::StateDecl` has no owner field, `ui_gen.rs` has zero references
+  to `WorkflowDecl`, and the one hand-written approval screen
+  `trade_finance.nir` actually ships is a read-only list gated to a
+  single fixed role with no decide action at all (it doesn't even use
+  `workflow{}` — a separate, older, hand-rolled mechanism). Full proposed
+  design — grammar (`owner: role(...)` on `state`), runtime enforcement
+  (`advance_<workflow>` gains an `identity` param, checked against the
+  *current instance's* live state, not a static per-function gate),
+  a generated `list_<workflow>_pending_for_me` read side, and a new
+  per-row-action-set UI screen archetype (`ui_gen.rs` has no precedent
+  for this shape today) — written up in `WORKFLOW.md`'s new "Proposed,
+  not built" section, including the one thing this design explicitly
+  does **not** solve: `owner` alone models a single decider
+  (Maker-Checker), not a quorum (six-eyes' "2 *distinct* holders of a
+  role"), which needs either new transition-level grammar or keeping
+  quorum counting in a hand-rolled table the way it works today. The
+  extraction schema's `owner_role`/`owner_claim`/`label`/
+  `required_decisions` (per `state`, `ExtractedState`) are the *data*
+  half of this, shipped now (`scratch/prompt_v2.txt`,
+  `extraction_schema.rs`, both with worked examples distinguishing a
+  no-owner automatic state from an owned single-decider one from an
+  owned quorum one) — the compiler-side grammar/runtime/UI work
+  `WORKFLOW.md` describes is the rest, genuinely not started.
+- `[DONE]` **A14. Real runtime deadlock detection for `chan`/`thread`
+  (`interpreter::DeadlockRegistry`) — closes a real gap between what
+  README.md/goal.md claimed ("no deadlocks... proof by construction...
+  an agent literally cannot generate a deadlock") and what the compiler
+  actually did.** Found and verified directly, not assumed: a fully
+  well-typed, cleanly-typechecking program —
+  `fn main() -> i64 { let c: chan i64 = chan; return recv(c) }` — hung
+  the process forever, with zero diagnostic, before this landed.
+  `PHASE0.md`'s own "Twelfth update" already disclosed this honestly
+  internally ("the *proof-by-construction* claim isn't fully earned
+  yet") — README.md's/goal.md's user-facing claims didn't carry that
+  caveat.
+  - **What's real now**: a `join`-cycle (two or more threads mutually
+    `join`-ing each other) is detected *precisely* — an exact wait-for
+    graph over `join` edges, since `join`'s argument always names one
+    specific target thread. A `recv` with no possible sender gets a
+    coarser, still-sound fallback: if *every* thread this run knows
+    about (`main` plus every currently-live `spawn`ed thread) is
+    simultaneously blocked on `recv`/`join`, none of them can ever run
+    code again, so none could ever call `send` — the same condition
+    Go's own runtime deadlock detector checks (`"fatal error: all
+    goroutines are asleep"`), generalized here to also catch a
+    same-process `join`-cycle mid-program, which Go's whole-process-only
+    check misses. Either case traps with a clear, structured
+    `ErrorKind::Deadlock` instead of hanging — `serve.rs`/`main.rs`
+    surface it exactly like any other runtime error, no special-casing
+    needed.
+  - **What's still honestly open, named rather than implied solved**: a
+    `recv` blocked forever while some *other*, unrelated live thread
+    stays busy on its own work (never touches that channel, never
+    finishes) is invisible to the coarse check — real detection there
+    would need points-to tracking of channel handles (freely copyable,
+    per `SANDBOXING.md`), not attempted. README.md/`WORKFLOW.md`'s
+    "Proposed, not built" framing elsewhere in this file is the model
+    for how this gap is disclosed, not silently dropped.
+  - **Two real correctness bugs found and fixed during construction, both
+    caught by this file's own test suite going red, not by inspection**:
+    (1) registering a spawned thread as "live" *inside its own closure*
+    raced against the parent immediately calling `recv`/`join` — fixed
+    by registering synchronously in the *parent*, right after
+    `std::thread::spawn` returns (a `JoinHandle`'s `ThreadId` is valid
+    the instant `spawn` returns, before the child's closure has
+    necessarily started). (2) a single check-before-blocking design
+    could still miss a deadlock that only finished forming *after* a
+    thread had already committed to a real, unstoppable OS wait (no
+    timed variant exists for `JoinHandle::join`) — fixed by converting
+    both `recv` and `join` into short poll loops (`DEADLOCK_POLL_
+    INTERVAL`, 10ms) that periodically re-check instead of blocking
+    unconditionally forever, with `try_recv`/`is_finished` fast paths so
+    an ordinary, already-resolved `recv`/`join` never touches the
+    registry at all (verified necessary: without the fast paths, a
+    same-thread `send` then `recv` was itself falsely flagged).
+  - Verified: new `compiler/tests/deadlock.rs` (6 tests — the two real
+    deadlock shapes, both resolving in a bounded-time harness rather
+    than risking a hung `cargo test`; four false-positive guards
+    including a 20-iteration repeat of the exact race this session hit
+    and a genuinely slow producer that legitimately spans several poll
+    cycles). Full existing concurrency suite (`concurrency.rs`,
+    `channels.rs`, `sandbox_channels.rs`) reverified green, repeated 15x
+    with no flakiness after the fix (the pre-fix version reliably
+    reintroduced the exact intermittent failures described above). Full
+    `cargo test` reverified green, repeated 4x. `README.md`'s deadlock-
+    freedom claims (the row-3 requirements table, the "no mutex" pitch
+    paragraph, the comparison-matrix row, and the concurrency section)
+    all corrected to the precise, now-true claim instead of the
+    overstated one — `goal.md`/`PHASE0.md` deliberately left as-is
+    (frozen design/historical-journal docs, not status trackers — this
+    file is where current status belongs, per this file's own stated
+    convention).
 
 ---
 

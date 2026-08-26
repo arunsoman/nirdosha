@@ -42,7 +42,7 @@
 //! statement list. `Signal` is what carries that: every `eval_expr` site
 //! propagates it with `?`, and only `call()` catches `Signal::Return`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -366,6 +366,39 @@ impl ChannelInner {
         }
     }
 
+    /// A cheap, best-effort peek used only to decide whether a blocking
+    /// `recv` is even eligible for `DeadlockRegistry`'s in-process check
+    /// — a `Socket`-backed channel (crossed into a `sandbox`) can always,
+    /// in principle, still be woken by that *external* process regardless
+    /// of what any Nirdosha thread is doing, so treating it as part of
+    /// the in-process whole-universe check would be a real false
+    /// positive, not just imprecision. Not synchronized with the
+    /// subsequent `recv()` call (state could transition in between) —
+    /// the same narrow, pre-existing race `prepare_for_sandbox`'s own doc
+    /// comment already accepts, not made meaningfully worse here.
+    fn is_in_memory(&self) -> bool {
+        matches!(&*self.state.lock().unwrap(), TransportState::InMemory(_))
+    }
+
+    /// Non-blocking: pops a value if one's already queued, otherwise
+    /// returns `None` immediately without ever touching the `Condvar`.
+    /// The deadlock-detection fast path (`Expr::Recv`'s handler) —
+    /// `send(c, v); recv(c)` in the *same* thread must never be flagged
+    /// as blocked at all, since it demonstrably isn't (the value's
+    /// already sitting in the queue); only calling `check_and_register`
+    /// when a real wait is actually about to happen is what keeps that
+    /// sound. Only meaningful for `InMemory` — a socket-backed channel
+    /// doesn't get a non-blocking peek here (not needed: `Expr::Recv`
+    /// only calls this after `is_in_memory()` already confirmed the
+    /// transport).
+    fn try_recv(&self) -> Option<Value> {
+        let mut state = self.state.lock().unwrap();
+        match &mut *state {
+            TransportState::InMemory(queue) => queue.pop_front(),
+            _ => None,
+        }
+    }
+
     fn recv(&self) -> std::io::Result<Value> {
         let mut state = self.state.lock().unwrap();
         loop {
@@ -380,6 +413,35 @@ impl ChannelInner {
                 TransportState::Socket(stream) => return read_value(stream),
                 TransportState::PendingListener(..) => unreachable!("ensure_connected already resolved this"),
             }
+        }
+    }
+
+    /// Same as `recv`, but gives up (returning `Ok(None)`) after `timeout`
+    /// instead of waiting indefinitely — `Expr::Recv`'s deadlock-detection
+    /// poll loop uses this so a thread blocked here periodically comes
+    /// back up for air and re-checks `DeadlockRegistry` for a *newly*
+    /// formed deadlock, not just the one snapshot taken the instant it
+    /// first blocked. Only ever called on the `InMemory` transport (see
+    /// `Expr::Recv`'s own `is_in_memory` gate) — `ensure_connected`/
+    /// `Socket` are unreachable here in practice, kept only so this
+    /// doesn't have to duplicate `recv`'s own transport `match`.
+    fn recv_timeout(&self, timeout: std::time::Duration) -> std::io::Result<Option<Value>> {
+        let mut state = self.state.lock().unwrap();
+        Self::ensure_connected(&mut state)?;
+        match &mut *state {
+            TransportState::InMemory(queue) => {
+                if let Some(v) = queue.pop_front() {
+                    return Ok(Some(v));
+                }
+                let (mut state, _timeout_result) = self.not_empty.wait_timeout(state, timeout).unwrap();
+                if let TransportState::InMemory(queue) = &mut *state {
+                    Ok(queue.pop_front())
+                } else {
+                    Ok(None)
+                }
+            }
+            TransportState::Socket(stream) => read_value(stream).map(Some),
+            TransportState::PendingListener(..) => unreachable!("ensure_connected already resolved this"),
         }
     }
 }
@@ -399,6 +461,215 @@ impl Drop for ChannelInner {
         if let TransportState::PendingListener(_, path) = state {
             let _ = std::fs::remove_file(path);
         }
+    }
+}
+
+/// Real, sound runtime deadlock detection for `chan`/`thread` —
+/// README.md's "no deadlock is expressible" claim was only ever true for
+/// *lock-ordering* deadlock (there's no mutex primitive in the language
+/// at all, so nothing to acquire out of order). A `recv` with no
+/// corresponding `send`, or two threads mutually `join`-ing each other,
+/// both compiled and typechecked fine and hung the process forever, with
+/// zero diagnostic, before this existed — verified directly: `fn main()
+/// -> i64 { let c: chan i64 = chan; return recv(c) }` typechecks and then
+/// never returns. This doesn't make deadlock *inexpressible* (a `while
+/// true {}` busy-loop still is one, and this can't see a `recv` blocked
+/// forever while some *other*, unrelated thread stays busy doing
+/// something else entirely — seen below) — it turns every deadlock this
+/// *can* prove is permanent into a clean `ErrorKind::Deadlock` trap
+/// instead of a silent hang, the same "never guess, fail loud" shape
+/// `TransactCommitPending`/`WorkflowActionPending` already use for a
+/// different class of permanently-stuck state.
+///
+/// **What's actually proven, and why it's sound (never a false
+/// positive):**
+/// - `join`-cycles are checked *precisely*: `join`'s argument names
+///   exactly one target thread, so a real wait-for graph over `Join`
+///   edges is exact, not an approximation. A → B → A (or any longer
+///   cycle) is a mathematical certainty of permanent deadlock the
+///   instant the closing edge is added — nothing else in the program
+///   could ever break it, so reporting it immediately is sound.
+/// - `recv` gets a coarser fallback, for a real reason: a `chan` handle
+///   is freely copyable (`SANDBOXING.md`), so precisely *which* thread(s)
+///   could still legally `send` on a given channel is, in general, an
+///   alias-analysis problem this doesn't attempt. Instead: if *every*
+///   thread this registry knows about (`main` plus every currently-live
+///   `spawn`ed thread) is *simultaneously* blocked on `recv`/`join`, none
+///   of them can ever run code again, which means none of them can ever
+///   call `send` — a real, sound conclusion (the same "all goroutines are
+///   asleep" condition Go's own runtime detector checks), just reached
+///   without needing to know *which* thread would have sent.
+/// - **The disclosed gap**: a `recv` blocked forever while some *other*
+///   live thread stays busy on unrelated work (never touches this
+///   channel, never finishes) is invisible to the whole-universe check —
+///   that thread isn't blocked, so the universe isn't "all blocked," even
+///   though the `recv` in question is, in fact, permanently stuck. Precise
+///   detection of that case needs real points-to tracking of channel
+///   handles, not built here. Named so it isn't mistaken for solved.
+///
+/// One registry per top-level program run — shared into every
+/// `Expr::Spawn`-created child's own `Interpreter` via `Arc::clone`, the
+/// same pattern `tracer`/`sandbox_exe` already use — never across two
+/// independent runs (e.g. two concurrent `nirdosha serve` requests), each
+/// of which gets its own fresh registry from `Interpreter::new`.
+struct DeadlockRegistry {
+    /// **Not** captured at registry construction — `Interpreter::new`
+    /// (and so `DeadlockRegistry::new`) often runs on a throwaway setup
+    /// thread, not the thread that actually executes `.nir` code:
+    /// `run_main_on_big_stack`/`call_named_on_big_stack` construct the
+    /// interpreter on the *caller's* thread but then move it into a
+    /// freshly `std::thread::spawn`ed worker with a bigger stack
+    /// (`run_on_big_stack`) before ever calling `main`/the named
+    /// function — verified the hard way: capturing this at construction
+    /// made a plain `recv(chan)`-with-no-`send` program still hang
+    /// forever, silently, because `std::thread::current().id()` at
+    /// `new()` time never matched the id `check_and_register` later saw.
+    /// Set instead by `Interpreter::run_main`/`call_named` — the two
+    /// entry points a genuine top-level run always goes through and
+    /// `Expr::Spawn`'s own handler never does (it calls the lower-level
+    /// `Interpreter::call` directly) — the first time either actually
+    /// runs, on whichever real OS thread that turns out to be.
+    main_thread_id: std::sync::OnceLock<std::thread::ThreadId>,
+    /// Spawned threads currently alive — inserted at the top of
+    /// `Expr::Spawn`'s closure, removed once it returns. Doesn't include
+    /// `main_thread_id`; the whole-universe check adds that separately.
+    live_spawned: Mutex<HashSet<std::thread::ThreadId>>,
+    /// Every thread (main or spawned) currently blocked on `recv`/`join`,
+    /// and what it's waiting on.
+    blocked: Mutex<HashMap<std::thread::ThreadId, BlockedOn>>,
+}
+
+/// How often a thread blocked on `recv`/`join` comes back up for air to
+/// re-check `DeadlockRegistry` for a deadlock that's formed *since* it
+/// first blocked — not just the one snapshot taken the instant it
+/// committed to waiting. Verified necessary, not just theoretical: a
+/// single check-then-block-forever design missed exactly this case (two
+/// threads deadlocked on each other while a third was still blocking on
+/// a `recv` no one would ever satisfy — by the time the third thread's
+/// *own* wait began, the first two hadn't finished unwinding yet, so its
+/// one-shot check legitimately saw "not everyone's blocked yet" and
+/// committed to a real, otherwise-unstoppable wait). Small enough that a
+/// real deadlock surfaces promptly; large enough that polling overhead on
+/// an ordinary, long-lived `recv`/`join` is not meaningfully different
+/// from a true blocking wait.
+const DEADLOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+#[derive(Debug, Clone, Copy)]
+enum BlockedOn {
+    /// Blocked in `recv` — *which* channel isn't tracked; see
+    /// `DeadlockRegistry`'s own doc comment for why (alias analysis).
+    Recv,
+    /// Blocked joining a specific thread — a precise edge, unlike `Recv`.
+    Join(std::thread::ThreadId),
+}
+
+impl DeadlockRegistry {
+    fn new() -> Self {
+        DeadlockRegistry {
+            main_thread_id: std::sync::OnceLock::new(),
+            live_spawned: Mutex::new(HashSet::new()),
+            blocked: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Idempotent — safe to call more than once (e.g. `run_main` calling
+    /// `self.call(...)`, which never itself calls this). Only the first
+    /// call on any given registry actually sets anything.
+    fn mark_main_thread(&self) {
+        self.main_thread_id.get_or_init(|| std::thread::current().id());
+    }
+
+    /// Registers `id` as live — called by the *parent*, synchronously,
+    /// immediately after `std::thread::spawn` returns, using the new
+    /// `JoinHandle`'s own `.thread().id()`. **Must not** be done by
+    /// having the *child* register itself as its first action instead —
+    /// verified the hard way: `std::thread::spawn` returning in the
+    /// parent doesn't mean the child's closure has started running yet,
+    /// so a parent that immediately calls `recv`/`join` after spawning
+    /// can (and, under real scheduling, sometimes does) run its own
+    /// `check_and_register` before the child ever reaches a
+    /// self-registering line — the exact race that made ordinary,
+    /// correct `spawn` + `recv` programs intermittently report a false
+    /// deadlock. A `JoinHandle`'s `ThreadId` is assigned at OS thread-
+    /// creation time, available synchronously the instant `spawn`
+    /// returns, which is what makes registering here race-free.
+    fn spawn_started(&self, id: std::thread::ThreadId) {
+        self.live_spawned.lock().unwrap().insert(id);
+    }
+
+    fn spawn_finished(&self) {
+        self.live_spawned.lock().unwrap().remove(&std::thread::current().id());
+    }
+
+    /// Registers the current thread as about to block on `on`, then
+    /// checks whether that provably makes the situation permanent (see
+    /// the two checks in this type's own doc comment). On `Err`, the
+    /// current thread's own registration is removed again (it's not
+    /// actually going to block — it's about to return this error
+    /// instead) and the caller must **not** proceed to the real,
+    /// potentially-blocking call. Any *other* thread named in the
+    /// returned message is left registered as blocked — accurate, not
+    /// stale, since a thread genuinely inside an unresolvable `recv`/
+    /// `join` wait will never call this registry again to say otherwise.
+    /// On `Ok(())`, the registration stays in place and the caller must
+    /// call `unblock` once its real wait returns.
+    fn check_and_register(&self, on: BlockedOn) -> Result<(), String> {
+        let me = std::thread::current().id();
+        let mut blocked = self.blocked.lock().unwrap();
+        blocked.insert(me, on);
+
+        // Precise check: does `me`'s new `Join` edge close a cycle?
+        // Sound to report immediately — the newest edge is the only way
+        // a cycle could have just formed, and once one exists nothing in
+        // the program can ever break it.
+        let mut path = vec![me];
+        let mut visited: HashSet<_> = std::iter::once(me).collect();
+        let mut cursor = me;
+        let cycle = loop {
+            match blocked.get(&cursor).copied() {
+                Some(BlockedOn::Join(target)) => {
+                    if !visited.insert(target) {
+                        let start = path.iter().position(|&t| t == target).unwrap();
+                        break Some(path[start..].to_vec());
+                    }
+                    path.push(target);
+                    cursor = target;
+                }
+                _ => break None,
+            }
+        };
+        if let Some(cycle) = cycle {
+            blocked.remove(&me);
+            let chain = cycle.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(" -> ");
+            return Err(format!(
+                "deadlock: {} thread(s) waiting on each other via `join`, in a cycle: {chain} -> {:?}",
+                cycle.len(),
+                cycle[0]
+            ));
+        }
+
+        // Coarse fallback: is *everyone* this registry knows about now
+        // blocked? See the type's own doc comment for why this is sound
+        // and what it deliberately doesn't catch.
+        let mut universe: HashSet<_> = self.live_spawned.lock().unwrap().iter().copied().collect();
+        // Falls back to treating `me` as main if somehow never set (should
+        // never happen for a real top-level run — see this field's own
+        // doc comment) — sound either way: worst case this just narrows
+        // the universe by one thread that was going to be `me` regardless.
+        universe.insert(*self.main_thread_id.get().unwrap_or(&me));
+        if universe.iter().all(|t| blocked.contains_key(t)) {
+            blocked.remove(&me);
+            return Err(format!(
+                "deadlock: all {} live thread(s) are permanently blocked on `recv`/`join`, none left running to ever unblock any of them",
+                universe.len()
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn unblock(&self) {
+        self.blocked.lock().unwrap().remove(&std::thread::current().id());
     }
 }
 
@@ -800,6 +1071,14 @@ pub enum ErrorKind {
     /// stuck — `state` names which case by naming the state whose
     /// actions were running.
     WorkflowActionPending { instance_id: i64, state: String, action: String },
+    /// `DeadlockRegistry::check_and_register` proved a `recv`/`join`
+    /// could never resolve — see that type's own module doc for exactly
+    /// what's proven (a real `join`-cycle, or every live thread
+    /// simultaneously blocked) versus what's a disclosed gap (a `recv`
+    /// blocked forever alongside an unrelated thread that's still busy).
+    /// A structured trap, never a silent hang — `ROADMAP.md`'s
+    /// deadlock-detection entry.
+    Deadlock { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -881,6 +1160,7 @@ impl std::fmt::Display for RuntimeError {
                 "{line}:{col}: workflow instance {instance_id}, state `{state}`: action `{action}` has not \
                  succeeded (retries exhausted)"
             ),
+            ErrorKind::Deadlock { message } => write!(f, "{line}:{col}: {message}"),
         }
     }
 }
@@ -3103,6 +3383,17 @@ pub struct Interpreter {
     /// overrides it via `with_workflow_log_path`/`--workflow-log <path>`.
     workflow_log_path: std::path::PathBuf,
     workflow_log_cell: std::cell::OnceCell<Arc<WorkflowLog>>,
+    /// Real deadlock detection for this program run's `chan`/`thread`
+    /// use — see `DeadlockRegistry`'s own doc comment for what's actually
+    /// proven. `Interpreter::new`'s default is a fresh, empty registry
+    /// (correct for a standalone run that never spawns); `Expr::Spawn`'s
+    /// handler overwrites a *child* interpreter's copy with
+    /// `Arc::clone(&self.deadlock_registry)` immediately after
+    /// construction, the same "cheap-`Arc::clone` into every spawned
+    /// thread's own fresh `Interpreter`" pattern `tracer`/`sandbox_exe`
+    /// already use — never a `pub` builder, since nothing outside this
+    /// file's own `Expr::Spawn` handler should ever inject one.
+    deadlock_registry: Arc<DeadlockRegistry>,
 }
 
 /// Past this many nested `call()`s, fail cleanly instead of overflowing
@@ -3262,7 +3553,15 @@ impl Interpreter {
             transact_log_cell: std::cell::OnceCell::new(),
             workflow_log_path: default_workflow_log_path(),
             workflow_log_cell: std::cell::OnceCell::new(),
+            deadlock_registry: Arc::new(DeadlockRegistry::new()),
         }
+    }
+
+    /// Not `pub` — see `deadlock_registry`'s own doc comment for why only
+    /// `Expr::Spawn`'s handler, in this same file, ever calls this.
+    fn with_deadlock_registry(mut self, registry: Arc<DeadlockRegistry>) -> Self {
+        self.deadlock_registry = registry;
+        self
     }
 
     pub fn with_sandbox_exe(mut self, path: std::path::PathBuf) -> Self {
@@ -3300,6 +3599,10 @@ impl Interpreter {
     }
 
     pub fn run_main(&self) -> Result<Value, RuntimeError> {
+        // Always the real top-level entry point for a root interpreter's
+        // execution thread — see `DeadlockRegistry::main_thread_id`'s doc
+        // comment for why this can't be captured any earlier.
+        self.deadlock_registry.mark_main_thread();
         let span = Span { line: 0, col: 0 };
         self.call("main", &[], span)
     }
@@ -3322,6 +3625,7 @@ impl Interpreter {
     /// `run_main` already uses one — there's no real call-site source
     /// position for "the CLI asked for this."
     pub fn call_named(&self, name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+        self.deadlock_registry.mark_main_thread();
         self.call(name, args, Span { line: 0, col: 0 })
     }
 
@@ -4956,6 +5260,13 @@ impl Interpreter {
                     let tracer = self.tracer.clone();
                     let name = name.clone();
                     let call_span = *span;
+                    // Same `Arc::clone` pattern as `tracer`/`sandbox_exe`
+                    // above — the child shares the *same* registry, not a
+                    // fresh one, so a `join`-cycle or "everyone's blocked"
+                    // condition spanning parent and child is actually
+                    // visible (see `DeadlockRegistry`'s doc comment).
+                    let deadlock_registry = Arc::clone(&self.deadlock_registry);
+                    let deadlock_registry_child = Arc::clone(&deadlock_registry);
                     let handle = std::thread::spawn(move || {
                         let mut interp = Interpreter::new(program, source);
                         if let Some(exe) = sandbox_exe {
@@ -4964,8 +5275,20 @@ impl Interpreter {
                         if let Some(t) = tracer {
                             interp = interp.with_tracer(t);
                         }
-                        interp.call(&name, &vals, call_span)
+                        interp = interp.with_deadlock_registry(Arc::clone(&deadlock_registry_child));
+                        let result = interp.call(&name, &vals, call_span);
+                        deadlock_registry_child.spawn_finished();
+                        result
                     });
+                    // Registered here, synchronously in the *parent*,
+                    // right after `spawn` returns — not inside the
+                    // child's own closure. See `DeadlockRegistry::
+                    // spawn_started`'s doc comment for the race this
+                    // avoids: counts as "live" (part of the whole-
+                    // universe check) from this instant, for as long as
+                    // it could still possibly call `send`, not just while
+                    // it's actually inside a recv/join.
+                    deadlock_registry.spawn_started(handle.thread().id());
                     Ok(Value::Thread(Arc::new(Mutex::new(Some(handle)))))
                 },
                 outcome_of_signal_result,
@@ -4987,21 +5310,73 @@ impl Interpreter {
                             let handle = slot.lock().unwrap().take();
                             match handle {
                                 None => Err(Signal::Err(RuntimeError { kind: ErrorKind::AlreadyJoined, span: *span })),
-                                Some(h) => match h.join() {
-                                    Ok(Ok(result)) => Ok(result),
-                                    Ok(Err(runtime_err)) => Err(Signal::Err(runtime_err)),
-                                    Err(panic_payload) => {
-                                        let message = panic_payload
-                                            .downcast_ref::<&str>()
-                                            .map(|s| s.to_string())
-                                            .or_else(|| panic_payload.downcast_ref::<String>().cloned())
-                                            .unwrap_or_else(|| "(no message)".to_string());
-                                        Err(Signal::Err(RuntimeError {
-                                            kind: ErrorKind::ThreadPanicked { message },
-                                            span: *span,
-                                        }))
+                                Some(h) => {
+                                    let finish = |h: ThreadHandle| match h.join() {
+                                        Ok(Ok(result)) => Ok(result),
+                                        Ok(Err(runtime_err)) => Err(Signal::Err(runtime_err)),
+                                        Err(panic_payload) => {
+                                            let message = panic_payload
+                                                .downcast_ref::<&str>()
+                                                .map(|s| s.to_string())
+                                                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                                                .unwrap_or_else(|| "(no message)".to_string());
+                                            Err(Signal::Err(RuntimeError { kind: ErrorKind::ThreadPanicked { message }, span: *span }))
+                                        }
+                                    };
+                                    // Fast path: a thread that already
+                                    // finished makes `.join()` return
+                                    // near-instantly — registering that as
+                                    // "blocked" at all would falsely flag
+                                    // completely ordinary "spawn, do other
+                                    // work, join later" code.
+                                    if h.is_finished() {
+                                        return finish(h);
                                     }
-                                },
+                                    let target_id = h.thread().id();
+                                    // Poll rather than a single check-then-
+                                    // block-forever — see `DEADLOCK_POLL_
+                                    // INTERVAL`'s doc comment: a deadlock
+                                    // among *other* threads can finish
+                                    // forming after this thread already
+                                    // committed to waiting, and `join` (a
+                                    // real `JoinHandle::join`) has no
+                                    // timed variant to fall back on the
+                                    // way `recv_timeout` gives `Expr::Recv`
+                                    // — so instead of one blocking call,
+                                    // this loop *is* the wait, checked
+                                    // between short sleeps.
+                                    loop {
+                                        if h.is_finished() {
+                                            return finish(h);
+                                        }
+                                        // Registered against the real
+                                        // target's own `ThreadId` — a
+                                        // precise edge, unlike `recv`'s
+                                        // coarser one (see
+                                        // `DeadlockRegistry`'s doc
+                                        // comment).
+                                        if let Err(message) = self.deadlock_registry.check_and_register(BlockedOn::Join(target_id)) {
+                                            // Race guard, same reasoning as
+                                            // `Expr::Recv`'s own: the check
+                                            // itself takes real time, during
+                                            // which the target can finish.
+                                            // `check_and_register`'s `Err`
+                                            // path already removed this
+                                            // thread's own registration.
+                                            if h.is_finished() {
+                                                return finish(h);
+                                            }
+                                            // A proven-permanent deadlock
+                                            // can never resolve — drop
+                                            // detaches the OS thread instead
+                                            // of hanging this one on it too.
+                                            drop(h);
+                                            return Err(Signal::Err(RuntimeError { kind: ErrorKind::Deadlock { message }, span: *span }));
+                                        }
+                                        std::thread::sleep(DEADLOCK_POLL_INTERVAL);
+                                        self.deadlock_registry.unblock();
+                                    }
+                                }
                             }
                         }
                         v => Err(mismatch("thread", v.ty_name(), *span)),
@@ -5109,12 +5484,66 @@ impl Interpreter {
                         *span,
                         "chan.recv",
                         None,
-                        || match inner.recv() {
-                            Ok(v) => Ok(v),
-                            Err(e) => Err(Signal::Err(RuntimeError {
-                                kind: ErrorKind::ChannelIoError { message: e.to_string() },
-                                span: *span,
-                            })),
+                        || {
+                            // Deadlock detection only applies to the
+                            // in-process transport — a `Socket`-backed
+                            // channel (crossed into a `sandbox`) can
+                            // always still be woken by that external
+                            // process; including it would be a real false
+                            // positive, not just imprecision (see
+                            // `ChannelInner::is_in_memory`'s doc comment).
+                            if inner.is_in_memory() {
+                                // Fast path: a value's already queued (the
+                                // common `send` then `recv` case, even
+                                // same-thread) — this call was never
+                                // actually going to block, so it must
+                                // never touch the deadlock registry at
+                                // all, or a program that legitimately
+                                // never blocks would get falsely flagged.
+                                if let Some(v) = inner.try_recv() {
+                                    return Ok(v);
+                                }
+                                // Poll rather than a single check-then-
+                                // block-forever — see `DEADLOCK_POLL_
+                                // INTERVAL`'s doc comment for why a
+                                // one-shot check isn't enough (a deadlock
+                                // among *other* threads can finish forming
+                                // after this thread already committed to
+                                // waiting).
+                                loop {
+                                    if let Err(message) = self.deadlock_registry.check_and_register(BlockedOn::Recv) {
+                                        // Race guard: `check_and_register`
+                                        // itself takes real time: a value
+                                        // can legitimately arrive in that
+                                        // window (`Expr::Join`'s own race
+                                        // guard documents the general
+                                        // shape in full).
+                                        if let Some(v) = inner.try_recv() {
+                                            return Ok(v);
+                                        }
+                                        return Err(Signal::Err(RuntimeError { kind: ErrorKind::Deadlock { message }, span: *span }));
+                                    }
+                                    let poll_result = inner.recv_timeout(DEADLOCK_POLL_INTERVAL);
+                                    self.deadlock_registry.unblock();
+                                    match poll_result {
+                                        Ok(Some(v)) => return Ok(v),
+                                        Ok(None) => continue, // timed out -- loop back and re-check for deadlock
+                                        Err(e) => {
+                                            return Err(Signal::Err(RuntimeError {
+                                                kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                                                span: *span,
+                                            }))
+                                        }
+                                    }
+                                }
+                            }
+                            match inner.recv() {
+                                Ok(v) => Ok(v),
+                                Err(e) => Err(Signal::Err(RuntimeError {
+                                    kind: ErrorKind::ChannelIoError { message: e.to_string() },
+                                    span: *span,
+                                })),
+                            }
                         },
                         outcome_of_signal_result,
                     ),

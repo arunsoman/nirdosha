@@ -164,18 +164,23 @@ flagged, not silently omitted.
 ## Reproducing
 
 ```sh
-cd compiler && cargo build --release
-cd ..
-# C
-for f in matmul det dot kalman fib floatloop; do
-  gcc -O2 -o benchmarks/c/${f}_bin benchmarks/c/${f}.c -lm
-done
-# Nirdosha (compiled -- Vector/Matrix now compiles too, as of goal.md §9 item 1)
-for f in matmul det dot kalman fib floatloop; do
-  compiler/target/release/nirdosha build benchmarks/nirdosha/$f.nir -o benchmarks/nirdosha/${f}_bin_compiled
-done
-# then run each of C/{bin}, `julia benchmarks/julia/{f}.jl`,
-# and the compiled Nirdosha binaries, and compare. Add `nirdosha
-# benchmarks/nirdosha/{f}.nir` (interpreted) too if you want the "before"
-# numbers for comparison.
+RUNS=5 WARM=1 ./benchmarks/run_head_to_head.sh
 ```
+
+`benchmarks/run_head_to_head.sh` builds C (`gcc -O2`) and Nirdosha
+(`nirdosha build`) for all six benchmarks, runs C/Nirdosha/Julia `RUNS`
+times each, prints **every individual sample** (not a silently-picked
+"best of N") plus min/median/max, and verifies every output numerically
+before printing "trustworthy" for that benchmark — a mismatch is a loud
+`!!` line, not a footnote. `WARM=1` additionally reports Julia's
+steady-state number (a full-size warmup call, discarded, then several
+timed calls in the same process — see `benchmarks/julia/*_warm.jl`'s own
+comment for why the warmup has to be full-size, not a token call, to be
+meaningful). Pass specific benchmark names to run a subset, e.g.
+`./benchmarks/run_head_to_head.sh matmul kalman`. Prints the actual
+machine/toolchain versions used for that run, not copied from this
+document.
+
+The older manual copy-paste version of this section is gone — this
+script does the same thing plus the verification and warm-mode
+measurement, so there's no reason to hand-roll it anymore.

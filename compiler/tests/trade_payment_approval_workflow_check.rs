@@ -207,3 +207,241 @@ fn wallet_settlement_workflow_compiles() {
     "#;
     build_program(src);
 }
+
+#[test]
+fn batch_payment_approval_workflow_compiles() {
+    let src = r#"
+        struct Text {
+            value: str,
+        }
+
+        fn required_eyes_for_batch(amount_a_cents: i64, amount_b_cents: i64, amount_c_cents: i64) -> i64 {
+            return if amount_a_cents + amount_b_cents + amount_c_cents >= 5000000 { 2 } else { 1 }
+        }
+
+        fn notify_checker(instance_id: i64) -> bool {
+            return match db_connect("batch_payment_approval.db") {
+                Ok(conn) => match mq_connect("127.0.0.1", 6379) {
+                    Ok(mq_conn) => match json_parse("{}") {
+                        Ok(vars) => match notify(conn, mq_conn, ByRole("checker"), "batch_payment_pending_approval", vars) {
+                            Ok(sent) => sent,
+                            Err(e) => false,
+                        },
+                        Err(e) => false,
+                    },
+                    Err(e) => false,
+                },
+                Err(e) => false,
+            }
+        }
+
+        fn notify_six_eyes_reviewer(instance_id: i64) -> bool {
+            return match db_connect("batch_payment_approval.db") {
+                Ok(conn) => match mq_connect("127.0.0.1", 6379) {
+                    Ok(mq_conn) => match json_parse("{}") {
+                        Ok(vars) => match notify(conn, mq_conn, ByRole("six_eyes_reviewer"), "batch_payment_pending_six_eyes_review", vars) {
+                            Ok(sent) => sent,
+                            Err(e) => false,
+                        },
+                        Err(e) => false,
+                    },
+                    Err(e) => false,
+                },
+                Err(e) => false,
+            }
+        }
+
+        fn notify_treasury_decided(instance_id: i64, template: Text) -> bool {
+            return match db_connect("batch_payment_approval.db") {
+                Ok(conn) => match mq_connect("127.0.0.1", 6379) {
+                    Ok(mq_conn) => match json_parse("{}") {
+                        Ok(vars) => match notify(conn, mq_conn, ByRole("treasury"), template.value, vars) {
+                            Ok(sent) => sent,
+                            Err(e) => false,
+                        },
+                        Err(e) => false,
+                    },
+                    Err(e) => false,
+                },
+                Err(e) => false,
+            }
+        }
+
+        workflow BatchPaymentApproval {
+            data {
+                amount_a_cents: i64,
+                amount_b_cents: i64,
+                amount_c_cents: i64,
+            }
+
+            state PendingClassification {
+                on Classified -> PendingMakerChecker
+                on ClassifiedHighValue -> PendingSixEyes
+            }
+
+            state PendingMakerChecker {
+                on_entry {
+                    notify_checker(instance_id)
+                }
+                on Approved -> Approved
+                on Rejected -> Rejected
+            }
+
+            state PendingSixEyes {
+                on_entry {
+                    notify_six_eyes_reviewer(instance_id)
+                }
+                on Approved -> Approved
+                on Rejected -> Rejected
+            }
+
+            state Approved terminal {
+                on_entry {
+                    notify_treasury_decided(instance_id, Text("batch_payment_approved"))
+                }
+            }
+
+            state Rejected terminal {
+                on_entry {
+                    notify_treasury_decided(instance_id, Text("batch_payment_rejected"))
+                }
+            }
+        }
+
+        fn submit_batch_payment_for_approval(amount_a_cents: i64, amount_b_cents: i64, amount_c_cents: i64) -> Result(i64, WorkflowActionError) {
+            return start_batch_payment_approval(BatchPaymentApprovalData(amount_a_cents, amount_b_cents, amount_c_cents))
+        }
+
+        fn classify_batch_and_advance(instance_id: i64, amount_a_cents: i64, amount_b_cents: i64, amount_c_cents: i64) -> Result(bool, WorkflowActionError) {
+            let event: BatchPaymentApprovalEvent = if required_eyes_for_batch(amount_a_cents, amount_b_cents, amount_c_cents) == 2 { ClassifiedHighValue() } else { Classified() }
+            return match json_parse("{}") {
+                Ok(payload) => advance_batch_payment_approval(instance_id, event, payload),
+                Err(e) => Err(NoSuchTransition()),
+            }
+        }
+    "#;
+    build_program(src);
+}
+
+#[test]
+fn commission_waterfall_settlement_workflow_compiles() {
+    let src = r#"
+        fn compute_commission_waterfall(instance_id: i64, payment_id: i64, settled_amount_cents: i64) -> bool {
+            return match db_connect("commission_waterfall_settlement.db") {
+                Ok(conn) => match db_execute(conn, "INSERT INTO commission_waterfall (payment_id, settled_amount_cents) VALUES (?, ?)", payment_id, settled_amount_cents) {
+                    Ok(n) => n >= 0,
+                    Err(e) => false,
+                },
+                Err(e) => false,
+            }
+        }
+
+        workflow CommissionWaterfallSettlement {
+            data {
+                payment_id: i64,
+                settled_amount_cents: i64,
+            }
+
+            state Settled terminal {
+                on_entry {
+                    compute_commission_waterfall(instance_id, data.payment_id, data.settled_amount_cents)
+                }
+            }
+        }
+
+        fn settle_commission_waterfall(payment_id: i64, settled_amount_cents: i64) -> Result(i64, WorkflowActionError) {
+            return start_commission_waterfall_settlement(CommissionWaterfallSettlementData(payment_id, settled_amount_cents))
+        }
+    "#;
+    build_program(src);
+}
+
+#[test]
+fn commission_dispute_resolution_workflow_compiles() {
+    let src = r#"
+        struct Text {
+            value: str,
+        }
+
+        fn notify_checker(instance_id: i64) -> bool {
+            return match db_connect("commission_dispute_resolution.db") {
+                Ok(conn) => match mq_connect("127.0.0.1", 6379) {
+                    Ok(mq_conn) => match json_parse("{}") {
+                        Ok(vars) => match notify(conn, mq_conn, ByRole("checker"), "commission_dispute_pending_correction", vars) {
+                            Ok(sent) => sent,
+                            Err(e) => false,
+                        },
+                        Err(e) => false,
+                    },
+                    Err(e) => false,
+                },
+                Err(e) => false,
+            }
+        }
+
+        fn apply_commission_correction(instance_id: i64, commission_waterfall_id: i64, disputed_amount_cents: i64) -> bool {
+            return match db_connect("commission_dispute_resolution.db") {
+                Ok(conn) => match db_execute(conn, "UPDATE commission_waterfall SET settled_amount_cents = ? WHERE id = ?", disputed_amount_cents, commission_waterfall_id) {
+                    Ok(n) => n >= 0,
+                    Err(e) => false,
+                },
+                Err(e) => false,
+            }
+        }
+
+        fn notify_treasury_decided(instance_id: i64, template: Text) -> bool {
+            return match db_connect("commission_dispute_resolution.db") {
+                Ok(conn) => match mq_connect("127.0.0.1", 6379) {
+                    Ok(mq_conn) => match json_parse("{}") {
+                        Ok(vars) => match notify(conn, mq_conn, ByRole("treasury"), template.value, vars) {
+                            Ok(sent) => sent,
+                            Err(e) => false,
+                        },
+                        Err(e) => false,
+                    },
+                    Err(e) => false,
+                },
+                Err(e) => false,
+            }
+        }
+
+        workflow CommissionDisputeResolution {
+            data {
+                commission_waterfall_id: i64,
+                disputed_amount_cents: i64,
+            }
+
+            state PendingCorrection {
+                on_entry {
+                    notify_checker(instance_id)
+                }
+                on Corrected -> Corrected
+                on Denied -> Denied
+            }
+
+            state Corrected terminal {
+                on_entry {
+                    apply_commission_correction(instance_id, data.commission_waterfall_id, data.disputed_amount_cents)
+                }
+            }
+
+            state Denied terminal {
+                on_entry {
+                    notify_treasury_decided(instance_id, Text("commission_dispute_denied"))
+                }
+            }
+        }
+
+        fn raise_commission_dispute(commission_waterfall_id: i64, disputed_amount_cents: i64) -> Result(i64, WorkflowActionError) {
+            return start_commission_dispute_resolution(CommissionDisputeResolutionData(commission_waterfall_id, disputed_amount_cents))
+        }
+
+        fn decide_commission_dispute(instance_id: i64, decision: CommissionDisputeResolutionEvent) -> Result(bool, WorkflowActionError) {
+            return match json_parse("{}") {
+                Ok(payload) => advance_commission_dispute_resolution(instance_id, decision, payload),
+                Err(e) => Err(NoSuchTransition()),
+            }
+        }
+    "#;
+    build_program(src);
+}
