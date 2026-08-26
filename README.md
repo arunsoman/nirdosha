@@ -327,8 +327,13 @@ other later pass — never sees `workflow` syntax itself. `on_entry`/
 restart), the same discipline `transact` already uses. Interpreter-only,
 the same way `transact`/`db`/`mq` are (§11): `nirdosha build`/`emit-llvm`
 cleanly rejects a program using `workflow`, naming the specific
-unsupported builtin, never a silent mis-compile. Full grammar and
-runtime protocol in [`WORKFLOW.md`](./WORKFLOW.md).
+unsupported builtin, never a silent mis-compile. A `state` can also
+declare `owner: role(...)`/`claim(...)` (who may fire its outgoing
+events, checked per-instance at runtime, not statically) and
+`label: "..."` -- `nirdosha serve`/`emit-ui` render a generated
+"Workflows" nav section from these: a per-role "what's waiting on me"
+queue, each row's own buttons driven by that row's own current state.
+Full grammar and runtime protocol in [`WORKFLOW.md`](./WORKFLOW.md).
 
 ### Data types & generics (row 11)
 `struct`, `enum`, and `match` (exhaustive, no wildcard/binding patterns in

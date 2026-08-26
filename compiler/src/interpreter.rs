@@ -1341,6 +1341,19 @@ fn reconstruct_transact_args(kinds: &[String], network_result: &Value, txn_id: &
 /// for a condition that isn't the calling program's fault to recover
 /// from). Same "constructed directly, sound because the shape is fixed"
 /// reasoning as `result_ok`/`result_err`.
+/// `advance_<workflow>`'s trailing `payload: json` argument, read for a
+/// `"comment"` string field if present — `WORKFLOW.md`'s "audit trail"
+/// section, the one piece of `payload`'s otherwise-still-unused v1 shape
+/// (see `workflow_advance`'s own doc comment) that now goes somewhere.
+/// Lenient by design: not a JSON object, or no `comment` field, or a
+/// non-string value there, all mean "no comment," never an error --
+/// `payload` is optional texture on an already-decided transition, not
+/// itself validated input.
+fn extract_comment(payload: &Value) -> Option<String> {
+    let Value::Json(doc) = payload else { return None };
+    doc.as_object()?.get("comment")?.as_str().map(|s| s.to_string())
+}
+
 fn workflow_err(variant: &str, payload: Vec<Value>) -> Value {
     let err = Value::Enum(Arc::from("WorkflowActionError"), Arc::from(variant), Arc::from(payload));
     Value::Enum(Arc::from("Result"), Arc::from("Err"), Arc::from(vec![err]))
@@ -1733,6 +1746,21 @@ fn mock_issue_token(
     Ok(format!("{header_b64}.{payload_b64}.{signature_b64}"))
 }
 
+/// `identity`'s (a `VerifiedIdentity` struct value) embedded `subject`
+/// field (index 0) — `WORKFLOW.md`'s "who submitted this"/"audit trail"
+/// sections use this to record *which* identity started an instance or
+/// fired a transition, the same field order `identity_claims` below
+/// already relies on for `claims_json` (index 5).
+fn identity_subject(identity: &Value) -> Arc<str> {
+    let Value::Struct(_, fields) = identity else {
+        unreachable!("typeck.rs already proved this is a VerifiedIdentity")
+    };
+    let Value::Str(subject) = &fields[0] else {
+        unreachable!("VerifiedIdentity.subject is str")
+    };
+    Arc::clone(subject)
+}
+
 /// Reads `identity`'s (a `VerifiedIdentity` struct value) embedded
 /// `claims_json` field (index 5) as a parsed JSON document. Shared root
 /// of `identity_has_role`/`identity_claim` below.
@@ -1757,6 +1785,39 @@ pub(crate) fn identity_has_role(identity: &Value, role: &str) -> Result<bool, St
     let claims = identity_claims(identity)?;
     let roles = json_field(&claims, "roles")?.as_array().ok_or_else(|| "`roles` is not an array".to_string())?;
     Ok(roles.iter().any(|v| v.as_str() == Some(role)))
+}
+
+/// `state Name { owner: role("...")/claim("...", "...") }` — `None` means
+/// unrestricted (`WORKFLOW.md`'s "state ownership" section: any
+/// authenticated caller may fire this state's outgoing events). Looked up
+/// from `StateDecl.entries`, the same open-ended `key: value` slot list
+/// `ScreenDecl.entries` already uses.
+pub(crate) fn state_owner(state: &StateDecl) -> Option<&Expr> {
+    state.entries.iter().find(|(k, _)| k == "owner").map(|(_, v)| v)
+}
+
+/// Whether `identity` satisfies `owner` — already proven by
+/// `typeck.rs::check_visibility_expr` to be exactly `role("...")` or
+/// `claim("...", "...")` with string-literal arguments, so the shape
+/// match below never needs to report a *new* error, only reuse
+/// `identity_has_role`/`identity_claim`'s own (a malformed/missing
+/// `claims_json`, same as any other identity check in this file).
+fn identity_satisfies_owner(owner: &Expr, identity: &Value) -> Result<bool, String> {
+    match owner {
+        Expr::Call(name, args, _) if name == "role" => {
+            let Expr::Str(role, _) = &args[0] else {
+                unreachable!("typeck.rs already proved role(...) takes a string literal")
+            };
+            identity_has_role(identity, role)
+        }
+        Expr::Call(name, args, _) if name == "claim" => {
+            let (Expr::Str(key, _), Expr::Str(value, _)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved claim(...) takes two string-literal arguments")
+            };
+            Ok(identity_claim(identity, key).map(|v| v == *value).unwrap_or(false))
+        }
+        _ => unreachable!("typeck.rs already proved owner is role(...)/claim(...)"),
+    }
 }
 
 /// The string value of claim `key` in `identity`'s embedded
@@ -4222,8 +4283,8 @@ impl Interpreter {
     }
 
     /// Dispatches `send_email`/`send_sms`/`send_push`/`notify` and
-    /// `workflow_lower.rs`'s three shared internal builtins — `Some(_)`
-    /// when `name` is one of these seven (handled here, needs `self`/
+    /// `workflow_lower.rs`'s six shared internal builtins — `Some(_)`
+    /// when `name` is one of these ten (handled here, needs `self`/
     /// durable-log access `eval_builtin`'s free-function shape can't
     /// provide, the same reason `Expr::Transact` gets its own dedicated
     /// evaluation instead of going through `eval_builtin`); `None` for
@@ -4234,12 +4295,152 @@ impl Interpreter {
             "__workflow_start" => self.workflow_start(args, span).map(Some),
             "__workflow_advance" => self.workflow_advance(args, span).map(Some),
             "__workflow_link_advance" => self.workflow_link_advance(args, span).map(Some),
+            "__workflow_pending_for_me" => self.workflow_pending_for_me(args, span).map(Some),
+            "__workflow_submitted_by_me" => self.workflow_submitted_by_me(args, span).map(Some),
+            "__workflow_history" => self.workflow_history(args, span).map(Some),
             "send_email" => self.dispatch_send(args, span, "email").map(Some),
             "send_sms" => self.dispatch_send(args, span, "sms").map(Some),
             "send_push" => self.dispatch_send(args, span, "push").map(Some),
             "notify" => self.dispatch_notify(args, span).map(Some),
             _ => Ok(None),
         }
+    }
+
+    /// `list_<workflow>_pending_for_me`'s implementation (`WORKFLOW.md`'s
+    /// "state ownership" section, read side): every instance of
+    /// `workflow_name` whose *current* state's `owner` `identity`
+    /// satisfies, as a JSON array of `{instance_id, state, state_label,
+    /// events, data}` — `ui_gen_template.html`'s generated "Workflows"
+    /// queue screen renders this directly, one row per instance, one
+    /// button per `events` entry (that row's own current state's own
+    /// outgoing event names, calling `advance_<workflow>` with whichever
+    /// one is clicked). A state with no `owner` at all is never returned
+    /// here — an unowned state is nobody's queue item by definition (any
+    /// authenticated caller could still `advance_*` it directly, they
+    /// just don't see it listed as "waiting on them" specifically).
+    fn workflow_pending_for_me(&self, args: &[Value], span: Span) -> SResult<Value> {
+        let Value::Str(workflow_name) = &args[0] else {
+            unreachable!("typeck.rs already proved this is a str")
+        };
+        let identity = &args[1];
+        let wf = self
+            .find_workflow(workflow_name)
+            .unwrap_or_else(|| unreachable!("workflow_lower.rs only ever emits calls naming a real workflow"));
+        let wlog = self.workflow_log(span).map_err(Signal::Err)?;
+        let instances = wlog.list_instances(workflow_name).map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
+        let mut out = Vec::new();
+        for (instance_id, state_name, data_json) in instances {
+            let Some(state) = wf.states.iter().find(|s| s.name == state_name) else { continue };
+            let Some(owner) = state_owner(state) else { continue };
+            let owned = identity_satisfies_owner(owner, identity).map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
+            if !owned {
+                continue;
+            }
+            out.push(
+                self.encode_instance_row(workflow_name, state, instance_id, &data_json, span)
+                    .map_err(Signal::Err)?,
+            );
+        }
+        Ok(result_ok(Value::Json(Arc::new(serde_json::Value::Array(out)))))
+    }
+
+    /// `list_<workflow>_submitted_by_me`'s implementation (`WORKFLOW.md`'s
+    /// "who submitted this" section): every instance whose durably-
+    /// recorded `started_by_subject` matches the caller's own `subject`
+    /// — regardless of which state it's currently in, unlike
+    /// `workflow_pending_for_me`'s owner-scoped read. A requester's own
+    /// view of their submissions is read-only in the generated UI (no
+    /// `events`/buttons rendered from this row shape), but the row
+    /// itself still carries `events` for consistency/future reuse.
+    fn workflow_submitted_by_me(&self, args: &[Value], span: Span) -> SResult<Value> {
+        let Value::Str(workflow_name) = &args[0] else {
+            unreachable!("typeck.rs already proved this is a str")
+        };
+        let identity = &args[1];
+        let subject = identity_subject(identity);
+        let wf = self
+            .find_workflow(workflow_name)
+            .unwrap_or_else(|| unreachable!("workflow_lower.rs only ever emits calls naming a real workflow"));
+        let wlog = self.workflow_log(span).map_err(Signal::Err)?;
+        let instances = wlog
+            .list_instances_by_starter(workflow_name, &subject)
+            .map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
+        let mut out = Vec::new();
+        for (instance_id, state_name, data_json) in instances {
+            let Some(state) = wf.states.iter().find(|s| s.name == state_name) else { continue };
+            out.push(
+                self.encode_instance_row(workflow_name, state, instance_id, &data_json, span)
+                    .map_err(Signal::Err)?,
+            );
+        }
+        Ok(result_ok(Value::Json(Arc::new(serde_json::Value::Array(out)))))
+    }
+
+    /// Shared row shape for `workflow_pending_for_me`/
+    /// `workflow_submitted_by_me`: `{instance_id, state, state_label,
+    /// events, data}`, `data` re-decoded/re-encoded through the
+    /// workflow's own `Data` struct type (not passed through raw) — the
+    /// same typed round-trip `workflow_start`/`workflow_advance` already
+    /// do, so a caller sees exactly the field set `data { ... }`
+    /// declares, nothing stored-but-since-removed.
+    fn encode_instance_row(
+        &self,
+        workflow_name: &str,
+        state: &StateDecl,
+        instance_id: i64,
+        data_json: &str,
+        span: Span,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let data_ty = Ty::Named(format!("{workflow_name}Data"), vec![]);
+        let label = state.entries.iter().find(|(k, _)| k == "label").and_then(|(_, v)| match v {
+            Expr::Str(s, _) => Some(s.clone()),
+            _ => None,
+        });
+        let json_val: serde_json::Value = serde_json::from_str(data_json).unwrap_or(serde_json::Value::Null);
+        let data_val =
+            crate::serve::decode_value(&json_val, &data_ty, &self.program, 0).map_err(|e| self.workflow_log_err(e, span))?;
+        let data_encoded = crate::serve::encode_value(&data_val, &self.program).map_err(|e| self.workflow_log_err(e, span))?;
+        Ok(serde_json::json!({
+            "instance_id": instance_id,
+            "state": state.name,
+            "state_label": label,
+            "events": state.transitions.iter().map(|t| t.event.clone()).collect::<Vec<_>>(),
+            "data": data_encoded,
+        }))
+    }
+
+    /// `get_<workflow>_history`'s implementation (`WORKFLOW.md`'s "audit
+    /// trail" section): the full, append-only transition log for one
+    /// instance, oldest first, as a JSON array of `{from_state, to_state,
+    /// event, actor_subject, via_link, comment, at}`. `identity` (the
+    /// caller) isn't checked against anything here beyond `serve.rs::
+    /// dispatch` already demanding *a* signed-in caller — see
+    /// `workflow_lower.rs`'s own doc comment on this fn for the disclosed
+    /// "no per-viewer ACL yet" simplification.
+    fn workflow_history(&self, args: &[Value], span: Span) -> SResult<Value> {
+        let Value::Str(_workflow_name) = &args[0] else {
+            unreachable!("typeck.rs already proved this is a str")
+        };
+        let Value::Int(instance_id) = &args[1] else {
+            unreachable!("typeck.rs already proved this is an i64")
+        };
+        let wlog = self.workflow_log(span).map_err(Signal::Err)?;
+        let rows = wlog.list_history(*instance_id).map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
+        let out: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|(from_state, to_state, event, actor_subject, via_link, comment, at)| {
+                serde_json::json!({
+                    "from_state": from_state,
+                    "to_state": to_state,
+                    "event": event,
+                    "actor_subject": actor_subject,
+                    "via_link": via_link,
+                    "comment": comment,
+                    "at": at,
+                })
+            })
+            .collect();
+        Ok(result_ok(Value::Json(Arc::new(serde_json::Value::Array(out)))))
     }
 
     /// Runs every action in `actions` in order, in `env` (already carrying
@@ -4420,7 +4621,16 @@ impl Interpreter {
         let Value::Str(workflow_name) = &args[0] else {
             unreachable!("typeck.rs already proved this is a str")
         };
-        let data_val = args[1].clone();
+        // `identity: Option(VerifiedIdentity)` (`WORKFLOW.md`'s "who
+        // submitted this" section) — `None` for a legitimately anonymous
+        // start, `Some(id)`'s own `subject` durably recorded so
+        // `list_<workflow>_submitted_by_me` can find it again later.
+        let started_by_subject: Option<Arc<str>> = match &args[1] {
+            Value::Enum(_, variant, payload) if variant.as_ref() == "Some" => Some(identity_subject(&payload[0])),
+            Value::Enum(_, variant, _) if variant.as_ref() == "None" => None,
+            _ => unreachable!("typeck.rs already proved this is an Option(VerifiedIdentity)"),
+        };
+        let data_val = args[2].clone();
         let wf = self
             .find_workflow(workflow_name)
             .unwrap_or_else(|| unreachable!("workflow_lower.rs only ever emits calls naming a real workflow"));
@@ -4430,7 +4640,7 @@ impl Interpreter {
         let now = now_secs();
         let wlog = self.workflow_log(span).map_err(Signal::Err)?;
         let instance_id = wlog
-            .create_instance(workflow_name, &initial.name, &data_json.to_string(), now)
+            .create_instance(workflow_name, &initial.name, &data_json.to_string(), started_by_subject.as_deref(), now)
             .map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
         let data_ty = Ty::Named(format!("{workflow_name}Data"), vec![]);
         let mut env = Env::new();
@@ -4445,18 +4655,52 @@ impl Interpreter {
     /// with `advance_*`'s own future evolution but not yet threaded into
     /// `on_entry`/`on_exit` bindings — a disclosed v1 gap, `WORKFLOW.md`'s
     /// "deliberate non-goals" section names it.
+    ///
+    /// `identity` (the second argument, `WORKFLOW.md`'s "state ownership"
+    /// section) is checked against `from_state`'s own `owner` — the one
+    /// piece of this whole feature that genuinely has to run here rather
+    /// than as a static `serve.rs::dispatch` gate: `advance_<workflow>` is
+    /// one function serving every instance/state of this workflow, so
+    /// "may this caller fire this event" depends on which state *this*
+    /// instance happens to be in *right now*, not on anything fixed at
+    /// the function level.
     fn workflow_advance(&self, args: &[Value], span: Span) -> SResult<Value> {
         let Value::Str(workflow_name) = &args[0] else {
             unreachable!("typeck.rs already proved this is a str")
         };
-        let Value::Int(instance_id) = &args[1] else {
+        let identity = &args[1];
+        let Value::Int(instance_id) = &args[2] else {
             unreachable!("typeck.rs already proved this is an i64")
         };
-        let instance_id = *instance_id;
-        let event_tag: Arc<str> = match &args[2] {
+        let event_tag: Arc<str> = match &args[3] {
             Value::Enum(_, variant, _) => Arc::clone(variant),
             _ => unreachable!("typeck.rs already proved this is a workflow event enum value"),
         };
+        self.workflow_advance_inner(workflow_name, Some(identity), *instance_id, &event_tag, &args[4], span)
+    }
+
+    /// The actual state-move logic, shared by `workflow_advance` (the
+    /// ordinary, authenticated path — `identity: Some(_)`, owner-checked)
+    /// and `workflow_link_advance` (the magic-link path, after its own
+    /// token verification already ran — `identity: None`, deliberately
+    /// **not** owner-checked: a consumed, single-use link token *is* the
+    /// authorization here, same as `advance_<workflow>`'s pre-ownership
+    /// behavior always was for every link-triggered transition, and the
+    /// same reason `*_via_link` fns take no `VerifiedIdentity` param at
+    /// all — see `workflow_lower.rs`'s doc comment on why. A state that
+    /// declares an `owner` can still legitimately have a `link`-marked
+    /// outgoing event (e.g. an unauthenticated email-click confirmation
+    /// out of an otherwise owner-gated state); this is what makes that
+    /// combination work rather than an unreachable dead end.
+    fn workflow_advance_inner(
+        &self,
+        workflow_name: &str,
+        identity: Option<&Value>,
+        instance_id: i64,
+        event_tag: &str,
+        payload: &Value,
+        span: Span,
+    ) -> SResult<Value> {
         let wf = self
             .find_workflow(workflow_name)
             .unwrap_or_else(|| unreachable!("workflow_lower.rs only ever emits calls naming a real workflow"));
@@ -4469,7 +4713,14 @@ impl Interpreter {
         let Some(from_state) = wf.states.iter().find(|s| s.name == current_state) else {
             return Ok(workflow_err("InstanceNotFound", vec![]));
         };
-        let Some(transition) = from_state.transitions.iter().find(|t| t.event.as_str() == event_tag.as_ref()) else {
+        if let (Some(owner), Some(identity)) = (state_owner(from_state), identity) {
+            let satisfies =
+                identity_satisfies_owner(owner, identity).map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
+            if !satisfies {
+                return Ok(workflow_err("NotStateOwner", vec![]));
+            }
+        }
+        let Some(transition) = from_state.transitions.iter().find(|t| t.event.as_str() == event_tag) else {
             return Ok(workflow_err("NoSuchTransition", vec![]));
         };
         let data_ty = Ty::Named(format!("{workflow_name}Data"), vec![]);
@@ -4485,9 +4736,28 @@ impl Interpreter {
         exit_env.define("data", data_val.clone(), data_ty.clone());
         self.run_workflow_actions(workflow_name, &from_state.on_exit, &mut exit_env, instance_id, &from_state.name, "exit")?;
 
+        // `WORKFLOW.md`'s "audit trail" section: *who* fired this
+        // transition (`None` only for the magic-link path — see this
+        // fn's own doc comment) and *how* (`via_link`), plus an optional
+        // free-text `comment` if `payload` carried one
+        // (`{"comment": "..."}`) — still not threaded into `on_entry`/
+        // `on_exit` bindings, `payload`'s own disclosed v1 gap, just
+        // durably logged here now.
+        let actor_subject = identity.map(identity_subject);
+        let via_link = identity.is_none();
+        let comment = extract_comment(payload);
         let now = now_secs();
-        wlog.record_transition(instance_id, &from_state.name, &transition.target, &event_tag, now)
-            .map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
+        wlog.record_transition(
+            instance_id,
+            &from_state.name,
+            &transition.target,
+            event_tag,
+            actor_subject.as_deref(),
+            via_link,
+            comment.as_deref(),
+            now,
+        )
+        .map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
 
         let to_state = wf
             .states
@@ -4537,9 +4807,15 @@ impl Interpreter {
             return Ok(workflow_err("LinkAlreadyConsumed", vec![]));
         }
         // Same transition/state-move/`on_entry` logic `workflow_advance`
-        // already implements -- the token isn't part of that, only its
-        // own verification above is.
-        self.workflow_advance(&[args[0].clone(), args[1].clone(), args[2].clone(), args[4].clone()], span)
+        // already implements, via the shared `workflow_advance_inner` --
+        // the token isn't part of that, only its own verification above
+        // is. `identity: None` — deliberately *not* owner-checked, see
+        // `workflow_advance_inner`'s own doc comment for why a consumed
+        // link token is its own authorization.
+        let Value::Str(workflow_name) = &args[0] else {
+            unreachable!("typeck.rs already proved this is a str")
+        };
+        self.workflow_advance_inner(workflow_name, None, instance_id, event_tag.as_ref(), &args[4], span)
     }
 
     /// `Recipient::BySubject(s)` is just `s`; `Recipient::ByRole(role)`

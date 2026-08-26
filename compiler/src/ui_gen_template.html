@@ -225,6 +225,7 @@ __NIRDOSHA_THEME_SCRIPT__
     background: var(--md-surface-variant); color: var(--md-on-surface-variant); margin-left: 6px;
   }
   .gate-note { font-size: 12px; color: var(--md-error); margin-top: 4px; }
+  .row-actions { display: flex; gap: 6px; }
   .stub-note {
     font-size: 12px; color: var(--md-on-surface-variant); background: var(--md-surface-variant);
     padding: 8px 12px; border-radius: var(--md-radius-sm); margin-bottom: 16px;
@@ -254,6 +255,13 @@ __NIRDOSHA_THEME_SCRIPT__
 const MANIFEST = __NIRDOSHA_MANIFEST__;
 const STATS = __NIRDOSHA_STATS__;
 const CHARTS = __NIRDOSHA_CHARTS__;
+// One entry per declared `workflow` (`WORKFLOW.md`'s "state ownership +
+// a generated queue UI" section) -- `{name, snake, title, pendingFn,
+// pendingRequiresLogin, advanceFn, dataFields}`. Unlike `MANIFEST`'s
+// screens, there's no static per-row action set here: which buttons a
+// row gets is decided per-row, at fetch time, by `pendingFn`'s own
+// response -- see `renderWorkflowQueue`.
+const WORKFLOWS = __NIRDOSHA_WORKFLOWS__;
 const API_BASE = window.NIRDOSHA_API_BASE || "/api";
 const IDENTITY_BASE = __NIRDOSHA_IDENTITY_BASE__;
 const IDENTITY_KEY = "nirdosha_identity";
@@ -805,6 +813,127 @@ async function renderListScreen(screen, root) {
   load();
 }
 
+// `WORKFLOW.md`'s "state ownership + a generated queue UI" section --
+// unlike `renderListScreen`, there's no fixed action set for the whole
+// table: each row's own button set is that row's own current state's own
+// outgoing `events`, straight from `pendingFn`'s response
+// (`interpreter.rs::workflow_pending_for_me`) -- a different row can be
+// in a different state with entirely different buttons. Clicking one
+// calls `advanceFn(instance_id, event, payload)` -- `payload` carries an
+// optional `{comment}` the caller was prompted for (`WORKFLOW.md`'s
+// "audit trail" section: still not threaded into `on_entry`/`on_exit`
+// bindings, that gap's own disclosed scope, just logged to the history
+// row now). Two tabs share this same render: "Waiting on me"
+// (`pendingFn`, action buttons rendered) and "My requests"
+// (`submittedByMeFn`, `WORKFLOW.md`'s "who submitted this" section --
+// the requester's own view, read-only, no buttons since they're not the
+// decider). Every row in either tab gets a "History" button
+// (`WORKFLOW.md`'s "audit trail" section, `historyFn`) that expands an
+// inline transition log below the row, the same toggle-a-row-below-it
+// shape `renderListScreen`'s own inline edit form already uses.
+async function renderWorkflowQueue(wf, root) {
+  root.appendChild(el("h2", { text: wf.title, style: "font-size:16px;font-weight:500;" }));
+
+  const tabBar = el("div", { class: "row-actions", style: "margin-bottom:12px;" }, []);
+  const pendingTab = el("button", { class: "btn btn-filled", text: "Waiting on me" });
+  const mineTab = el("button", { class: "btn btn-outlined", text: "My requests" });
+  tabBar.appendChild(pendingTab);
+  tabBar.appendChild(mineTab);
+  root.appendChild(tabBar);
+
+  const tableWrap = el("div", { class: "card" }, []);
+  root.appendChild(tableWrap);
+
+  let mode = "pending"; // "pending" | "mine"
+  function setMode(next) {
+    if (mode === next) return;
+    mode = next;
+    pendingTab.className = mode === "pending" ? "btn btn-filled" : "btn btn-outlined";
+    mineTab.className = mode === "mine" ? "btn btn-filled" : "btn btn-outlined";
+    load();
+  }
+  pendingTab.addEventListener("click", () => setMode("pending"));
+  mineTab.addEventListener("click", () => setMode("mine"));
+
+  function historyTable(rows) {
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return el("div", { class: "empty-state", text: "No history yet." });
+    }
+    const t = el("table", {}, []);
+    t.appendChild(el("thead", {}, [
+      el("tr", {}, ["From", "To", "Event", "By", "Via link", "Comment", "At"].map((h) => el("th", { text: h }))),
+    ]));
+    const tbody = el("tbody", {}, rows.map((h) => el("tr", {}, [
+      el("td", { text: h.from_state }),
+      el("td", { text: h.to_state }),
+      el("td", { text: h.event }),
+      el("td", { text: h.actor_subject || "(unauthenticated link)" }),
+      el("td", { text: h.via_link ? "Yes" : "No" }),
+      el("td", { text: h.comment || "" }),
+      el("td", { text: new Date(h.at * 1000).toLocaleString() }),
+    ])));
+    t.appendChild(tbody);
+    return el("div", { class: "table-scroll" }, [t]);
+  }
+
+  async function load() {
+    tableWrap.textContent = "";
+    tableWrap.appendChild(el("div", { class: "empty-state", text: "Loading…" }));
+    const listFn = mode === "pending" ? wf.pendingFn : wf.submittedByMeFn;
+    const rows = await callFn(listFn, {});
+    tableWrap.textContent = "";
+    if (!Array.isArray(rows) || rows.length === 0) {
+      tableWrap.appendChild(el("div", { class: "empty-state",
+        text: mode === "pending" ? "Nothing is waiting on you here." : "You haven't submitted anything here yet." }));
+      return;
+    }
+    const table = el("table", {}, []);
+    const thead = el("tr", {}, [
+      ...wf.dataFields.map((f) => el("th", { text: fieldLabel(f) })),
+      el("th", { text: "Status" }),
+      el("th", { text: "" }),
+    ]);
+    table.appendChild(el("thead", {}, [thead]));
+    const tbody = el("tbody", {}, []);
+    let rowIndex = 0;
+    for (const row of rows) {
+      const tds = wf.dataFields.map((f) => el("td", { text: cellText(f, row.data) }));
+      tds.push(el("td", {}, [el("span", { class: "badge", text: row.state_label || row.state, style: "margin-left:0;" })]));
+      const btnCell = el("td", { class: "row-actions" }, []);
+      let tr, historyRow = null;
+      if (mode === "pending") {
+        for (const eventName of row.events || []) {
+          const btn = el("button", { class: "btn btn-filled", text: eventName });
+          btn.addEventListener("click", async () => {
+            const comment = window.prompt(`Add a comment for "${eventName}" (optional):`, "");
+            if (comment === null) return; // cancelled, not an empty comment
+            const payload = comment ? { comment } : null;
+            const r = await callFn(wf.advanceFn, { instance_id: row.instance_id, event: eventName, payload });
+            if (r !== null) { showSnackbar(`${eventName}: recorded.`); load(); }
+          });
+          btnCell.appendChild(btn);
+        }
+      }
+      const historyBtn = el("button", { class: "btn btn-outlined", text: "History" });
+      historyBtn.addEventListener("click", async () => {
+        if (historyRow) { historyRow.remove(); historyRow = null; return; }
+        const historyRows = await callFn(wf.historyFn, { instance_id: row.instance_id });
+        const colspan = wf.dataFields.length + 2;
+        historyRow = el("tr", {}, [el("td", { colspan: String(colspan) }, [historyTable(historyRows)])]);
+        tr.after(historyRow);
+      });
+      btnCell.appendChild(historyBtn);
+      tds.push(btnCell);
+      tr = el("tr", { class: "row-enter", style: `animation-delay: calc(var(--stagger-ms) * ${rowIndex} * 1ms)` }, tds);
+      rowIndex++;
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    tableWrap.appendChild(el("div", { class: "table-scroll" }, [table]));
+  }
+  load();
+}
+
 async function renderSingularScreen(screen, root) {
   const getAction = screen.actions.find((a) => a.kind === "get");
   const updateAction = screen.actions.find((a) => a.kind === "update");
@@ -946,6 +1075,25 @@ function renderScreen(screen) {
   else renderListScreen(screen, content);
 }
 
+// `WORKFLOW.md`'s "state ownership + a generated queue UI" section --
+// `renderScreen`'s sibling for a `#/wf/<snake>` route instead of a
+// `#/<screen>` one. No singular/list split (a workflow queue is always a
+// table), no `requiresLogin` stub-note badge scan (every workflow fn
+// takes `VerifiedIdentity`, unconditionally -- see `wf.pendingRequiresLogin`,
+// always true).
+function renderWorkflowScreen(wf) {
+  const content = document.getElementById("content");
+  content.textContent = "";
+  replayAnimation(content, "screen-enter");
+  content.appendChild(el("h1", { class: "screen-title", text: wf.title }));
+  content.appendChild(el("p", { class: "screen-sub", text: "Workflow queue" }));
+  if (!IDENTITY_BASE) {
+    content.appendChild(el("div", { class: "stub-note",
+      text: "Sign-in on this page is a generated stub (localStorage identity), not real token verification -- wire it to your own auth once a backend exists." }));
+  }
+  renderWorkflowQueue(wf, content);
+}
+
 // ---- login (stub) screen ----
 // Called right after a successful sign-in. `route()` alone would just
 // re-render the login screen again -- the hash is still `#/login` at
@@ -1078,6 +1226,13 @@ function renderNav() {
 
   if (id) {
     if (HAS_DASHBOARD) nav.appendChild(navButton("dashboard", "Dashboard"));
+    // "Workflows" -- one nav entry per declared `workflow`
+    // (`WORKFLOW.md`'s "state ownership + a generated queue UI" section),
+    // always shown to any signed-in identity (a workflow's own states
+    // decide, per row, who actually sees anything once the queue loads
+    // -- `canRun`-style nav-visibility gating doesn't apply here, there's
+    // no single static role to check).
+    for (const wf of WORKFLOWS) nav.appendChild(navButton("wf/" + wf.snake, wf.title));
 
     const currentHash = (location.hash || "").replace(/^#\//, "");
     const groups = [];
@@ -1122,10 +1277,15 @@ function route() {
   if (!getIdentity() && hash !== "login") { location.hash = "#/login"; return; }
   if (hash === "login") { renderLogin(); return; }
   if (hash === "dashboard") { renderDashboard(); return; }
+  if (hash.startsWith("wf/")) {
+    const wf = WORKFLOWS.find((w) => w.snake === hash.slice(3));
+    if (wf) { renderWorkflowScreen(wf); return; }
+  }
   const screen = MANIFEST.find((s) => s.snake === hash) || MANIFEST[0];
   if (!hash && HAS_DASHBOARD) { location.hash = "#/dashboard"; return; }
+  if (!hash && !screen && WORKFLOWS.length) { location.hash = "#/wf/" + WORKFLOWS[0].snake; return; }
   if (!screen) {
-    if (!HAS_DASHBOARD) {
+    if (!HAS_DASHBOARD && !WORKFLOWS.length) {
       document.getElementById("content").appendChild(el("div", { class: "empty-state",
         text: "No screens derived -- add list_/create_/update_/delete_/get_ or stat_/chart_ functions to generate one." }));
     }

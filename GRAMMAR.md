@@ -214,9 +214,18 @@ module_decl ::= "module" string "{" (fn_decl | struct_decl | enum_decl)* "}"
 // else" restriction — a bare `name(args)`, never an arbitrary expression
 // — except a workflow action call *may* name a builtin (`send_email`
 // etc. are builtins), the opposite of `transact`'s own restriction.
+// `state_item`'s trailing `kv_entry` alternative is `WORKFLOW.md`'s
+// "state ownership + a generated queue UI" section: `owner: role(...)`/
+// `owner: claim(...)` (who may fire this state's outgoing events —
+// `typeck.rs::check_visibility_expr`, the same shape `screen`'s own
+// `view`/`edit` already use) and `label: "..."` (a display name for a
+// generated queue UI's status badge) are the two keys given meaning
+// today; any other key is parsed but ignored, the same forward-
+// compatible posture `screen_item`'s own `kv_entry` fallback already has.
 workflow_decl  ::= "workflow" ident "{" data_block? state_decl+ "}"
 data_block     ::= "data" "{" field ("," field)* ","? "}"
-state_decl     ::= "state" ident "terminal"? "{" on_entry_block? on_exit_block? transition* "}"
+state_decl     ::= "state" ident "terminal"? "{" state_item* "}"
+state_item     ::= on_entry_block | on_exit_block | transition | kv_entry
 on_entry_block ::= "on_entry" "{" action_call* "}"
 on_exit_block  ::= "on_exit" "{" action_call* "}"
 action_call    ::= ident "(" (expr ("," expr)*)? ")"

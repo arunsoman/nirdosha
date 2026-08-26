@@ -357,7 +357,10 @@ pub enum TypeErrorKind {
     /// literal, or a `field <name> { min/max: ... }` whose value isn't a
     /// plain int/float literal — the only shapes `serve.rs`'s runtime
     /// enforcement (and `ui_gen_template.html`'s client-side mirror) know
-    /// how to read.
+    /// how to read. Also reused for `state Name { label: ... }`
+    /// (`WORKFLOW.md`'s "state ownership" section) whose value isn't a
+    /// plain string literal — same "must be a literal, not a computed
+    /// expression" shape, different construct.
     InvalidFieldValidationExpr { key: String },
     /// `field <name> { pattern: "..." }` where `<name>`'s declared type
     /// isn't `str` (a regex has nothing to match against a number/bool/
@@ -728,6 +731,9 @@ impl std::fmt::Display for TypeError {
             TypeErrorKind::InvalidFieldValidationExpr { key } if key == "pattern" => {
                 write!(f, "{line}:{col}: `pattern` must be a string literal (a regex)")
             }
+            TypeErrorKind::InvalidFieldValidationExpr { key } if key == "label" => {
+                write!(f, "{line}:{col}: `label` must be a string literal")
+            }
             TypeErrorKind::InvalidFieldValidationExpr { key } => {
                 write!(f, "{line}:{col}: `{key}` must be an int or float literal")
             }
@@ -920,6 +926,17 @@ pub enum TypeWarningKind {
     /// "79 of 246" figure). `nirdosha serve` will route it and any caller
     /// with no token at all can call it.
     UngatedFnReachableWithNoToken { fn_name: String },
+    /// `WORKFLOW.md`'s "state ownership" section: a non-terminal `state`
+    /// with no `owner: role(...)/claim(...)` entry — any authenticated
+    /// caller may fire one of its outgoing events (the same "default open
+    /// unless you say otherwise" posture `UngatedFnReachableWithNoToken`
+    /// already warns about for ordinary `fn`s, applied to a workflow
+    /// state instead). Non-fatal for the same reason that one is: a
+    /// state's owner genuinely is optional (a purely automatic, no-
+    /// human-in-the-loop state, `WF-RIDE-003`'s `FareSettlement` shape),
+    /// so this surfaces the *unintentional* case rather than forbidding
+    /// the intentional one.
+    WorkflowStateHasNoOwner { workflow: String, state: String },
 }
 
 impl std::fmt::Display for TypeWarning {
@@ -932,6 +949,12 @@ impl std::fmt::Display for TypeWarning {
                  parameter — it will be callable by anyone with no token at all once served; add \
                  `requires(role: ...)`/`requires(claim: ..., ...)` to gate it, or `requires(public)` \
                  if that's intentional"
+            ),
+            TypeWarningKind::WorkflowStateHasNoOwner { workflow, state } => write!(
+                f,
+                "{line}:{col}: warning: `workflow {workflow}`'s state `{state}` has no `owner: role(...)` \
+                 — any signed-in caller will be able to advance it once served; add an `owner` if that's \
+                 not intended"
             ),
         }
     }
@@ -960,11 +983,43 @@ fn is_reachable_with_no_token(f: &FnDecl) -> bool {
     if f.requires.is_some() || f.explicit_public {
         return false;
     }
-    !f.params.iter().any(|p| is_verified_identity(&p.ty) || matches!(p.ty, Ty::Db | Ty::Mq))
+    // `Option(VerifiedIdentity)` (`WORKFLOW.md`'s "who submitted this"
+    // section) is a deliberate, explicit "reachable with no token, and
+    // I know it" declaration — the same reasoning `explicit_public`
+    // above already gets exempted for, not an oversight the warning
+    // should be surfacing.
+    !f.params.iter().any(|p| is_verified_identity(&p.ty) || is_optional_verified_identity(&p.ty) || matches!(p.ty, Ty::Db | Ty::Mq))
 }
 
 fn is_verified_identity(ty: &Ty) -> bool {
     matches!(ty, Ty::Named(n, args) if n == "VerifiedIdentity" && args.is_empty())
+}
+
+/// `Option(VerifiedIdentity)` — the optional-identity shape `serve.rs::
+/// dispatch` injects `Some(id)`/`None` for, never a 401 either way (see
+/// that module's doc comment and `WORKFLOW.md`'s "who submitted this"
+/// section, the feature that motivated it).
+fn is_optional_verified_identity(ty: &Ty) -> bool {
+    matches!(ty, Ty::Named(n, args) if n == "Option" && args.len() == 1 && is_verified_identity(&args[0]))
+}
+
+/// Walks every declared `workflow`'s non-terminal `state`s and reports
+/// `WorkflowStateHasNoOwner` for each one with no `owner` entry — the
+/// workflow sibling of `ungated_fn_warnings` above, same "separate,
+/// non-fatal pass" reasoning (a warning must never fail a build).
+/// Terminal states are exempt: nothing is ever *decided* there (no
+/// outgoing event to gate), only `on_entry`/`on_exit` actions run.
+pub fn workflow_owner_warnings(program: &Program) -> Vec<TypeWarning> {
+    program
+        .workflows
+        .iter()
+        .flat_map(|w| {
+            w.states.iter().filter(|s| !s.terminal && !s.entries.iter().any(|(k, _)| k == "owner")).map(|s| TypeWarning {
+                kind: TypeWarningKind::WorkflowStateHasNoOwner { workflow: w.name.clone(), state: s.name.clone() },
+                span: s.span,
+            })
+        })
+        .collect()
 }
 
 fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeError>> {
@@ -1498,6 +1553,25 @@ impl<'a> Checker<'a> {
                 }
                 if t.via_link {
                     link_events.push(t.event.as_str());
+                }
+            }
+
+            // `state Name { owner: role(...)/claim(...), label: "..." }`
+            // (`WORKFLOW.md`'s "state ownership" section) — `owner` reuses
+            // `screen`'s own `view`/`edit` shape check exactly (a role(...)/
+            // claim(...) call with string-literal args); `label` must be a
+            // plain string literal. Unknown keys are silently accepted,
+            // same forward-compatible posture `check_screen` already has
+            // for `screen.entries`.
+            for (key, value) in &s.entries {
+                match key.as_str() {
+                    "owner" => self.check_visibility_expr(key, value),
+                    "label" => {
+                        if !matches!(value, Expr::Str(..)) {
+                            self.error(TypeErrorKind::InvalidFieldValidationExpr { key: key.to_string() }, value.span());
+                        }
+                    }
+                    _ => {}
                 }
             }
 
@@ -3289,9 +3363,20 @@ impl<'a> Checker<'a> {
             // `event`/`token`'s type isn't pinned to one fixed `Ty` here
             // (a different compiler-synthesized enum/struct per
             // workflow); see `WorkflowEventArgMustBeEnum`'s doc comment.
-            ("__workflow_start", 2) => {
+            ("__workflow_start", 3) => {
                 self.check(&args[0], &Ty::Str, expected_ret, scopes); // workflow_name
-                let data_ty = self.infer(&args[1], expected_ret, scopes);
+                // `identity: Option(VerifiedIdentity)` (`WORKFLOW.md`'s
+                // "who submitted this" section) — checked against the
+                // concrete `Option(VerifiedIdentity)` type, not just any
+                // `Option(_)`, the same precision `__workflow_advance`'s
+                // own plain `VerifiedIdentity` check already has.
+                self.check(
+                    &args[1],
+                    &Ty::Named("Option".to_string(), vec![Ty::Named("VerifiedIdentity".to_string(), vec![])]),
+                    expected_ret,
+                    scopes,
+                );
+                let data_ty = self.infer(&args[2], expected_ret, scopes);
                 if data_ty != Ty::Error && !matches!(&data_ty, Ty::Named(n, _) if self.registry.is_struct(n)) {
                     self.error(
                         TypeErrorKind::WorkflowStructArgMustBeStruct {
@@ -3299,23 +3384,52 @@ impl<'a> Checker<'a> {
                             arg: "data".to_string(),
                             found: data_ty,
                         },
-                        args[1].span(),
+                        args[2].span(),
                     );
                 }
                 workflow_result_of(Ty::I64)
             }
-            ("__workflow_advance", 4) => {
+            ("__workflow_advance", 5) => {
                 self.check(&args[0], &Ty::Str, expected_ret, scopes); // workflow_name
-                self.check(&args[1], &Ty::I64, expected_ret, scopes); // instance_id
-                let event_ty = self.infer(&args[2], expected_ret, scopes);
+                self.check(&args[1], &Ty::Named("VerifiedIdentity".to_string(), vec![]), expected_ret, scopes); // identity
+                self.check(&args[2], &Ty::I64, expected_ret, scopes); // instance_id
+                let event_ty = self.infer(&args[3], expected_ret, scopes);
                 if event_ty != Ty::Error && !matches!(&event_ty, Ty::Named(n, _) if self.registry.is_enum(n)) {
                     self.error(
                         TypeErrorKind::WorkflowEventArgMustBeEnum { fn_name: name.to_string(), found: event_ty },
-                        args[2].span(),
+                        args[3].span(),
                     );
                 }
-                self.check(&args[3], &Ty::Json, expected_ret, scopes); // payload
+                self.check(&args[4], &Ty::Json, expected_ret, scopes); // payload
                 workflow_result_of(Ty::Bool)
+            }
+            // `WORKFLOW.md`'s "state ownership" section: backs
+            // `list_<workflow>_pending_for_me`. `identity` names the
+            // caller whose owned states are being queried — the query
+            // itself (which instances/states satisfy it) is entirely a
+            // `workflow_log.rs`/`WorkflowDecl` runtime lookup, nothing
+            // left to typecheck about it beyond these two argument types.
+            ("__workflow_pending_for_me", 2) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes); // workflow_name
+                self.check(&args[1], &Ty::Named("VerifiedIdentity".to_string(), vec![]), expected_ret, scopes); // identity
+                workflow_result_of(Ty::Json)
+            }
+            // `WORKFLOW.md`'s "who submitted this" section.
+            ("__workflow_submitted_by_me", 2) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes); // workflow_name
+                self.check(&args[1], &Ty::Named("VerifiedIdentity".to_string(), vec![]), expected_ret, scopes); // identity
+                workflow_result_of(Ty::Json)
+            }
+            // `WORKFLOW.md`'s "audit trail" section — `identity` isn't
+            // one of these two arguments: `get_<workflow>_history`'s own
+            // `identity: VerifiedIdentity` param exists only so
+            // `serve.rs::dispatch` demands *a* signed-in caller (this
+            // read has no per-viewer scoping to check against it, a
+            // disclosed simplification — see that fn's own doc comment).
+            ("__workflow_history", 2) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes); // workflow_name
+                self.check(&args[1], &Ty::I64, expected_ret, scopes); // instance_id
+                workflow_result_of(Ty::Json)
             }
             ("__workflow_link_advance", 5) => {
                 self.check(&args[0], &Ty::Str, expected_ret, scopes); // workflow_name
@@ -3365,11 +3479,11 @@ impl<'a> Checker<'a> {
             | "json_get_bool" | "json_array_get" | "check_role" | "extract_claim" | "extract_claim_path"
             | "db_query" | "db_execute" | "validate_api_key" | "mq_connect" | "constant_time_str_eq" => 2,
             "http_get" | "https_get" | "exchange_refresh_token" | "mq_publish" | "mq_consume" | "check_role_path" => 3,
-            "http_post" | "https_post" | "oidc_validate_token" | "send_email" | "send_sms" | "send_push"
-            | "__workflow_advance" => 4,
+            "http_post" | "https_post" | "oidc_validate_token" | "send_email" | "send_sms" | "send_push" => 4,
             "mock_issue_token" => 7,
-            "notify" | "__workflow_link_advance" => 5,
-            "__workflow_start" => 2,
+            "notify" | "__workflow_link_advance" | "__workflow_advance" => 5,
+            "__workflow_start" => 3,
+            "__workflow_pending_for_me" | "__workflow_submitted_by_me" | "__workflow_history" => 2,
             _ => 1,
         }
     }

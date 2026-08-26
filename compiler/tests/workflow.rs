@@ -37,6 +37,32 @@ fn ok_payload(v: &Value) -> Value {
     }
 }
 
+/// A `VerifiedIdentity` value carrying `roles` in its embedded
+/// `claims_json`, field order matching `ast::prelude_structs`'s own
+/// declaration (`subject, issuer, audience, expires_at, issued_at,
+/// claims_json`) — `advance_<workflow>` (`WORKFLOW.md`'s "state
+/// ownership" section) takes one as its leading param, so every direct
+/// `call_named("advance_...", ...)` in this file needs one to construct
+/// by hand (a real `nirdosha serve` request gets this injected from the
+/// bearer token instead — see `serve.rs::dispatch` — but these tests
+/// drive `Interpreter` directly, the same "go around the language" shape
+/// `link_transition_mints_a_single_use_token_that_advances_the_state`'s
+/// own doc comment already uses for reading a minted link token).
+fn mock_identity(subject: &str, roles: &[&str]) -> Value {
+    let claims = serde_json::json!({ "roles": roles }).to_string();
+    Value::Struct(
+        Arc::from("VerifiedIdentity"),
+        Arc::from(vec![
+            Value::Str(Arc::from(subject)),
+            Value::Str(Arc::from("test-issuer")),
+            Value::Str(Arc::from("test-audience")),
+            Value::Int(9_999_999_999),
+            Value::Int(0),
+            Value::Str(Arc::from(claims.as_str())),
+        ]),
+    )
+}
+
 fn err_variant(v: &Value) -> String {
     match v {
         Value::Enum(name, variant, payload) if name.as_ref() == "Result" && variant.as_ref() == "Err" => {
@@ -80,7 +106,7 @@ fn start_creates_an_instance_and_runs_on_entry() {
     let interp = Interpreter::new(Arc::new(program), Arc::from(SRC))
         .with_workflow_log_path(temp_path("start"));
     let data = Value::Struct(Arc::from("OnboardingData"), Arc::from(vec![Value::Str(Arc::from("alice"))]));
-    let result = interp.call_named("start_onboarding", &[data]).expect("start_onboarding should not trap");
+    let result = interp.call_named("start_onboarding", &[Value::Enum(Arc::from("Option"), Arc::from("None"), Arc::from(vec![])), data]).expect("start_onboarding should not trap");
     let Value::Int(instance_id) = ok_payload(&result) else { panic!("expected Ok(i64)") };
     assert!(instance_id > 0);
 }
@@ -91,7 +117,7 @@ fn advance_with_no_such_event_is_a_clean_err_not_a_trap() {
     let log_path = temp_path("no-such-transition");
     let interp = Interpreter::new(Arc::new(program), Arc::from(SRC)).with_workflow_log_path(log_path);
     let data = Value::Struct(Arc::from("OnboardingData"), Arc::from(vec![Value::Str(Arc::from("bob"))]));
-    let start_result = interp.call_named("start_onboarding", &[data]).expect("start should not trap");
+    let start_result = interp.call_named("start_onboarding", &[Value::Enum(Arc::from("Option"), Arc::from("None"), Arc::from(vec![])), data]).expect("start should not trap");
     let Value::Int(instance_id) = ok_payload(&start_result) else { panic!("expected Ok(i64)") };
 
     // `Onboarding` only declares transitions on `Start`, reachable via the
@@ -99,7 +125,7 @@ fn advance_with_no_such_event_is_a_clean_err_not_a_trap() {
     // (non-link) event to offer here, so this exercises the
     // instance-not-found path on a bogus id instead, proving that shape
     // returns a clean `Err`, not a trap.
-    let bogus = interp.call_named("advance_onboarding", &[Value::Int(instance_id + 1_000_000), Value::Enum(Arc::from("OnboardingEvent"), Arc::from("Verify"), Arc::from(vec![])), Value::Json(Arc::new(serde_json::Value::Null))]).expect("advance should not trap");
+    let bogus = interp.call_named("advance_onboarding", &[mock_identity("bob", &[]), Value::Int(instance_id + 1_000_000), Value::Enum(Arc::from("OnboardingEvent"), Arc::from("Verify"), Arc::from(vec![])), Value::Json(Arc::new(serde_json::Value::Null))]).expect("advance should not trap");
     assert_eq!(err_variant(&bogus), "InstanceNotFound");
 }
 
@@ -109,7 +135,7 @@ fn link_transition_mints_a_single_use_token_that_advances_the_state() {
     let log_path = temp_path("link-transition");
     let interp = Interpreter::new(Arc::new(program), Arc::from(SRC)).with_workflow_log_path(log_path.clone());
     let data = Value::Struct(Arc::from("OnboardingData"), Arc::from(vec![Value::Str(Arc::from("carol"))]));
-    let start_result = interp.call_named("start_onboarding", &[data]).expect("start should not trap");
+    let start_result = interp.call_named("start_onboarding", &[Value::Enum(Arc::from("Option"), Arc::from("None"), Arc::from(vec![])), data]).expect("start should not trap");
     let Value::Int(instance_id) = ok_payload(&start_result) else { panic!("expected Ok(i64)") };
 
     // Read the token `bind_link_tokens` minted during `Start`'s `on_entry`

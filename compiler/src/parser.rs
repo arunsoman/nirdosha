@@ -561,11 +561,16 @@ impl Parser {
         Ok(fields)
     }
 
-    /// `state_decl ::= "state" IDENT "terminal"? "{" on_entry_block?
-    /// on_exit_block? transition* "}"` — `terminal` is matched by
-    /// identifier text right after the state name (same "keyword only in
-    /// this one slot" treatment as everywhere else in this grammar), not
-    /// a reserved `Tok`.
+    /// `state_decl ::= "state" IDENT "terminal"? "{" state_item* "}"`
+    /// `state_item ::= on_entry_block | on_exit_block | transition | kv_entry`
+    /// — `terminal` is matched by identifier text right after the state
+    /// name (same "keyword only in this one slot" treatment as everywhere
+    /// else in this grammar), not a reserved `Tok`. Any leading identifier
+    /// other than `on_entry`/`on_exit`/`on` is a plain `kv_entry`
+    /// (`owner: role(...)`, `label: "..."` — `WORKFLOW.md`'s "state
+    /// ownership" section) — same "first-token-text dispatch, no second-
+    /// token lookahead" shape `parse_screen_decl`'s body already uses, so
+    /// `owner`/`label` stay ordinary identifiers everywhere else.
     fn parse_state_decl(&mut self) -> PResult<StateDecl> {
         let span = self.span();
         self.expect(&Tok::State, "`state`")?;
@@ -580,6 +585,7 @@ impl Parser {
         let mut on_entry = Vec::new();
         let mut on_exit = Vec::new();
         let mut transitions = Vec::new();
+        let mut entries = Vec::new();
         while self.peek().tok != Tok::RBrace {
             match &self.peek().tok {
                 Tok::Ident(s) if s == "on_entry" => {
@@ -591,6 +597,7 @@ impl Parser {
                     on_exit = self.parse_action_block()?;
                 }
                 Tok::Ident(s) if s == "on" => transitions.push(self.parse_transition()?),
+                Tok::Ident(_) => entries.push(self.parse_kv_entry()?),
                 Tok::Eof => {
                     return Err(ParseError {
                         message: format!("unterminated `state {name}` block, expected `}}`"),
@@ -600,7 +607,7 @@ impl Parser {
                 other => {
                     return Err(ParseError {
                         message: format!(
-                            "expected `on_entry`, `on_exit`, or `on` inside `state {name}`, found {other:?}"
+                            "expected `on_entry`, `on_exit`, `on`, or a `key: value` entry inside `state {name}`, found {other:?}"
                         ),
                         span: self.span(),
                     });
@@ -608,7 +615,7 @@ impl Parser {
             }
         }
         self.expect(&Tok::RBrace, "`}`")?;
-        Ok(StateDecl { name, terminal, on_entry, on_exit, transitions, span })
+        Ok(StateDecl { name, terminal, on_entry, on_exit, transitions, entries, span })
     }
 
     // action_block ::= "{" action_call* "}"

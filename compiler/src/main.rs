@@ -227,6 +227,12 @@ fn print_ungated_fn_warnings(program: &nirdosha::ast::Program) {
     for w in nirdosha::typeck::ungated_fn_warnings(program) {
         eprintln!("{w}");
     }
+    // `WORKFLOW.md`'s "state ownership" section: same non-fatal,
+    // reachability-shaped warning, for a workflow `state` with no
+    // `owner` rather than a plain `fn` with no `requires(...)`.
+    for w in nirdosha::typeck::workflow_owner_warnings(program) {
+        eprintln!("{w}");
+    }
 }
 
 fn typecheck_and_own_impl(src: &str, require_main: bool) -> Result<nirdosha::ast::Program, String> {

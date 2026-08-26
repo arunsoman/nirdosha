@@ -21,6 +21,11 @@ fn warned_fn_names(src: &str) -> Vec<String> {
         .into_iter()
         .map(|w| match w.kind {
             TypeWarningKind::UngatedFnReachableWithNoToken { fn_name } => fn_name,
+            // `ungated_fn_warnings` only ever produces the variant above
+            // — `WorkflowStateHasNoOwner` is `workflow_owner_warnings`'s
+            // own, separate pass (`WORKFLOW.md`'s "state ownership"
+            // section).
+            other => unreachable!("ungated_fn_warnings should never produce {other:?}"),
         })
         .collect()
 }

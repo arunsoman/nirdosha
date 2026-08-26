@@ -129,21 +129,35 @@ For `workflow KycOnboarding`:
   carrier struct (not the user's own `Text`, if they happen to have one —
   `LANGUAGE.md` §6b's convention name — since that would risk a name
   collision this doesn't need to risk).
-- `fn start_kyc_onboarding(data: KycOnboardingData) -> Result(i64, WorkflowActionError)`
+- `fn start_kyc_onboarding(identity: Option(VerifiedIdentity), data: KycOnboardingData) -> Result(i64, WorkflowActionError)`
   — creates the durable instance (state = first-declared state), runs
   that state's `on_entry`, returns the new instance id. A real
-  `POST /api/start_kyc_onboarding` endpoint, for free.
-- `fn advance_kyc_onboarding(instance_id: i64, event: KycOnboardingEvent, payload: json) -> Result(bool, WorkflowActionError)`
-  — the ordinary, authenticated transition entry point.
+  `POST /api/start_kyc_onboarding` endpoint, for free. `identity` is
+  **optional** — §6 below ("who submitted this"): `Some(_)`'s `subject`
+  is durably recorded as `started_by_subject`; `None` is the legitimate
+  anonymous-start case this very example (`kyc_onboarding.nir`) uses.
+- `fn advance_kyc_onboarding(identity: VerifiedIdentity, instance_id: i64, event: KycOnboardingEvent, payload: json) -> Result(bool, WorkflowActionError)`
+  — the ordinary, authenticated transition entry point. `identity` is
+  **required** here (§§1-4 above, "state ownership") — checked against
+  the *current instance's* live state's `owner`, never statically.
 - `fn email_verified_via_link(instance_id: i64, token: KycOnboardingLinkToken, payload: json) -> Result(bool, WorkflowActionError)`
   — one per distinct `link`-marked event name, **unauthenticated** (no
   `requires`, no `VerifiedIdentity` param) — same shape
   `trade_finance.nir:637-689`'s hand-written `decide_approval_via_link`
-  already established.
+  already established, and deliberately **not** owner-checked either — a
+  consumed, single-use link token is its own authorization.
+- `fn list_kyc_onboarding_pending_for_me(identity: VerifiedIdentity) -> Result(json, WorkflowActionError)`
+  — §§1-4 above, the queue read side.
+- `fn list_kyc_onboarding_submitted_by_me(identity: VerifiedIdentity) -> Result(json, WorkflowActionError)`
+  — §6 below, the "My Requests" read side.
+- `fn get_kyc_onboarding_history(identity: VerifiedIdentity, instance_id: i64) -> Result(json, WorkflowActionError)`
+  — §7 below, the audit-trail read side.
 
-`payload` is accepted by `advance_*`/`*_via_link` for signature symmetry
-with a future increment, but is **not yet threaded into `on_entry`/
-`on_exit` bindings** — see "Deliberate non-goals" below.
+`payload` (`advance_*`/`*_via_link`'s trailing argument) is still not
+threaded into `on_entry`/`on_exit` bindings — see "Deliberate non-goals"
+below — but §7's audit trail now reads one field out of it
+(`{"comment": "..."}`), a narrow, self-contained exception to that gap,
+not a change to it.
 
 ## Runtime protocol (`interpreter.rs`, `workflow_log.rs`)
 
@@ -288,23 +302,35 @@ builtin).
   `check_supported` names the specific unsupported builtin, never a
   silent mis-compile.
 
-## Proposed, not built: state ownership + a generated queue UI
+## State ownership + a generated queue UI
 
-**2026-08-26.** Found working through `scratch/extracted_typed_v1.json`'s
+**2026-08-26, built.** Found working through `scratch/extracted_typed_v1.json`'s
 `WF-TRDPAY-001` example against the real, shipped six-eyes/Maker-Checker
 implementation (`examples/trade-finance/trade_finance.nir`'s
 `submit_approval`/`decide_approval`, which doesn't even use `workflow{}`):
-today there is **no** way to say, in `.nir` source, who may act on a
-`state`, and **no** generated UI anywhere a user could see "the things
-currently waiting on me" and act on one. Verified directly, not assumed:
-`ast::StateDecl` has no owner field; `ui_gen.rs` has zero references to
-`WorkflowDecl` at all; the one hand-written approval screen
-`trade_finance.nir` actually ships (`screen`-free, naming-convention-only
-`Approval`) is a read-only list gated to a single fixed role, with no
-decide action and no per-row "is this mine" filtering. This section is a
-proposed design to close that gap — a sketch for review, matching every
-other `[OPEN]`/proposed section this file and `API_TRUST_MODEL.md`
-already use that convention for, **nothing here is built**.
+before this, there was **no** way to say, in `.nir` source, who may act
+on a `state`, and **no** generated UI anywhere a user could see "the
+things currently waiting on me" and act on one — `ast::StateDecl` had no
+owner field, `ui_gen.rs` had zero references to `WorkflowDecl` at all,
+and the one hand-written approval screen `trade_finance.nir` actually
+ships (`screen`-free, naming-convention-only `Approval`) was a read-only
+list gated to a single fixed role, with no decide action and no per-row
+"is this mine" filtering. The section below was a proposed design
+sketch; every numbered piece is now real (`ROADMAP.md` Track A item A13,
+`compiler/UI_DSL_TODO.md`) — updated in place to describe what actually
+shipped rather than kept as a stale "not built" proposal, and extended
+past the original sketch with three more real, shipped pieces this
+session added on top of it (§6-§8 below): **who submitted this**
+(`Option(VerifiedIdentity)` on `start_<workflow>`, a "My Requests" tab),
+an **audit trail** (`get_<workflow>_history`: actor/via-link/comment per
+transition), and a **broader enterprise catalog** disclosing what's
+still genuinely not built (delegation, SLA/escalation timers, quorum,
+bulk actions, an in-app notification inbox — see §9). Two pieces remain
+deliberately not built, disclosed in their own sections: **quorum**
+("N of these, not just one," six-eyes) is still extraction-schema
+metadata only (`required_decisions`), not runtime-enforced; per-viewer
+history ACL is a disclosed simplification (any signed-in identity may
+view any instance's history today).
 
 ### Why this needs new machinery, not just a new field
 
@@ -431,3 +457,125 @@ hint distinguishing a single-decider state from a quorum one — data ready
 to feed this design the moment it's built, explicitly *not* implying any
 of it is enforced today (`ROADMAP.md` tracks the compiler-side gap
 separately from the schema's ability to record the intent).
+
+### 6. "Who submitted this" — built
+
+Surfaced by a direct question against `examples/purchase_approval.nir`'s
+own demo: a real approval-chain app needs the *requester* to be able to
+track their own submission's status, not just the approvers to see their
+own queues — arguably the single most basic expectation of *any*
+enterprise approval system (ServiceNow, SAP Business Workflow, Salesforce
+Approval Processes, Concur all put "my requests" one click from the
+homepage). Nothing in the original design above provided it: `start_*`
+had no identity slot at all, so no instance could be traced back to
+whoever created it.
+
+- `start_<workflow>` gains a leading `identity: Option(VerifiedIdentity)`
+  param — **optional**, unlike `advance_<workflow>`'s required one,
+  because starting a workflow is legitimately anonymous in real programs
+  today (`kyc_onboarding.nir`'s own public intake: a brand-new applicant
+  has no account yet). `serve.rs::dispatch` gained a genuinely new,
+  general capability for this, not workflow-specific: a fn param typed
+  `Option(VerifiedIdentity)` is injected `Some(id)` when a valid bearer
+  token was presented, `None` when absent — **never** a 401 either way,
+  unlike a bare `VerifiedIdentity` param. Any program can use this for
+  "personalize when signed in, still work when not," not just workflows.
+- `workflow_instance` (`workflow_log.rs`) gains a `started_by_subject`
+  column, populated from `identity.subject` when `Some(_)`, left `NULL`
+  for a legitimate anonymous start.
+- A new synthesized read fn, `list_<workflow>_submitted_by_me(identity:
+  VerifiedIdentity) -> Result(json, WorkflowActionError)` — `identity`
+  here is **required** (unlike `start_*`'s optional one): "show me my
+  own requests" is meaningless with nothing to scope it to.
+- Generated UI: the "Workflows" queue screen gained a second tab, **"My
+  requests"**, next to "Waiting on me" — same row shape, but read-only
+  (no action buttons; a requester watches, they don't decide).
+
+### 7. Audit trail — built
+
+The other near-universal enterprise expectation: *who* approved/rejected
+*what*, *when*, and *why* (SOX/banking-regulation territory — every
+system above has some version of this). `workflow_history` already
+existed, durably, from `WORKFLOW.md`'s very first version — it just
+wasn't exposed to a caller, and didn't record *who* acted or *why*.
+
+- `workflow_history` gains `actor_subject` (the acting identity's
+  `subject`, `NULL` only for the magic-link path — see below),
+  `via_link` (whether this transition fired through an unauthenticated
+  magic-link click rather than an ordinary authenticated call), and
+  `comment` (free text, see next point).
+- `advance_<workflow>`'s trailing `payload: json` argument — accepted
+  since the very first version of this feature but never threaded
+  anywhere (the "deliberate non-goals" section above still correctly
+  says it isn't threaded into `on_entry`/`on_exit` bindings) — is now
+  read for a `{"comment": "..."}` string and logged to the history row.
+  The generated UI prompts for one (optional) when a decision button is
+  clicked. This is a narrow, self-contained use of `payload`, not the
+  fuller on_entry/on_exit threading that section still discloses as not
+  done.
+- A new synthesized read fn, `get_<workflow>_history(identity:
+  VerifiedIdentity, instance_id: i64) -> Result(json, WorkflowActionError)`
+  — the full transition log, oldest first. **Disclosed simplification,
+  not a real per-viewer ACL**: any signed-in identity may view any
+  instance's history today, the same way `identity` on this fn exists
+  only to demand *a* signed-in caller, not to scope what they see. A
+  real system would restrict this to participants (any state's owner
+  across the workflow's whole lifetime) and the original requester —
+  building that needs a join across every state's `owner` plus
+  `started_by_subject`, not sketched here.
+- Generated UI: every row, in both "Waiting on me" and "My requests",
+  gets a "History" button expanding an inline transition log below it.
+
+### 8. Bug found and fixed in passing: `payload: json` never actually worked over HTTP
+
+While wiring §7 above, found `serve.rs::decode_value` had **no `Ty::Json`
+arm at all** — any `fn` param typed `json` (which `advance_<workflow>`'s
+own `payload` always was, since the very first version of this feature)
+unconditionally 400'd over a real `nirdosha serve` request, regardless of
+what the caller sent. Nothing in this feature's design depended on that
+working before now, so it went unnoticed; fixed with a direct pass-
+through arm (`Ty::Json => Ok(Value::Json(Arc::new(json.clone())))`),
+unrelated to ownership/audit specifically but blocking §7's comment
+capture from working end to end.
+
+### 9. The enterprise catalog: what real systems have that this still doesn't
+
+A direct answer to "what would it take to handle every real-world
+enterprise approval pattern" — drawing on the same shape ServiceNow, SAP
+Business Workflow, Salesforce Approval Processes, Concur, Camunda/
+Flowable, and banking maker-checker/six-eyes systems all converge on.
+Each row below is a real, common pattern; "Have?" says whether today's
+`workflow`/`ui_gen.rs` can express it, not whether it's a good idea.
+
+| Pattern | Real-world example | Have? | What it would take |
+|---|---|---|---|
+| Sequential multi-level approval, different role per stage | Purchase orders, expense reports (this doc's own `examples/purchase_approval.nir`) | **Yes** | Already built — this is exactly §§1-7 above. |
+| Quorum / N-of-role ("six-eyes") | Large wire transfers, dual-control banking release | **No** | §5 above — needs `on N-of-role(X) event -> target` grammar or a hand-rolled decision-count table; `owner` alone models one decider, not several. |
+| Who submitted this / "my requests" | Every system listed above | **Yes** | §6 above. |
+| Audit trail (who/when/why) | SOX compliance, banking regulation | **Yes**, with the disclosed per-viewer-ACL gap in §7 | §7 above; a real per-viewer ACL (participants + requester only) is the remaining gap. |
+| Delegation / out-of-office reassignment | "I'm on leave, my approvals route to my manager for two weeks" (every system above has this) | **No** | Needs a new admin-editable `WorkflowDelegation`-shaped struct (`from_subject, to_subject, workflow_name, starts_at, ends_at`) and a second check in `identity_satisfies_owner` — real, buildable, same "ordinary struct, free CRUD screen" convention `RoleMapping`/`EmailProviderConfig` already use, just not built. |
+| SLA / escalation timers | "If not acted on in 48h, escalate to the owner's manager or notify again" (universal in enterprise workflow engines) | **No, structurally** | `WORKFLOW.md`'s own "Deliberate non-goals" section already discloses this: **there is no scheduling/cron primitive in Nirdosha at all**. The `state`/`on_entry` shape is durable and retry-safe, but nothing inside the language can fire "48 hours from now" on its own — this needs an *external* scheduler calling `advance_<workflow>`/a new escalation fn, same as every other "nightly" workflow already has to work this way. |
+| Bulk actions ("approve all 12 selected") | Any queue-shaped enterprise UI | **No** | Pure UI-layer batching over the existing `advance_<workflow>` calls, one request per selected row — no new compiler construct needed, just not built in `ui_gen_template.html` yet. |
+| In-app notification inbox (persisted, browsable later) | Almost every enterprise app's bell icon | **Already possible today, not a compiler gap** | `on_entry`/`on_exit` can call *any* function, not just `send_email`/`send_sms`/`notify` — an ordinary user-defined `fn` that `db_execute`s an insert into your own `struct Notification { ... }` (a real, free CRUD screen) gives a persisted, browsable inbox with zero new grammar. What's still missing is only a UI *bell icon* convention (`ui_gen.rs` has no special-cased "notification" struct today — it would just render as an ordinary screen, not a badge in the nav bar). |
+| Unified cross-workflow "Approvals" inbox (one queue merging every workflow, not one nav tab per workflow) | Any org with more than one approval process | **No** | Pure UI aggregation over each workflow's own `list_<workflow>_pending_for_me` — no new compiler construct, just not built (today's "Workflows" nav is one entry per `workflow`, not a merged view). |
+| Reporting/analytics (cycle time, bottleneck stage, volume by requester) | Every workflow engine's dashboard | **Already possible today, not a gap** | `workflow_history` has everything a `db_query`-driven `stat_*`/`chart_*` fn needs — but `workflow_history`/`workflow_instance` live in `workflow_log.rs`'s own private SQLite store, not the app's `--db` database, so a report can't `db_query` them directly today; the existing dashboard convention (`LANGUAGE.md` §11) would need a new builtin exposing this store to ordinary SQL, or a periodic export, to actually wire up. |
+| Real-time push to an open browser tab | Slack-style live badge updates | **No, structurally, by design** | Already disclosed in "Deliberate non-goals" above: `notify()`'s online path assumes an *external* WS gateway relaying its Redis `PUBLISH`; this repository terminates no WebSocket connections itself. |
+| Visual drag-and-drop workflow designer | Most enterprise workflow *products'* own admin UI | **No, out of scope by design** | Orthogonal to a compiled DSL — `workflow { ... }` is source code, the same way `struct`/`fn` are; a visual designer is a separate tool that would *generate* `.nir` source, not a compiler feature. |
+
+Two rows are marked **Yes** because this session built them; the rest
+are named here specifically so a future session (or reader) doesn't have
+to re-derive "does Nirdosha have X" from scratch — each row's "what it
+would take" is a real, scoped starting point, not a vague TODO.
+
+**The exact reach of `on_entry`/`on_exit`, worth stating plainly:** they
+can call *any* function — not just `send_email`/`send_sms`/`send_push`/
+`notify`, but an ordinary user-defined `fn` doing `http_post` (call any
+webhook), `db_execute` (persist anything to your own `--db` tables, e.g.
+a real notification-inbox row), or both. That closes the notification-
+inbox row above for free. What it structurally *cannot* do: fire with no
+transition at all (SLA/escalation needs something external calling back
+in *after a delay with no human action*, which nothing in this language
+provides) or change who is *authorized* to act (`owner` is checked
+before `on_entry`/`on_exit` ever run, so delegation needs the owner
+check itself to consult a delegation table — notifying a stand-in
+doesn't authorize them).

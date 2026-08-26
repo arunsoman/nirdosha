@@ -198,6 +198,15 @@ workflow KycOnboarding {
     }
 
     state UnderReview {
+        // `WORKFLOW.md`'s "state ownership + a generated queue UI"
+        // section: `owner` matches `notify_compliance_review_needed`'s
+        // own notification target below exactly (they usually do, though
+        // nothing forces it — see that section's `owner`/`on_entry`
+        // independence note). Without this, any signed-in caller could
+        // fire `Approve`/`Reject` on somebody else's KYC review, not just
+        // compliance.
+        owner: role("compliance_officer")
+        label: "Pending Compliance Review"
         on_entry {
             notify_compliance_review_needed(instance_id)
         }
@@ -223,13 +232,25 @@ workflow KycOnboarding {
 // `trade_finance.nir`'s own approval flow layers a friendlier public `fn`
 // over its `_inner` helper: a caller shouldn't have to know the exact
 // synthesized name/shape to use this workflow.
+// `start_kyc_onboarding`'s leading `identity: Option(VerifiedIdentity)`
+// param (`WORKFLOW.md`'s "who submitted this" section) is `None()` here
+// deliberately, not a shortcut: a brand-new applicant doing KYC has no
+// account yet, so there's genuinely no identity to record as
+// `started_by_subject` — the legitimate anonymous-intake case that
+// param being *optional* (unlike `advance_<workflow>`'s required one)
+// exists for.
 fn submit_kyc_application(applicant_subject: Text, risk_score: i64) -> Result(i64, WorkflowActionError) {
-    return start_kyc_onboarding(KycOnboardingData(applicant_subject.value, risk_score))
+    return start_kyc_onboarding(None(), KycOnboardingData(applicant_subject.value, risk_score))
 }
 
-fn review_kyc_application(instance_id: i64, decision: KycOnboardingEvent) -> Result(bool, WorkflowActionError) {
+// `identity` is a real, disclosed breaking-change param
+// (`WORKFLOW.md`'s "state ownership" section) — `advance_kyc_onboarding`
+// now checks it against `UnderReview`'s own `owner: role(...)` above, so
+// this wrapper has to take one to pass through (`nirdosha serve` injects
+// it from the caller's bearer token automatically; see `serve.rs::dispatch`).
+fn review_kyc_application(identity: VerifiedIdentity, instance_id: i64, decision: KycOnboardingEvent) -> Result(bool, WorkflowActionError) {
     return match json_parse("{}") {
-        Ok(payload) => advance_kyc_onboarding(instance_id, decision, payload),
+        Ok(payload) => advance_kyc_onboarding(identity, instance_id, decision, payload),
         Err(e) => Err(NoSuchTransition()),
     }
 }

@@ -75,11 +75,11 @@ const TRADE_PAYMENT_APPROVAL_NIR: &str = r#"
         state Rejected terminal { on_entry { notify_treasury_decided(instance_id, Text("r")) } }
     }
     fn submit_trade_payment_for_approval(payment_id: i64, amount_cents: i64) -> Result(i64, WorkflowActionError) {
-        return start_trade_payment_approval(TradePaymentApprovalData(payment_id, amount_cents))
+        return start_trade_payment_approval(None(), TradePaymentApprovalData(payment_id, amount_cents))
     }
-    fn classify_and_advance(instance_id: i64, amount_cents: i64) -> Result(bool, WorkflowActionError) {
+    fn classify_and_advance(identity: VerifiedIdentity, instance_id: i64, amount_cents: i64) -> Result(bool, WorkflowActionError) {
         let event: TradePaymentApprovalEvent = if required_eyes_for_amount(amount_cents) == 2 { ClassifiedHighValue() } else { Classified() }
-        return match json_parse("{}") { Ok(payload) => advance_trade_payment_approval(instance_id, event, payload), Err(e) => Err(NoSuchTransition()) }
+        return match json_parse("{}") { Ok(payload) => advance_trade_payment_approval(identity, instance_id, event, payload), Err(e) => Err(NoSuchTransition()) }
     }
 "#;
 
@@ -117,11 +117,11 @@ const BATCH_PAYMENT_APPROVAL_NIR: &str = r#"
         state Rejected terminal { on_entry { notify_treasury_decided(instance_id, Text("r")) } }
     }
     fn submit_batch_payment_for_approval(amount_a_cents: i64, amount_b_cents: i64, amount_c_cents: i64) -> Result(i64, WorkflowActionError) {
-        return start_batch_payment_approval(BatchPaymentApprovalData(amount_a_cents, amount_b_cents, amount_c_cents))
+        return start_batch_payment_approval(None(), BatchPaymentApprovalData(amount_a_cents, amount_b_cents, amount_c_cents))
     }
-    fn classify_batch_and_advance(instance_id: i64, amount_a_cents: i64, amount_b_cents: i64, amount_c_cents: i64) -> Result(bool, WorkflowActionError) {
+    fn classify_batch_and_advance(identity: VerifiedIdentity, instance_id: i64, amount_a_cents: i64, amount_b_cents: i64, amount_c_cents: i64) -> Result(bool, WorkflowActionError) {
         let event: BatchPaymentApprovalEvent = if required_eyes_for_batch(amount_a_cents, amount_b_cents, amount_c_cents) == 2 { ClassifiedHighValue() } else { Classified() }
-        return match json_parse("{}") { Ok(payload) => advance_batch_payment_approval(instance_id, event, payload), Err(e) => Err(NoSuchTransition()) }
+        return match json_parse("{}") { Ok(payload) => advance_batch_payment_approval(identity, instance_id, event, payload), Err(e) => Err(NoSuchTransition()) }
     }
 "#;
 
@@ -135,10 +135,10 @@ const ESCROW_TRANCHE_RELEASE_NIR: &str = r#"
         state TrancheReleased terminal { on_entry { release_tranche(instance_id, data.purchase_order_id, data.tranche_amount_cents) } }
     }
     fn open_escrow_tranche(purchase_order_id: i64, tranche_amount_cents: i64) -> Result(i64, WorkflowActionError) {
-        return start_escrow_tranche_release(EscrowTrancheReleaseData(purchase_order_id, tranche_amount_cents))
+        return start_escrow_tranche_release(None(), EscrowTrancheReleaseData(purchase_order_id, tranche_amount_cents))
     }
-    fn confirm_milestone_and_release(instance_id: i64) -> Result(bool, WorkflowActionError) {
-        return match json_parse("{}") { Ok(payload) => advance_escrow_tranche_release(instance_id, MilestoneVerified(), payload), Err(e) => Err(NoSuchTransition()) }
+    fn confirm_milestone_and_release(identity: VerifiedIdentity, instance_id: i64) -> Result(bool, WorkflowActionError) {
+        return match json_parse("{}") { Ok(payload) => advance_escrow_tranche_release(identity, instance_id, MilestoneVerified(), payload), Err(e) => Err(NoSuchTransition()) }
     }
 "#;
 
@@ -151,7 +151,7 @@ const COMMISSION_WATERFALL_SETTLEMENT_NIR: &str = r#"
         state Settled terminal { on_entry { compute_commission_waterfall(instance_id, data.payment_id, data.settled_amount_cents) } }
     }
     fn settle_commission_waterfall(payment_id: i64, settled_amount_cents: i64) -> Result(i64, WorkflowActionError) {
-        return start_commission_waterfall_settlement(CommissionWaterfallSettlementData(payment_id, settled_amount_cents))
+        return start_commission_waterfall_settlement(None(), CommissionWaterfallSettlementData(payment_id, settled_amount_cents))
     }
 "#;
 
@@ -177,10 +177,10 @@ const COMMISSION_DISPUTE_RESOLUTION_NIR: &str = r#"
         state Denied terminal { on_entry { notify_treasury_decided(instance_id, Text("d")) } }
     }
     fn raise_commission_dispute(commission_waterfall_id: i64, disputed_amount_cents: i64) -> Result(i64, WorkflowActionError) {
-        return start_commission_dispute_resolution(CommissionDisputeResolutionData(commission_waterfall_id, disputed_amount_cents))
+        return start_commission_dispute_resolution(None(), CommissionDisputeResolutionData(commission_waterfall_id, disputed_amount_cents))
     }
-    fn decide_commission_dispute(instance_id: i64, decision: CommissionDisputeResolutionEvent) -> Result(bool, WorkflowActionError) {
-        return match json_parse("{}") { Ok(payload) => advance_commission_dispute_resolution(instance_id, decision, payload), Err(e) => Err(NoSuchTransition()) }
+    fn decide_commission_dispute(identity: VerifiedIdentity, instance_id: i64, decision: CommissionDisputeResolutionEvent) -> Result(bool, WorkflowActionError) {
+        return match json_parse("{}") { Ok(payload) => advance_commission_dispute_resolution(identity, instance_id, decision, payload), Err(e) => Err(NoSuchTransition()) }
     }
 "#;
 
@@ -193,7 +193,7 @@ const WALLET_SETTLEMENT_NIR: &str = r#"
         state Settled terminal { on_entry { transfer_to_partner_bank_account(instance_id, data.channel_partner_id, data.swept_balance_cents) } }
     }
     fn settle_channel_partner_wallet(channel_partner_id: i64, swept_balance_cents: i64) -> Result(i64, WorkflowActionError) {
-        return start_wallet_settlement(WalletSettlementData(channel_partner_id, swept_balance_cents))
+        return start_wallet_settlement(None(), WalletSettlementData(channel_partner_id, swept_balance_cents))
     }
 "#;
 

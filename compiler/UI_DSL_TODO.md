@@ -337,6 +337,111 @@ invention. Full design in `LANGUAGE.md` §11b.
   baked-in defaults and the theme override, the dark-mode bootstrap
   script, the `content-boxed` html class).
 
+## BUILT (later session) — workflow state ownership + a generated "Workflows" queue UI (`ROADMAP.md` Track A item A13)
+
+Mission: `ui_gen.rs` had zero references to `WorkflowDecl` at all — a
+declared `workflow { ... }` (`WORKFLOW.md`) produced a real backend state
+machine with no UI anywhere a user could see "the things currently
+waiting on me" and act on one, and no way in `.nir` source to say *who*
+may act on a `state` at all. Full design in `WORKFLOW.md`'s "State
+ownership + a generated queue UI" section (formerly "Proposed, not
+built," now updated in place to describe what shipped).
+
+- **Grammar/AST** (`token.rs` unaffected, `ast.rs`, `parser.rs`):
+  `state { ... }` bodies now accept plain `key: value` entries alongside
+  `on_entry`/`on_exit`/`on` (`StateDecl.entries: Vec<KvEntry>`, the same
+  open-ended shape `ScreenDecl.entries` already has) — `owner:
+  role("...")`/`owner: claim("...", "...")` and `label: "..."` are the
+  two keys given meaning; any other key parses but is currently ignored.
+- **Typeck**: `owner` reuses `check_visibility_expr` (`screen`'s own
+  `view`/`edit` shape check) verbatim; `label` must be a string literal.
+  New non-fatal `TypeWarningKind::WorkflowStateHasNoOwner`
+  (`typeck::workflow_owner_warnings`, wired into `nirdosha serve`/
+  `emit-ui` alongside `ungated_fn_warnings`) — the workflow-state sibling
+  of `ROADMAP.md` A10's "default open, but tell you" posture, for a
+  non-terminal state with no `owner`.
+- **`workflow_lower.rs`**: `advance_<workflow>` gains a real, disclosed
+  breaking-change leading `identity: VerifiedIdentity` param (no
+  `requires(...)` — the owner check is a runtime, per-instance question,
+  not a static per-function gate, see `WORKFLOW.md`'s own "why this
+  needs new machinery" note); a new synthesized
+  `list_<workflow>_pending_for_me(identity: VerifiedIdentity) ->
+  Result(json, WorkflowActionError)` read side.
+- **`interpreter.rs`**: `workflow_advance`/the new `workflow_pending_for_me`
+  builtin (`__workflow_advance` now 5-ary, new `__workflow_pending_for_me`)
+  — the owner check happens inside `workflow_advance_inner` against the
+  *instance's own current state*, shared by both the ordinary
+  (owner-checked) path and the magic-link path (`workflow_link_advance`,
+  deliberately **not** owner-checked — a consumed single-use link token
+  is its own authorization). `workflow_log.rs` gains `list_instances`
+  (every instance of a workflow, id/state/data) to back the pending-for-me
+  query.
+- **`ui_gen.rs`/`ui_gen_template.html`**: a new `WorkflowQueue` manifest
+  entry per declared `workflow` (`build_workflow_queues`,
+  `__NIRDOSHA_WORKFLOWS__`), rendered as a new **"Workflows"** nav
+  section — the first new screen archetype `ui_gen.rs` has, distinct
+  from `screen`'s fixed-action-set table: each row's own button set is
+  that row's own *current state's* own outgoing events, straight from
+  `pendingFn`'s per-row response (`state`, `state_label`, `events`,
+  `data`), not anything static in the manifest. Clicking a button calls
+  `advance_<workflow>(instance_id, event, payload: null)` (`identity`
+  injected from the bearer token, same as any other `VerifiedIdentity`
+  param — see `serve.rs::dispatch`).
+- **Bug fixed in passing**: `serve.rs::decode_value` had no `Ty::Json`
+  arm at all — any `fn` param typed `json` (e.g. `advance_<workflow>`'s
+  own pre-existing trailing `payload: json`) always 400'd over a real
+  `nirdosha serve` request, regardless of what the caller sent. Found
+  while wiring the client's `payload: null` call; fixed with a direct
+  pass-through arm, unrelated to the ownership feature itself but
+  blocking it end-to-end.
+- **"Who submitted this" + audit trail, added same session**: `start_<workflow>`
+  gains a leading `identity: Option(VerifiedIdentity)` param (optional —
+  unlike `advance_<workflow>`'s required one, since starting a workflow
+  is legitimately anonymous in real programs, e.g. `kyc_onboarding.nir`'s
+  own public intake). This needed a genuinely new, general `serve.rs::
+  dispatch` capability, not workflow-specific: a fn param typed
+  `Option(VerifiedIdentity)` is injected `Some(id)`/`None` depending on
+  whether a valid bearer token was presented, never a 401 either way
+  (`is_optional_verified_identity`, exempted from the A10 ungated-fn
+  warning the same way `explicit_public` already is). `workflow_instance`
+  (`workflow_log.rs`) gains `started_by_subject`; a new
+  `list_<workflow>_submitted_by_me` read fn backs a second "My Requests"
+  tab in the generated UI (same row shape as the queue, but read-only —
+  no action buttons). `workflow_history` gains `actor_subject`/
+  `via_link`/`comment`; `advance_<workflow>`'s pre-existing (previously
+  unused) `payload: json` argument is now read for a `{"comment": "..."}`
+  string and logged; a new `get_<workflow>_history` read fn backs a
+  per-row "History" button in both tabs, prompting for an optional
+  comment on every decision. New `compiler/tests/workflow_ownership.rs`
+  (5 real-server integration tests: owner enforcement across all 3
+  levels of a sequential chain, `pending_for_me`/`submitted_by_me`/
+  `history` correctness, the `Option(VerifiedIdentity)` capability).
+- **What's still not built, disclosed** — the full enterprise-pattern
+  catalog with what each would take: `WORKFLOW.md` §9. Short version:
+  quorum ("N *distinct* holders of `owner_role`," six-eyes — `owner`
+  alone models a single decider, the first qualifying caller's decision
+  fires the transition immediately; `required_decisions` is still
+  extraction-schema metadata only, not enforced); a real per-viewer
+  history ACL (today: any signed-in identity may view any instance's
+  history); delegation/out-of-office reassignment; SLA/escalation timers
+  (structurally impossible without a scheduler primitive — Nirdosha has
+  none); bulk actions; a unified cross-workflow inbox. **Not** a gap,
+  contrary to first appearance: an in-app notification inbox's
+  *persistence* is already fully expressible today via an ordinary
+  `on_entry`-called `fn` + struct (`on_entry`/`on_exit` can call *any*
+  function, not just `send_email`/`send_sms`/`notify`) — only a UI
+  bell-icon *convention* is missing, not a compiler construct.
+- Reverified: full `cargo test` (compiler crate, every existing test
+  binary) green, including four pre-existing test files updated for the
+  `advance_<workflow>` signature change (`compiler/tests/workflow.rs`,
+  `trade_payment_approval_workflow_check.rs`,
+  `extracted_typed_v2_verification.rs`, `examples/kyc_onboarding.nir`).
+  Live end-to-end demo: a real 3-level sequential purchase-order
+  approval (`examples/purchase_approval.nir`) served via `nirdosha
+  serve`, driven through all three levels via curl with three distinct
+  mock-issued role tokens, plus a real browser screenshot of the
+  generated "Workflows" queue.
+
 ## NOT YET BUILT — tracked for future sessions
 - **Eight of the ten enterprise "lifestyle" features** from the design
   doc. Two are now real, both from earlier sessions' work: loading

@@ -18,6 +18,14 @@
 //! generated (every non-terminal state has a transition, `data.<field>`/
 //! `link_<Event>` references resolve) are `typeck.rs::check_workflow_decl`'s
 //! job instead — it runs after lowering and reads the same `WorkflowDecl`.
+//!
+//! `WORKFLOW.md`'s "state ownership + a generated queue UI" section adds a
+//! fourth synthesized fn/builtin pair, `list_<workflow>_pending_for_me`/
+//! `__workflow_pending_for_me`, and a real, disclosed breaking-change
+//! `identity: VerifiedIdentity` leading param on `advance_<workflow>` — see
+//! that fn's own doc comment below for why the owner check has to live at
+//! runtime (`interpreter.rs::workflow_advance`) rather than as a static
+//! `requires(...)` here.
 
 use crate::ast::*;
 use crate::parser::ParseError;
@@ -145,14 +153,30 @@ fn lower_one(w: &WorkflowDecl, program: &mut Program) -> Result<(), ParseError> 
         module: None,
     });
 
-    // 3. `start_<workflow_snake>(data: <Workflow>Data) -> Result(i64, WorkflowActionError)`
+    // 3. `start_<workflow_snake>(identity: Option(VerifiedIdentity), data:
+    // <Workflow>Data) -> Result(i64, WorkflowActionError)` — `identity` is
+    // a real, disclosed breaking-change param (`WORKFLOW.md`'s "who
+    // submitted this" section), *optional* rather than required like
+    // `advance_<workflow>`'s own `identity: VerifiedIdentity`: unlike
+    // firing a state's transition, starting a workflow is legitimately
+    // anonymous in real programs today (`kyc_onboarding.nir`'s own public
+    // intake — a brand-new applicant has no account yet). `serve.rs::
+    // dispatch` injects `Some(id)`/`None` for an `Option(VerifiedIdentity)`
+    // param from whatever bearer token (if any) was presented, never a
+    // 401 either way — a new, general capability, not workflow-specific.
     program.fns.push(FnDecl {
         name: format!("start_{}", to_snake_case(&w.name)),
-        params: vec![Param { name: "data".to_string(), ty: Ty::Named(data_struct_name, vec![]) }],
+        params: vec![
+            Param {
+                name: "identity".to_string(),
+                ty: Ty::Named("Option".to_string(), vec![Ty::Named("VerifiedIdentity".to_string(), vec![])]),
+            },
+            Param { name: "data".to_string(), ty: Ty::Named(data_struct_name.clone(), vec![]) },
+        ],
         ret: result_ty(Ty::I64),
         body: one_return(Expr::Call(
             "__workflow_start".to_string(),
-            vec![Expr::Str(w.name.clone(), span), Expr::Ident("data".to_string(), span)],
+            vec![Expr::Str(w.name.clone(), span), Expr::Ident("identity".to_string(), span), Expr::Ident("data".to_string(), span)],
             span,
         )),
         span,
@@ -162,11 +186,73 @@ fn lower_one(w: &WorkflowDecl, program: &mut Program) -> Result<(), ParseError> 
         module: None,
     });
 
-    // 4. `advance_<workflow_snake>(instance_id: i64, event: <Workflow>Event,
-    // payload: json) -> Result(bool, WorkflowActionError)`
+    // 3b. `list_<workflow_snake>_submitted_by_me(identity: VerifiedIdentity)
+    // -> Result(json, WorkflowActionError)` — `WORKFLOW.md`'s "who
+    // submitted this" section, read side: every instance whose
+    // `started_by_subject` (`workflow_log.rs`) matches the caller's own
+    // subject. Unlike `start_*` above, `identity` here is **required**,
+    // not optional — "show me my own requests" is meaningless with no
+    // identity to scope it to.
+    program.fns.push(FnDecl {
+        name: format!("list_{}_submitted_by_me", to_snake_case(&w.name)),
+        params: vec![Param { name: "identity".to_string(), ty: Ty::Named("VerifiedIdentity".to_string(), vec![]) }],
+        ret: result_ty(Ty::Json),
+        body: one_return(Expr::Call(
+            "__workflow_submitted_by_me".to_string(),
+            vec![Expr::Str(w.name.clone(), span), Expr::Ident("identity".to_string(), span)],
+            span,
+        )),
+        span,
+        declared_effects: None,
+        requires: None,
+        explicit_public: false,
+        module: None,
+    });
+
+    // 3c. `get_<workflow_snake>_history(identity: VerifiedIdentity,
+    // instance_id: i64) -> Result(json, WorkflowActionError)` —
+    // `WORKFLOW.md`'s "audit trail" section: the full, append-only
+    // transition log for one instance (who/when/via-link-or-not/comment,
+    // oldest first). Gated to "any signed-in identity may view any
+    // instance's history" — a disclosed simplification, not a per-viewer
+    // ACL (only participants/the original requester, say) — see
+    // `WORKFLOW.md`'s own note on this.
+    program.fns.push(FnDecl {
+        name: format!("get_{}_history", to_snake_case(&w.name)),
+        params: vec![
+            Param { name: "identity".to_string(), ty: Ty::Named("VerifiedIdentity".to_string(), vec![]) },
+            Param { name: "instance_id".to_string(), ty: Ty::I64 },
+        ],
+        ret: result_ty(Ty::Json),
+        body: one_return(Expr::Call(
+            "__workflow_history".to_string(),
+            vec![Expr::Str(w.name.clone(), span), Expr::Ident("instance_id".to_string(), span)],
+            span,
+        )),
+        span,
+        declared_effects: None,
+        requires: None,
+        explicit_public: false,
+        module: None,
+    });
+
+    // 4. `advance_<workflow_snake>(identity: VerifiedIdentity, instance_id:
+    // i64, event: <Workflow>Event, payload: json) -> Result(bool,
+    // WorkflowActionError)` — `identity` is a real, disclosed breaking
+    // change from the pre-ownership signature (`WORKFLOW.md`'s "state
+    // ownership" section): one `advance_*` fn serves every instance/state
+    // of this workflow, so *who* may fire the current state's transition
+    // can only be checked at runtime, against the live instance
+    // (`interpreter.rs::workflow_advance`), never via a static
+    // `requires(...)` here — no `requires` is set on this fn itself, the
+    // `VerifiedIdentity` param alone is what makes `serve.rs::dispatch`
+    // demand *a* valid token (any signed-in caller may attempt any
+    // transition; whether *this* caller may fire *this* instance's
+    // current event is the interpreter-level `owner` check).
     program.fns.push(FnDecl {
         name: format!("advance_{}", to_snake_case(&w.name)),
         params: vec![
+            Param { name: "identity".to_string(), ty: Ty::Named("VerifiedIdentity".to_string(), vec![]) },
             Param { name: "instance_id".to_string(), ty: Ty::I64 },
             Param { name: "event".to_string(), ty: Ty::Named(event_enum_name, vec![]) },
             Param { name: "payload".to_string(), ty: Ty::Json },
@@ -176,10 +262,36 @@ fn lower_one(w: &WorkflowDecl, program: &mut Program) -> Result<(), ParseError> 
             "__workflow_advance".to_string(),
             vec![
                 Expr::Str(w.name.clone(), span),
+                Expr::Ident("identity".to_string(), span),
                 Expr::Ident("instance_id".to_string(), span),
                 Expr::Ident("event".to_string(), span),
                 Expr::Ident("payload".to_string(), span),
             ],
+            span,
+        )),
+        span,
+        declared_effects: None,
+        requires: None,
+        explicit_public: false,
+        module: None,
+    });
+
+    // 4b. `list_<workflow_snake>_pending_for_me(identity: VerifiedIdentity)
+    // -> Result(json, WorkflowActionError)` — `WORKFLOW.md`'s "state
+    // ownership" section, read side: every instance currently sitting in
+    // a state whose `owner` `identity` satisfies. Same "gains a real
+    // `VerifiedIdentity` param, no `requires`" posture as `advance_*`
+    // above — this fn's caller only ever asks about *their own* pending
+    // items, so no static role can name who may call it (anyone signed
+    // in may ask "what's waiting on me", the query itself is what filters
+    // by identity).
+    program.fns.push(FnDecl {
+        name: format!("list_{}_pending_for_me", to_snake_case(&w.name)),
+        params: vec![Param { name: "identity".to_string(), ty: Ty::Named("VerifiedIdentity".to_string(), vec![]) }],
+        ret: result_ty(Ty::Json),
+        body: one_return(Expr::Call(
+            "__workflow_pending_for_me".to_string(),
+            vec![Expr::Str(w.name.clone(), span), Expr::Ident("identity".to_string(), span)],
             span,
         )),
         span,

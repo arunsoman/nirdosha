@@ -219,6 +219,41 @@ struct Screen {
     is_singular: bool,
 }
 
+/// One derived "Workflows" nav entry (`WORKFLOW.md`'s "state ownership +
+/// a generated queue UI" section) — a declared `workflow` plus the two
+/// fns `workflow_lower.rs` always synthesizes for it
+/// (`list_<workflow>_pending_for_me`/`advance_<workflow>`). Unlike
+/// `Screen`, there's no static per-row action set to derive: which
+/// buttons a row gets depends on *that row's own current state*, which
+/// only `pending_fn`'s own response (`{instance_id, state, state_label,
+/// events, data}` per row, `interpreter.rs::workflow_pending_for_me`)
+/// knows — so this only carries what genuinely is static: the two fn
+/// names and the `data` block's field shape (for column headers/
+/// controls, reusing `build_field` exactly as a struct's own fields do).
+struct WorkflowQueue {
+    name: String,
+    title: String,
+    /// Built via `build_action(..., "list", ...)` — reused purely for its
+    /// existing gating-info plumbing (`requires_login` is always true, a
+    /// `VerifiedIdentity`-only param never carries a static role/claim;
+    /// see that fn's own doc comment), not because this is a `list`
+    /// action in the `Screen`/`Action` sense.
+    pending_fn: Action,
+    advance_fn_name: String,
+    /// `list_<workflow>_submitted_by_me` (`WORKFLOW.md`'s "who submitted
+    /// this" section) — the client's "My Requests" tab, same row shape
+    /// as `pending_fn`'s but with no action buttons rendered (a
+    /// requester watches, they don't decide).
+    submitted_by_me_fn: Action,
+    /// `get_<workflow>_history` (`WORKFLOW.md`'s "audit trail" section)
+    /// — plain fn name only, not a full `Action`: every row in either
+    /// tab gets a "History" button calling this with that row's own
+    /// `instance_id`, the same per-row-param shape a custom `screen`
+    /// action's single-id param already has.
+    history_fn_name: String,
+    data_fields: Vec<FieldSpec>,
+}
+
 /// `Todo` -> `todo`, `UserProfile` -> `user_profile`, `HTTPClient` ->
 /// `http_client`. Only needs to handle the ASCII PascalCase Nirdosha
 /// struct names actually use — not a general-purpose Unicode caser.
@@ -928,6 +963,62 @@ fn build_screens(program: &Program, effects: &HashMap<String, FnEffects>) -> Vec
     screens
 }
 
+/// One `WorkflowQueue` per declared `workflow` — `WORKFLOW.md`'s "state
+/// ownership + a generated queue UI" section. Both synthesized fns
+/// (`list_<workflow>_pending_for_me`/`advance_<workflow>`) always exist
+/// once `workflow_lower.rs` has run (this pass only ever sees an already-
+/// lowered `Program`), so — unlike `build_screens`' "no convention fn at
+/// all -> not a screen" skip — every declared `workflow` becomes a queue
+/// entry unconditionally.
+fn build_workflow_queues(program: &Program, effects: &HashMap<String, FnEffects>) -> Vec<WorkflowQueue> {
+    let mut queues = vec![];
+    for w in &program.workflows {
+        let snake = to_snake_case(&w.name);
+        let pending_fn_name = format!("list_{snake}_pending_for_me");
+        let submitted_by_me_fn_name = format!("list_{snake}_submitted_by_me");
+        let advance_fn_name = format!("advance_{snake}");
+        let history_fn_name = format!("get_{snake}_history");
+        // `workflow_lower.rs` always emits all four; absence means a
+        // stale/hand-edited AST, not a real case — skip the queue
+        // entirely rather than render a partially-wired one.
+        let (Some(pending_fn), Some(submitted_by_me_fn)) = (
+            build_action(program, effects, "list", &pending_fn_name),
+            build_action(program, effects, "list", &submitted_by_me_fn_name),
+        ) else {
+            continue;
+        };
+        let data_fields: Vec<FieldSpec> = w.data.iter().map(|f| build_field(program, &f.name, &f.ty, 0)).collect();
+        queues.push(WorkflowQueue {
+            name: w.name.clone(),
+            title: to_display_label(&w.name),
+            pending_fn,
+            advance_fn_name,
+            submitted_by_me_fn,
+            history_fn_name,
+            data_fields,
+        });
+    }
+    queues
+}
+
+fn workflows_json(queues: &[WorkflowQueue]) -> String {
+    let value = serde_json::json!(queues
+        .iter()
+        .map(|q| serde_json::json!({
+            "name": q.name,
+            "snake": to_snake_case(&q.name),
+            "title": q.title,
+            "pendingFn": q.pending_fn.fn_name,
+            "pendingRequiresLogin": q.pending_fn.requires_login,
+            "advanceFn": q.advance_fn_name,
+            "submittedByMeFn": q.submitted_by_me_fn.fn_name,
+            "historyFn": q.history_fn_name,
+            "dataFields": q.data_fields.iter().map(field_json).collect::<Vec<_>>(),
+        }))
+        .collect::<Vec<_>>());
+    serde_json::to_string(&value).expect("workflow manifest is built from plain strings/bools, always serializes")
+}
+
 fn field_json(f: &FieldSpec) -> serde_json::Value {
     serde_json::json!({
         "name": f.name, "control": f.control, "required": f.required, "label": f.label,
@@ -1022,6 +1113,7 @@ pub fn generate(
     let manifest = manifest_json(&screens);
     let stats = metrics_json(&build_stats(program));
     let charts = metrics_json(&build_charts(program));
+    let workflows = workflows_json(&build_workflow_queues(program, effects));
     let identity_base_js = match identity_base {
         Some(url) => serde_json::to_string(url).expect("a URL string always serializes"),
         None => "null".to_string(),
@@ -1030,6 +1122,7 @@ pub fn generate(
         .replace("__NIRDOSHA_MANIFEST__", &manifest)
         .replace("__NIRDOSHA_STATS__", &stats)
         .replace("__NIRDOSHA_CHARTS__", &charts)
+        .replace("__NIRDOSHA_WORKFLOWS__", &workflows)
         .replace("__NIRDOSHA_IDENTITY_BASE__", &identity_base_js)
         .replace("__NIRDOSHA_SERVER_TABLE_API__", if server_table_api { "true" } else { "false" })
         .replace("__NIRDOSHA_THEME_OVERRIDE__", &theme_override_css(theme))

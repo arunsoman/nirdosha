@@ -117,13 +117,13 @@ fn trade_payment_approval_workflow_compiles() {
         }
 
         fn submit_trade_payment_for_approval(payment_id: i64, amount_cents: i64) -> Result(i64, WorkflowActionError) {
-            return start_trade_payment_approval(TradePaymentApprovalData(payment_id, amount_cents))
+            return start_trade_payment_approval(None(), TradePaymentApprovalData(payment_id, amount_cents))
         }
 
-        fn classify_and_advance(instance_id: i64, amount_cents: i64) -> Result(bool, WorkflowActionError) {
+        fn classify_and_advance(identity: VerifiedIdentity, instance_id: i64, amount_cents: i64) -> Result(bool, WorkflowActionError) {
             let event: TradePaymentApprovalEvent = if required_eyes_for_amount(amount_cents) == 2 { ClassifiedHighValue() } else { Classified() }
             return match json_parse("{}") {
-                Ok(payload) => advance_trade_payment_approval(instance_id, event, payload),
+                Ok(payload) => advance_trade_payment_approval(identity, instance_id, event, payload),
                 Err(e) => Err(NoSuchTransition()),
             }
         }
@@ -162,12 +162,12 @@ fn escrow_tranche_release_workflow_compiles() {
         }
 
         fn open_escrow_tranche(purchase_order_id: i64, tranche_amount_cents: i64) -> Result(i64, WorkflowActionError) {
-            return start_escrow_tranche_release(EscrowTrancheReleaseData(purchase_order_id, tranche_amount_cents))
+            return start_escrow_tranche_release(None(), EscrowTrancheReleaseData(purchase_order_id, tranche_amount_cents))
         }
 
-        fn confirm_milestone_and_release(instance_id: i64) -> Result(bool, WorkflowActionError) {
+        fn confirm_milestone_and_release(identity: VerifiedIdentity, instance_id: i64) -> Result(bool, WorkflowActionError) {
             return match json_parse("{}") {
-                Ok(payload) => advance_escrow_tranche_release(instance_id, MilestoneVerified(), payload),
+                Ok(payload) => advance_escrow_tranche_release(identity, instance_id, MilestoneVerified(), payload),
                 Err(e) => Err(NoSuchTransition()),
             }
         }
@@ -202,7 +202,7 @@ fn wallet_settlement_workflow_compiles() {
         }
 
         fn settle_channel_partner_wallet(channel_partner_id: i64, swept_balance_cents: i64) -> Result(i64, WorkflowActionError) {
-            return start_wallet_settlement(WalletSettlementData(channel_partner_id, swept_balance_cents))
+            return start_wallet_settlement(None(), WalletSettlementData(channel_partner_id, swept_balance_cents))
         }
     "#;
     build_program(src);
@@ -309,13 +309,13 @@ fn batch_payment_approval_workflow_compiles() {
         }
 
         fn submit_batch_payment_for_approval(amount_a_cents: i64, amount_b_cents: i64, amount_c_cents: i64) -> Result(i64, WorkflowActionError) {
-            return start_batch_payment_approval(BatchPaymentApprovalData(amount_a_cents, amount_b_cents, amount_c_cents))
+            return start_batch_payment_approval(None(), BatchPaymentApprovalData(amount_a_cents, amount_b_cents, amount_c_cents))
         }
 
-        fn classify_batch_and_advance(instance_id: i64, amount_a_cents: i64, amount_b_cents: i64, amount_c_cents: i64) -> Result(bool, WorkflowActionError) {
+        fn classify_batch_and_advance(identity: VerifiedIdentity, instance_id: i64, amount_a_cents: i64, amount_b_cents: i64, amount_c_cents: i64) -> Result(bool, WorkflowActionError) {
             let event: BatchPaymentApprovalEvent = if required_eyes_for_batch(amount_a_cents, amount_b_cents, amount_c_cents) == 2 { ClassifiedHighValue() } else { Classified() }
             return match json_parse("{}") {
-                Ok(payload) => advance_batch_payment_approval(instance_id, event, payload),
+                Ok(payload) => advance_batch_payment_approval(identity, instance_id, event, payload),
                 Err(e) => Err(NoSuchTransition()),
             }
         }
@@ -350,7 +350,7 @@ fn commission_waterfall_settlement_workflow_compiles() {
         }
 
         fn settle_commission_waterfall(payment_id: i64, settled_amount_cents: i64) -> Result(i64, WorkflowActionError) {
-            return start_commission_waterfall_settlement(CommissionWaterfallSettlementData(payment_id, settled_amount_cents))
+            return start_commission_waterfall_settlement(None(), CommissionWaterfallSettlementData(payment_id, settled_amount_cents))
         }
     "#;
     build_program(src);
@@ -433,12 +433,12 @@ fn commission_dispute_resolution_workflow_compiles() {
         }
 
         fn raise_commission_dispute(commission_waterfall_id: i64, disputed_amount_cents: i64) -> Result(i64, WorkflowActionError) {
-            return start_commission_dispute_resolution(CommissionDisputeResolutionData(commission_waterfall_id, disputed_amount_cents))
+            return start_commission_dispute_resolution(None(), CommissionDisputeResolutionData(commission_waterfall_id, disputed_amount_cents))
         }
 
-        fn decide_commission_dispute(instance_id: i64, decision: CommissionDisputeResolutionEvent) -> Result(bool, WorkflowActionError) {
+        fn decide_commission_dispute(identity: VerifiedIdentity, instance_id: i64, decision: CommissionDisputeResolutionEvent) -> Result(bool, WorkflowActionError) {
             return match json_parse("{}") {
-                Ok(payload) => advance_commission_dispute_resolution(instance_id, decision, payload),
+                Ok(payload) => advance_commission_dispute_resolution(identity, instance_id, decision, payload),
                 Err(e) => Err(NoSuchTransition()),
             }
         }

@@ -658,6 +658,19 @@ extra syntax — see the `screen`/`dashboard` DSL in `LANGUAGE.md` §11 if
 you need to customize that generated UI (custom labels, field
 validation, role-gated visibility, dashboard tiles/charts).
 
+Multi-step approval / state-machine flows (KYC onboarding, purchase
+approvals, maker-checker) have their own construct: `workflow Name {
+data { field: Ty, ... } state Name { on_entry { ... } on Event ->
+Target } ... }` — durable, named states with `on <Event> -> <Target>`
+transitions, desugared into ordinary `fn`s (`start_<name>`,
+`advance_<name>`, etc.), so it needs no new runtime. `state { owner:
+role("...") }` names who may fire that state's outgoing events —
+checked live, per instance, not statically — and `nirdosha serve`/
+`emit-ui` generate a "Workflows" queue screen from it automatically
+(each role sees only what's waiting on them, plus a "my requests" tab
+for whoever started an instance and an audit-trail "history" view), no
+extra syntax needed. See `WORKFLOW.md` for the full construct.
+
 ## How to verify what you wrote
 
 **If you're pasting this into a file by hand (the paste-anywhere-prompt
@@ -696,7 +709,8 @@ run through the real compiler.
 ## Where to go deeper
 
 Full type/builtin reference: `LANGUAGE.md`. Full EBNF grammar:
-`GRAMMAR.md`. Worked examples: `examples/*.nir` in the main repo
+`GRAMMAR.md`. `workflow`/state-ownership construct: `WORKFLOW.md`.
+Worked examples: `examples/*.nir` in the main repo
 (https://github.com/arunsoman/nirdosha).
 
 ## Your task

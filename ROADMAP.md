@@ -981,34 +981,95 @@ of Track B has landed.*
   consumes `implements` yet — the field exists and validates, but no
   extraction has populated it with real data yet, so user-story-level
   Tier 1 checking (§7.5) isn't exercised end-to-end.
-- `[OPEN]` **A13. Workflow state ownership + a generated "my queue" UI —
-  proposed, not built.** Surfaced by a direct question: does today's
-  `workflow`/extraction schema even carry *who owns a state* (e.g.
-  which users are the "two eyes" in six-eyes) or *where the UI is* for a
-  user to see/act on their pending items? Verified directly: no —
-  `ast::StateDecl` has no owner field, `ui_gen.rs` has zero references
-  to `WorkflowDecl`, and the one hand-written approval screen
-  `trade_finance.nir` actually ships is a read-only list gated to a
-  single fixed role with no decide action at all (it doesn't even use
-  `workflow{}` — a separate, older, hand-rolled mechanism). Full proposed
-  design — grammar (`owner: role(...)` on `state`), runtime enforcement
-  (`advance_<workflow>` gains an `identity` param, checked against the
-  *current instance's* live state, not a static per-function gate),
-  a generated `list_<workflow>_pending_for_me` read side, and a new
-  per-row-action-set UI screen archetype (`ui_gen.rs` has no precedent
-  for this shape today) — written up in `WORKFLOW.md`'s new "Proposed,
-  not built" section, including the one thing this design explicitly
-  does **not** solve: `owner` alone models a single decider
+- `[DONE]` **A13. Workflow state ownership + a generated "my queue" UI.**
+  Surfaced by a direct question: does today's `workflow`/extraction
+  schema even carry *who owns a state* (e.g. which users are the "two
+  eyes" in six-eyes) or *where the UI is* for a user to see/act on their
+  pending items? Verified directly: no — `ast::StateDecl` had no owner
+  field, `ui_gen.rs` had zero references to `WorkflowDecl`, and the one
+  hand-written approval screen `trade_finance.nir` actually ships is a
+  read-only list gated to a single fixed role with no decide action at
+  all (it doesn't even use `workflow{}` — a separate, older, hand-rolled
+  mechanism).
+
+  **2026-08-26 — built**, against the design `WORKFLOW.md`'s "State
+  ownership + a generated queue UI" section wrote up (now updated in
+  place to describe what shipped, not kept as a stale proposal):
+  `state { owner: role(...)/claim(...), label: "..." }` grammar
+  (`StateDecl.entries`, reusing `screen`'s own `view`/`edit` shape check);
+  `advance_<workflow>` gains a real, disclosed breaking-change leading
+  `identity: VerifiedIdentity` param, checked in `interpreter.rs::
+  workflow_advance_inner` against the *current instance's* live state,
+  not a static per-function gate (the magic-link path stays deliberately
+  un-owner-checked — a consumed single-use token is its own
+  authorization); a new synthesized `list_<workflow>_pending_for_me` read
+  side; and `ui_gen.rs`'s first new screen archetype beyond `screen`'s
+  fixed-action-set table — a generated **"Workflows"** nav section where
+  each row's button set is that row's own current state's own outgoing
+  events, from a real per-row server response, not anything static.
+  New non-fatal `TypeWarningKind::WorkflowStateHasNoOwner` (A10's
+  "default open, but tell you" posture, for a state instead of a fn).
+  Full detail, including the exact new fns/builtins/manifest shape and a
+  bug fix found in passing (`serve.rs::decode_value` had no `Ty::Json`
+  arm at all, so any `json`-typed fn param 400'd over real HTTP,
+  unconditionally): `compiler/UI_DSL_TODO.md`'s own new "workflow state
+  ownership" section.
+
+  **Not solved, disclosed**: `owner` alone models a single decider
   (Maker-Checker), not a quorum (six-eyes' "2 *distinct* holders of a
-  role"), which needs either new transition-level grammar or keeping
-  quorum counting in a hand-rolled table the way it works today. The
-  extraction schema's `owner_role`/`owner_claim`/`label`/
-  `required_decisions` (per `state`, `ExtractedState`) are the *data*
-  half of this, shipped now (`scratch/prompt_v2.txt`,
-  `extraction_schema.rs`, both with worked examples distinguishing a
-  no-owner automatic state from an owned single-decider one from an
-  owned quorum one) — the compiler-side grammar/runtime/UI work
-  `WORKFLOW.md` describes is the rest, genuinely not started.
+  role" — the first qualifying caller's decision would fire the
+  transition immediately). The extraction schema's
+  `owner_role`/`owner_claim`/`label`/`required_decisions` (per `state`,
+  `ExtractedState`, shipped earlier: `scratch/prompt_v2.txt`,
+  `extraction_schema.rs`) are the data half; `required_decisions` is
+  still metadata only, not enforced anywhere in the runtime — six-eyes
+  needs either new transition-level grammar or a hand-rolled
+  decision-count table layered on top of this.
+
+  **Extended same session, from a direct enterprise-systems question
+  ("does this handle every real-world approval pattern?")**: two more
+  near-universal enterprise expectations, both fully built, plus an
+  honest catalog of what still isn't. **Who submitted this** (every
+  system from ServiceNow to Concur puts "my requests" one click from the
+  homepage): `start_<workflow>` gains a leading `identity:
+  Option(VerifiedIdentity)` param — optional, unlike `advance_<workflow>`'s
+  required one, since starting a workflow is legitimately anonymous in
+  real programs today (`kyc_onboarding.nir`'s own public intake). This
+  needed a genuinely new, general `serve.rs::dispatch` capability, not
+  workflow-specific: a fn param typed `Option(VerifiedIdentity)` is
+  injected `Some(id)`/`None` depending on whether a valid bearer token
+  was presented, never a 401 either way — useful for any "personalize
+  when signed in, still work when not" endpoint. `workflow_instance`
+  gains `started_by_subject`; a new `list_<workflow>_submitted_by_me`
+  read fn backs a second, read-only "My Requests" tab in the generated
+  UI. **Audit trail** (who/when/why, SOX/banking-regulation territory):
+  `workflow_history` (already durable from this feature's first version)
+  gains `actor_subject`/`via_link`/`comment`; a new
+  `get_<workflow>_history` read fn backs a per-row "History" button.
+  Found and fixed in passing: `serve.rs::decode_value` had no `Ty::Json`
+  arm at all, so `advance_<workflow>`'s own pre-existing `payload: json`
+  param unconditionally 400'd over real HTTP, regardless of what a
+  caller sent — nothing had exercised it end to end before now.
+  **Disclosed, not built**: quorum (unchanged from above); a real
+  per-viewer history ACL (today: any signed-in identity may view any
+  instance's history); delegation/out-of-office reassignment; SLA/
+  escalation timers (structurally impossible without a scheduler
+  primitive Nirdosha doesn't have); bulk actions; a unified cross-
+  workflow inbox; an in-app notification *bell/inbox UI* convention
+  (the persistence itself is already possible today via an ordinary
+  `on_entry`-called `fn` + struct, no gap there) — full table with
+  what each would take, `WORKFLOW.md` §9.
+
+  Verified: full `cargo test` green (including four pre-existing test
+  files/examples updated for the `advance_<workflow>` signature change,
+  plus a new `compiler/tests/workflow_ownership.rs`, 5 real-server
+  integration tests covering owner enforcement across all three levels,
+  `pending_for_me`/`submitted_by_me`/`history`, and the
+  `Option(VerifiedIdentity)` capability); a real 3-level sequential
+  purchase-order approval (`examples/purchase_approval.nir`) served via
+  `nirdosha serve`, driven through all three levels via curl with three
+  distinct mock-issued role tokens, plus real browser screenshots of the
+  generated queue and the requester's own "My Requests"/History view.
 - `[DONE]` **A14. Real runtime deadlock detection for `chan`/`thread`
   (`interpreter::DeadlockRegistry`) — closes a real gap between what
   README.md/goal.md claimed ("no deadlocks... proof by construction...

@@ -1134,6 +1134,13 @@ fn dispatch(
             }
             continue;
         }
+        if is_optional_verified_identity(&p.ty) {
+            args.push(match &identity {
+                Some(id) => Value::Enum(Arc::from("Option"), Arc::from("Some"), Arc::from(vec![id.clone()])),
+                None => Value::Enum(Arc::from("Option"), Arc::from("None"), Arc::from(vec![])),
+            });
+            continue;
+        }
         let Some(v) = body_obj.get(&p.name) else {
             return (400, json_err(&format!("missing field `{}` in request body", p.name)));
         };
@@ -1348,6 +1355,18 @@ fn is_verified_identity(ty: &Ty) -> bool {
     matches!(ty, Ty::Named(n, args) if n == "VerifiedIdentity" && args.is_empty())
 }
 
+/// `Option(VerifiedIdentity)` — `WORKFLOW.md`'s "who submitted this"
+/// section: a fn param that wants to know the caller's identity *when
+/// there is one*, without demanding a token the way a bare
+/// `VerifiedIdentity` param does. `dispatch` injects `Some(id)` when a
+/// valid bearer token was presented, `None` when absent or invalid —
+/// never a 401 for this param alone (a *different* declared
+/// `requires(...)`/bare `VerifiedIdentity` param on the same fn can
+/// still demand one, unaffected by this).
+fn is_optional_verified_identity(ty: &Ty) -> bool {
+    matches!(ty, Ty::Named(n, args) if n == "Option" && args.len() == 1 && is_verified_identity(&args[0]))
+}
+
 fn json_err(msg: &str) -> String {
     serde_json::json!({ "err": msg }).to_string()
 }
@@ -1399,6 +1418,19 @@ pub(crate) fn decode_value(json: &JsonVal, ty: &Ty, program: &Program, depth: u8
         }
         Ty::F64 => json.as_f64().map(Value::Float).ok_or_else(|| "expected a number".to_string()),
         Ty::Bool => json.as_bool().map(Value::Bool).ok_or_else(|| "expected a boolean".to_string()),
+        // Nirdosha's own opaque JSON type -- passes through unchanged,
+        // the mirror of `encode_value`'s own `Value::Json(doc) =>
+        // Ok((**doc).clone())` arm. Found missing while wiring
+        // `WORKFLOW.md`'s "state ownership" section: every desugared
+        // `advance_<workflow>`/`*_via_link` fn takes a trailing `payload:
+        // json` param (reserved for a future increment, currently unused
+        // by `on_entry`/`on_exit` bindings -- see that doc's "deliberate
+        // non-goals" section), and with no arm here, calling any of them
+        // through a real `nirdosha serve` request always 400'd on that
+        // field before this fix, regardless of what the caller sent --
+        // a pre-existing gap, not something specific to the ownership
+        // feature, just never previously exercised end-to-end over HTTP.
+        Ty::Json => Ok(Value::Json(Arc::new(json.clone()))),
         Ty::Named(n, args) if n == "Option" && args.len() == 1 => {
             if json.is_null() {
                 Ok(Value::Enum(Arc::from("Option"), Arc::from("None"), Arc::from(vec![])))

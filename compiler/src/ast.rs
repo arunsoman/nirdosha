@@ -674,6 +674,14 @@ pub fn prelude_enums() -> Vec<EnumDecl> {
                 Variant { name: "LinkAlreadyConsumed".to_string(), payload: vec![], span },
                 Variant { name: "LinkTokenMismatch".to_string(), payload: vec![], span },
                 Variant { name: "ActionPending".to_string(), payload: vec![Ty::Str], span },
+                // `WORKFLOW.md`'s "state ownership" section: the caller
+                // doesn't satisfy the current state's `owner: role(...)`/
+                // `owner: claim(...)` gate. Checked inside
+                // `interpreter.rs::workflow_advance` itself (a runtime,
+                // per-instance question — see that section's "why this
+                // needs new machinery" note), never by `serve.rs::dispatch`'s
+                // static `requires(...)` gate.
+                Variant { name: "NotStateOwner".to_string(), payload: vec![], span },
             ],
             span,
             module: None,
@@ -1418,6 +1426,25 @@ pub struct StateDecl {
     pub on_entry: Vec<TransactSlot>,
     pub on_exit: Vec<TransactSlot>,
     pub transitions: Vec<Transition>,
+    /// `state Name { owner: role("...")  label: "..." ... }` — plain
+    /// `key: value` slots, same open-ended shape `ScreenDecl.entries`
+    /// already uses (see that field's doc comment) rather than dedicated
+    /// typed fields, so a future key needs no grammar/AST change, only a
+    /// new `typeck`/`ui_gen` consumer. Two keys are meaningful today
+    /// (`WORKFLOW.md`'s "Proposed, not built: state ownership + a
+    /// generated queue UI" section, now built):
+    /// - `owner: role("...")`/`owner: claim("...", "...")` — who may fire
+    ///   one of this state's outgoing events (`typeck.rs::
+    ///   check_visibility_expr` validates the shape, same as `screen`'s
+    ///   own `view`/`edit`). Absent means unrestricted (any authenticated
+    ///   caller may act) — checked at runtime by `interpreter.rs::
+    ///   workflow_advance` against the *instance's own current state*,
+    ///   never statically, since one `advance_<workflow>` fn serves every
+    ///   state of every instance.
+    /// - `label: "..."` — a human-readable display name for this state
+    ///   (a generated queue UI's status badge/screen title); absent means
+    ///   the client falls back to the bare PascalCase state name.
+    pub entries: Vec<KvEntry>,
     pub span: Span,
 }
 
@@ -1860,6 +1887,16 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "__workflow_start",
     "__workflow_advance",
     "__workflow_link_advance",
+    // `WORKFLOW.md`'s "state ownership + a generated queue UI" section:
+    // backs every workflow's synthesized `list_<workflow>_pending_for_me`
+    // — same "never written by hand" convention as the three above.
+    "__workflow_pending_for_me",
+    // `WORKFLOW.md`'s "who submitted this" / "audit trail" sections:
+    // back every workflow's synthesized `list_<workflow>_submitted_by_me`
+    // and `get_<workflow>_history` respectively — same "never written by
+    // hand" convention.
+    "__workflow_submitted_by_me",
+    "__workflow_history",
 ];
 
 pub fn is_builtin(name: &str) -> bool {

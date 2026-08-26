@@ -42,6 +42,7 @@ impl WorkflowLog {
                 workflow_name TEXT NOT NULL,
                 state TEXT NOT NULL,
                 data_json TEXT NOT NULL,
+                started_by_subject TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -51,6 +52,9 @@ impl WorkflowLog {
                 from_state TEXT NOT NULL,
                 to_state TEXT NOT NULL,
                 event TEXT NOT NULL,
+                actor_subject TEXT,
+                via_link INTEGER NOT NULL DEFAULT 0,
+                comment TEXT,
                 at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS magic_link (
@@ -86,15 +90,52 @@ impl WorkflowLog {
             );",
         )
         .map_err(io_err)?;
+        // Backfill columns added after this table's original shape shipped,
+        // the same "ALTER TABLE only the columns actually missing" idiom
+        // `transact_log.rs::open` already established — a workflow-log
+        // file written by a pre-upgrade binary only ever creates the
+        // table fresh, never alters one that's already there, so a
+        // reopened pre-existing file needs these added explicitly rather
+        // than assumed present.
+        let backfill = |conn: &Connection, table: &str, column: &str, ddl: &str| -> Result<(), String> {
+            let existing: std::collections::HashSet<String> = conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .map_err(io_err)?
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(io_err)?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(io_err)?;
+            if !existing.contains(column) {
+                conn.execute(&format!("ALTER TABLE \"{table}\" ADD COLUMN {ddl}"), []).map_err(io_err)?;
+            }
+            Ok(())
+        };
+        backfill(&conn, "workflow_instance", "started_by_subject", "started_by_subject TEXT")?;
+        backfill(&conn, "workflow_history", "actor_subject", "actor_subject TEXT")?;
+        backfill(&conn, "workflow_history", "via_link", "via_link INTEGER NOT NULL DEFAULT 0")?;
+        backfill(&conn, "workflow_history", "comment", "comment TEXT")?;
         Ok(WorkflowLog { conn: Mutex::new(conn) })
     }
 
-    pub fn create_instance(&self, workflow_name: &str, state: &str, data_json: &str, now: i64) -> Result<i64, String> {
+    /// `started_by_subject`: the calling identity's `subject`, when
+    /// `start_<workflow>`'s (now-optional, `WORKFLOW.md`'s "who submitted
+    /// this" section) `identity: Option(VerifiedIdentity)` param was
+    /// `Some(_)` — `None` for a legitimately anonymous start (e.g.
+    /// `kyc_onboarding.nir`'s own public intake, unauthenticated by
+    /// design). Backs `list_<workflow>_submitted_by_me`.
+    pub fn create_instance(
+        &self,
+        workflow_name: &str,
+        state: &str,
+        data_json: &str,
+        started_by_subject: Option<&str>,
+        now: i64,
+    ) -> Result<i64, String> {
         let conn = self.conn.lock().expect("workflow log mutex poisoned");
         conn.execute(
-            "INSERT INTO workflow_instance (workflow_name, state, data_json, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?)",
-            params![workflow_name, state, data_json, now, now],
+            "INSERT INTO workflow_instance (workflow_name, state, data_json, started_by_subject, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![workflow_name, state, data_json, started_by_subject, now, now],
         )
         .map_err(io_err)?;
         Ok(conn.last_insert_rowid())
@@ -112,10 +153,73 @@ impl WorkflowLog {
         .map_err(io_err)
     }
 
+    /// Every instance of `workflow_name`, as `(id, state, data_json)` —
+    /// backs `interpreter.rs::workflow_pending_for_me`
+    /// (`__workflow_pending_for_me`, `WORKFLOW.md`'s "state ownership"
+    /// section): the interpreter, not this query, decides which of these
+    /// the caller actually owns (it needs the live `WorkflowDecl` AST to
+    /// know each state's `owner`, which this store doesn't have — this
+    /// method only ever answers "every instance," the same "SQL does the
+    /// narrow mechanical part, the caller does the semantic part"
+    /// division `get_instance` already draws for one instance at a time).
+    pub fn list_instances(&self, workflow_name: &str) -> Result<Vec<(i64, String, String)>, String> {
+        let conn = self.conn.lock().expect("workflow log mutex poisoned");
+        let mut stmt = conn
+            .prepare("SELECT id, state, data_json FROM workflow_instance WHERE workflow_name = ? ORDER BY id")
+            .map_err(io_err)?;
+        let rows = stmt
+            .query_map(params![workflow_name], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(io_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(io_err)
+    }
+
+    /// Every instance of `workflow_name` that `subject` itself started —
+    /// backs `list_<workflow>_submitted_by_me`
+    /// (`__workflow_submitted_by_me`, `WORKFLOW.md`'s "who submitted
+    /// this" section), the read side a requester needs to track their
+    /// own request without needing `owner` on any state at all. Unlike
+    /// `list_instances`, scoped in SQL, not by the caller — there's no
+    /// per-state semantic to apply here (submission isn't a decision
+    /// gate), so nothing stops this query from doing the whole filter
+    /// itself, unlike `list_instances`' own doc comment explains for the
+    /// owner case.
+    pub fn list_instances_by_starter(&self, workflow_name: &str, subject: &str) -> Result<Vec<(i64, String, String)>, String> {
+        let conn = self.conn.lock().expect("workflow log mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, state, data_json FROM workflow_instance \
+                 WHERE workflow_name = ? AND started_by_subject = ? ORDER BY id DESC",
+            )
+            .map_err(io_err)?;
+        let rows = stmt
+            .query_map(params![workflow_name, subject], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(io_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(io_err)
+    }
+
     /// Moves `id` to `to_state` and appends the history row in one call —
     /// callers always want both together (`Interpreter`'s `advance`
     /// dispatch never updates state without also recording why).
-    pub fn record_transition(&self, id: i64, from_state: &str, to_state: &str, event: &str, now: i64) -> Result<(), String> {
+    /// `actor_subject`/`via_link` (`WORKFLOW.md`'s "audit trail" section)
+    /// record *who* fired this transition and *how* — `None`/`false` for
+    /// `actor_subject`/`via_link` only ever happens together (the magic-
+    /// link path is the one case with no `identity` to attribute this
+    /// to at all, `interpreter.rs::workflow_advance_inner`). `comment`
+    /// is the caller-supplied free-text reason, if `advance_<workflow>`'s
+    /// `payload` carried one (`{"comment": "..."}`) — still not threaded
+    /// into `on_entry`/`on_exit` bindings, `WORKFLOW.md`'s disclosed v1
+    /// gap for `payload` in general, just durably logged here now.
+    pub fn record_transition(
+        &self,
+        id: i64,
+        from_state: &str,
+        to_state: &str,
+        event: &str,
+        actor_subject: Option<&str>,
+        via_link: bool,
+        comment: Option<&str>,
+        now: i64,
+    ) -> Result<(), String> {
         let conn = self.conn.lock().expect("workflow log mutex poisoned");
         conn.execute(
             "UPDATE workflow_instance SET state = ?, updated_at = ? WHERE id = ?",
@@ -123,11 +227,36 @@ impl WorkflowLog {
         )
         .map_err(io_err)?;
         conn.execute(
-            "INSERT INTO workflow_history (instance_id, from_state, to_state, event, at) VALUES (?, ?, ?, ?, ?)",
-            params![id, from_state, to_state, event, now],
+            "INSERT INTO workflow_history (instance_id, from_state, to_state, event, actor_subject, via_link, comment, at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![id, from_state, to_state, event, actor_subject, via_link, comment, now],
         )
         .map_err(io_err)?;
         Ok(())
+    }
+
+    /// The full append-only transition log for one instance, oldest
+    /// first — backs `get_<workflow>_history` (`__workflow_history`,
+    /// `WORKFLOW.md`'s "audit trail" section): `(from_state, to_state,
+    /// event, actor_subject, via_link, comment, at)`.
+    #[allow(clippy::type_complexity)]
+    pub fn list_history(
+        &self,
+        instance_id: i64,
+    ) -> Result<Vec<(String, String, String, Option<String>, bool, Option<String>, i64)>, String> {
+        let conn = self.conn.lock().expect("workflow log mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT from_state, to_state, event, actor_subject, via_link, comment, at \
+                 FROM workflow_history WHERE instance_id = ? ORDER BY at ASC, id ASC",
+            )
+            .map_err(io_err)?;
+        let rows = stmt
+            .query_map(params![instance_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+            })
+            .map_err(io_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(io_err)
     }
 
     pub fn mint_link(&self, instance_id: i64, event: &str, token: &str) -> Result<(), String> {
