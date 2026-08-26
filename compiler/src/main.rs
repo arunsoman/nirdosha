@@ -211,6 +211,18 @@ fn typecheck_and_own_optional_main(src: &str) -> Result<nirdosha::ast::Program, 
     typecheck_and_own_impl(src, false)
 }
 
+/// Prints `typeck::ungated_fn_warnings` to stderr — non-fatal, unlike a
+/// `TypeError` (`ROADMAP.md` A10). Called only from `serve`/`emit-ui`,
+/// the two commands where "reachable via `/api/<fn>`" is actually the
+/// question being asked; `run`/`build`/`emit-llvm` never serve anything,
+/// so warning about HTTP reachability there would be noise unrelated to
+/// what those commands do.
+fn print_ungated_fn_warnings(program: &nirdosha::ast::Program) {
+    for w in nirdosha::typeck::ungated_fn_warnings(program) {
+        eprintln!("{w}");
+    }
+}
+
 fn typecheck_and_own_impl(src: &str, require_main: bool) -> Result<nirdosha::ast::Program, String> {
     let toks = nirdosha::token::Lexer::new(src)
         .tokenize()
@@ -514,6 +526,7 @@ fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    print_ungated_fn_warnings(&program);
     let theme = match load_theme(theme_path.as_deref()) {
         Ok(t) => t,
         Err(msg) => {
@@ -641,6 +654,7 @@ fn cmd_serve(
             return ExitCode::FAILURE;
         }
     };
+    print_ungated_fn_warnings(&program);
     let theme = match load_theme(theme_path.as_deref()) {
         Ok(t) => t,
         Err(msg) => {

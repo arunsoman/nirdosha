@@ -892,6 +892,81 @@ pub fn typecheck_optional_main(program: &Program) -> Result<(), Vec<TypeError>> 
     typecheck_impl(program, false)
 }
 
+/// A non-fatal diagnostic — unlike `TypeError`, this never blocks
+/// `typecheck`/compilation; a caller prints it (or not) and continues
+/// either way. The one kind that exists today is `ROADMAP.md` A10 /
+/// `API_TRUST_MODEL.md` §4's fix: `serve.rs::dispatch` is default-open
+/// (any `fn` with no `requires(...)` and no `VerifiedIdentity` param is
+/// callable by anyone, with no token at all), and nothing previously
+/// surfaced that as anything other than silent. This doesn't change
+/// `dispatch`'s runtime behavior — it makes the previously-silent case
+/// visible at typecheck time instead, so an author has to see and
+/// deliberately silence (`requires(public)`) an unintentionally-open
+/// function rather than ship one by omission.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypeWarning {
+    pub kind: TypeWarningKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum TypeWarningKind {
+    /// `fn_name` has no `requires(...)`, no `requires(public)`, no
+    /// `VerifiedIdentity` parameter, and no `db`/`mq` parameter (the last
+    /// two would already 400 at `serve.rs::decode_value` regardless of
+    /// this warning — excluded so the count matches what's actually
+    /// reachable, same accounting `API_TRUST_MODEL.md` §4 uses for its
+    /// "79 of 246" figure). `nirdosha serve` will route it and any caller
+    /// with no token at all can call it.
+    UngatedFnReachableWithNoToken { fn_name: String },
+}
+
+impl std::fmt::Display for TypeWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Span { line, col } = self.span;
+        match &self.kind {
+            TypeWarningKind::UngatedFnReachableWithNoToken { fn_name } => write!(
+                f,
+                "{line}:{col}: warning: `{fn_name}` has no `requires(...)` and takes no `VerifiedIdentity` \
+                 parameter — it will be callable by anyone with no token at all once served; add \
+                 `requires(role: ...)`/`requires(claim: ..., ...)` to gate it, or `requires(public)` \
+                 if that's intentional"
+            ),
+        }
+    }
+}
+
+/// Walks every declared `fn` and reports `UngatedFnReachableWithNoToken`
+/// for each one `serve.rs::dispatch` would route to an anonymous caller.
+/// Deliberately a separate pass from `typecheck`/`typecheck_impl` above,
+/// not folded into `Checker`'s error list — a warning must never fail a
+/// build the way a `TypeError` does, and every existing caller of
+/// `typecheck`/`typecheck_optional_main` already treats `Ok(())` as
+/// "proceed"; adding a new fatal condition to that Result would be a
+/// behavior change well beyond this fix's scope. Callers that want these
+/// (`main.rs`'s CLI commands, `serve.rs::run`) call this alongside
+/// `typecheck`, not instead of it.
+pub fn ungated_fn_warnings(program: &Program) -> Vec<TypeWarning> {
+    program
+        .fns
+        .iter()
+        .filter(|f| is_reachable_with_no_token(f))
+        .map(|f| TypeWarning { kind: TypeWarningKind::UngatedFnReachableWithNoToken { fn_name: f.name.clone() }, span: f.span })
+        .collect()
+}
+
+fn is_reachable_with_no_token(f: &FnDecl) -> bool {
+    if f.requires.is_some() || f.explicit_public {
+        return false;
+    }
+    !f.params.iter().any(|p| is_verified_identity(&p.ty) || matches!(p.ty, Ty::Db | Ty::Mq))
+}
+
+fn is_verified_identity(ty: &Ty) -> bool {
+    matches!(ty, Ty::Named(n, args) if n == "VerifiedIdentity" && args.is_empty())
+}
+
 fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeError>> {
     let registry = TypeRegistry::build(program);
     let mut c = Checker { sigs: HashMap::new(), errors: Vec::new(), registry, silent: false };

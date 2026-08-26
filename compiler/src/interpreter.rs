@@ -1104,6 +1104,11 @@ pub(crate) fn validate_oidc_token(token: &str, expected_issuer: &str, expected_a
         .and_then(|v| v.as_str())
         .ok_or_else(|| "malformed JWT: header has no `kid`".to_string())?
         .to_string();
+    let alg = header
+        .get("alg")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "malformed JWT: header has no `alg`".to_string())?
+        .to_string();
 
     let payload_json = String::from_utf8(
         URL_SAFE_NO_PAD
@@ -1145,10 +1150,7 @@ pub(crate) fn validate_oidc_token(token: &str, expected_issuer: &str, expected_a
     let jwks: JsonDoc = serde_json::from_str(jwks_json).map_err(|e| format!("malformed JWKS: {e}"))?;
     let key = jwks_key(&jwks, &kid)?;
     let signed_input = format!("{header_b64}.{payload_b64}").into_bytes();
-    let expected_sig = hmac_sha256_base64url(&key, &signed_input);
-    if !constant_time_eq(signature_b64, &expected_sig) {
-        return Err("invalid JWT signature".to_string());
-    }
+    verify_jwt_signature(&alg, &key, &kid, &signed_input, signature_b64)?;
 
     // Retain every claim except the registered OIDC ones for later
     // role/claim extraction.
@@ -1165,16 +1167,110 @@ pub(crate) fn validate_oidc_token(token: &str, expected_issuer: &str, expected_a
     Ok(verified_identity_value(sub, iss, aud, exp, iat, &claims_json))
 }
 
-fn jwks_key(jwks: &JsonDoc, kid: &str) -> Result<Vec<u8>, String> {
+/// A JWKS key's actual key material, keyed off its `kty` — the piece
+/// `validate_oidc_token` was missing entirely before this revision (only
+/// `Symmetric` existed, read unconditionally from a key's `k` member with
+/// no `kty` check at all). Matching on this alongside the JWT header's own
+/// `alg` (`verify_jwt_signature`) is what closes the classic algorithm-
+/// confusion attack: an RSA public key can no longer be replayed as an
+/// HMAC secret, because `kty: "RSA"` never produces a `Symmetric` variant.
+enum JwksKeyMaterial {
+    /// `kty: "oct"` — a raw symmetric secret, `HS256` only.
+    Symmetric(Vec<u8>),
+    /// `kty: "RSA"` — `n`/`e`, big-endian, `RS256` only.
+    Rsa { n: Vec<u8>, e: Vec<u8> },
+    /// `kty: "EC"` — `crv`/`x`/`y`, `ES256` only (`crv` must be `P-256`).
+    Ec { crv: String, x: Vec<u8>, y: Vec<u8> },
+}
+
+fn jwks_key(jwks: &JsonDoc, kid: &str) -> Result<JwksKeyMaterial, String> {
     let keys = jwks.get("keys").and_then(|k| k.as_array()).ok_or_else(|| "JWKS has no `keys` array".to_string())?;
     for k in keys {
         let k_kid = k.get("kid").and_then(|v| v.as_str()).unwrap_or("");
-        if k_kid == kid {
-            let b64 = k.get("k").and_then(|v| v.as_str()).ok_or_else(|| format!("JWKS key `{kid}` has no `k`"))?;
-            return URL_SAFE_NO_PAD.decode(b64).map_err(|_| format!("JWKS key `{kid}` is not valid base64url"));
+        if k_kid != kid {
+            continue;
         }
+        // Defaults to `oct` for backward compatibility with a JWKS that
+        // predates this revision and never set `kty` at all — every real
+        // JWKS this codebase ships (`examples/store_jwks.json`, every
+        // test fixture) already sets it explicitly.
+        let kty = k.get("kty").and_then(|v| v.as_str()).unwrap_or("oct");
+        return match kty {
+            "oct" => {
+                let b64 = k.get("k").and_then(|v| v.as_str()).ok_or_else(|| format!("JWKS key `{kid}` has no `k`"))?;
+                URL_SAFE_NO_PAD
+                    .decode(b64)
+                    .map(JwksKeyMaterial::Symmetric)
+                    .map_err(|_| format!("JWKS key `{kid}` is not valid base64url"))
+            }
+            "RSA" => {
+                let n = decode_jwks_component(k, kid, "n")?;
+                let e = decode_jwks_component(k, kid, "e")?;
+                Ok(JwksKeyMaterial::Rsa { n, e })
+            }
+            "EC" => {
+                let crv = k.get("crv").and_then(|v| v.as_str()).ok_or_else(|| format!("JWKS EC key `{kid}` has no `crv`"))?.to_string();
+                let x = decode_jwks_component(k, kid, "x")?;
+                let y = decode_jwks_component(k, kid, "y")?;
+                Ok(JwksKeyMaterial::Ec { crv, x, y })
+            }
+            other => Err(format!("JWKS key `{kid}` has unsupported `kty` `{other}` — expected `oct`, `RSA`, or `EC`")),
+        };
     }
     Err(format!("JWKS has no key with kid `{kid}`"))
+}
+
+fn decode_jwks_component(key: &JsonDoc, kid: &str, member: &str) -> Result<Vec<u8>, String> {
+    let b64 = key.get(member).and_then(|v| v.as_str()).ok_or_else(|| format!("JWKS key `{kid}` has no `{member}`"))?;
+    URL_SAFE_NO_PAD.decode(b64).map_err(|_| format!("JWKS key `{kid}`'s `{member}` is not valid base64url"))
+}
+
+/// Checks `signature_b64` over `signed_input` against `key`, dispatching
+/// on the JWT header's own `alg` — the fix for the JWKS-is-symmetric-only
+/// gap (`ROADMAP.md` A11 / `API_TRUST_MODEL.md` §3): `RS256`/`ES256` are
+/// real RSA-PKCS1v1.5/ECDSA-P256 signature verification via `ring`, not
+/// just HMAC. `alg` and the resolved key's `kty` must agree (enforced by
+/// the match arms below having no fallthrough that ignores either) — an
+/// `RS256` header can never be satisfied by a `Symmetric` key or vice
+/// versa, which is what actually prevents algorithm confusion (a caller
+/// presenting `alg: "HS256"` and using the server's own public RSA key
+/// bytes as the HMAC secret).
+fn verify_jwt_signature(alg: &str, key: &JwksKeyMaterial, kid: &str, signed_input: &[u8], signature_b64: &str) -> Result<(), String> {
+    match (alg, key) {
+        ("HS256", JwksKeyMaterial::Symmetric(secret)) => {
+            let expected_sig = hmac_sha256_base64url(secret, signed_input);
+            if !constant_time_eq(signature_b64, &expected_sig) {
+                return Err("invalid JWT signature".to_string());
+            }
+            Ok(())
+        }
+        ("RS256", JwksKeyMaterial::Rsa { n, e }) => {
+            let signature = URL_SAFE_NO_PAD
+                .decode(signature_b64)
+                .map_err(|_| "malformed JWT: signature is not valid base64url".to_string())?;
+            let public_key = ring::signature::RsaPublicKeyComponents { n: n.as_slice(), e: e.as_slice() };
+            public_key
+                .verify(&ring::signature::RSA_PKCS1_2048_8192_SHA256, signed_input, &signature)
+                .map_err(|_| "invalid JWT signature".to_string())
+        }
+        ("ES256", JwksKeyMaterial::Ec { crv, x, y }) => {
+            if crv != "P-256" {
+                return Err(format!("JWKS EC key `{kid}` has unsupported `crv` `{crv}` — expected `P-256`"));
+            }
+            let signature = URL_SAFE_NO_PAD
+                .decode(signature_b64)
+                .map_err(|_| "malformed JWT: signature is not valid base64url".to_string())?;
+            let mut point = Vec::with_capacity(1 + x.len() + y.len());
+            point.push(0x04);
+            point.extend_from_slice(x);
+            point.extend_from_slice(y);
+            let public_key = ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, point);
+            public_key.verify(signed_input, &signature).map_err(|_| "invalid JWT signature".to_string())
+        }
+        (other_alg, _) => Err(format!(
+            "JWT `alg` `{other_alg}` is unsupported, or doesn't match JWKS key `{kid}`'s key type — expected `HS256` (kty `oct`), `RS256` (kty `RSA`), or `ES256` (kty `EC`)"
+        )),
+    }
 }
 
 fn hmac_sha256_base64url(key: &[u8], message: &[u8]) -> String {
@@ -1252,7 +1348,13 @@ fn mock_issue_token(
 
     let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).map_err(|e| e.to_string())?);
     let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).map_err(|e| e.to_string())?);
-    let key = jwks_key(&jwks, kid)?;
+    // `mock_issue_token` only ever mints `HS256` tokens (see this fn's own
+    // doc comment) — the picked `kid` must therefore resolve to a
+    // symmetric key; an RSA/EC entry has no matching private key this
+    // codebase could sign with anyway.
+    let JwksKeyMaterial::Symmetric(key) = jwks_key(&jwks, kid)? else {
+        return Err(format!("mock_issue_token only supports a symmetric (`oct`) JWKS key; kid `{kid}` is not one"));
+    };
     let signature_b64 = hmac_sha256_base64url(&key, format!("{header_b64}.{payload_b64}").as_bytes());
     Ok(format!("{header_b64}.{payload_b64}.{signature_b64}"))
 }

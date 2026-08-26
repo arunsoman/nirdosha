@@ -233,6 +233,36 @@ checks the proof's field against the requirement string at runtime
 (same spirit as `check_role`'s own string check) and returns
 `Result(fn(params) -> ret, str)`.
 
+**`requires(public)` — 2026-08-26, `ROADMAP.md` A10.** `nirdosha serve`
+routes every declared `fn` (`serve.rs::dispatch`'s route resolution has
+no allowlist), and authorization only runs `if let Some(req) = &f.requires`
+— so a function with **neither** `requires(...)` **nor** a
+`VerifiedIdentity` parameter is reachable at `POST /api/<fn>` by anyone,
+with no token at all. That was previously silent: nothing in this file,
+`ROADMAP.md`, or a typecheck pass said so. `requires(public)` is the fix:
+an explicit marker meaning "this fn is intentionally callable with no
+token." Unlike `requires(role: ...)`/`requires(claim: ..., ...)`, it does
+**not** gate the function — `FnDecl::requires` stays `None`, so a
+`requires(public)`-marked fn needs no `acquire` and is exactly as
+directly callable as one with no `requires(...)` at all:
+
+```
+fn health_check() -> bool requires(public) { return true }
+```
+
+Its only effect is silencing `typeck::ungated_fn_warnings`'s new
+diagnostic — a **non-fatal** warning (never blocks `nirdosha build`/
+`run`/`serve`, unlike a real `TypeErrorKind`), printed by `nirdosha serve`/
+`emit-ui` for every `fn` with no `requires(...)`, no `requires(public)`, no
+`VerifiedIdentity` parameter, and no `db`/`mq` parameter (the last two
+already 400 at `serve.rs::decode_value` regardless, so they're excluded
+from the count the same way `API_TRUST_MODEL.md` §4 excludes them). It's
+a warning, not a gate: a program that never adds `requires(public)`
+anywhere still serves exactly as it did before this fix — the point is
+that an author now *sees* every unintentionally-open endpoint at
+`serve`/`emit-ui` time instead of discovering it in a security review.
+Full writeup: `API_TRUST_MODEL.md` §4.
+
 This is deliberately different from an annotation-based checker like
 Spring's `@PreAuthorize`: there's no ambient thread-local security
 context to consult (or forget to consult) at each call site, and no AOP

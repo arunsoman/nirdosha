@@ -158,6 +158,7 @@ fn lower_one(w: &WorkflowDecl, program: &mut Program) -> Result<(), ParseError> 
         span,
         declared_effects: None,
         requires: None,
+        explicit_public: false,
         module: None,
     });
 
@@ -184,6 +185,7 @@ fn lower_one(w: &WorkflowDecl, program: &mut Program) -> Result<(), ParseError> 
         span,
         declared_effects: None,
         requires: None,
+        explicit_public: false,
         module: None,
     });
 
@@ -215,6 +217,14 @@ fn lower_one(w: &WorkflowDecl, program: &mut Program) -> Result<(), ParseError> 
             span,
             declared_effects: None,
             requires: None,
+            // Genuinely intentional, not an oversight — the documented
+            // carve-out `API_TRUST_MODEL.md` §1 names explicitly (a
+            // single-use magic-link token compare stands in for
+            // `IdentityValid` here). Marking it so keeps the new
+            // ungated-fn warning (`ROADMAP.md` A10) silent for exactly
+            // this one deliberately-public shape, not every `workflow`
+            // function.
+            explicit_public: true,
             module: None,
         });
     }

@@ -150,6 +150,49 @@ and a minimal buildable project wrapper (Swift Package / bare
 `.xcodeproj`; Gradle module) so the output opens directly in Xcode /
 Android Studio without hand-assembly.
 
+### Per-target screen/dashboard exclusion (`target:` key)
+
+Not every screen belongs on every renderer — a dense admin table is a
+web-shaped screen, a future camera-capture flow (blocked on `D3`,
+below) will be a mobile-only one. Rather than a parallel declaration
+syntax, this is one more optional `kv_entry` on `screen_decl` and on
+`dashboard`'s `tile`/`chart` entries: `target: "web"` / `"mobile"` /
+`"all"` (default `"all"` — an existing `.nir` file with no `target` key
+anywhere behaves exactly as it does today, on both renderers). It needs
+**no grammar change at all**: `screen_item`/`dashboard_item` already
+reduce to `kv_entry ::= ident ":" expr` (`GRAMMAR.md`), the same
+generic production `title`/`list`/`create` already go through — only
+`typeck.rs` (a new `TypeErrorKind` if `target`'s value isn't one of the
+fixed three strings) and `ui_gen.rs` need real work.
+
+Concretely: `Screen`/`Metric` (`ui_gen.rs`) each gain a `target: Target`
+field (`enum Target { Web, Mobile, All }`, defaulting to `All` when the
+key is absent — same "absent key = today's behavior" pattern every
+other optional `screen`/`dashboard` key already follows). `manifest_json`
+filters `Screen`/`Metric` lists per consumer: `ui_gen::generate`
+(`emit-ui`/`serve`) keeps only `Web`/`All`, `mobile_gen::generate_ios`/
+`generate_android` (once built) keep only `Mobile`/`All`. Both
+renderers read the one already-filtered manifest — neither one carries
+its own exclusion logic, the same "one IR, thin renderers" property the
+rest of this doc is built on.
+
+**This is a `ui_gen.rs` change today, not something deferred until
+mobile exists.** Since `Screen`/`Metric` are the one shared IR both
+renderers consume, and web is the only renderer that exists right now,
+`target: "mobile"` has to make a screen disappear from `emit-ui`'s own
+output *before* `mobile_gen.rs` is written — otherwise a `.nir` author
+declaring a mobile-only screen today would see it wrongly rendered on
+web with no native counterpart to fall back to. That's why this lands
+as part of `D1`'s own scope (`ROADMAP.md` Track D), not a `D6` bolted
+on after: `D1` is the first point both the IR shape and web's filtering
+behavior need to be right.
+
+**Interacts with `module` grouping** (LANGUAGE.md §12): a `target`-
+excluded screen is also excluded from whichever `module` nav section it
+would have grouped under on the renderer it's excluded from — an empty
+module (every member screen excluded on this target) simply emits no
+nav entry, rather than an empty group.
+
 ## Standard profile — ships first, zero new server primitives
 
 Same fidelity as the web renderer, native chrome: SwiftUI `List`/`Form`/
@@ -252,10 +295,12 @@ exactly-once guarantee).
   profile's `D5`, once built) — it never falls back to running Nirdosha
   logic locally.
 - **No new UI-DSL.** `screen`/`dashboard`/`field`/`action` stay the one
-  surface authors write against; Rich profile only ever adds new *keys*
-  inside the existing `action { ... }`/`field { ... }` blocks (e.g.
-  `step_up: biometric`), never a parallel mobile-specific declaration
-  syntax.
+  surface authors write against; mobile-specific behavior only ever
+  adds new *keys* — inside `action { ... }`/`field { ... }` bodies (e.g.
+  `step_up: biometric`), or, for `target:` (above), directly on
+  `screen`/`dashboard`/`tile`/`chart` themselves, since `kv_entry` is
+  already generic there too — never a parallel mobile-specific
+  declaration syntax, and never a new grammar production either way.
 - **No parity beyond what the manifest already models.** A struct/fn
   shape the web renderer can't turn into a screen (an affine-handle
   param, a payload-carrying-enum field, anything `"readonly"` today)

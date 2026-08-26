@@ -66,6 +66,7 @@ effect-name ::= "pure" | "rng" | "io" | "concurrent" | "network"
 requires-annotation ::= "requires" ws "(" ws (
                            ("role" ws ":" ws str-lit)
                          | ("claim" ws ":" ws str-lit ws "," ws str-lit)
+                         | "public"
                        ) ws ")"
 
 struct-decl ::= "struct" ws ident (ws type-param-list)? ws "{" ws field (ws "," ws field)* (ws ",")? ws "}"

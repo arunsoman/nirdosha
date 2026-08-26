@@ -287,3 +287,147 @@ builtin).
   same clean, disclosed way it already rejects one using `transact` —
   `check_supported` names the specific unsupported builtin, never a
   silent mis-compile.
+
+## Proposed, not built: state ownership + a generated queue UI
+
+**2026-08-26.** Found working through `scratch/extracted_typed_v1.json`'s
+`WF-TRDPAY-001` example against the real, shipped six-eyes/Maker-Checker
+implementation (`examples/trade-finance/trade_finance.nir`'s
+`submit_approval`/`decide_approval`, which doesn't even use `workflow{}`):
+today there is **no** way to say, in `.nir` source, who may act on a
+`state`, and **no** generated UI anywhere a user could see "the things
+currently waiting on me" and act on one. Verified directly, not assumed:
+`ast::StateDecl` has no owner field; `ui_gen.rs` has zero references to
+`WorkflowDecl` at all; the one hand-written approval screen
+`trade_finance.nir` actually ships (`screen`-free, naming-convention-only
+`Approval`) is a read-only list gated to a single fixed role, with no
+decide action and no per-row "is this mine" filtering. This section is a
+proposed design to close that gap — a sketch for review, matching every
+other `[OPEN]`/proposed section this file and `API_TRUST_MODEL.md`
+already use that convention for, **nothing here is built**.
+
+### Why this needs new machinery, not just a new field
+
+A state's owner is a **runtime** question, not a static one — unlike an
+ordinary `fn`'s `requires(role: ...)`, which is checked once per function
+regardless of which instance is involved, `advance_<workflow>` is one
+function serving every instance of that workflow; whether the *current
+caller* may fire an event out of instance `N`'s *current* state depends on
+which state instance `N` happens to be in *right now*. That check has to
+happen inside `__workflow_advance` itself (interpreter-level, against the
+instance's live row), not at `serve.rs::dispatch`'s static per-function
+gate — the same reason row-level ACL (`API_TRUST_MODEL.md` §6) can't be
+expressed as an ordinary `requires(...)` either. This is the one genuinely
+new piece of runtime logic the whole proposal needs; everything else below
+is plumbing around it.
+
+### 1. Grammar: `owner` on a `state`
+
+Reuses the exact visibility-expression grammar `screen`'s `field { view:
+role(...) }` already has (`typeck.rs::check_visibility_expr`) — no new
+expression syntax:
+
+```
+state PendingSixEyes {
+    owner: role("six_eyes_reviewer")
+    on_entry {
+        notify_six_eyes_reviewer(instance_id)
+    }
+    on Approved -> Approved
+    on Rejected -> Rejected
+}
+```
+
+`owner` is deliberately independent of `on_entry`'s `notify(...)` target —
+they typically name the same role, but they answer different questions
+("who's told" vs. "who may act") and nothing should force them to agree
+syntactically. A state with no `owner` is unrestricted (any authenticated
+caller may fire its transitions) — the same "default open unless you say
+otherwise" posture `requires(...)` already has on ordinary functions
+(`ROADMAP.md` A10), so this needs the *same* typeck-warning treatment A10
+shipped: an owner-less, non-terminal state should warn, not silently ship
+open.
+
+### 2. Runtime enforcement
+
+`advance_<workflow>` gains a leading `identity: VerifiedIdentity`
+parameter (a real, disclosed signature change from today's
+`advance_kyc_onboarding(instance_id, event, payload)` — every existing
+`workflow` program would need updating, the same class of migration the
+str-ban and other breaking changes already went through, `ROADMAP.md`
+A4's compatibility-policy gap being exactly why this needs a real policy
+before it ships). `__workflow_advance` looks up the instance's current
+state's `owner` from the `WorkflowDecl` AST (already in scope — the
+interpreter already holds the whole `Program`) and checks `identity`
+against it with the same `identity_has_role`/`identity_has_mapped_role`
+logic `serve.rs`'s own `requires(role: ...)` enforcement already uses —
+no new authorization primitive, just a new call site for the existing one.
+A caller who fails this gets a clean `Err(NotStateOwner)` (a new
+`WorkflowActionError` variant), never a trap.
+
+### 3. Read side: "what's waiting on me"
+
+No new storage — `workflow_instance` already durably tracks each
+instance's current state (`workflow_log.rs`). `workflow_lower.rs`
+additionally synthesizes, per workflow:
+
+```
+fn list_<workflow_snake>_pending_for_me(identity: VerifiedIdentity) -> Result(json, WorkflowActionError)
+```
+
+— queries instances whose current state's `owner` the caller satisfies,
+the same query shape `list_approval`/`list_audit_log` already run by hand
+today, just generic and auto-generated instead of hand-rolled per app.
+
+### 4. UI: a new screen archetype, plus real navigation
+
+This is the part `ui_gen.rs` has no precedent for at all: every existing
+generated screen has a **fixed** action set for the whole table (`list`/
+`create`/`update`/`delete`, declared once). A workflow queue needs a
+**per-row** action set, because different rows can be in different
+states with different outgoing events. Proposed shape:
+
+- One new top-level nav section, **"Workflows"** — one entry per declared
+  `workflow`, exactly answering the "a menu of workflows, click one, see
+  its entries" question directly. Needs `ui_gen.rs` to read
+  `Program.workflows` at all, which it doesn't today.
+- Clicking a workflow opens its queue: `list_<workflow>_pending_for_me`'s
+  rows, columns from the `data` block (same field→control inference
+  `screen`s already have), a status badge for the current state, and —
+  per row — a button per outgoing event of *that row's own current
+  state*, calling `advance_<workflow>(event, ...)`. A state's own human-
+  readable name is currently just its PascalCase identifier
+  (`PendingSixEyes`); a `label: "string"` kv-entry on `state` (same shape
+  `screen`'s own `title`) would give this a real display string instead
+  of splitting the identifier client-side.
+- Clicking an instance row opens its detail: full `data`, current state,
+  and — real, already-durable data nothing new needs building —
+  `workflow_history`'s append-only transition log as an audit trail.
+
+### 5. The thing this still can't express: quorum ("N of these, not just one")
+
+`owner` answers "who may decide," not "how many *distinct* such people
+must decide before advancing" — six-eyes needs the latter. The real
+shipped system gets this today via `required_eyes: i64` counted against
+an `approval_decision` table, a fundamentally different shape than a
+single `on Event -> State` transition firing once. Bolting `owner` onto
+`state` does not, by itself, correctly model quorum — a state with
+`owner: role("six_eyes_reviewer")` alone would let the *first* qualifying
+person's decision fire the transition immediately, which is Maker-Checker
+semantics (one decider), not six-eyes (several, independent, distinct).
+Getting this right needs either a new transition shape (`on N-of-role(X)
+event -> target`, real new grammar, not sketched here) or keeping quorum
+counting in a hand-rolled table the way it works today and layering
+`owner`/the queue UI only on top of that existing mechanism instead of
+`workflow{}`'s own transitions. **Not resolved here** — named so a first
+implementation doesn't quietly assume `owner` alone covers six-eyes when
+it demonstrably doesn't.
+
+### What's parked in the extraction schema for this already
+
+`scratch/prompt_v2.txt`/`extraction_schema.rs` now capture `owner_role`/
+`owner_claim`/`label` per extracted `state`, and a `required_decisions`
+hint distinguishing a single-decider state from a quorum one — data ready
+to feed this design the moment it's built, explicitly *not* implying any
+of it is enforced today (`ROADMAP.md` tracks the compiler-side gap
+separately from the schema's ability to record the intent).

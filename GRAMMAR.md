@@ -117,11 +117,18 @@ effect_annotation ::= "effect" "(" effect_name ("," effect_name)* ")"
 effect_name ::= "pure" | "rng" | "io" | "concurrent" | "network"
 
 // `requires(role: "admin")` / `requires(claim: "department",
-// "cardiology")` -- `None` (ungated, the common case) if absent.
-// `role`/`claim` are matched by identifier text only in this one slot,
-// same "keyword only within this one leading position" treatment
-// `screen_decl`'s own `field`/`action`/`paginate` names get (see below).
-requires_annotation ::= "requires" "(" ("role" ":" str | "claim" ":" str "," str) ")"
+// "cardiology")` / `requires(public)` -- `None` (ungated, the common
+// case) if absent. `role`/`claim`/`public` are matched by identifier text
+// only in this one slot, same "keyword only within this one leading
+// position" treatment `screen_decl`'s own `field`/`action`/`paginate`
+// names get (see below). `public` (added `ROADMAP.md` A10 / `API_TRUST_
+// MODEL.md` §4) is an explicit, typechecked "this fn is intentionally
+// callable with no token" marker -- unlike `role`/`claim` it does not
+// gate the function (`ast::FnDecl::requires` stays `None`; a
+// `requires(public)` fn needs no `acquire` and is exactly as directly
+// callable as one with no `requires(...)` at all); its only effect is
+// silencing `typeck::ungated_fn_warnings`' warning for that one fn.
+requires_annotation ::= "requires" "(" ("role" ":" str | "claim" ":" str "," str | "public") ")"
 
 // Row 11 (`nirdosha_row11_amendment.md`) — product and sum types.
 // `type_params` (layer 6, generics) is an optional bare-name list, empty

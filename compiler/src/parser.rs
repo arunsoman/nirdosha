@@ -781,9 +781,9 @@ impl Parser {
             Ty::Unit
         };
         let declared_effects = self.parse_effect_annotation()?;
-        let requires = self.parse_requires_annotation()?;
+        let (requires, explicit_public) = self.parse_requires_annotation()?;
         let body = self.parse_block()?;
-        Ok(FnDecl { name, params, ret, body, span, declared_effects, requires, module: None })
+        Ok(FnDecl { name, params, ret, body, span, declared_effects, requires, explicit_public, module: None })
     }
 
     /// `effect(pure)` / `effect(io, network)` / ... — `None` if there's no
@@ -843,36 +843,44 @@ impl Parser {
     }
 
     /// `requires(role: "admin")` / `requires(claim: "department",
-    /// "cardiology")` — `None` if there's no `requires(...)` at all (the
-    /// common, ungated case). `role`/`claim` are matched by identifier
-    /// text, same "keyword only within this one slot" treatment
-    /// `parse_effect_annotation`'s own names get.
-    fn parse_requires_annotation(&mut self) -> PResult<Option<Requirement>> {
+    /// "cardiology")` / `requires(public)` — `(None, false)` if there's no
+    /// `requires(...)` at all (the common, ungated case). `role`/`claim`/
+    /// `public` are matched by identifier text, same "keyword only within
+    /// this one slot" treatment `parse_effect_annotation`'s own names get.
+    /// `public` is deliberately not a `Requirement` variant — see
+    /// `ast::FnDecl::explicit_public`'s doc comment for why — so it's
+    /// returned out-of-band as the second tuple element instead of
+    /// through the `Option<Requirement>` slot `role`/`claim` use.
+    fn parse_requires_annotation(&mut self) -> PResult<(Option<Requirement>, bool)> {
         if self.peek().tok != Tok::Requires {
-            return Ok(None);
+            return Ok((None, false));
         }
         self.bump();
         self.expect(&Tok::LParen, "`(`")?;
         let kind_span = self.span();
         let kind = self.expect_ident()?;
-        self.expect(&Tok::Colon, "`:`")?;
-        let req = match kind.as_str() {
-            "role" => Requirement::Role(self.expect_str_lit("a role name")?),
+        let result = match kind.as_str() {
+            "role" => {
+                self.expect(&Tok::Colon, "`:`")?;
+                (Some(Requirement::Role(self.expect_str_lit("a role name")?)), false)
+            }
             "claim" => {
+                self.expect(&Tok::Colon, "`:`")?;
                 let name = self.expect_str_lit("a claim name")?;
                 self.expect(&Tok::Comma, "`,`")?;
                 let value = self.expect_str_lit("the claim's required value")?;
-                Requirement::Claim(name, value)
+                (Some(Requirement::Claim(name, value)), false)
             }
+            "public" => (None, true),
             other => {
                 return Err(ParseError {
-                    message: format!("unknown requirement `{other}` — expected `role` or `claim`"),
+                    message: format!("unknown requirement `{other}` — expected `role`, `claim`, or `public`"),
                     span: kind_span,
                 });
             }
         };
         self.expect(&Tok::RParen, "`)`")?;
-        Ok(Some(req))
+        Ok(result)
     }
 
     /// A bare string literal, for the handful of grammar slots (`requires`'
@@ -964,7 +972,7 @@ impl Parser {
     }
 
     // expr ::= if_expr | transact_expr | match_expr | assignment
-    fn parse_expr(&mut self) -> PResult<Expr> {
+    pub(crate) fn parse_expr(&mut self) -> PResult<Expr> {
         self.enter_nesting()?;
         let result = if self.peek().tok == Tok::If {
             self.parse_if_expr()
@@ -1576,4 +1584,27 @@ impl Parser {
             }),
         }
     }
+}
+
+/// Parses `src` as one bare expression, not a whole program — the entry
+/// point `contract_check.rs` uses to turn a Hoare predicate string (a
+/// user story's `pre_logic`/`post_logic`, a `routing_fn`'s own, straight
+/// out of an extraction JSON like `scratch/extracted_typed_v1.json`)
+/// into a real `Expr`, using the exact same grammar/precedence a `.nir`
+/// file's own expressions get — no separate predicate mini-language to
+/// keep in sync. Requires the whole string to be consumed by one
+/// expression (a stray trailing token is a parse error, not silently
+/// ignored), the same "no leftover input" discipline `parse_program`
+/// gets from consuming every token up to `Tok::Eof`.
+pub fn parse_standalone_expr(src: &str) -> Result<Expr, String> {
+    let toks = crate::token::Lexer::new(src)
+        .tokenize()
+        .map_err(|e| format!("lex error at {}:{}: {}", e.span.line, e.span.col, e.message))?;
+    let mut parser = Parser::new(toks);
+    let expr = parser.parse_expr().map_err(|e| format!("parse error at {}:{}: {}", e.span.line, e.span.col, e.message))?;
+    if parser.peek().tok != Tok::Eof {
+        let span = parser.span();
+        return Err(format!("{}:{}: unexpected trailing input after the expression", span.line, span.col));
+    }
+    Ok(expr)
 }

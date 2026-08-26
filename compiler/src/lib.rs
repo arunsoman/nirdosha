@@ -1,7 +1,9 @@
 pub mod ast;
 pub mod codegen;
+pub mod contract_check;
 pub mod dbconn;
 pub mod effects;
+pub mod extraction_schema;
 pub mod init;
 pub mod interpreter;
 pub mod migrate;
@@ -15,6 +17,7 @@ pub mod token;
 pub mod transact_log;
 pub mod typeck;
 pub mod ui_gen;
+pub mod workflow_conformance;
 pub mod workflow_lower;
 pub mod workflow_log;
 

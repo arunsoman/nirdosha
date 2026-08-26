@@ -856,6 +856,17 @@ pub struct FnDecl {
     /// presenting a matching `RoleView`/`ClaimView` proof. See
     /// `Requirement`'s own doc comment.
     pub requires: Option<Requirement>,
+    /// `requires(public)` — an explicit, typechecked "this fn is
+    /// intentionally callable with no token" marker (`ROADMAP.md` A10 /
+    /// `API_TRUST_MODEL.md` §4, direction (a)). Deliberately **not** a
+    /// `Requirement` variant: unlike `Role`/`Claim`, it must not gate
+    /// direct calls or `Ty::Fn` references — a function marked
+    /// `requires(public)` stays exactly as callable as one with no
+    /// `requires(...)` at all (`requires` stays `None`). Its only effect
+    /// is silencing `TypeErrorKind::UngatedFnReachableWithNoToken` — see
+    /// `typeck.rs::check_fn`'s "does this fn need `requires(public)`?"
+    /// check for the full reachability rule that warning implements.
+    pub explicit_public: bool,
     /// Same meaning as `StructDecl::module` — see its doc comment.
     pub module: Option<String>,
 }

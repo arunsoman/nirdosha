@@ -325,7 +325,7 @@ assumed from a doc comment.
 | Privacy | India DPDP Act | `[N/A]` | Same reasoning as GDPR. |
 | Privacy | CCPA/CPRA | `[N/A]` | Same reasoning as GDPR. |
 | Identity and access | OAuth 2.0 | `[PARTIAL]` | No authorization-code/client-credentials grant flow (zero matches for `/authorize`, `redirect_uri`, `grant_type`). What's real: a session layer on top of OIDC token validation — `create_application_session`/`session_cookie`/`new_refresh_token`/`exchange_refresh_token`/`check_revocation` (`interpreter.rs:2580+`), unpredictable session IDs (`interpreter.rs:1474`), real revocation checking (`:2649`). This is "validate a token and manage sessions," not "be an OAuth2 authorization server or client." |
-| Identity and access | OpenID Connect | `[PARTIAL]` | Real ID-token validation (`validate_oidc_token`, `interpreter.rs:1085`, real JWKS lookup `:1168`) — but signature verification is **HS256-only** (`:1241`), no RS256, which is what most real IdPs (Auth0/Okta/Keycloak/Azure AD) issue by default. No discovery endpoint, no `/userinfo`. |
+| Identity and access | OpenID Connect | `[PARTIAL]` | Real ID-token validation (`validate_oidc_token`, `interpreter.rs`, real JWKS lookup) — **2026-08-26: RS256/ES256 signature verification added** (Track A11, real RSA/EC via `ring`, alongside the original HS256), closing the single largest gap here. Still missing: no discovery endpoint, no `/userinfo`, one fixed JWKS/issuer/audience per `serve` process (Track A6's "Multi-IdP registry" is still `[OPEN]`). |
 | Identity and access | SAML 2.0 | `[OPEN]` | Zero matches repo-wide. |
 | Identity and access | SCIM | `[OPEN]` | Zero matches repo-wide (no user/group provisioning protocol). |
 | Identity and access | FIDO2/WebAuthn | `[OPEN]` | Zero matches repo-wide (no passkey/phishing-resistant login). |
@@ -350,6 +350,35 @@ assumed from a doc comment.
 | Accessibility | India GIGW | `[OPEN]` | Same — includes WCAG-aligned accessibility criteria. |
 | Quality management | ISO 9001 | `[N/A]` | Organizational quality-management-system certification. |
 | Quality management | ISO/IEC 25010 | `[N/A]` | No formal characteristic-by-characteristic assessment has been run — this file's own `[DONE]`/`[PARTIAL]`/`[OPEN]` discipline plus the compiler's test suite are the project's actual (informal) substitute today. |
+
+### Domain applicability
+
+Added 2026-08-25, same session. All of these are *product/process*
+certifications — they certify a specific shipped product's full
+development, verification, and traceability process (often including
+the toolchain used to build it), not a language or compiler in the
+abstract. So **every row below is `[N/A]` for "Nirdosha the project
+holds this certification"** — that will always be true, regardless of
+how the language matures, because a compiler isn't the kind of thing
+these standards certify. What *can* change over time is which of
+Nirdosha's real properties (SMT-proven overflow/bounds safety,
+ownership-proven memory safety, structural deadlock-freedom, structured
+machine-readable diagnostics) would count as useful supporting evidence
+for a team pursuing one of these for an actual product built with it —
+that's what the notes below capture.
+
+| Domain | Relevant standards | Status | Notes |
+|---|---|---|---|
+| General SaaS | ISO 9001, ISO 27001, SOC 2, ISO/IEC 29119, ISO/IEC 25010 | `[N/A]` | Covered individually above (Information security / Quality management rows) — ISO/IEC 29119 (software testing standard) is new here: no formal 29119-structured test-process documentation exists; the project has a real, substantial test suite (`cargo test` across `compiler/`, `grammar_export/`, `bench/`) but it isn't mapped to 29119's process vocabulary. |
+| Medical software | IEC 62304, ISO 13485, ISO 14971, IEC 81001-5-1 | `[N/A]` | None built or claimed. IEC 62304 (medical device software lifecycle) and ISO 14971 (risk management) are both about the *development process* for a specific device, not a language — using Nirdosha wouldn't satisfy either on its own. Real supporting evidence a team could cite: SMT-discharged overflow/bounds proofs and ownership-checked memory safety are exactly the class of property IEC 62304's risk-control expectations care about, but citing them isn't the same as having the certification. |
+| Automotive | ISO 26262, Automotive SPICE, ISO/SAE 21434 | `[N/A]` | Same reasoning — ISO 26262 (functional safety) has ASIL-level tool-qualification requirements for anything in the safety-critical toolchain; Nirdosha's compiler has never gone through that qualification process. Structural deadlock-freedom and proven overflow safety are relevant *properties*, not a substitute for ASIL tool qualification. |
+| Aerospace | DO-178C, DO-278A, AS9100 | `[N/A]` | Sharpest caveat of this whole table: DO-178C explicitly requires separate **tool qualification (DO-330)** for any tool (including a compiler) used in the verification process — Nirdosha's LLVM-based backend has no DO-330 qualification, and "the language has safety properties" doesn't substitute for that requirement. |
+| Industrial control | IEC 61508, IEC 62443 | `[N/A]` | IEC 61508 (functional safety, SIL levels) has the same tool-qualification expectation as automotive/aerospace above. IEC 62443 is industrial-control *cybersecurity* — see the Network security/API security rows above (`[OPEN]` mTLS, no rate limiting) for what's concretely missing if this mattered today. |
+| Banking and payments | PCI DSS, ISO 20022, secure SDLC and audit controls | `[N/A]` | PCI DSS is an assessed compliance program for whoever handles cardholder data, not a language property. Real gap already surfaced this session: no built-in audit-trail feature exists (`ROADMAP.md`'s own earlier note, confirmed absent in code) — PCI DSS requirement 10 (track/monitor all access) would need that built at the application layer today, same as the trade-finance example already does by hand with `sha256_hex`. |
+| Government software | NIST, Common Criteria, FIPS 140-3 where cryptography is involved | `[N/A]` | NIST CSF already covered above. Common Criteria is a per-product security evaluation. **FIPS 140-3 specifically does not hold**: Nirdosha's cryptography (`hmac`/`sha2` crates, `Cargo.toml`) are standard RustCrypto software implementations, not a NIST CMVP-validated cryptographic module — a government deployment requiring FIPS-validated crypto could not use Nirdosha's built-in `sha256_hex`/HMAC as-is. |
+| AI and ML | ISO/IEC 42001, ISO/IEC 23894, NIST AI RMF, AI-testing practices | `[N/A]` | These govern an AI *management system* or *risk process* around a product, not a compiler. Adjacent and real: the `bench/` harness (pass@1 + self-repair rate, 23 tasks) is a genuine piece of "AI-testing practice" infrastructure for evaluating a model's Nirdosha-generation quality — but it's evaluating *models writing Nirdosha*, not Nirdosha itself as an AI system, and (per this session's earlier check) it's only ever been run against mock models, never a real one. |
+| Accessibility | WCAG 2.2, EN 301 549, Section 508 | `[OPEN]` | Duplicate of the Accessibility rows above — kept `[OPEN]` here (not `[N/A]`) since, unlike the rest of this table, accessibility genuinely *is* a property the generated UI could have; it just doesn't yet (zero `aria-` attributes in `ui_gen_template.html`, confirmed this session). |
+| Cloud service | ISO 27001, ISO 27017, ISO 27018, SOC 2, CSA CCM | `[N/A]` | ISO 27017/SOC 2/CSA CCM already covered above (Cloud security rows). ISO 27018 (PII protection in public clouds) is new here — same reasoning as the Privacy rows: no built-in data-subject/PII-handling tooling exists, so this would depend entirely on the deploying operator, not on Nirdosha. |
 
 ## 0. Where the existing plan already stands
 
@@ -566,6 +595,242 @@ of Track B has landed.*
   `z3-src = "416"` — upgrading requires either a new `z3` crate release
   or a `[patch]` override, not just a version bump in this repo's own
   `Cargo.toml`).
+- `[OPEN]` **A9. Business-rule parameters (thresholds, boundary
+  operators, currency) have no elicitation or config-store path.**
+  Found via `examples/trade-finance/trade_finance.nir`'s
+  `required_eyes_for_amount` (Module 4's Maker-Checker/6-Eyes
+  governance routing) against its own source user story
+  (`US-TRDPAY-002`, `scratch/extracted_userstories_v2.json`):
+  - **Threshold value drift** — the story's acceptance criteria use
+    "$1,000,000" (the PRD's own "e.g." hedge); the shipped rule uses
+    $50,000 (5,000,000 cents), self-disclosed in its own comment as "a
+    fixed illustrative cutoff... no per-tenant config store exists
+    yet." Two different sources of truth, neither actually authoritative.
+  - **Boundary-operator drift** — the story's `post_logic`
+    (`routed_to_six_eyes == (payment_amount > high_value_threshold)`)
+    and its second acceptance criterion ("at or below the threshold ->
+    Maker-Checker") both imply strict `>`; the shipped rule uses `>=`
+    — exactly-at-threshold is six-eyes in code, Maker-Checker in the
+    spec. Documented, not silently "fixed," by
+    `compiler/tests/trade_finance_governance_routing.rs`'s
+    `boundary_case_at_exact_threshold_is_six_eyes_per_shipped_code`.
+  - **Currency-blind comparison** — `submit_trade_payment`/
+    `required_eyes_for_amount` take a raw `amount_cents: i64` and never
+    consult `currency` at all, even though `Currency` already exists as
+    an enum and `TradePayment` carries a `currency` field: a
+    5,000,000-cent JPY payment (~$33) and a 5,000,000-cent USD payment
+    ($50,000) route identically today.
+
+  None of these are LLM-generation bugs fixable at the prompt level —
+  they're missing *inputs*: nobody with real business authority was
+  ever asked what the threshold, the boundary, or the per-currency
+  conversion should be, so an LLM (or a developer) filled in a
+  placeholder. Proposed direction, not started: `nirdosha init` grows a
+  domain-aware question phase — e.g. "does this project have
+  monetary threshold-routing rules? if so, for each one: what's the
+  threshold per currency/corridor, and is the boundary inclusive or
+  exclusive?" — with answers landing in a runtime-editable config
+  table (the same "ordinary struct, free CRUD screen" convention
+  `EmailProviderConfig`/`RoleMapping` already use, per **A6**), not
+  inlined as `.nir` literals. Needs two things that don't exist yet:
+  (1) a structured, domain-specific elicitation schema (a flat "what
+  domain?" question doesn't surface "inclusive or exclusive boundary?"
+  on its own), and (2) the config-store primitive itself, generalized
+  beyond identity/provider settings to arbitrary business-rule data.
+- `[DONE]` **A10. `serve.rs`'s dispatcher is default-open, not
+  default-deny.** Found red-teaming `API_TRUST_MODEL.md`, verified
+  directly: `dispatch` (`compiler/src/serve.rs:1030-1063`) only runs an
+  authorization check `if let Some(req) = &f.requires` — a function with
+  no `requires(...)` annotation skips the block entirely and is callable
+  by anyone, with or without a Bearer token. Counted against the shipped
+  `examples/trade-finance/trade_finance.nir`: 246 functions, 34 declare
+  `requires(...)`, **79 are reachable with no token at all**, including
+  mutating ones (`issue_letter_of_credit`, `clear_sanctions_override`,
+  `update_counterparty`). This directly contradicts how the project
+  describes its own output — `PROTOBOX_INTEGRATION.md`'s own Purpose
+  line calls the generated app "a real, running, **role-gated** web
+  app."
+
+  **2026-08-26 — fixed via direction (a): a new `requires(public)`
+  marker plus a typeck warning, not a runtime behavior change.** Direction
+  (b) (a project-level default-deny `serve` flag) was scoped out for this
+  pass — it would force triaging all 79 already-open
+  `trade_finance.nir` functions before that flag could ever be turned on
+  for it, real follow-up work distinct from this fix. What shipped:
+  - `requires(public)` (`ast::FnDecl::explicit_public`,
+    `parser.rs::parse_requires_annotation`, `GRAMMAR.md`/
+    `compiler/nirdosha.gbnf` updated) — an explicit "this fn is
+    intentionally callable with no token" marker. Deliberately **not** a
+    `Requirement` variant: it does not gate direct calls or `Ty::Fn`
+    references the way `requires(role/claim: ...)` does — a
+    `requires(public)`-marked fn stays exactly as directly callable as an
+    unannotated one (`requires` stays `None`).
+  - `typeck::ungated_fn_warnings` (new, non-fatal — never blocks
+    `typecheck`/a build, unlike a real `TypeErrorKind`) walks every
+    declared `fn` and warns on one with no `requires(...)`, no
+    `requires(public)`, no `VerifiedIdentity` parameter, and no `db`/`mq`
+    parameter (the last two already 400 at `serve.rs::decode_value`
+    regardless, excluded so the count matches what's actually reachable).
+    Wired into `nirdosha serve`/`emit-ui` (`main.rs::
+    print_ungated_fn_warnings`), the two commands where HTTP reachability
+    is the actual question; `run`/`build`/`emit-llvm` are unaffected.
+  - `workflow_lower.rs`'s synthesized `<event>_via_link` functions are
+    marked `explicit_public: true` — the pre-existing, already-documented
+    deliberate carve-out (`API_TRUST_MODEL.md` §1) — so the new warning
+    doesn't fire on the one shape that's supposed to be open; synthesized
+    `start_*`/`advance_*` are not marked, so they do warn today (an
+    honest gap: the `workflow` DSL has no syntax yet to attach
+    `requires(...)` to those generated functions).
+  - Verified end-to-end against the real flagship example: `nirdosha
+    emit-ui examples/trade-finance/trade_finance.nir` now prints exactly
+    **79** `UngatedFnReachableWithNoToken` warnings — an exact match with
+    this entry's own hand-counted figure above, confirming the
+    reachability logic is right, not just plausible.
+  - New `compiler/tests/ungated_fn_warning.rs` (8 tests: plain-fn warns;
+    `requires(role/claim)`, a `VerifiedIdentity` param, a `db`/`mq`
+    param, and `requires(public)` each silence it; `requires(public)`
+    confirmed to *not* gate a direct call; an unknown `requires(...)` kind
+    is still a parse error naming `public` as a valid option). Full
+    `cargo test` reverified green.
+  - Full design and the runtime invariant this closes: `API_TRUST_MODEL.md`
+    §4, `LANGUAGE.md` §6a.
+- `[DONE]` **A11. JWKS validation is symmetric-only — no mainstream IdP
+  can be plugged in today.** Found in the same red-team pass, verified
+  directly: `jwks_key` (`compiler/src/interpreter.rs:1168-1178`) reads
+  only a JWKS key's `k` member (a base64 symmetric/HMAC secret) — there
+  is no RSA (`n`/`e`) or EC (`x`/`y`/`crv`) key-material path anywhere
+  in the validator, and `validate_oidc_token`
+  (`compiler/src/interpreter.rs:1085-1184`) never inspects the token
+  header's `alg` at all. `mock_issue_token`
+  (`compiler/src/interpreter.rs:1241`) hardcodes `alg: HS256` to match.
+  Auth0, Okta, Keycloak, and Azure AD all sign with RS256/ES256 by
+  default — none of their JWKS documents are consumable by this code
+  path as it stands. `LANGUAGE.md` §5 already hedges this correctly ("a
+  **mock** OIDC/JWT ID token"); `PROTOBOX_INTEGRATION.md`'s "replace the
+  three placeholder flags in `run.sh` with a real IdP's `--jwks-file`"
+  (§4) currently cannot be completed for any mainstream IdP without an
+  RSA/EC signature-verification path first.
+
+  **2026-08-26 — fixed: real RS256/ES256 verification via `ring`.**
+  New `ring = "0.17"` dependency (pure-Rust, no dynamic system-crypto
+  link, same "just works" posture `rusqlite`'s `bundled` feature already
+  gives this project). `jwks_key` now returns a `JwksKeyMaterial` enum
+  (`Symmetric`/`Rsa { n, e }`/`Ec { crv, x, y }`) keyed off each JWKS
+  key's own `kty` (`oct`/`RSA`/`EC`), instead of unconditionally reading
+  `k`. `validate_oidc_token` now reads the JWT header's `alg` (previously
+  never inspected at all) and dispatches to a new `verify_jwt_signature`:
+  `HS256` keeps the existing constant-time HMAC path; `RS256` verifies
+  via `ring::signature::RsaPublicKeyComponents`/
+  `RSA_PKCS1_2048_8192_SHA256`; `ES256` via `ring::signature::
+  UnparsedPublicKey`/`ECDSA_P256_SHA256_FIXED` over the raw uncompressed
+  SEC1 point. Closes algorithm confusion as a side effect, not an
+  afterthought: `alg` and the resolved key's `kty` must agree (there is
+  no match arm accepting `HS256` against an `Rsa`/`Ec` key), so an
+  attacker can no longer replay a JWKS's public RSA/EC key bytes as an
+  HS256 HMAC secret. `mock_issue_token` is intentionally unchanged — it
+  stays HS256-only (its own doc comment's documented scope; it now
+  errors clearly if pointed at a non-symmetric `kid` instead of silently
+  misusing the key material).
+
+  Verified with real key material, not just unit-level mocks: new
+  `compiler/tests/oidc_jwt_algorithms.rs` (5 tests) signs real JWTs with
+  a freshly generated 2048-bit RSA keypair (RS256) and a `ring`-generated
+  P-256 keypair (ES256), round-trips both through the real
+  `oidc_validate_token` builtin (parser/typeck/interpreter, not a
+  Rust-level unit test), confirms a tampered signature is rejected for
+  each algorithm, and confirms the algorithm-confusion forgery (an
+  RS256 JWKS's public `n` bytes reused as an HS256 HMAC secret) is
+  rejected rather than silently HMAC-verified. All 5 existing JWKS-based
+  test suites (`row12_identity`, `claim_path`, `privileged_fn`,
+  `role_mapping`, `field_rbac`, `serve` — every fixture already declared
+  `"kty":"oct"`) re-verified green with no changes needed. Full
+  `cargo test` green. Full design and remaining scope (mobile identity,
+  a multi-IdP registry) unchanged: `API_TRUST_MODEL.md` §3.
+- `[DONE]` **A12. Verbatim, mathematical verification of a PRD
+  extraction against real `.nir` code** — `API_TRUST_MODEL.md` §7.5's
+  Tier 1 (an SMT obligation channel for a human/extractor-written
+  predicate) and a new sibling structural construct for `workflow`
+  shape, both built and demonstrated against a real extraction file,
+  `scratch/extracted_typed_v1.json`, not a synthetic fixture.
+  - **`contract_check::check_fn_contract`** (new
+    `compiler/src/contract_check.rs`) — Tier 1, for real: takes a real
+    Hoare pair (`pre_logic`/`post_logic`, straight out of the extraction
+    JSON's own shape) and a real named `.nir` function, parses each
+    predicate with the exact same grammar every `.nir` expression gets
+    (`parser::parse_standalone_expr`, one new entry point — no separate
+    predicate mini-language), asserts `pre_logic` as a hypothesis, then
+    either proves every `post_logic` clause for **every** input the
+    function's declared param types admit or returns a real
+    counterexample pulled from Z3's own model, naming exactly which
+    clause it violates. Deliberately a separate module from `smt.rs`
+    rather than an extension of it — same "duplicate a focused walker
+    rather than couple two independently-evolving analyses" precedent
+    `smt.rs`'s own module doc already sets. Scoped exactly as §7.5
+    proposed: one named pure, loop-free, integer-only function, no
+    interprocedural reasoning — anything outside that (a `Call`, a
+    `while`, a non-integer type) is an honest `Unsupported`, never a
+    silent wrong answer (approximating an unmodelable sub-expression
+    would be sound for a universal proof but **unsound for a
+    counterexample**, so the walker aborts on both sides instead).
+    Demonstrated end-to-end: `required_eyes_for_amount`'s real body
+    (`if amount_cents >= 5000000 { 2 } else { 1 }`) is proved to satisfy
+    `WF-TRDPAY-001.routing_fn.post_logic`'s real biconditional,
+    `(result == 2) == (amount_cents >= high_value_threshold)`, for every
+    `i64` `amount_cents` — once told `high_value_threshold`'s actual
+    value. That threshold is exactly §7.1a's "the spec references a
+    quantity the code doesn't parameterize on" case:
+    `required_eyes_for_amount` takes no such parameter, the real code
+    hardcodes 5,000,000 (`ROADMAP.md` A9), so `check_fn_contract`
+    requires it as an explicit `extra_bindings` input — omitted, it
+    returns `UnboundIdentifier` rather than a misleading answer;
+    supplied wrong (6,000,000), it correctly returns a real
+    `Counterexample`. A `bool_expr` case `smt.rs`'s own didn't need
+    (nothing it synthesizes itself is shaped this way) had to be added
+    to get the biconditional right: the predicate's outer `==` is
+    boolean equality between two comparisons, not integer equality
+    between two numbers.
+  - **`workflow_conformance::check_workflow_conformance`** (new
+    `compiler/src/workflow_conformance.rs`, plus new
+    `compiler/src/extraction_schema.rs` — a typed `serde::Deserialize`
+    mirror of the extraction JSON's whole shape) — no solver needed: a
+    `workflow`'s states/transitions/data fields are a finite, fully-known
+    structure the moment `.nir` source parses, so checking the real
+    `workflow { ... }` against an extraction's version is ordinary
+    set/relation equality, always a real match or a real, named diff.
+    Narrower than the SMT construct in one way: verifies shape, not
+    behavior (`on_entry`/`on_exit` compared by count, not by matching
+    prose against a real `notify(...)` call's actual arguments — a
+    natural-language-to-call binding deliberately not attempted here).
+  - Both verified against all three of `scratch/extracted_typed_v1.json`'s
+    `workflows[]` entries — new `compiler/tests/
+    extracted_typed_v1_verification.rs` (8 tests): 3 exact-match
+    conformance checks against `.nir` snippets mirrored verbatim from
+    `compiler/tests/trade_payment_approval_workflow_check.rs`; 2 tests
+    that deliberately mutate the real `.nir` source (drop a transition;
+    flip a `terminal` flag) and confirm the *specific* mismatch is
+    reported, not just that some diff exists; 3 tests proving/
+    counterexampling the routing_fn contract as described above. Full
+    `cargo test` reverified green.
+  - **What this doesn't close, named rather than silently implied:** a
+    user story's own `pre_logic`/`post_logic` (e.g. `US-COMM-006`'s
+    `withdrawal_amount > 0`) isn't checkable yet — the extraction schema
+    has no field binding a story to the real function(s) that implement
+    it (`ExtractedUserStory::implements` exists as a `#[serde(default)]`
+    placeholder, always empty until the extraction prompt emits it); per
+    §7.1a most user-story postconditions are Tier 2b's shape anyway
+    (end-to-end DB state after several functions, not one pure
+    function's return value) — Tier 2b itself, the repair loop, and
+    row-level ACL remain exactly as `[OPEN]` as before this item. Full
+    design detail: `API_TRUST_MODEL.md` §7.5.
+- `[OPEN]` **A12a. Extend the extraction schema with `implements:
+  [fn_name, ...]` on a user story** — the single concrete next step for
+  user-story-level Tier 1 (parked here, not forgotten: A12 above
+  identified it as the one missing binding, not a `contract_check.rs`
+  design gap). Scope: one new field in
+  `scratch/prompt_v2.txt`/`extraction_schema::ExtractedUserStory`
+  (`#[serde(default)]` already in place on the Rust side, so this is a
+  prompt-side change plus dropping the default once real data flows) —
+  no compiler-side work beyond that field landing with real values.
 
 ---
 
@@ -677,13 +942,24 @@ capability, per `MOBILE.md`'s own archetype ranking.*
 
 - `[OPEN]` **D1. `emit-mobile` codegen scaffold + Standard profile.**
   New `mobile_gen.rs` (`generate_ios`/`generate_android`), consuming
-  `ui_gen.rs::build_screens`'s existing `Screen`/`FieldSpec`/`Action`/
-  `Metric` IR unchanged; a checked-in Swift/Kotlin runtime library
-  (generic per-`control`-kind field views, list/singular/dashboard/login
-  screens, networking client, `Theme` mapper) embedded via `include_str!`
-  the same way `codegen.rs`'s `RUNTIME_KERNELS_LIB` is; per-app generated
-  code is one typed struct per `Screen`, not per-struct logic. No new
-  `ScreenDecl` grammar, no new builtins, no new `serve.rs` routes.
+  `ui_gen.rs::build_screens`'s `Screen`/`FieldSpec`/`Action`/`Metric` IR
+  — plus one real addition to that IR, not carried over unchanged: a
+  `target: Web|Mobile|All` field on `Screen`/`Metric` (default `All`)
+  backing a new optional `target: "web"|"mobile"|"all"` `kv_entry` on
+  `screen`/`dashboard`/`tile`/`chart`, so mutually-exclusive per-target
+  screens are possible (`MOBILE.md`'s "Per-target screen/dashboard
+  exclusion" section). That filtering has to land in `ui_gen.rs`/
+  `manifest_json` as part of this item, before `mobile_gen.rs` itself —
+  `emit-ui` is the only renderer that exists while D1 is being built, so
+  a `target: "mobile"` screen must already disappear from *its* output,
+  not just from a native renderer that doesn't exist yet. Otherwise:
+  checked-in Swift/Kotlin runtime library (generic per-`control`-kind
+  field views, list/singular/dashboard/login screens, networking client,
+  `Theme` mapper) embedded via `include_str!` the same way `codegen.rs`'s
+  `RUNTIME_KERNELS_LIB` is; per-app generated code is one typed struct
+  per `Screen`, not per-struct logic. No new `ScreenDecl` grammar (the
+  `target` key reuses the existing generic `kv_entry` production), no
+  new builtins, no new `serve.rs` routes.
 - `[OPEN]` **D2. Device-bound biometric step-up.** New credential
   artifact a native app can hold in Keychain/Keystore and unlock via
   Face ID/Touch ID/BiometricPrompt before presenting — layered on
