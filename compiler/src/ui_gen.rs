@@ -67,6 +67,9 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
+
 use crate::ast::{Effect, Expr, Field, FnDecl, Program, Requirement, ScreenDecl, Ty};
 use crate::effects::FnEffects;
 
@@ -1128,6 +1131,22 @@ pub fn generate(
         .replace("__NIRDOSHA_THEME_OVERRIDE__", &theme_override_css(theme))
         .replace("__NIRDOSHA_HTML_CLASS__", &theme_html_class(theme))
         .replace("__NIRDOSHA_THEME_SCRIPT__", &theme_bootstrap_script(theme))
+        .replace("__NIRDOSHA_FAVICON__", &favicon_data_uri())
+}
+
+/// The Nirdosha brand mark (`assets/brand/`'s standalone icon, cropped
+/// tighter and downsized to a 128x128/16-color PNG for a small embed
+/// payload — ~2KB source, ~2.6KB base64) as an inline `data:` URI, baked
+/// into every `emit-ui`/`serve` page via `__NIRDOSHA_FAVICON__` with zero
+/// network dependency — same "zero network dependency by default"
+/// posture `ui_gen_template.html`'s own header comment already states for
+/// fonts. `include_bytes!` pulls the PNG in at COMPILE time, so every
+/// `.nir` file gets this icon automatically the moment a built `nirdosha`
+/// binary runs `emit-ui`/`serve` on it — no per-project asset, no
+/// override flag, nothing the project author has to opt into.
+fn favicon_data_uri() -> String {
+    const FAVICON_PNG: &[u8] = include_bytes!("nirdosha-favicon.png");
+    format!("data:image/png;base64,{}", BASE64_STANDARD.encode(FAVICON_PNG))
 }
 
 /// Optional per-project theme, layered on top of the baked-in Material

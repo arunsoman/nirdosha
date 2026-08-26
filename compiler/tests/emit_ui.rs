@@ -482,3 +482,34 @@ fn dark_mode_none_emits_no_dark_override_at_all() {
     assert!(!html.contains("--md-primary: #eeeeee;"), "the dark-step color should never appear anywhere");
     assert_eq!(html.matches("@media (prefers-color-scheme: dark)").count(), 1, "only the baked-in block");
 }
+
+// ── Favicon: the Nirdosha brand mark, baked in at compile time ─────────
+
+#[test]
+fn every_generated_page_carries_the_nirdosha_favicon_with_no_placeholder_left_over() {
+    let html = emit_ui(include_str!("../../examples/ui_todo.nir"));
+    assert!(
+        html.contains(r#"<link rel="icon" type="image/png" href="data:image/png;base64,"#),
+        "every emit-ui page must self-contain the brand favicon, no network fetch"
+    );
+    assert!(
+        !html.contains("__NIRDOSHA_FAVICON__"),
+        "the placeholder must always be substituted, never leak into real output"
+    );
+}
+
+#[test]
+fn the_embedded_favicon_data_uri_decodes_to_a_real_png() {
+    use base64::Engine;
+    let html = emit_ui(include_str!("../../examples/ui_todo.nir"));
+    let marker = r#"href="data:image/png;base64,"#;
+    let start = html.find(marker).expect("favicon link tag present") + marker.len();
+    let end = html[start..].find('"').expect("closing quote") + start;
+    let b64 = &html[start..end];
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .expect("embedded favicon must be valid base64");
+    // PNG magic bytes -- confirms this is a real image, not garbage text
+    // that merely survived the placeholder substitution.
+    assert_eq!(&bytes[0..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+}
