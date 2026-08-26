@@ -77,7 +77,7 @@ use crate::effects::FnEffects;
 /// infrastructure types, never a user's own data model, so screens are
 /// never derived from them.
 const PRELUDE_STRUCT_NAMES: &[&str] =
-    &["HttpResponse", "VerifiedIdentity", "RoleView", "ClaimView", "ApplicationSession", "RefreshTokenHandle", "Pair"];
+    &["HttpResponse", "VerifiedIdentity", "RoleView", "ClaimView", "ApplicationSession", "RefreshTokenHandle", "Pair", "Money", "Measure"];
 
 /// One field of a derived form/table column.
 struct FieldSpec {
@@ -307,6 +307,7 @@ fn ty_label(ty: &Ty) -> String {
         Ty::Str => "str".to_string(),
         Ty::Bool => "bool".to_string(),
         Ty::F64 => "f64".to_string(),
+        Ty::Dec128 => "dec128".to_string(),
         Ty::I8 => "i8".to_string(),
         Ty::I16 => "i16".to_string(),
         Ty::I32 => "i32".to_string(),
@@ -386,6 +387,20 @@ fn build_field(program: &Program, name: &str, ty: &Ty, depth: u8) -> FieldSpec {
         Ty::Str => base("text", true),
         Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::Usize | Ty::F64 => {
             base("number", true)
+        }
+        // Text, not `number` — a `dec128` field round-trips through
+        // JSON/DB as its canonical decimal *string* (`serve.rs::
+        // decode_value`/`encode_value`'s `Ty::Dec128` arms,
+        // `interpreter.rs::sql_bind_params`), and an `<input type=number>`
+        // is IEEE-754 under the hood in every browser, exactly the
+        // silent-drift failure `dec128` exists to prevent (`LANGUAGE.md`
+        // §5's "Decimal arithmetic"). `pattern` gives it basic decimal-
+        // shape validation client-side without a numeric spinner nudging
+        // toward float behavior.
+        Ty::Dec128 => {
+            let mut f = base("text", true);
+            f.pattern = Some(r"^-?\d+(\.\d+)?$".to_string());
+            f
         }
         Ty::Bool => base("checkbox", false),
         Ty::Named(n, args) if n == "Option" && args.len() == 1 => {
@@ -1132,6 +1147,17 @@ pub fn generate(
         .replace("__NIRDOSHA_HTML_CLASS__", &theme_html_class(theme))
         .replace("__NIRDOSHA_THEME_SCRIPT__", &theme_bootstrap_script(theme))
         .replace("__NIRDOSHA_FAVICON__", &favicon_data_uri())
+        .replace("__NIRDOSHA_LOGO__", &logo_data_uri())
+}
+
+/// The same brand mark as `favicon_data_uri`, at a larger 96x96 size for
+/// the app-bar itself (rendered at ~32px — 96px source stays crisp on a
+/// 3x-density display, the favicon's 128px source would too but that one
+/// stays dedicated to the `<link rel=icon>` role it already has). Same
+/// "baked in at compile time, zero per-project opt-in" posture.
+fn logo_data_uri() -> String {
+    const LOGO_PNG: &[u8] = include_bytes!("nirdosha-app-bar-icon.png");
+    format!("data:image/png;base64,{}", BASE64_STANDARD.encode(LOGO_PNG))
 }
 
 /// The Nirdosha brand mark (`assets/brand/`'s standalone icon, cropped

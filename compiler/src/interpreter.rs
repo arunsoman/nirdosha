@@ -58,6 +58,9 @@ use crate::workflow_log::{PendingWorkflowAction, WorkflowLog};
 /// collide with `serde_json::Value`'s name at every use site.
 use serde_json::Value as JsonDoc;
 
+use rust_decimal::Decimal;
+use std::str::FromStr;
+
 // Row 12: relying-party identity validation (mock OIDC/JWT).
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -121,6 +124,14 @@ pub enum Value {
     /// `in_range` call) -- floats saturate to `inf`/`NaN` instead of
     /// trapping, per this phase's float semantics (see `ast.rs::Ty::F64`).
     Float(f64),
+    /// A 128-bit fixed-point decimal (`Ty::Dec128` — its doc comment has
+    /// the full design). `rust_decimal::Decimal` directly, not wrapped:
+    /// it's already `Copy`/`Clone`/cheap, unlike `Value::Str`/`Value::
+    /// Json`'s `Arc`-wrapped content, so there's no cheap-clone-on-read
+    /// problem here to solve. Scale lives on the value itself (`Decimal`
+    /// tracks its own exponent) — there's no separate scale field to
+    /// keep in sync.
+    Dec128(Decimal),
     Bool(bool),
     Unit,
     Boxed(Box<Value>),
@@ -929,6 +940,7 @@ impl PartialEq for Value {
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Dec128(a), Value::Dec128(b)) => a == b,
             (Value::Vector(a), Value::Vector(b)) => a == b,
             (Value::Matrix(a, ar, ac), Value::Matrix(b, br, bc)) => ar == br && ac == bc && a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -970,6 +982,7 @@ impl Value {
         match self {
             Value::Int(_) => "int",
             Value::Float(_) => "f64",
+            Value::Dec128(_) => "dec128",
             Value::Vector(_) => "vector",
             Value::Matrix(..) => "matrix",
             Value::Bool(_) => "bool",
@@ -1001,6 +1014,7 @@ impl Value {
         match self {
             Value::Int(n) => n.to_string(),
             Value::Float(n) => n.to_string(),
+            Value::Dec128(d) => d.to_string(),
             Value::Vector(elems) => {
                 format!("[{}]", elems.iter().map(Value::render).collect::<Vec<_>>().join(", "))
             }
@@ -1276,6 +1290,27 @@ fn scalar_binop(op: BinOp, a: &Value, b: &Value, span: Span) -> Result<Value, Ru
             BinOp::Sub => Ok(Value::Float(x - y)),
             BinOp::Mul | BinOp::ElemMul => Ok(Value::Float(x * y)),
             BinOp::Div | BinOp::ElemDiv => Ok(Value::Float(x / y)),
+            _ => unreachable!("scalar_binop is only ever called with Add/Sub/Mul/Div/ElemMul/ElemDiv"),
+        },
+        // `Decimal`'s own `+`/`-`/`*` panic on overflow past its 28-29
+        // digit representation limit — the same "bare arithmetic panic
+        // is the trap" idiom `i64` overflow already relies on (see
+        // `Cargo.toml`'s `overflow-checks = true` comment). `/` gets an
+        // explicit `DivByZero` check instead of letting `Decimal`'s own
+        // divide-by-zero panic fire, matching `Value::Int`'s arm above —
+        // LANGUAGE.md §2/§6c/§6d promise a real `ErrorKind`, not a raw
+        // panic, for this one case specifically.
+        (Value::Dec128(x), Value::Dec128(y)) => match op {
+            BinOp::Add => Ok(Value::Dec128(x + y)),
+            BinOp::Sub => Ok(Value::Dec128(x - y)),
+            BinOp::Mul | BinOp::ElemMul => Ok(Value::Dec128(x * y)),
+            BinOp::Div | BinOp::ElemDiv => {
+                if y.is_zero() {
+                    err(ErrorKind::DivByZero, span)
+                } else {
+                    Ok(Value::Dec128(x / y))
+                }
+            }
             _ => unreachable!("scalar_binop is only ever called with Add/Sub/Mul/Div/ElemMul/ElemDiv"),
         },
         _ => unreachable!("typeck.rs already proved matching, numeric-scalar element types"),
@@ -2080,6 +2115,12 @@ fn sql_bind_params(args: &[Value]) -> Result<Vec<crate::dbconn::Param>, String> 
             Value::Float(f) => Ok(crate::dbconn::Param::Float(*f)),
             Value::Str(s) => Ok(crate::dbconn::Param::Text(s.to_string())),
             Value::Bool(b) => Ok(crate::dbconn::Param::Bool(*b)),
+            // `dec128` binds as its canonical decimal string, same as
+            // `dec_to_str` (`LANGUAGE.md` §5's "Decimal arithmetic") --
+            // a `NUMERIC`/`DECIMAL` Postgres column or `TEXT` SQLite
+            // column, never a float column, to avoid reintroducing the
+            // float-rounding drift this type exists to prevent.
+            Value::Dec128(d) => Ok(crate::dbconn::Param::Text(d.to_string())),
             // A zero-payload ("unit") enum variant -- e.g. a categorical
             // `enum RiskRating { Low, Medium, High }` field -- binds as
             // its own variant name, TEXT. A payload-carrying variant
@@ -2089,7 +2130,7 @@ fn sql_bind_params(args: &[Value]) -> Result<Vec<crate::dbconn::Param>, String> 
             Value::Enum(_, variant, payload) if payload.is_empty() => {
                 Ok(crate::dbconn::Param::Text(variant.to_string()))
             }
-            other => Err(format!("db bind value must be str/i64/f64/bool, got {}", other.ty_name())),
+            other => Err(format!("db bind value must be str/i64/f64/bool/dec128, got {}", other.ty_name())),
         })
         .collect()
 }
@@ -3264,6 +3305,47 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
                     Err(e) => Ok(result_err(e)),
                 },
             }
+        }
+        // `dec128` (`LANGUAGE.md` §5's "Decimal arithmetic", §6c/§6d) --
+        // the only way in and out of a `dec128` value; `+`/`-`/`*`/`/`/
+        // comparisons dispatch through `eval_binary`'s own `Value::
+        // Dec128` arm instead, not through here.
+        "dec_from_str" => {
+            let Value::Str(s) = &args[0] else { unreachable!("typeck.rs already proved this is a str") };
+            match Decimal::from_str(s) {
+                Ok(d) => Ok(result_ok(Value::Dec128(d))),
+                Err(e) => Ok(result_err(format!("malformed dec128: {e}"))),
+            }
+        }
+        // `Decimal::new`'s own scale argument panics past 28 -- the
+        // representation's own limit, not a data problem, the same trap
+        // idiom `Int` overflow already relies on (see `scalar_binop`'s
+        // Dec128 arm doc comment) -- so this stays infallible, no
+        // `Result` wrapping.
+        "dec_from_i64" => {
+            let (Value::Int(v), Value::Int(scale)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are i64 and u32")
+            };
+            Ok(Value::Dec128(Decimal::new(*v, *scale as u32)))
+        }
+        "dec_to_str" => {
+            let Value::Dec128(d) = &args[0] else { unreachable!("typeck.rs already proved this is a dec128") };
+            Ok(Value::Str(Arc::from(d.to_string())))
+        }
+        // Round-half-to-even ("banker's rounding") -- `LANGUAGE.md` §5's
+        // "the only rounding policy v1 ships," named explicitly rather
+        // than picked silently (`rust_decimal`'s plain `round_dp`
+        // defaults to away-from-zero instead, which is why this calls
+        // the `_with_strategy` form rather than the default).
+        "dec_round" => {
+            let (Value::Dec128(d), Value::Int(scale)) = (&args[0], &args[1]) else {
+                unreachable!("typeck.rs already proved these are dec128 and u32")
+            };
+            Ok(Value::Dec128(d.round_dp_with_strategy(*scale as u32, rust_decimal::RoundingStrategy::MidpointNearestEven)))
+        }
+        "dec_scale" => {
+            let Value::Dec128(d) = &args[0] else { unreachable!("typeck.rs already proved this is a dec128") };
+            Ok(Value::Int(d.scale() as i64))
         }
         // MQ, layer 1 (`Ty::Mq`'s doc comment) -- Redis-backed.
         "mq_connect" => {
@@ -5118,6 +5200,13 @@ impl Interpreter {
             // `Value::Channel` above already give.
             (Value::Fn(_), Ty::Fn(_, _)) => Ok(()),
             (Value::Float(_), Ty::F64) => Ok(()),
+            // No range check the way an integer type gets one — `Decimal`
+            // already caps itself at 28-29 significant digits on
+            // construction/arithmetic (`dec_from_i64`/`scalar_binop`
+            // trap there), so there's nothing left for a boundary check
+            // to catch here, the same "no-guard passthrough" shape
+            // `Value::Float`/`Ty::F64` above already has.
+            (Value::Dec128(_), Ty::Dec128) => Ok(()),
             (Value::Vector(elems), Ty::Vector(elem_ty, n)) => {
                 if elems.len() != *n {
                     return err(
@@ -6547,6 +6636,32 @@ impl Interpreter {
                 BinOp::Sub => Ok(Value::Float(a - b)),
                 BinOp::Mul | BinOp::ElemMul => Ok(Value::Float(a * b)),
                 BinOp::Div | BinOp::ElemDiv => Ok(Value::Float(a / b)),
+                BinOp::Eq => Ok(Value::Bool(a == b)),
+                BinOp::NotEq => Ok(Value::Bool(a != b)),
+                BinOp::Lt => Ok(Value::Bool(a < b)),
+                BinOp::Gt => Ok(Value::Bool(a > b)),
+                BinOp::LtEq => Ok(Value::Bool(a <= b)),
+                BinOp::GtEq => Ok(Value::Bool(a >= b)),
+                BinOp::And | BinOp::Or => unreachable!("handled above"),
+            },
+            // `dec128` (`LANGUAGE.md` §2/§6c/§6d) — traps on div-by-zero
+            // like `Int`, not saturate like `Float`, since a `Decimal`
+            // dividing by zero has no `inf`/`NaN` to saturate to. `+`/
+            // `-`/`*` are `Decimal`'s own operators, which panic past the
+            // representation's digit limit — see `scalar_binop`'s Dec128
+            // arm doc comment for why that's the intended trap idiom
+            // here, not a gap.
+            (Value::Dec128(a), Value::Dec128(b)) => match op {
+                BinOp::Add => Ok(Value::Dec128(a + b)),
+                BinOp::Sub => Ok(Value::Dec128(a - b)),
+                BinOp::Mul | BinOp::ElemMul => Ok(Value::Dec128(a * b)),
+                BinOp::Div | BinOp::ElemDiv => {
+                    if b.is_zero() {
+                        err(ErrorKind::DivByZero, span)
+                    } else {
+                        Ok(Value::Dec128(a / b))
+                    }
+                }
                 BinOp::Eq => Ok(Value::Bool(a == b)),
                 BinOp::NotEq => Ok(Value::Bool(a != b)),
                 BinOp::Lt => Ok(Value::Bool(a < b)),

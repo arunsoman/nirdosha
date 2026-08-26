@@ -205,6 +205,10 @@ pub(crate) fn builtin_effect(name: &str) -> EffectSet {
         // so a reader doesn't have to wonder whether they were missed).
         "json_parse" | "json_get" | "json_get_str" | "json_get_i64" | "json_get_f64" | "json_get_bool"
         | "json_array_len" | "json_array_get" | "json_set_str" => {}
+        // `dec128` builtins (`LANGUAGE.md` §5) are pure -- same reasoning
+        // as the `json_*` group just above: plain in-memory value
+        // construction/conversion, nothing touching the outside world.
+        "dec_from_str" | "dec_from_i64" | "dec_to_str" | "dec_round" | "dec_scale" => {}
         // Same effect `file`'s `open`/`send`/`recv`/`stop` already get --
         // right for SQLite (a local file). `db_connect`'s base tag is
         // still `Io` here (this table is also `observability.rs::

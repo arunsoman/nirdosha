@@ -1,0 +1,164 @@
+// A real shipment-tracking app, served with `nirdosha serve
+// examples/measure_shipment.nir --port 8081 --db measure_shipment.db`.
+//
+// Demonstrates `LANGUAGE.md` §6d's `dec128`/`UnitCode`/`Measure` end to
+// end. As of 2026-08-27 all three are real **prelude** types, built into
+// every `.nir` program automatically (no more pasting the starter
+// `UnitCode` list into each file that needs it -- see
+// `money_invoice.nir`'s header for the same promotion on the `CurrencyCode`
+// side). `Shipment.quantity`/`.unit_code` stay flat scalar columns, not a
+// nested `Measure` field, for the same `migrate.rs` auto-migration reason
+// `money_invoice.nir` keeps `InvoiceLine` flat; `combine_shipments` below
+// is where a real `Measure` value gets constructed and returned.
+//
+// `combine_shipments` is §6d's `add_measure` example, made into a real
+// endpoint: refuses to add two shipments whose units don't match, rather
+// than silently summing mismatched units.
+//
+// `ucum_code_of` is §6d's `ucum_code` bridge, made callable: given a
+// `UnitCode`, returns the real UCUM string an external system (an EDI/
+// customs document, say) would expect -- `[in_i]`/`{each}`/etc. aren't
+// valid Nirdosha identifiers, so this lookup is the only way to get the
+// standard's own spelling back out.
+
+enum ErrorCode {
+    DbError(str),
+    UnitMismatch,
+}
+
+struct Text {
+    value: str,
+}
+
+struct Shipment {
+    id: i64,
+    description: str,
+    quantity: dec128,
+    unit_code: UnitCode,
+}
+
+// ---- CRUD, SQLite-backed ------------------------------------------------
+
+fn list_shipment_inner(conn: db) -> Result(json, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS shipment (id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT, quantity TEXT, unit_code TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, description, quantity, unit_code FROM shipment ORDER BY id") {
+        Ok(r) => Ok(r),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return rows
+}
+
+fn list_shipment() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("measure_shipment.db") {
+        Ok(conn) => list_shipment_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn create_shipment_inner(conn: db, s: Shipment) -> Result(i64, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS shipment (id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT, quantity TEXT, unit_code TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO shipment (description, quantity, unit_code) VALUES (?, ?, ?)", s.description, s.quantity, s.unit_code) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn create_shipment(s: Shipment) -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("measure_shipment.db") {
+        Ok(conn) => create_shipment_inner(conn, s),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn delete_shipment_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS shipment (id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT, quantity TEXT, unit_code TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "DELETE FROM shipment WHERE id = ?", id) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn delete_shipment(id: i64) -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("measure_shipment.db") {
+        Ok(conn) => delete_shipment_inner(conn, id),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+// ---- the actual point of this demo --------------------------------------
+
+// `LANGUAGE.md` §6d's `add_measure`, as a real endpoint returning a real
+// prelude `Measure` value -- `POST /api/combine_shipments` with
+// `{"a": {...}, "b": {...}}`.
+fn combine_shipments(a: Shipment, b: Shipment) -> Result(Measure, ErrorCode) requires(public) {
+    if a.unit_code != b.unit_code {
+        return Err(UnitMismatch())
+    }
+    return Ok(Measure(a.quantity + b.quantity, a.unit_code))
+}
+
+// `LANGUAGE.md` §6d's `ucum_code`, verbatim, as a real endpoint --
+// `POST /api/ucum_code_of` with `{"unit_code": "Kilogram"}` returns
+// `{"ok": {"value": "kg"}}`.
+fn ucum_code_of(unit_code: UnitCode) -> Text requires(public) {
+    return match unit_code {
+        Metre => Text("m"),
+        Centimetre => Text("cm"),
+        Millimetre => Text("mm"),
+        Kilometre => Text("km"),
+        Inch => Text("[in_i]"),
+        Foot => Text("[ft_i]"),
+        Yard => Text("[yd_i]"),
+        Mile => Text("[mi_i]"),
+        NauticalMile => Text("[nmi_i]"),
+        Milligram => Text("mg"),
+        Gram => Text("g"),
+        Kilogram => Text("kg"),
+        MetricTon => Text("t"),
+        PoundAv => Text("[lb_av]"),
+        OunceAv => Text("[oz_av]"),
+        Millilitre => Text("mL"),
+        Litre => Text("L"),
+        CubicMetre => Text("m3"),
+        CubicFoot => Text("[cft_i]"),
+        USGallon => Text("[gal_us]"),
+        UKGallon => Text("[gal_br]"),
+        USBarrel => Text("[bbl_us]"),
+        SquareMetre => Text("m2"),
+        SquareFoot => Text("[sft_i]"),
+        Hectare => Text("har"),
+        Second => Text("s"),
+        Minute => Text("min"),
+        Hour => Text("h"),
+        Day => Text("d"),
+        Celsius => Text("Cel"),
+        Fahrenheit => Text("[degF]"),
+        Kelvin => Text("K"),
+        Each => Text("{each}"),
+        Dozen => Text("{dozen}"),
+    }
+}
+
+screen Shipment {
+    title: "Shipments"
+    field quantity {
+        label: "Quantity"
+    }
+    field unit_code {
+        label: "Unit"
+    }
+}

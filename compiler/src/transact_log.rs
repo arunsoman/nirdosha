@@ -34,6 +34,7 @@
 //! of needing to handle (and fail on) an unrepresentable `Value` variant.
 
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -125,6 +126,12 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Float(n) => serde_json::json!({"t": "f", "v": n}),
         Value::Bool(b) => serde_json::json!({"t": "b", "v": b}),
         Value::Str(s) => serde_json::json!({"t": "s", "v": s.as_ref()}),
+        // Canonical decimal string, same shape `dec_to_str`/`serve.rs`'s
+        // JSON encoding already use — `Decimal` round-trips through its
+        // own `Display`/`FromStr` exactly, so this is lossless (unlike
+        // `Value::Float`'s arm above, which was already accepting
+        // whatever precision loss an `f64` durability slot implies).
+        Value::Dec128(d) => serde_json::json!({"t": "d", "v": d.to_string()}),
         other => unreachable!(
             "typeck.rs::infer_transact_slot_durable already restricted every value that reaches \
              this module to Ty::is_transact_scalar -- got {other:?}"
@@ -138,6 +145,10 @@ fn value_from_json(v: &serde_json::Value) -> Value {
         Some("f") => Value::Float(v["v"].as_f64().expect("value_to_json's own format")),
         Some("b") => Value::Bool(v["v"].as_bool().expect("value_to_json's own format")),
         Some("s") => Value::Str(Arc::from(v["v"].as_str().expect("value_to_json's own format"))),
+        Some("d") => Value::Dec128(
+            rust_decimal::Decimal::from_str(v["v"].as_str().expect("value_to_json's own format"))
+                .expect("value_to_json's own format"),
+        ),
         _ => unreachable!("value_from_json only ever reads back value_to_json's own format"),
     }
 }

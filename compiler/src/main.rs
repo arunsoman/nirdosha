@@ -129,6 +129,7 @@ fn print_value(v: &Value) -> ExitCode {
     match v {
         Value::Int(n) => println!("=> {n}"),
         Value::Float(n) => println!("=> {n}"),
+        Value::Dec128(d) => println!("=> {d}"),
         Value::Bool(b) => println!("=> {b}"),
         Value::Unit => {}
         Value::Str(s) => println!("=> {s:?}"),

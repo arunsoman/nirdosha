@@ -39,6 +39,24 @@ pub enum Ty {
     /// literal is just `Str`. Not affine, not in `bounds()`'s domain
     /// (`is_integer()` is false for this on purpose — see `is_numeric()`).
     F64,
+    /// A 128-bit fixed-point decimal (`rust_decimal::Decimal` backs
+    /// `Value::Dec128` in `interpreter.rs`) — `LANGUAGE.md` §2, added
+    /// 2026-08-26 so money/interest/tax/FX arithmetic has a real type
+    /// instead of an `f64` a program author has to promise not to
+    /// misuse. One width, like `F64` — no `dec32`/`dec64` — and unlike
+    /// the integer types, scale isn't part of the type either: each
+    /// value carries its own scale (`dec_scale`), the same way
+    /// `rust_decimal::Decimal` already does internally, so there's no
+    /// const-generic-style `Dec128(2)` to design. No literal syntax —
+    /// built only via the `dec_from_str`/`dec_from_i64` builtins (§5) —
+    /// and no implicit conversion to/from `I64`/`F64` (`is_numeric()` is
+    /// true so `+`/`-`/`*`/`/`/comparisons dispatch natively, but
+    /// `infer_binary`'s `l == r` same-type check still rejects mixing
+    /// it with any other numeric type, same as `I64`/`I32`). Interpreter-
+    /// only for now — `codegen.rs::check_supported` rejects it with a
+    /// named reason (§10), joining `Json`/`Db`/`Mq` rather than being
+    /// silently mis-compiled.
+    Dec128,
     /// A fixed-length, dense, homogeneous 1-D array — `Vector(f64, 3)`.
     /// "Sized by Default" (the unified plan's §2): the length is part of
     /// the type, so `Vector(f64, 3)` and `Vector(f64, 4)` are different
@@ -258,6 +276,7 @@ impl Ty {
             "u64" => Ty::U64,
             "usize" => Ty::Usize,
             "f64" => Ty::F64,
+            "dec128" => Ty::Dec128,
             "bool" => Ty::Bool,
             "unit" => Ty::Unit,
             "str" => Ty::Str,
@@ -285,6 +304,7 @@ impl Ty {
             Ty::U64 => "u64".to_string(),
             Ty::Usize => "usize".to_string(),
             Ty::F64 => "f64".to_string(),
+            Ty::Dec128 => "dec128".to_string(),
             Ty::Vector(inner, n) => format!("Vector({}, {n})", inner.name()),
             Ty::Matrix(inner, r, c) => format!("Matrix({}, {r}, {c})", inner.name()),
             Ty::Bool => "bool".to_string(),
@@ -343,21 +363,23 @@ impl Ty {
                 | Ty::Fn(_, _)
                 | Ty::Named(_, _)
                 | Ty::F64
+                | Ty::Dec128
                 | Ty::Vector(_, _)
                 | Ty::Matrix(_, _, _)
         )
     }
 
-    /// `is_integer() || self == F64` — the gate every arithmetic operator
-    /// (`typeck.rs::infer_binary`) now checks instead of `is_integer()`
-    /// alone. Kept as its own named predicate, not inlined at each call
-    /// site, because "numeric" and "integer" mean different things from
-    /// this phase on: literal-widening (`unify_operands`'s `in_range`
-    /// check) is still integer-only — there's no second float width to
-    /// widen *to* — so code that needs "can this hold a bare int literal"
-    /// still has to ask `is_integer()` specifically, not this.
+    /// `is_integer() || self == F64 || self == Dec128` — the gate every
+    /// arithmetic operator (`typeck.rs::infer_binary`) now checks instead
+    /// of `is_integer()` alone. Kept as its own named predicate, not
+    /// inlined at each call site, because "numeric" and "integer" mean
+    /// different things from this phase on: literal-widening
+    /// (`unify_operands`'s `in_range` check) is still integer-only —
+    /// there's no float or `dec128` literal to widen *to* — so code that
+    /// needs "can this hold a bare int literal" still has to ask
+    /// `is_integer()` specifically, not this.
     pub fn is_numeric(&self) -> bool {
-        self.is_integer() || *self == Ty::F64
+        self.is_integer() || *self == Ty::F64 || *self == Ty::Dec128
     }
 
     /// True for every fixed-shape aggregate type (`Vector`/`Matrix`, and
@@ -383,10 +405,12 @@ impl Ty {
         matches!(self, Ty::Vector(_, _) | Ty::Matrix(_, _, _) | Ty::Named(_, _))
     }
 
-    /// True for the four plain scalar types a `transact` block's
-    /// durability log can actually serialize and replay after a crash —
-    /// `Str` included, everything else (a resource handle like `Db`/
-    /// `Tcp`/`Thread`/`Sandbox`, or an aggregate/struct/enum) excluded.
+    /// True for the plain scalar types a `transact` block's durability
+    /// log can actually serialize and replay after a crash — every
+    /// `is_numeric()` type (`dec128` included, 2026-08-26 —
+    /// `transact_log.rs::value_to_json`'s `"t": "d"` case) plus `Bool`/
+    /// `Str`; everything else (a resource handle like `Db`/`Tcp`/
+    /// `Thread`/`Sandbox`, or an aggregate/struct/enum) excluded.
     /// `typeck.rs::infer_transact_slot` requires every `transact` slot's
     /// arguments, and `network`/`verify`'s own declared return types, to
     /// satisfy this — a live resource handle can't survive a process
@@ -512,6 +536,7 @@ impl Ty {
             | Ty::Fn(_, _)
             | Ty::Named(_, _)
             | Ty::F64
+            | Ty::Dec128
             | Ty::Vector(_, _)
             | Ty::Matrix(_, _, _)
             | Ty::Error => (i64::MIN, i64::MAX),
@@ -686,7 +711,81 @@ pub fn prelude_enums() -> Vec<EnumDecl> {
             span,
             module: None,
         },
+        // 2026-08-27: `LANGUAGE.md` §6c's `CurrencyCode` promoted from a
+        // documented per-program convention (paste this enum into your
+        // own file) to a real prelude type, injected here the same way
+        // `Option`/`Result` already are -- no more re-pasting ISO 4217
+        // into every `.nir` program that needs it. Same "no `import`/
+        // module-reuse mechanism" reasoning that used to justify the
+        // pasted-convention version now argues the other way: the one
+        // place that *can* be shared across every program without a
+        // module system is the compiler's own prelude. Best-effort
+        // transcription of ISO 4217's active codes (see the exclusions
+        // §6c itself documents) -- still not re-derived from the
+        // standard, same caveat as before, just no longer copy-pasted by
+        // hand into each app.
+        zero_payload_enum("CurrencyCode", &[
+            "AED", "AFN", "ALL", "AMD", "ANG", "AOA", "ARS", "AUD", "AWG", "AZN",
+            "BAM", "BBD", "BDT", "BGN", "BHD", "BIF", "BMD", "BND", "BOB", "BRL", "BSD", "BTN", "BWP", "BYN", "BZD",
+            "CAD", "CDF", "CHF", "CLP", "CNY", "COP", "CRC", "CUP", "CVE", "CZK",
+            "DJF", "DKK", "DOP", "DZD",
+            "EGP", "ERN", "ETB", "EUR",
+            "FJD", "FKP",
+            "GBP", "GEL", "GHS", "GIP", "GMD", "GNF", "GTQ", "GYD",
+            "HKD", "HNL", "HTG", "HUF",
+            "IDR", "ILS", "INR", "IQD", "IRR", "ISK",
+            "JMD", "JOD", "JPY",
+            "KES", "KGS", "KHR", "KMF", "KPW", "KRW", "KWD", "KYD", "KZT",
+            "LAK", "LBP", "LKR", "LRD", "LSL", "LYD",
+            "MAD", "MDL", "MGA", "MKD", "MMK", "MNT", "MOP", "MRU", "MUR", "MVR", "MWK", "MXN", "MYR", "MZN",
+            "NAD", "NGN", "NIO", "NOK", "NPR", "NZD",
+            "OMR",
+            "PAB", "PEN", "PGK", "PHP", "PKR", "PLN", "PYG",
+            "QAR",
+            "RON", "RSD", "RUB", "RWF",
+            "SAR", "SBD", "SCR", "SDG", "SEK", "SGD", "SHP", "SLE", "SOS", "SRD", "SSP", "STN", "SVC", "SYP", "SZL",
+            "THB", "TJS", "TMT", "TND", "TOP", "TRY", "TTD", "TWD", "TZS",
+            "UAH", "UGX", "USD", "UYU", "UZS",
+            "VES", "VND", "VUV",
+            "WST",
+            "XAF", "XCD", "XOF", "XPF",
+            "YER",
+            "ZAR", "ZMW", "ZWG",
+        ], span),
+        // `LANGUAGE.md` §6d's `UnitCode`, same promotion, same reasoning
+        // -- a curated starter vocabulary, not the whole UCUM standard
+        // (UCUM codes are compositional expressions, not a closed list —
+        // §6d's own "why an enum field" paragraph explains why there's
+        // no version of this that could be "the whole standard" the way
+        // `CurrencyCode` above actually is ISO 4217). Extend this list
+        // (and `ucum_code_of`-style bridging functions, still user-level
+        // — §6d) as real programs need units this starter set doesn't
+        // cover yet.
+        zero_payload_enum("UnitCode", &[
+            "Metre", "Centimetre", "Millimetre", "Kilometre",
+            "Inch", "Foot", "Yard", "Mile", "NauticalMile",
+            "Milligram", "Gram", "Kilogram", "MetricTon", "PoundAv", "OunceAv",
+            "Millilitre", "Litre", "CubicMetre", "CubicFoot", "USGallon", "UKGallon", "USBarrel",
+            "SquareMetre", "SquareFoot", "Hectare",
+            "Second", "Minute", "Hour", "Day",
+            "Celsius", "Fahrenheit", "Kelvin",
+            "Each", "Dozen",
+        ], span),
     ]
+}
+
+/// Builds a zero-payload `EnumDecl` from a bare variant-name list --
+/// shared by `CurrencyCode`/`UnitCode` above, purely to keep ~200
+/// variant declarations from being ~200 repetitive `Variant { .. }`
+/// struct literals.
+fn zero_payload_enum(name: &str, variants: &[&str], span: Span) -> EnumDecl {
+    EnumDecl {
+        name: name.to_string(),
+        type_params: vec![],
+        variants: variants.iter().map(|v| Variant { name: v.to_string(), payload: vec![], span }).collect(),
+        span,
+        module: None,
+    }
 }
 
 /// `struct HttpResponse { status: i64, body: str }` — `http_get`/
@@ -779,6 +878,45 @@ pub fn prelude_structs() -> Vec<StructDecl> {
             fields: vec![
                 Field { name: "first".to_string(), ty: Ty::Named("A".to_string(), vec![]) },
                 Field { name: "second".to_string(), ty: Ty::Named("B".to_string(), vec![]) },
+            ],
+            span,
+            module: None,
+        },
+        // 2026-08-27: `LANGUAGE.md` §6c's `Money`, promoted from a
+        // documented convention to a real prelude type -- same mechanism,
+        // same motivation as `CurrencyCode`'s own promotion just above in
+        // `prelude_enums`. Mixing currencies is still not a *compile-time*
+        // type error (`Money` isn't generic over `CurrencyCode` -- §6c's
+        // own "what this deliberately doesn't give you" paragraph, whose
+        // reasoning is unchanged by this promotion: a `db_query` row or an
+        // `emit-ui` column still needs the currency to vary at runtime).
+        // What the promotion buys is exactly "no re-declaring this, no
+        // re-pasting `CurrencyCode`" -- construct it positionally, same as
+        // any struct: `Money(amount, currency)`.
+        StructDecl {
+            name: "Money".to_string(),
+            type_params: vec![],
+            fields: vec![
+                Field { name: "amount".to_string(), ty: Ty::Dec128 },
+                Field { name: "currency".to_string(), ty: Ty::Named("CurrencyCode".to_string(), vec![]) },
+            ],
+            span,
+            module: None,
+        },
+        // `LANGUAGE.md` §6d's `Measure`, same promotion, same reasoning.
+        // Field is `unit_code`, not `unit` -- `unit` lexes as
+        // `Tok::TypeName("unit")` (`Ty::Unit`'s own keyword, `token.rs`'s
+        // `TYPE_NAMES`) regardless of position, so `m.unit` would be a
+        // parse error, not a field access, for any real `.nir` source
+        // that tried to write it (found the same way §6d's own
+        // `measure_shipment.nir` example already had to work around this
+        // for its `Shipment.unit_code` field).
+        StructDecl {
+            name: "Measure".to_string(),
+            type_params: vec![],
+            fields: vec![
+                Field { name: "value".to_string(), ty: Ty::Dec128 },
+                Field { name: "unit_code".to_string(), ty: Ty::Named("UnitCode".to_string(), vec![]) },
             ],
             span,
             module: None,
@@ -1848,6 +1986,22 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "db_connect",
     "db_query",
     "db_execute",
+    // `Ty::Dec128`'s doc comment has the full design (`LANGUAGE.md` §5's
+    // "Decimal arithmetic" / §6c / §6d). No literal syntax and no
+    // int/float conversion — these five are the only way in and out of
+    // a `dec128` value. `dec_from_str` is the only fallible one
+    // (malformed external input, `Result(dec128, str)`, same convention
+    // as JSON/HTTP/DB above); `dec_from_i64`'s `scale` argument is a
+    // representation-limit question (traps past 28), not a data
+    // problem, so it isn't `Result`. `+`/`-`/`*`/`/` and the comparison
+    // operators are *not* here — `dec128` gets those natively through
+    // `scalar_binop`, the same operator dispatch every numeric scalar
+    // gets, not a builtin call.
+    "dec_from_str",
+    "dec_from_i64",
+    "dec_to_str",
+    "dec_round",
+    "dec_scale",
     // `Ty::Mq`'s doc comment has the full design: one connection handle,
     // `stop`-able like `db`, backed by Redis (`LPUSH`/`BLPOP`).
     // `mq_connect(host, port)`, `mq_publish(conn, queue, message)`,

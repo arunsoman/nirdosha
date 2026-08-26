@@ -179,7 +179,12 @@ fn wrong_role_is_rejected_and_right_role_advances_through_every_level() {
         Some(&bearer(&vp)),
     );
     assert_eq!(status, 200, "{denied:?}"); // a clean Err, not an HTTP-level rejection
-    assert_eq!(denied["err"]["variant"], "NotStateOwner", "{denied:?}");
+    // A zero-payload enum error encodes as its bare variant name now,
+    // matching what `decode_value`/the DB round-trip already required on
+    // the way in (`serve.rs::encode_value`'s `Value::Enum` arm, fixed
+    // 2026-08-27 — a real pre-existing asymmetry, not a deliberate
+    // `{"variant":...}` wire contract this test should keep pinning).
+    assert_eq!(denied["err"], "NotStateOwner", "{denied:?}");
 
     // The manager approves -- moves to PendingDirectorApproval.
     let (status, approved) = http_request(
@@ -199,7 +204,7 @@ fn wrong_role_is_rejected_and_right_role_advances_through_every_level() {
         &format!(r#"{{"instance_id":{instance_id},"event":"Approved","payload":null}}"#),
         Some(&bearer(&manager)),
     );
-    assert_eq!(denied_again["err"]["variant"], "NotStateOwner", "{denied_again:?}");
+    assert_eq!(denied_again["err"], "NotStateOwner", "{denied_again:?}");
 
     // The director approves -- moves to PendingVpApproval.
     let (_, approved2) =

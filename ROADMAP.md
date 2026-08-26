@@ -288,6 +288,105 @@ messages.
   list (native inherits the same closed sets, not a separate mobile
   gap).
 
+- **2026-08-27 — `dec128`: a real 128-bit fixed-point decimal type.**
+  `LANGUAGE.md` §2/§5, plus the `Money`/`Measure` conventions in §6c/§6d
+  (`dec128` + a closed `CurrencyCode`/`UnitCode` enum) replacing the
+  "money is a naming convention" gap — no `From<f64>`, no implicit
+  conversion to/from `i64`/`f64`, native `+`/`-`/`*`/`/`/comparisons via
+  `rust_decimal::Decimal`, five builtins (`dec_from_str`/`dec_from_i64`/
+  `dec_to_str`/`dec_round`/`dec_scale`). Wired end to end: `ast.rs`'s
+  `Ty`/lexer/parser, `typeck.rs`, `interpreter.rs` (`Value::Dec128`,
+  `eval_binary`, `sql_bind_params`), `serve.rs` (JSON encode/decode as a
+  *string*, not a JSON number — the drift `dec128` exists to prevent),
+  `ui_gen.rs` (renders as a text field, not a number spinner),
+  `migrate.rs` (`TEXT` column), `transact_log.rs` (durability-log
+  round-trip). Interpreter-only for now — `codegen.rs::check_supported`
+  rejects it by name, joining `json`/`db`/`mq`, not silently mis-compiled.
+  Verified with two real `nirdosha serve` apps, not just unit tests:
+  `examples/money_invoice.nir` (currency-safe invoice line totals) and
+  `examples/measure_shipment.nir` (unit-safe shipment quantities + a
+  UCUM-code bridge) — full CRUD, DB persistence, and the currency/unit-
+  mismatch guard exercised live over real HTTP.
+
+- **2026-08-27 — Default web-app style: subtle hover/entrance motion,
+  everywhere.** `ui_gen_template.html`'s shared design-token motion
+  system (already real: `--motion-*`/`--hover-lift-px`/`--stagger-ms`,
+  keyframes, staggered row entrance, global `prefers-reduced-motion`)
+  extended to two spots that had no hover treatment at all: `.card`
+  (table wrapper/form/dashboard-tile — subtle lift on hover) and
+  `tbody tr` (background highlight, scoped off the header). Applies to
+  every `.nir` app automatically — it's the one shared template, not a
+  per-app opt-in.
+
+- **2026-08-27 — `Money`/`Measure`/`CurrencyCode`/`UnitCode` promoted
+  from documented convention to real prelude types.** `LANGUAGE.md`
+  §6c/§6d. Injected into every `.nir` program via `ast.rs::
+  prelude_structs`/`prelude_enums`, the same mechanism `Option`/`Result`/
+  `HttpResponse` already use — no more pasting the ~180-entry
+  `CurrencyCode`/34-entry `UnitCode` list into each program that needs
+  one. `Measure`'s field is `unit_code`, not `unit` — `unit` lexes as
+  `Ty::Unit`'s own keyword regardless of position (`token.rs::
+  TYPE_NAMES`), so `m.unit` would be a parse error, not a field access.
+  `PRELUDE_STRUCT_NAMES` (three separate copies: `migrate.rs`/`serve.rs`/
+  `ui_gen.rs`) extended with `Money`/`Measure` so auto-migration/table-
+  catalog/screen-derivation keep skipping them, same as every other
+  prelude struct. `examples/money_invoice.nir`/`measure_shipment.nir`
+  updated to stop pasting their own copies and construct real `Money`/
+  `Measure` values directly (`combine_lines`/`combine_shipments` now
+  return `Result(Money, ErrorCode)`/`Result(Measure, ErrorCode)`) —
+  re-verified live over real HTTP after the change, full test suite
+  (600+ tests) green.
+  - **Real bug found and fixed along the way:** `serve.rs::encode_value`'s
+    `Value::Enum` arm encoded *every* enum value as `{"variant":...,
+    "payload":[...]}`, including zero-payload ones — asymmetric with
+    `decode_value`/`decode_enum_value`/the DB round-trip, which all
+    require/produce a bare variant-name *string* for a zero-payload
+    variant. Surfaced by `combine_lines` returning a real `Money` (whose
+    `currency` field hit this exact case) — `{"err":"CurrencyMismatch"}`
+    now, not `{"err":{"variant":"CurrencyMismatch","payload":[]}}`. Was
+    also silently producing `"[object Object]"` in `ui_gen_template.html`'s
+    error snackbar (`String(body.err)`) for any endpoint returning
+    `Result(_, SomeZeroPayloadEnum)` — a real, user-visible UI bug, not
+    just a wire-format nicety. Fixed; `tests/workflow_ownership.rs`'s two
+    assertions pinning the old (wrong) shape updated to match.
+  - **Known gap, found but *not* fixed (out of scope for this pass):**
+    the compiler has no duplicate struct/enum name detection at all —
+    not new here, and not specific to prelude collisions (two
+    user-declared `struct Foo { .. }` in one file also silently pass
+    typeck today, first one wins). This makes the new prelude promotion
+    slightly riskier to adopt than it should be: a program that still
+    pastes its *own* `Money`/`CurrencyCode`/etc. (old habit, or hasn't
+    seen this note) gets silently shadowed, not a clear error — directly
+    against this project's own "reject, don't silently mis-compile"
+    stance (§1). Worth a real fix (a name-collision pass over
+    `Program.structs`/`Program.enums`, prelude entries included) — not
+    attempted here; flagging so it doesn't quietly stay unowned.
+
+- **2026-08-27 — `dec128` onto real LLVM codegen: investigated, not
+  shipped — a genuine architectural blocker, not a time-boxing punt.**
+  `runtime_kernels.rs` (the freestanding kernel library `codegen.rs`
+  links compiled `.nir` binaries against) is deliberately a *dependency-
+  free* `rustc --crate-type staticlib` compilation, entirely separate
+  from the main `nirdosha` crate's own dependency graph (`build.rs`'s own
+  doc comment: "no circular-dependency risk from a sub-crate"). Reusing
+  `rust_decimal` there means locating and `--extern`-linking its compiled
+  `.rlib` from Cargo's own build output — checked empirically in this
+  environment: `target/debug/deps/` didn't even exist at the point
+  `build.rs` would need it, meaning that lookup is genuinely racy, not
+  just theoretically fragile. The alternative — hand-rolling decimal
+  add/sub/mul/div/cmp directly against `rust_decimal`'s documented
+  128-bit `serialize()`/`deserialize()` bit layout, no crate dependency —
+  is the same "duplicate the algorithm, catch divergence with parity
+  tests" pattern the existing f64 linalg kernels already use
+  (`runtime_kernels.rs`'s own module doc), so it's not unprecedented, but
+  it's real numeric code (mantissa rescaling, overflow, rounding) with
+  real correctness stakes for the one type whose entire point is "no
+  silent rounding drift" — not something to rush in the same pass as
+  everything else above. Left interpreter-only, unchanged from how it
+  shipped (§10's list) — nothing regressed, nothing silently half-built.
+  Needs a deliberate decision on which path (fragile-but-reuses-proven-
+  logic vs. self-contained-but-newly-written) before landing.
+
 ---
 
 ## Standards & compliance posture
@@ -1139,6 +1238,50 @@ of Track B has landed.*
     (frozen design/historical-journal docs, not status trackers — this
     file is where current status belongs, per this file's own stated
     convention).
+- `[OPEN]` **A15. SLA/escalation timers for `workflow` states — no
+  scheduler primitive exists; `owner`/`on_entry` alone can't express
+  "escalate after N hours of silence."** Surfaced by the enterprise-
+  catalog review `WORKFLOW.md` §9 did against real systems (ServiceNow,
+  SAP Business Workflow, Concur, banking maker-checker all have this).
+  Verified directly: `on_entry`/`on_exit` only ever fire in response to
+  a transition that already happened — nothing in the language calls
+  back into a running instance after a time delay with no human action,
+  and `WORKFLOW.md`'s own "Deliberate non-goals" section already
+  discloses "no scheduling/cron primitive in Nirdosha at all." A state
+  sitting in `PendingManagerApproval` for a week with nobody acting is
+  invisible today: no re-notification, no auto-escalation to a
+  substitute approver, no visibility that an SLA was even breached.
+
+  **Proposed design, not started** — two independent pieces, drawing
+  the same "in-language vs. external infrastructure" line `notify()`'s
+  own realtime path (an external WS gateway relays its Redis `PUBLISH`)
+  already draws:
+  1. **In-language**: a new `state { sla: "<duration>" }` kv-entry — no
+     new grammar needed, just a new key on the same open-ended
+     `StateDecl.entries` slot `owner`/`label` already use (`ROADMAP.md`
+     A13). `workflow_instance` gains an `sla_deadline_at` column,
+     computed at entry time (`now + duration`) the same way
+     `record_transition`/`create_instance` already stamp `updated_at`. A
+     new synthesized read fn, `list_<workflow>_overdue() ->
+     Result(json, WorkflowActionError)`, queries every instance whose
+     current state declares an `sla` and whose deadline has passed —
+     pure SQL, no scheduler needed for the query itself.
+  2. **External** (the part Nirdosha genuinely cannot do alone, disclosed
+     not hidden): something has to actually *call* that query
+     periodically and act on what it finds (re-notify, auto-reassign, or
+     fire a new `Escalated` event via `advance_<workflow>`) — a cron job
+     or orchestrator polling `list_<workflow>_overdue()`, the same "the
+     schedule itself is always external" posture `WORKFLOW.md`'s own
+     "nightly workflow" note already establishes for a purely time-
+     triggered `workflow`. `nirdosha serve` itself needs no new
+     subsystem — this is a client of the existing RPC surface, not a new
+     runtime concept.
+
+  **Not solved by this**: what "escalate" actually *does* (e.g.
+  auto-reassign `owner` to someone's manager) needs the delegation
+  feature (also `[OPEN]`, same `WORKFLOW.md` §9 review) or a hand-
+  written `Escalated` transition in the workflow's own states — left to
+  the app author, not something `sla` alone would automate.
 
 ---
 

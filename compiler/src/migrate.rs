@@ -35,7 +35,7 @@ use crate::ast::{EnumDecl, Field, Program, Ty};
 /// A struct with no matching entry here (or any field this can't map)
 /// contributes no table at all -- see `column_def`'s doc comment.
 const PRELUDE_STRUCT_NAMES: &[&str] =
-    &["HttpResponse", "VerifiedIdentity", "RoleView", "ClaimView", "ApplicationSession", "RefreshTokenHandle", "Pair"];
+    &["HttpResponse", "VerifiedIdentity", "RoleView", "ClaimView", "ApplicationSession", "RefreshTokenHandle", "Pair", "Money", "Measure"];
 
 /// Same word-boundary walk as `ui_gen.rs`/`serve.rs::to_snake_case` --
 /// duplicated, not shared, matching those two modules' own established
@@ -85,6 +85,12 @@ fn sql_type_for(program: &Program, ty: &Ty) -> Option<&'static str> {
     match ty {
         Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::Usize => Some("INTEGER"),
         Ty::F64 => Some("REAL"),
+        // `TEXT`, not `REAL` — a `dec128` column stores its canonical
+        // decimal string (`sql_bind_params`'s `Value::Dec128` arm,
+        // `LANGUAGE.md` §5's "Decimal arithmetic"); SQLite has no real
+        // decimal storage class, and `REAL` would silently reintroduce
+        // the float-rounding drift this type exists to prevent.
+        Ty::Dec128 => Some("TEXT"),
         Ty::Bool => Some("INTEGER"),
         Ty::Str => Some("TEXT"),
         Ty::Named(n, args) if n == "Option" && args.len() == 1 => sql_type_for(program, &args[0]),

@@ -298,6 +298,9 @@ fn llvm_ty(ty: &Ty, registry: &TypeRegistry) -> Result<String, CodegenError> {
         Ty::File => unsupported(
             "codegen doesn't support `file` yet — open/send/recv/stop on file are interpreter-only for now",
         ),
+        Ty::Dec128 => unsupported(
+            "codegen doesn't support `dec128` yet — decimal arithmetic is interpreter-only for now (LANGUAGE.md §6c/§6d)",
+        ),
         Ty::Json => unsupported("codegen doesn't support `json` yet — JSON is interpreter-only for now"),
         Ty::Db => unsupported("codegen doesn't support `db` yet — DB connectivity is interpreter-only for now"),
         Ty::Mq => unsupported("codegen doesn't support `mq` yet — message-queue connectivity is interpreter-only for now"),

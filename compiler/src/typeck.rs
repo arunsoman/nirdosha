@@ -3303,6 +3303,34 @@ impl<'a> Checker<'a> {
                 }
                 result_of(Ty::I64)
             }
+            // `dec128` (`LANGUAGE.md` §5 "Decimal arithmetic", §6c/§6d) --
+            // the only way in and out of a `dec128` value. `+`/`-`/`*`/
+            // `/`/comparisons don't go through here at all -- they
+            // dispatch through `infer_binary`'s ordinary numeric-scalar
+            // path (`Ty::is_numeric()`), the ordinary operator table,
+            // not a builtin call.
+            ("dec_from_str", 1) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes);
+                result_of(Ty::Dec128)
+            }
+            ("dec_from_i64", 2) => {
+                self.check(&args[0], &Ty::I64, expected_ret, scopes); // unscaled value
+                self.check(&args[1], &Ty::U32, expected_ret, scopes); // scale
+                Ty::Dec128
+            }
+            ("dec_to_str", 1) => {
+                self.check(&args[0], &Ty::Dec128, expected_ret, scopes);
+                Ty::Str
+            }
+            ("dec_round", 2) => {
+                self.check(&args[0], &Ty::Dec128, expected_ret, scopes);
+                self.check(&args[1], &Ty::U32, expected_ret, scopes); // scale
+                Ty::Dec128
+            }
+            ("dec_scale", 1) => {
+                self.check(&args[0], &Ty::Dec128, expected_ret, scopes);
+                Ty::U32
+            }
             // MQ, layer 1 (`Ty::Mq`'s doc comment) -- Redis-backed, same
             // `Result(_, str)` convention as `db`.
             ("mq_connect", 2) => {
@@ -3477,7 +3505,8 @@ impl<'a> Checker<'a> {
             "json_set_str" => 3,
             "dot" | "cross" | "solve" | "json_get" | "json_get_str" | "json_get_i64" | "json_get_f64"
             | "json_get_bool" | "json_array_get" | "check_role" | "extract_claim" | "extract_claim_path"
-            | "db_query" | "db_execute" | "validate_api_key" | "mq_connect" | "constant_time_str_eq" => 2,
+            | "db_query" | "db_execute" | "validate_api_key" | "mq_connect" | "constant_time_str_eq"
+            | "dec_from_i64" | "dec_round" => 2,
             "http_get" | "https_get" | "exchange_refresh_token" | "mq_publish" | "mq_consume" | "check_role_path" => 3,
             "http_post" | "https_post" | "oidc_validate_token" | "send_email" | "send_sms" | "send_push" => 4,
             "mock_issue_token" => 7,

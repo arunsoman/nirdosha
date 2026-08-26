@@ -51,8 +51,10 @@
 //! `check_role` builtin's own implementation, which has no server-only
 //! cache to consult.
 
+use std::str::FromStr;
 use std::sync::Arc;
 
+use rust_decimal::Decimal;
 use serde_json::Value as JsonVal;
 
 use crate::ast::{Program, Requirement, Ty};
@@ -643,7 +645,7 @@ fn refresh_theme_html_if_stale(
 
 fn build_table_catalog(program: &Program) -> std::collections::HashMap<String, Vec<String>> {
     const PRELUDE_STRUCT_NAMES: &[&str] =
-        &["HttpResponse", "VerifiedIdentity", "RoleView", "ClaimView", "ApplicationSession", "RefreshTokenHandle", "Pair"];
+        &["HttpResponse", "VerifiedIdentity", "RoleView", "ClaimView", "ApplicationSession", "RefreshTokenHandle", "Pair", "Money", "Measure"];
     program
         .structs
         .iter()
@@ -1417,6 +1419,15 @@ pub(crate) fn decode_value(json: &JsonVal, ty: &Ty, program: &Program, depth: u8
             json.as_i64().map(Value::Int).ok_or_else(|| "expected an integer".to_string())
         }
         Ty::F64 => json.as_f64().map(Value::Float).ok_or_else(|| "expected a number".to_string()),
+        // A JSON **string**, not a JSON number — `LANGUAGE.md` §5's
+        // "Decimal arithmetic" section: a JSON number is IEEE-754 double
+        // under nearly every consumer's parser, exactly the silent-
+        // drift failure `dec128` exists to prevent. Mirrors
+        // `encode_value`'s `Value::Dec128 => JsonVal::String(...)` arm.
+        Ty::Dec128 => json
+            .as_str()
+            .ok_or_else(|| "expected a decimal string".to_string())
+            .and_then(|s| Decimal::from_str(s).map(Value::Dec128).map_err(|e| format!("malformed dec128: {e}"))),
         Ty::Bool => json.as_bool().map(Value::Bool).ok_or_else(|| "expected a boolean".to_string()),
         // Nirdosha's own opaque JSON type -- passes through unchanged,
         // the mirror of `encode_value`'s own `Value::Json(doc) =>
@@ -1475,6 +1486,9 @@ pub(crate) fn encode_value(v: &Value, program: &Program) -> Result<JsonVal, Stri
     match v {
         Value::Int(n) => Ok(JsonVal::from(*n)),
         Value::Float(f) => Ok(if f.is_finite() { JsonVal::from(*f) } else { JsonVal::Null }),
+        // A JSON string, not a JSON number — see `decode_value`'s
+        // `Ty::Dec128` arm for why.
+        Value::Dec128(d) => Ok(JsonVal::String(d.to_string())),
         Value::Bool(b) => Ok(JsonVal::Bool(*b)),
         Value::Unit => Ok(JsonVal::Null),
         Value::Str(s) => Ok(JsonVal::String(s.to_string())),
@@ -1501,6 +1515,22 @@ pub(crate) fn encode_value(v: &Value, program: &Program) -> Result<JsonVal, Stri
                     "Some" => encode_value(&payload[0], program),
                     _ => Ok(JsonVal::Null),
                 };
+            }
+            // A zero-payload variant encodes as its bare name -- the
+            // wire format `decode_value`/`decode_enum_value` already
+            // *requires* on the way in (a JSON string naming the
+            // variant), and the same one `sql_bind_params`/`migrate.rs`
+            // already use for the DB round-trip. Found while returning a
+            // `Money`/`Measure` value (whose `currency`/`unit_code`
+            // field is exactly this shape) directly from a `.nir` fn:
+            // this arm's own `_ => None` fallback below used to encode
+            // *every* enum, zero-payload or not, as `{"variant":...,
+            // "payload":[]}}` -- a real, previously-untested asymmetry
+            // with what decode accepts back, not a deliberate format. A
+            // payload-carrying variant keeps the tagged shape below;
+            // there's no flat representation for it to fall back to.
+            if payload.is_empty() {
+                return Ok(JsonVal::String(variant.to_string()));
             }
             let payload_json = payload.iter().map(|p| encode_value(p, program)).collect::<Result<Vec<_>, _>>()?;
             Ok(serde_json::json!({ "variant": variant.as_ref(), "payload": payload_json }))

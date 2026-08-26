@@ -39,6 +39,7 @@ nirdosha emit-ast <file.nir>          # print the parsed AST as JSON
 | Signed integers | `i8` `i16` `i32` `i64` | no | Range-checked at every `let`/return/assign boundary (runtime; some proven away statically — see §8). |
 | Unsigned integers | `u8` `u16` `u32` `u64` `usize` | no | Same range-checking. Compiled (§10) — same widths as their signed counterparts; `codegen.rs` needs the signed-vs-unsigned instruction choice in exactly one place, not throughout (every unsigned type's range is capped at `[0, i64::MAX]`, and this backend computes all arithmetic at `i64` width regardless of source width). |
 | Float | `f64` | no | IEEE 754 double. One width — no `f32`, no literal-widening story. Saturates (`inf`/`NaN`), never traps. |
+| Decimal | `dec128` | no | 2026-08-26. 128-bit fixed-point decimal (`rust_decimal::Decimal` backs the interpreter's `Value`), up to 28 significant digits. One width — no `dec32`/`dec64`, and no user-facing scale parameter: scale lives on the *value*, not the type (`dec_scale`, §5), the same way `rust_decimal::Decimal` itself tracks it internally. No literal syntax and no implicit conversion to/from `i64`/`f64` (same "no implicit numeric conversions, ever" rule as §3) — construct via `dec_from_str`/`dec_from_i64` (§5) only. `+`/`-`/`*`/`/`/comparisons are native, like any other numeric scalar (§4); a result past 28 digits traps (Tier-1/2 `abort()`, §8), the same idiom as int div-by-zero, not a `Result`. **Interpreter-only for now** — `nirdosha build`/`emit-llvm` reject it with a specific reason (§10), joining `db`/`json`/`mq` rather than silently mis-compiling. See §6c for the `Money` convention built on it. |
 | Boolean | `bool` | no | |
 | Unit | `unit` | no | No literal syntax — only reachable as a function's implicit return. |
 | String | `str` | no | UTF-8, `Arc<str>`-backed. Literal + escapes (`\"` `\\` `\n` `\t` `\r`) only — no concatenation, slicing, or indexing. May not be, or be part of, a user `fn`'s parameter or return type — see §6b. |
@@ -78,7 +79,10 @@ Integer literals are the *only* thing with width flexibility — `let n:
 i8 = 100` needs no cast, but `let a: i64 = 1; let b: i32 = 2; a + b` is a
 type error (no implicit conversions, ever, between two already-typed
 values). A float literal is always exactly `f64`; there is no
-int↔float conversion operator at all.
+int↔float conversion operator at all. `dec128` has no literal syntax at
+all (not even a decimal-point form) — it's built only from
+`dec_from_str`/`dec_from_i64` (§5), so `dec128 + i64` is the same type
+error as `i64 + i32` above.
 
 ---
 
@@ -154,6 +158,16 @@ to write them with). All require `f64` elements unless noted.
 - Postgres is strongly typed at the wire level (unlike SQLite): a schema column meant to hold a Nirdosha `i64`/`f64`/`bool`/`str` value should be declared `BIGINT`/`DOUBLE PRECISION`/`BOOLEAN`/`TEXT` — a narrower column type (e.g. `integer`) is a clear `Err` from the driver, not a silent misbind.
 - TLS to Postgres is opt-in, read from the connection string's own `sslmode=require`/`verify-ca`/`verify-full`; no `sslmode` (or `disable`/`prefer`/`allow`) connects in plaintext.
 - `nirdosha serve --db <path>`'s auto-generated table routes and automatic schema migrations (§13) are a separate mechanism, still SQLite-only.
+
+**Decimal arithmetic** (`dec128`, interpreter-only — §2, §10) — 2026-08-26.
+- `dec_from_str(s: str) -> Result(dec128, str)` — parses a decimal string (optional leading `-`, digits, optional `.` + digits; no scientific notation, no thousands separators). `Err(message)` on malformed input — external data, not a trap, the same convention as `db_query`/`db_execute` above.
+- `dec_from_i64(v: i64, scale: u32) -> dec128` — `v` is the unscaled integer, `scale` the number of implied decimal places (`dec_from_i64(1999, 2)` is `19.99`). Traps if `scale > 28` (Tier-1/2 guard, §8) — the representation's own limit, not a data problem, so this one doesn't return `Result`.
+- `dec_to_str(d: dec128) -> str` — canonical string form, no scientific notation, trailing zeros kept out to the value's own scale (`19.90` round-trips as `"19.90"`, not `"19.9"`).
+- `dec_round(d: dec128, scale: u32) -> dec128` — round-half-to-even ("banker's rounding") to `scale` places. The only rounding policy v1 ships; named explicitly here rather than picked silently, since interest/tax/FX math is exactly where a rounding-mode choice needs to be visible.
+- `dec_scale(d: dec128) -> u32` — the value's current number of decimal places, since scale lives on the value, not the type (§2).
+- Arithmetic (`+ - * /`) and comparisons (`== != < > <= >=`) work on `dec128` natively — the same operator dispatch every numeric scalar gets (§4), no builtin functions needed. `/` rounds to the type's max representable scale rather than trapping on a non-terminating result (e.g. `1 / 3`); narrow with `dec_round` afterward when a program needs fewer places.
+- `db_query`/`db_execute` bind values gain `dec128` as a sixth bindable type, sent as `dec_to_str`'s canonical form. Use a `NUMERIC`/`DECIMAL` Postgres column, not `DOUBLE PRECISION` — reintroducing float storage on the far side defeats the point. SQLite has no real decimal column type; `TEXT` is the honest choice there.
+- JSON encode/decode (`nirdosha serve`, `json_get_*`) represents `dec128` as a JSON **string**, not a JSON number, for the same reason as the DB binding — a JSON number is IEEE-754 double under nearly every consumer's parser, exactly the silent-drift failure this type exists to prevent. `emit-ui` renders a `dec128` field as a text input, not `<input type=number>`.
 
 **Identity / relying party** (Row 12)
 - `oidc_validate_token(token: str, expected_issuer: str, expected_audience: str, jwks_json: str) -> Result(VerifiedIdentity, str)` — validates a mock OIDC/JWT ID token against the supplied JWKS JSON (HMAC-SHA256). Checks issuer, audience, and signature. Returns a `VerifiedIdentity` on success. The runtime never mints tokens; it only consumes externally-issued ones.
@@ -355,6 +369,215 @@ and forward an unpredictable builtin failure message (`External(str)`)
 uniformly through one `Result(_, ErrorCode)`, not a loophole around the
 rule's intent (nothing compares an `External` payload with `==`/
 literal-`match`).
+
+### 6c. `Money` and `CurrencyCode` — real prelude types
+
+2026-08-26, promoted to a real prelude type 2026-08-27. `Money` and
+`CurrencyCode` are built into every `.nir` program automatically, the
+same way `Option`/`Result`/`HttpResponse` already are
+(`ast.rs::prelude_structs`/`prelude_enums`) — no declaration needed, and
+nothing to paste in. (They started life one day earlier as a *documented
+convention* — two declarations an author pasted into their own program,
+same shape `Text` still is below — until pasting the same ~180-variant
+enum into every program that needed one made the convention itself the
+next thing worth fixing.)
+
+```
+struct Money {
+    amount: dec128,
+    currency: CurrencyCode,
+}
+
+enum CurrencyCode {
+    AED, AFN, ALL, AMD, ANG, AOA, ARS, AUD, AWG, AZN,
+    BAM, BBD, BDT, BGN, BHD, BIF, BMD, BND, BOB, BRL, BSD, BTN, BWP, BYN, BZD,
+    CAD, CDF, CHF, CLP, CNY, COP, CRC, CUP, CVE, CZK,
+    DJF, DKK, DOP, DZD,
+    EGP, ERN, ETB, EUR,
+    FJD, FKP,
+    GBP, GEL, GHS, GIP, GMD, GNF, GTQ, GYD,
+    HKD, HNL, HTG, HUF,
+    IDR, ILS, INR, IQD, IRR, ISK,
+    JMD, JOD, JPY,
+    KES, KGS, KHR, KMF, KPW, KRW, KWD, KYD, KZT,
+    LAK, LBP, LKR, LRD, LSL, LYD,
+    MAD, MDL, MGA, MKD, MMK, MNT, MOP, MRU, MUR, MVR, MWK, MXN, MYR, MZN,
+    NAD, NGN, NIO, NOK, NPR, NZD,
+    OMR,
+    PAB, PEN, PGK, PHP, PKR, PLN, PYG,
+    QAR,
+    RON, RSD, RUB, RWF,
+    SAR, SBD, SCR, SDG, SEK, SGD, SHP, SLE, SOS, SRD, SSP, STN, SVC, SYP, SZL,
+    THB, TJS, TMT, TND, TOP, TRY, TTD, TWD, TZS,
+    UAH, UGX, USD, UYU, UZS,
+    VES, VND, VUV,
+    WST,
+    XAF, XCD, XOF, XPF,
+    YER,
+    ZAR, ZMW, ZWG,
+}
+```
+
+This closes the two holes the *naming-convention* version left open:
+`Money.amount` can't silently be an `f64` (§2's type-checked construction
+via `dec_from_str`/`dec_from_i64`), and `Money.currency` gets exhaustive
+`match`, `==`/`!=`, and a searchable `emit-ui` dropdown for free, the same
+as any other enum field (§6b) — instead of `match currency { "USD" =>
+...`.
+
+**What this deliberately doesn't give you: compile-time currency-mixing
+safety.** `Money(USD)` and `Money(EUR)` are not distinct *types* — currency
+lives in a field, not a type parameter. Nirdosha's generics (Row 11,
+`nirdosha_row11_amendment.md`) could in principle make them distinct
+(`struct Money(C) { amount: dec128 }`, instantiated once per currency) —
+the same phantom-type trick Rust's `typed-money` crate uses. It's
+deliberately not done that way here: a `Money(C)` per-currency type can't
+sit in one `db_query` result row, one JSON array, or one `emit-ui` table
+column where the currency *varies row to row* — which is the ordinary
+shape of a ledger/payments table, not the exception. A generic `Money(C)`
+only earns its keep when a whole computation is pinned to one currency at
+compile time (an FX function's declared input side, say); it's a local
+tool, not the default representation.
+
+Combining two `Money` values with mismatched currencies is therefore
+caught at the point they're combined, not by the compiler:
+
+```
+enum ErrorCode { CurrencyMismatch }
+
+fn add_money(a: Money, b: Money) -> Result(Money, ErrorCode) {
+    if a.currency != b.currency {
+        return Err(CurrencyMismatch())
+    }
+    return Ok(Money(a.amount + b.amount, a.currency))
+}
+```
+
+**On the `CurrencyCode` list above:** a best-effort transcription of
+ISO 4217's *active, transactable* codes, dated 2026-08-26 — it excludes
+precious-metal/fund settlement codes (`XAU`/`XAG`/`XPD`/`XPT`/`XDR`/`BOV`/
+`CHE`/`CHW`/`CLF`/`COU`/`MXV`/`USN`/`UYW`/`UYI`) and the no-currency/test
+codes (`XXX`/`XTS`). Verify against the current published ISO 4217 table
+before relying on it in production — currency codes are revised
+periodically (e.g. `ZWL`→`ZWG` in 2024, `SLL`→`SLE` in 2022), and this
+snapshot was written from memory, not re-derived from the standard.
+
+### 6d. `Measure` and `UnitCode` — real prelude types
+
+2026-08-26, promoted to a real prelude type 2026-08-27, same shape and
+same reasoning as `Money`/`CurrencyCode` (§6c): a `dec128` value paired
+with a closed enum, built into every `.nir` program automatically —
+no declaration needed.
+
+```
+struct Measure {
+    value: dec128,
+    unit: UnitCode,
+}
+
+enum UnitCode {
+    // Length
+    Metre, Centimetre, Millimetre, Kilometre,
+    Inch, Foot, Yard, Mile, NauticalMile,
+    // Mass
+    Milligram, Gram, Kilogram, MetricTon, PoundAv, OunceAv,
+    // Volume
+    Millilitre, Litre, CubicMetre, CubicFoot, USGallon, UKGallon, USBarrel,
+    // Area
+    SquareMetre, SquareFoot, Hectare,
+    // Time
+    Second, Minute, Hour, Day,
+    // Temperature
+    Celsius, Fahrenheit, Kelvin,
+    // Count -- UCUM's curly-brace "annotation" convention, not true units
+    Each, Dozen,
+}
+```
+
+**Why an enum field, not `Length(Metre)` vs `Length(Inch)` as distinct
+generic types:** the `Money`/`Money(C)` tradeoff in §6c applies here
+unchanged — a per-unit generic type can't sit in one `db_query` row or
+one `emit-ui` column where the unit *varies row to row* (a shipment
+weight that's `kg` for one supplier and `lb` for another is the ordinary
+case, not the exception). But physical units have a second problem
+currencies don't: **ISO 4217 is a closed, flat list — UCUM isn't.** UCUM
+unit *codes* are compositional expressions (`kg.m/s2`, `mm[Hg]`,
+`10*3/uL`), not a fixed vocabulary, so there is no version of this enum
+that's "the full standard" the way `CurrencyCode` (§6c) actually is
+ISO 4217. `UnitCode` above is a curated subset — the units a real
+program needs — extended the same way `CurrencyCode` is: add a variant
+when a program needs one that isn't here. It does not, and cannot without
+a real unit-expression parser (a separate, much bigger feature), accept
+arbitrary UCUM expressions.
+
+**Bridging to the real UCUM code**, for interop with a system that
+expects the standard's own strings (an EDI/customs document, say) — a
+lookup, not a claim that the variant name *is* the code, since most UCUM
+codes (`[in_i]`, `{each}`) aren't valid Nirdosha identifiers:
+
+```
+fn ucum_code(u: UnitCode) -> Text {
+    return match u {
+        Metre => Text("m"),
+        Centimetre => Text("cm"),
+        Millimetre => Text("mm"),
+        Kilometre => Text("km"),
+        Inch => Text("[in_i]"),
+        Foot => Text("[ft_i]"),
+        Yard => Text("[yd_i]"),
+        Mile => Text("[mi_i]"),
+        NauticalMile => Text("[nmi_i]"),
+        Milligram => Text("mg"),
+        Gram => Text("g"),
+        Kilogram => Text("kg"),
+        MetricTon => Text("t"),
+        PoundAv => Text("[lb_av]"),
+        OunceAv => Text("[oz_av]"),
+        Millilitre => Text("mL"),
+        Litre => Text("L"),
+        CubicMetre => Text("m3"),
+        CubicFoot => Text("[cft_i]"),
+        USGallon => Text("[gal_us]"),
+        UKGallon => Text("[gal_br]"),
+        USBarrel => Text("[bbl_us]"),
+        SquareMetre => Text("m2"),
+        SquareFoot => Text("[sft_i]"),
+        Hectare => Text("har"),
+        Second => Text("s"),
+        Minute => Text("min"),
+        Hour => Text("h"),
+        Day => Text("d"),
+        Celsius => Text("Cel"),
+        Fahrenheit => Text("[degF]"),
+        Kelvin => Text("K"),
+        Each => Text("{each}"),
+        Dozen => Text("{dozen}"),
+    }
+}
+```
+
+Combining two `Measure` values needs a matching-unit check, the same
+discipline `add_money` (§6c) applies to currency — extending that same
+`ErrorCode` enum with one more variant, since a real program pasting in
+both conventions shares one `ErrorCode`:
+
+```
+enum ErrorCode { CurrencyMismatch, UnitMismatch }
+
+fn add_measure(a: Measure, b: Measure) -> Result(Measure, ErrorCode) {
+    if a.unit != b.unit {
+        return Err(UnitMismatch())
+    }
+    return Ok(Measure(a.value + b.value, a.unit))
+}
+```
+
+**What this doesn't give you: unit conversion.** `add_measure` above
+*refuses* mismatched units, it doesn't convert between them — going from
+"refuse" to "convert `[ft_i]` to `m` automatically" needs a
+conversion-factor table keyed by unit pair (and, for temperature,
+non-linear conversion — `Cel`→`[degF]` isn't a scale factor). That's a
+real, separate feature, not shipped here.
 
 ---
 
@@ -561,6 +784,8 @@ never silently mis-compiled):
 - `thread`/`spawn`/`join`, `chan`/`send`/`recv` (channel — distinct from
   the already-compiled `tcp`), `sandbox`/`stop`.
 - `file`/`open` (`PROTOLANG_PORT.md`'s file I/O port).
+- `dec128` and its `dec_*` builtins (§2, §5) — not yet in `Ty` or
+  `codegen.rs`'s builtin allowlists.
 - `json`/`db`/`mq` (`Ty::Json`/`Ty::Db`/`Ty::Mq`) and every Row 12
   identity/session/API-key builtin (`oidc_validate_token`,
   `check_role(_path)`, `extract_claim(_path)`, sessions, refresh,

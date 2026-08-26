@@ -18,6 +18,7 @@ tiny_http = "0.12"
 postgres = "0.19"
 postgres-native-tls = "0.5"
 regex = "1.13.1"
+rust_decimal = "1"
 
 # `dist`: statically vendors Z3 (compiles it from source via `z3-src`)
 # instead of dynamically linking the system `libz3` — same pattern as
