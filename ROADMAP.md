@@ -660,15 +660,37 @@ of Track B has landed.*
     "shell out, no new dependency" approach the Unix version already
     documents.
 
-  Both fixes verified: full local suite (`cargo test`, every
-  `tests/*.rs`) green on Linux, no regressions; pushed to `main` for
-  `build-windows` to confirm on real Windows CI. Flips to `[DONE]` once
-  that run is observed green — per this file's own "checked off only
-  once actually run/verified" rule, not on "believed fixed."
-  Still open, narrower than before: this proves the *compiler and its
-  test suite* build and run on Windows CI, not that a shipped end-user
-  release binary has been run on someone's own Windows machine outside
-  CI.
+  Both fixes verified locally (`cargo test` green on Linux) and pushed;
+  the resulting `build-windows` run (`32975984692`) confirmed the
+  sandbox-channel fix — `tcp`/`sandbox`/`sandbox_channels`/`channels`
+  all green — but surfaced a **third**, independent real bug in the
+  same job's next step: `clang: error: linker command failed with exit
+  code 1120` (unresolved externals) on all 4 of the compiled-TCP
+  `codegen.rs` tests. Root cause: `runtime_kernels.rs`'s `nir_tcp_*`
+  kernels (added for the TCP codegen path, `RUNTIME_KERNELS_LIB`) call
+  into `std::net`, which needs `ws2_32.lib` on Windows — but
+  `codegen.rs::build()` links that staticlib with a bare `clang`
+  invocation, not `rustc`, so none of the OS-level libraries `rustc`
+  would normally supply automatically (`ws2_32.lib` and friends) were
+  ever being passed. The existing Unix fix for the same *class* of gap
+  (`-lm`, needed for `atan2`) was a one-off hardcoded flag; Windows
+  needs a whole list, and guessing it wasn't necessary — `rustc
+  --print=native-static-libs` (`build.rs`) captures the real list at the
+  exact moment `rustc` already knows it, for whichever platform the
+  build is actually running on, written to `OUT_DIR/
+  native_static_libs.txt` and threaded into `clang`'s link line via a
+  new `#[cfg(windows)]` arm (`codegen.rs::NATIVE_STATIC_LIBS`) — Unix's
+  existing `-lm` arm is untouched. Verified locally: `cargo build
+  --release` + full `cargo test`/`--test codegen` (142 tests) still
+  green on Linux with this change (the captured Unix list is `-lgcc_s
+  -lutil -lrt -lpthread -lm -ldl -lc`, a superset of the old hardcoded
+  `-lm`, applied only under `cfg(unix)` so behavior there is unchanged).
+  Pushed for `build-windows` to confirm the actual Windows list links
+  cleanly — not yet observed green. Flips `[DONE]` only once that run
+  is confirmed, per this file's own rule. Still open, narrower than
+  before: this proves the *compiler and its test suite* build and run
+  on Windows CI, not that a shipped end-user release binary has been
+  run on someone's own Windows machine outside CI.
 - `[OPEN]` **A8. macOS Z3 vendoring.** `z3-src` 416.0.2 (pulled by the
   current `z3` 0.20.2 crate) fails to compile against the AppleClang on
   GitHub's `macos-13`/`macos-14` runners — a real `obj_hashtable.h`

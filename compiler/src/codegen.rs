@@ -5217,6 +5217,20 @@ impl OptLevel {
 /// runtime dependency on this compiler's installation.
 static RUNTIME_KERNELS_LIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libnirdosha_runtime.a"));
 
+/// The OS-level system libraries `RUNTIME_KERNELS_LIB`'s own code (now
+/// including the `nir_tcp_*` kernels' `std::net` calls) needs at final
+/// link time — captured by `build.rs` via `rustc --print=native-static-
+/// libs` at the same moment it builds that staticlib, since `rustc`
+/// itself doesn't drive this crate's final link (see `build.rs`'s doc
+/// comment for the real Windows failure this fixes: `ws2_32.lib` wasn't
+/// being linked, so `nir_tcp_connect`/etc. were unresolved externals).
+/// Whitespace-separated, already in whatever form the platform's own
+/// linker expects (`-lfoo` on Unix, `foo.lib` on Windows-MSVC) — passed
+/// through to `clang` as separate arguments unchanged, not parsed
+/// further.
+#[allow(dead_code)] // only read under `#[cfg(windows)]` below; Unix has its own `-lm` arm
+static NATIVE_STATIC_LIBS: &str = include_str!(concat!(env!("OUT_DIR"), "/native_static_libs.txt"));
+
 pub fn build(
     program: &Program,
     smt_report: &SmtReport,
@@ -5259,6 +5273,14 @@ pub fn build(
     // Unix-only.
     #[cfg(unix)]
     clang_cmd.arg("-lm");
+    // Windows has no equivalent hand-picked single flag — `std::net`
+    // (the `nir_tcp_*` kernels) needs `ws2_32.lib`, and other stdlib
+    // pieces need their own system libs beside it, so the captured,
+    // rustc-verified list is used instead of guessing which ones.
+    // `NATIVE_STATIC_LIBS`'s doc comment on its declaration above has the
+    // real failure this fixes.
+    #[cfg(windows)]
+    clang_cmd.args(NATIVE_STATIC_LIBS.split_whitespace());
     let result = clang_cmd.arg("-o").arg(output_path).output();
     let _ = std::fs::remove_file(&ll_path); // best-effort cleanup either way
     let _ = std::fs::remove_file(&runtime_lib_path);
