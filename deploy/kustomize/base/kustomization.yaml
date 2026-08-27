@@ -1,0 +1,19 @@
+# Kustomize alternative to deploy/helm/nirdosha for an operator who
+# prefers plain manifests over templating (KUBERNETES.md P3: "Helm
+# chart / Kustomize overlay"). `nirdosha-sqlite.yaml` is a static
+# render of the Helm chart's own defaults (ServiceAccount + Service +
+# single-replica StatefulSet + PVC, local SQLite, no auth/ingress) — the
+# two are meant to stay in sync; regenerate it with:
+#
+#   helm template nirdosha ../../helm/nirdosha --namespace default \
+#     > nirdosha-sqlite.yaml
+#
+# rather than hand-editing it, if the chart's own templates change.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: default
+resources:
+  - nirdosha-sqlite.yaml
+images:
+  - name: ghcr.io/protobox/nirdosha-runtime
+    newTag: latest

@@ -1,0 +1,15 @@
+.git
+compiler/target
+*.db
+*.db-wal
+*.db-shm
+*.lock.db
+scratch/
+grammar_check/
+grammar_export/
+bench/
+benchmarks/
+announcements/
+assets/macos
+assets/linux
+node_modules

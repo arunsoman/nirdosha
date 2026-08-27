@@ -30,6 +30,7 @@ rust_decimal = "1"
 r2d2 = "0.8"
 r2d2_sqlite = { version = "0.24", default-features = false, features = ["bundled"] }
 r2d2_postgres = "0.18"
+signal-hook = { version = "0.4", default-features = false }
 
 # `dist`: statically vendors Z3 (compiles it from source via `z3-src`)
 # instead of dynamically linking the system `libz3` — same pattern as

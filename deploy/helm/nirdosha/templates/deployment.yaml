@@ -1,0 +1,23 @@
+{{- include "nirdosha.validateReplicaMode" . -}}
+{{- if eq .Values.db.mode "postgres" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "nirdosha.fullname" . }}
+  labels:
+    {{- include "nirdosha.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "nirdosha.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Rolling restarts must never take every replica down at once --
+      # the whole reason >1 replica was requested.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    {{- include "nirdosha.podTemplate" . | nindent 4 }}
+{{- end }}

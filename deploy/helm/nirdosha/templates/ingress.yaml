@@ -1,0 +1,44 @@
+{{- /*
+One path for both UI and API (KUBERNETES.md's "[DONE], by design" row —
+`serve.rs` fuses UI+API on one listener, so there is no separate
+frontend Ingress/CORS config, ever). TLS termination is the Ingress
+controller's job, not this chart's — `serve.rs` itself is plain HTTP by
+design (delegated to a reverse proxy/mesh, same as any other Rust
+`tiny_http` service).
+*/ -}}
+{{- if .Values.ingress.enabled }}
+{{- if not .Values.ingress.host }}
+{{- fail "ingress.enabled=true requires ingress.host" }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "nirdosha.fullname" . }}
+  labels:
+    {{- include "nirdosha.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "nirdosha.fullname" . }}
+                port:
+                  number: {{ .Values.service.port }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host }}
+      secretName: {{ .Values.ingress.tls.secretName | default (printf "%s-tls" (include "nirdosha.fullname" .)) }}
+  {{- end }}
+{{- end }}

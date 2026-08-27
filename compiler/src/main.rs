@@ -115,12 +115,17 @@ fn print_usage() {
     eprintln!("  nirdosha emit-ui <file.nir> [-o out.html]");
     eprintln!("                                      derive a Material-styled web UI from struct/fn conventions");
     eprintln!("  nirdosha serve <file.nir> [--host 127.0.0.1] [--port 8080] [--jwks-file P --issuer S --audience S]");
-    eprintln!("                             [--identity-base URL] [--db PATH] [--otel-port PORT --otel-token TOKEN]");
+    eprintln!("                             [--identity-base URL] [--db PATH]");
+    eprintln!("                             [--presence-token TOKEN | --presence-token-file PATH]");
+    eprintln!("                             [--otel-port PORT (--otel-token TOKEN | --otel-token-file PATH)]");
     eprintln!("                                      run the program as a real HTTP service (UI at GET /,");
-    eprintln!("                                      API at POST /api/<fn>) -- see src/serve.rs");
+    eprintln!("                                      API at POST /api/<fn>, plus GET /healthz, /readyz, /metrics");
+    eprintln!("                                      for Kubernetes probes/scraping) -- see src/serve.rs");
     eprintln!("                                      (--otel-port: a second, loopback-only APM port, dynamically");
     eprintln!("                                       enabled only while a token-authenticated client is connected");
-    eprintln!("                                       -- observability layer 2a, requires --otel-token)");
+    eprintln!("                                       -- observability layer 2a, requires --otel-token(-file))");
+    eprintln!("                                      (--*-token-file: read a Secret-mounted file instead of a raw");
+    eprintln!("                                       CLI value, which leaks via /proc/<pid>/cmdline in a Pod)");
 }
 
 fn read_source(path: &str) -> Result<String, ExitCode> {
@@ -675,8 +680,10 @@ fn cmd_serve(
     let mut db_path: Option<String> = None;
     let mut theme_path: Option<String> = None;
     let mut presence_token: Option<String> = None;
+    let mut presence_token_file: Option<String> = None;
     let mut otel_port: Option<u16> = None;
     let mut otel_token: Option<String> = None;
+    let mut otel_token_file: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--host" => host = args.next().unwrap_or(host),
@@ -696,6 +703,17 @@ fn cmd_serve(
             // path, the same "a feature you don't opt into costs nothing"
             // degradation `--db`-gated routes already follow.
             "--presence-token" => presence_token = args.next(),
+            // `KUBERNETES.md`'s "Configuration (12-factor)" row: the raw
+            // `--presence-token`/`--otel-token` value above is visible via
+            // `/proc/<pid>/cmdline` to anyone else on the same host/
+            // container — a real leak in a Kubernetes Pod, where
+            // `cmdline` is trivially readable by anything sharing the
+            // Pod's PID namespace. `--jwks-file` already took a path for
+            // exactly this reason; these two mirror that precedent.
+            // Mutually exclusive with the raw-value flag (checked below,
+            // same "don't silently let one win" posture `--jwks-file`'s
+            // own all-or-nothing trio takes).
+            "--presence-token-file" => presence_token_file = args.next(),
             // Observability layer 2a (`observability.rs`'s "Rollout
             // layers 2-4" section): a second, loopback-only listener
             // dedicated to APM consumers, dynamically gated by whether
@@ -705,14 +723,53 @@ fn cmd_serve(
             // opt-in flag here already follows.
             "--otel-port" => otel_port = args.next().and_then(|s| s.parse().ok()),
             "--otel-token" => otel_token = args.next(),
+            "--otel-token-file" => otel_token_file = args.next(),
             other => input = Some(other.to_string()),
         }
     }
     let Some(path) = input else {
         eprintln!(
-            "usage: nirdosha serve <file.nir> [--host 127.0.0.1] [--port 8080] [--jwks-file P --issuer S --audience S] [--identity-base URL] [--db PATH] [--theme theme.json] [--presence-token TOKEN] [--otel-port PORT --otel-token TOKEN]"
+            "usage: nirdosha serve <file.nir> [--host 127.0.0.1] [--port 8080] [--jwks-file P --issuer S --audience S] [--identity-base URL] [--db PATH] [--theme theme.json] [--presence-token TOKEN | --presence-token-file PATH] [--otel-port PORT (--otel-token TOKEN | --otel-token-file PATH)]"
         );
         return ExitCode::FAILURE;
+    };
+    // Read a Secret-volume-mounted token file, trimming exactly one
+    // trailing newline (the common `echo token > file`/Kubernetes Secret
+    // convention) but nothing else — a token is opaque data, so no
+    // further trimming/parsing is safe to assume.
+    fn read_token_file(path: &str) -> Result<String, String> {
+        let raw = std::fs::read_to_string(path).map_err(|e| format!("error reading {path}: {e}"))?;
+        Ok(raw.strip_suffix('\n').map(str::to_string).unwrap_or(raw))
+    }
+    let presence_token = match (presence_token, presence_token_file) {
+        (Some(_), Some(_)) => {
+            eprintln!("--presence-token and --presence-token-file are mutually exclusive — pass exactly one");
+            return ExitCode::FAILURE;
+        }
+        (Some(t), None) => Some(t),
+        (None, Some(f)) => match read_token_file(&f) {
+            Ok(t) => Some(t),
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::FAILURE;
+            }
+        },
+        (None, None) => None,
+    };
+    let otel_token = match (otel_token, otel_token_file) {
+        (Some(_), Some(_)) => {
+            eprintln!("--otel-token and --otel-token-file are mutually exclusive — pass exactly one");
+            return ExitCode::FAILURE;
+        }
+        (Some(t), None) => Some(t),
+        (None, Some(f)) => match read_token_file(&f) {
+            Ok(t) => Some(t),
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::FAILURE;
+            }
+        },
+        (None, None) => None,
     };
     // All-or-nothing, same posture `--jwks-file`/`--issuer`/`--audience`
     // already take below: a bearer-token-gated internal channel that
@@ -722,7 +779,7 @@ fn cmd_serve(
     // which is allowed to be absent because absence just 404s the routes
     // it gates instead of exposing anything).
     if otel_port.is_some() && otel_token.is_none() {
-        eprintln!("--otel-port requires --otel-token (an unauthenticated APM port would leak call timing/error-rate data to anyone who can reach it)");
+        eprintln!("--otel-port requires --otel-token or --otel-token-file (an unauthenticated APM port would leak call timing/error-rate data to anyone who can reach it)");
         return ExitCode::FAILURE;
     }
     let src = match read_source(&path) {

@@ -1,0 +1,30 @@
+nirdosha is deploying as a {{ if eq .Values.db.mode "postgres" }}Deployment ({{ .Values.replicaCount }} replica(s), Postgres-backed durability){{ else }}StatefulSet (1 replica, local SQLite + PersistentVolumeClaim){{ end }}.
+
+Check rollout status:
+  {{- if eq .Values.db.mode "postgres" }}
+  kubectl rollout status deployment/{{ include "nirdosha.fullname" . }} -n {{ .Release.Namespace }}
+  {{- else }}
+  kubectl rollout status statefulset/{{ include "nirdosha.fullname" . }} -n {{ .Release.Namespace }}
+  {{- end }}
+
+Probe the health/readiness routes (see KUBERNETES.md's "Health &
+lifecycle" row) from inside the cluster:
+  kubectl exec -n {{ .Release.Namespace }} {{ include "nirdosha.fullname" . }}-0 -- wget -qO- http://localhost:8080/healthz
+
+{{- if .Values.ingress.enabled }}
+
+The app should be reachable at:
+  http{{ if .Values.ingress.tls.enabled }}s{{ end }}://{{ .Values.ingress.host }}/
+{{- else }}
+
+No Ingress is enabled (ingress.enabled=false). Port-forward to reach it locally:
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "nirdosha.fullname" . }} 8080:{{ .Values.service.port }}
+{{- end }}
+
+{{- if not .Values.auth.enabled }}
+
+NOTE: auth.enabled=false — every request is unauthenticated and every
+`requires(...)`-gated fn is unreachable (401 for everyone). Set
+auth.enabled=true with a real jwksSecretName/issuer/audience before
+exposing this outside a trusted network.
+{{- end }}

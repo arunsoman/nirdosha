@@ -1,0 +1,111 @@
+# Default values for the nirdosha chart — see KUBERNETES.md for the
+# compliance matrix every default below traces back to.
+
+image:
+  # Unpublished as of this chart's first version — KUBERNETES.md P0's
+  # first item. Build+push it from the repo root Dockerfile, or point
+  # this at your own derived image (base image + your .nir source
+  # COPY'd in, same shape `plugins/deploy_targets/kubernetes.py`'s
+  # `_derived_dockerfile` synthesizes on protobox's side).
+  repository: ghcr.io/protobox/nirdosha-runtime
+  tag: latest
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+# The single .nir entrypoint this release serves. Required — there is no
+# sensible default (KUBERNETES.md: one process, one file per `serve`
+# invocation).
+entrypointFile: "app.nir"
+
+# `.nir` has no runtime env-var read (`db_connect(...)` is a literal
+# compiled into the source itself, KUBERNETES.md's "State, data &
+# horizontal scaling" row) — replicas > 1 is refused by this chart's own
+# templates (see statefulset/deployment .tpl logic) unless
+# db.mode=postgres, matching `kubernetes.py::render_manifests`'s own
+# ValueError guard on the protobox side. `sqlite` -> a StatefulSet + one
+# PVC, exactly one replica. `postgres` -> a plain Deployment, any replica
+# count, but you must ALSO point --transact-log/--workflow-log at
+# Postgres yourself by pre-generating a program whose db_connect(...)
+# literal is already a postgres:// URL (this chart cannot rewrite your
+# .nir source for you) and set db.postgresSecretName below.
+db:
+  mode: sqlite # sqlite | postgres
+  postgresSecretName: ""
+  storage:
+    size: 1Gi
+    storageClassName: ""
+
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 2m
+  host: ""
+  tls:
+    enabled: true
+    secretName: ""
+
+# Auth (`--jwks-file`/`--issuer`/`--audience`) — all three, or none.
+auth:
+  enabled: false
+  jwksSecretName: ""
+  issuer: ""
+  audience: ""
+
+# `--presence-token-file`/`--otel-token-file` — Secret-mounted, never a
+# bare CLI value (KUBERNETES.md's "Secrets sourced from files, not bare
+# CLI values" row; this same compliance change added the -file flags).
+presence:
+  enabled: false
+  tokenSecretName: ""
+
+otel:
+  enabled: false
+  port: 4319
+  tokenSecretName: ""
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# KUBERNETES.md's "Security posture" row / P3's "Pod Security
+# 'restricted' profile" item.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  seccompProfile:
+    type: RuntimeDefault
+
+podSecurityContext:
+  fsGroup: 10001
+
+# Durability (Track A1) already survives a hard SIGKILL; the graceful
+# SIGTERM handler this compliance change adds drains within its ~200ms
+# poll interval, so this is a safety margin, not load-bearing.
+terminationGracePeriodSeconds: 30
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
