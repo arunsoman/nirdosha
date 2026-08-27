@@ -36,7 +36,13 @@ COPY compiler/src ./src
 RUN cargo build --release --features dist
 
 # ---- runtime stage -------------------------------------------------------
-FROM python:3.12-slim-bookworm AS runtime
+# `trixie`, matching the build stage exactly -- NOT bookworm: a binary
+# built against trixie's glibc/libstdc++ (needed for z3-src's <format>
+# usage, see the build stage comment) fails to even start on bookworm's
+# older runtime ("version `GLIBC_2.39' not found"/"version
+# `GLIBCXX_3.4.31' not found") -- confirmed by a real `docker run`
+# against a first version of this image that mismatched the two.
+FROM python:3.12-slim-trixie AS runtime
 
 LABEL org.opencontainers.image.source="https://github.com/arunsoman/nirdosha" \
       org.opencontainers.image.description="nirdosha: one process serves both the API and the UI generated from a single .nir program" \
