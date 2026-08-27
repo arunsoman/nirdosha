@@ -1453,7 +1453,7 @@ fn dispatch(
         let Some(v) = body_obj.get(&p.name) else {
             return (400, json_err(&format!("missing field `{}` in request body", p.name)));
         };
-        match decode_value(v, &p.ty, program, 0) {
+        match decode_value_root(v, &p.ty, program) {
             Ok(val) => args.push(val),
             Err(e) => return (400, json_err(&format!("field `{}`: {e}", p.name))),
         }
@@ -1710,16 +1710,81 @@ fn decode_enum_value(json: &JsonVal, enum_name: &str, e: &crate::ast::EnumDecl) 
     Ok(Value::Enum(Arc::from(enum_name), Arc::from(variant.name.as_str()), Arc::from(vec![])))
 }
 
+/// Real recursion protection isn't the same question as "how deep is
+/// this domain model" — `Order -> LineItem -> Product -> Category` is
+/// four real, non-repeating levels a legitimate schema needs
+/// (2026-08-27: the old flat `depth >= 2` cap rejected exactly this,
+/// unconditionally, regardless of whether anything was actually
+/// cyclic). What genuinely can't be allowed to recurse forever is a
+/// **repeat** — the same struct name reappearing on the very path
+/// that's expanding it (`struct A { b: B } struct B { a: A }` typechecks
+/// today, `ast.rs`/`typeck.rs` have no cycle check on struct
+/// declarations themselves, confirmed empirically: `emit-ast` accepts
+/// that pair with no error). `DecodeGuard::enter` is that real check —
+/// a name already on `visiting` means a cycle, a clear 400 instead of a
+/// stack overflow. `MAX_DEPTH` is a second, independent, much more
+/// generous backstop: JSON *input* depth is caller-controlled
+/// regardless of whether the `.nir` program's own struct graph is
+/// cyclic (an attacker can nest plain JSON objects to any depth without
+/// needing a cyclic type at all), so recursion still needs a hard
+/// ceiling even on a genuinely acyclic schema — just one sized for
+/// "deeper than any real domain model", not "deeper than the *shallowest*
+/// real one".
+const MAX_DECODE_DEPTH: u32 = 64;
+
+pub(crate) struct DecodeGuard<'a> {
+    pub(crate) visiting: &'a mut Vec<String>,
+    pub(crate) depth: u32,
+}
+
+impl<'a> DecodeGuard<'a> {
+    /// `Err` on a real cycle (`name` already mid-expansion on this path)
+    /// or on hitting `MAX_DECODE_DEPTH` — `Ok(())` pushes `name` onto
+    /// `visiting`; the caller must pop it (`leave`) once done expanding,
+    /// so sibling fields of the same struct type (not an ancestor) are
+    /// never falsely flagged.
+    fn enter(&mut self, name: &str) -> Result<(), String> {
+        if self.depth >= MAX_DECODE_DEPTH {
+            return Err(format!(
+                "JSON request body nests {MAX_DECODE_DEPTH} levels deep at `{name}` -- refusing to decode further"
+            ));
+        }
+        if self.visiting.iter().any(|v| v == name) {
+            return Err(format!(
+                "`{name}` is already being decoded higher up this same path -- cyclic/self-referential struct nesting isn't supported"
+            ));
+        }
+        self.visiting.push(name.to_string());
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.visiting.pop();
+        self.depth -= 1;
+    }
+}
+
 /// Decodes one JSON value into a `Value`, driven by `ty` — the server-
 /// side mirror of `ui_gen.rs::build_field`'s client-side control
 /// derivation: scalars decode directly, `Option(T)` unwraps (`null` ->
 /// `None`), a zero-payload enum reference decodes from its variant name
 /// (`decode_enum_value` above), a bare reference to another struct in
-/// this program expands one level deep (depth-capped at 2, same
-/// cycle-safety reasoning `build_field` documents), and anything else
-/// (affine handles, `Fn`, a payload-carrying enum, deeper nesting) is a
-/// clear 400, never a silent misdecode.
-pub(crate) fn decode_value(json: &JsonVal, ty: &Ty, program: &Program, depth: u8) -> Result<Value, String> {
+/// this program expands (`DecodeGuard`'s doc comment above — real cycle
+/// detection, not a flat depth cap), and anything else (affine handles,
+/// `Fn`, a payload-carrying enum) is a clear 400, never a silent
+/// misdecode.
+/// `decode_value` for every caller that's decoding one independent
+/// top-level value (a request parameter, a workflow `data` blob) rather
+/// than recursing itself -- builds the one-shot `DecodeGuard` so call
+/// sites don't each repeat that boilerplate.
+pub(crate) fn decode_value_root(json: &JsonVal, ty: &Ty, program: &Program) -> Result<Value, String> {
+    let mut visiting = Vec::new();
+    let mut guard = DecodeGuard { visiting: &mut visiting, depth: 0 };
+    decode_value(json, ty, program, &mut guard)
+}
+
+pub(crate) fn decode_value(json: &JsonVal, ty: &Ty, program: &Program, guard: &mut DecodeGuard) -> Result<Value, String> {
     match ty {
         Ty::Str => json.as_str().map(|s| Value::Str(Arc::from(s))).ok_or_else(|| "expected a string".to_string()),
         Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::Usize => {
@@ -1753,7 +1818,7 @@ pub(crate) fn decode_value(json: &JsonVal, ty: &Ty, program: &Program, depth: u8
             if json.is_null() {
                 Ok(Value::Enum(Arc::from("Option"), Arc::from("None"), Arc::from(vec![])))
             } else {
-                let inner = decode_value(json, &args[0], program, depth)?;
+                let inner = decode_value(json, &args[0], program, guard)?;
                 Ok(Value::Enum(Arc::from("Option"), Arc::from("Some"), Arc::from(vec![inner])))
             }
         }
@@ -1761,17 +1826,16 @@ pub(crate) fn decode_value(json: &JsonVal, ty: &Ty, program: &Program, depth: u8
             if let Some(e) = resolve_enum(program, n) {
                 return decode_enum_value(json, n, e);
             }
-            if depth >= 2 {
-                return Err(format!("cannot decode a `{n}` from a JSON request body"));
-            }
             match resolve_struct(program, n) {
                 Some(s) => {
+                    guard.enter(n)?;
                     let obj = json.as_object().ok_or_else(|| format!("expected an object for `{n}`"))?;
                     let mut fields = Vec::with_capacity(s.fields.len());
                     for field in &s.fields {
                         let fv = obj.get(&field.name).ok_or_else(|| format!("missing field `{}` for `{n}`", field.name))?;
-                        fields.push(decode_value(fv, &field.ty, program, depth + 1)?);
+                        fields.push(decode_value(fv, &field.ty, program, guard)?);
                     }
+                    guard.leave();
                     Ok(Value::Struct(Arc::from(n.as_str()), Arc::from(fields)))
                 }
                 None => Err(format!("cannot decode a `{n}` from a JSON request body")),

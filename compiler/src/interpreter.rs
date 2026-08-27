@@ -4624,7 +4624,7 @@ impl Interpreter {
         });
         let json_val: serde_json::Value = serde_json::from_str(data_json).unwrap_or(serde_json::Value::Null);
         let data_val =
-            crate::serve::decode_value(&json_val, &data_ty, &self.program, 0).map_err(|e| self.workflow_log_err(e, span))?;
+            crate::serve::decode_value_root(&json_val, &data_ty, &self.program).map_err(|e| self.workflow_log_err(e, span))?;
         let data_encoded = crate::serve::encode_value(&data_val, &self.program).map_err(|e| self.workflow_log_err(e, span))?;
         Ok(serde_json::json!({
             "instance_id": instance_id,
@@ -4793,7 +4793,7 @@ impl Interpreter {
         }
         let mut vals = Vec::with_capacity(arr.len());
         for (j, param) in arr.iter().zip(f.params.iter()) {
-            match crate::serve::decode_value(j, &param.ty, &self.program, 0) {
+            match crate::serve::decode_value_root(j, &param.ty, &self.program) {
                 Ok(v) => vals.push(v),
                 Err(e) => {
                     return WorkflowReplayOutcome::Stuck {
@@ -4951,7 +4951,7 @@ impl Interpreter {
         };
         let data_ty = Ty::Named(format!("{workflow_name}Data"), vec![]);
         let json_val: serde_json::Value = serde_json::from_str(&data_json).unwrap_or(serde_json::Value::Null);
-        let data_val = crate::serve::decode_value(&json_val, &data_ty, &self.program, 0)
+        let data_val = crate::serve::decode_value_root(&json_val, &data_ty, &self.program)
             .map_err(|e| Signal::Err(self.workflow_log_err(e, span)))?;
 
         // `on_exit` of the old state runs before the state actually

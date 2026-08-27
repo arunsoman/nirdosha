@@ -1697,22 +1697,57 @@ impl<'a> TypeRegistry<'a> {
     /// Recurses "one level through" a field/payload at a time otherwise,
     /// exactly as `nirdosha_row11_amendment.md` §3.5 describes.
     ///
-    /// **Known, deliberate non-issue, not a guarded-against case:** a
-    /// struct/enum that's directly self-referential with no `box`/`chan`/
-    /// etc. indirection (`struct A { b: B } struct B { a: A }`) would
-    /// recurse here forever — not defended against, because no program
-    /// could ever construct a value of such a type in the first place
-    /// (the constructor call itself could never terminate), so no
-    /// well-typed program can ever reach this path with one.
+    /// 2026-08-27: **was** "known, deliberate non-issue, not a guarded-
+    /// against case" — the reasoning (a directly self-referential
+    /// struct/enum with no `box`/`chan`/etc. indirection, `struct A { b:
+    /// B } struct B { a: A }`, could recurse here forever, but no
+    /// well-typed program could ever reach this path with one, since no
+    /// program could ever construct a *value* of such a type) turned out
+    /// to be false: `is_affine` gets asked about a *type*, not a value —
+    /// `fn echo(a: CycleA) -> CycleA` mentions `CycleA` in its signature
+    /// with no value of it ever constructed anywhere, and that alone is
+    /// enough to reach this recursion (`ownership.rs`/`typeck.rs`/
+    /// `codegen.rs` all ask "is this parameter/return type affine" from a
+    /// signature, not from a live value). Confirmed empirically: `nirdosha
+    /// emit-ui`/`serve` on exactly that shape aborted with a real stack
+    /// overflow, not a hang or a clean error — `struct A { b: B } struct
+    /// B { a: A }` typechecks today (no cycle check at declaration time),
+    /// so this was reachable by any author who wrote one, not an
+    /// adversarial-input concern. `is_affine_visiting` is the real fix —
+    /// same "track names on the current resolution path, stop the second
+    /// time one repeats" shape `serve.rs::DecodeGuard`/`ui_gen.rs::
+    /// build_field`'s `visiting` already use for the identical class of
+    /// bug at the JSON boundary. A cycle can still never produce a real
+    /// value (that part of the original reasoning holds), so `false` on
+    /// a detected repeat is sound by construction, not a guess: whatever
+    /// this function returns for a type no value can ever inhabit is
+    /// vacuously correct.
     pub fn is_affine(&self, ty: &Ty) -> bool {
+        let mut visiting = Vec::new();
+        self.is_affine_visiting(ty, &mut visiting)
+    }
+
+    fn is_affine_visiting(&self, ty: &Ty, visiting: &mut Vec<String>) -> bool {
         match ty {
             Ty::Named(name, args) => {
+                if visiting.iter().any(|v| v == name.as_str()) {
+                    return false;
+                }
                 if let Some(decl) = self.structs.get(name.as_str()) {
+                    visiting.push(name.clone());
                     let subst = zip_type_params(&decl.type_params, args);
-                    decl.fields.iter().any(|f| self.is_affine(&substitute_ty(&f.ty, &subst)))
+                    let result = decl.fields.iter().any(|f| self.is_affine_visiting(&substitute_ty(&f.ty, &subst), visiting));
+                    visiting.pop();
+                    result
                 } else if let Some(decl) = self.enums.get(name.as_str()) {
+                    visiting.push(name.clone());
                     let subst = zip_type_params(&decl.type_params, args);
-                    decl.variants.iter().any(|v| v.payload.iter().any(|t| self.is_affine(&substitute_ty(t, &subst))))
+                    let result = decl
+                        .variants
+                        .iter()
+                        .any(|v| v.payload.iter().any(|t| self.is_affine_visiting(&substitute_ty(t, &subst), visiting)));
+                    visiting.pop();
+                    result
                 } else {
                     // Unknown name -- `typeck.rs` reports this separately
                     // (`TypeErrorKind::UnknownType`); nothing sound to say

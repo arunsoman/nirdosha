@@ -206,27 +206,58 @@ const WGS84_E2: f64 = WGS84_F * (2.0 - WGS84_F);
 /// other affine leaf (`thread`, `sandbox`, `file`, `db`, `mq`) or a
 /// struct/enum containing one keeps the whole type rejected.
 fn affine_codegen_supported(registry: &TypeRegistry, ty: &Ty) -> bool {
+    let mut visiting = Vec::new();
+    affine_codegen_supported_visiting(registry, ty, &mut visiting)
+}
+
+/// `affine_codegen_supported`'s real recursion, guarded the same
+/// "track names on the current path, a repeat is the cycle" way
+/// `TypeRegistry::is_affine_visiting` is (`ast.rs`). Needed once
+/// `check_supported`'s `has_cyclic_layout` guard started letting a
+/// genuinely-finite `box`-indirected self-reference through (a
+/// `struct Node { next: box Node }` cons-list shape, same as any real
+/// language's) — that recursion crosses back into `Ty::Named` through
+/// the `Ty::Box` arm below with no size limit of its own, so without a
+/// `visiting` set it walks `Node -> box Node -> Node -> ...` forever,
+/// a real stack overflow confirmed empirically the same way
+/// `is_affine`'s own cycle bug was. A repeat on the path is sound to
+/// treat as "supported" here (not "unsupported", unlike
+/// `is_affine_visiting`'s `false`): the cycle is only reachable at all
+/// because every step across it was a `box` — the one affine leaf this
+/// function already tears down via `nir_free` — so a second pass over
+/// the same name can only re-confirm what the first pass already
+/// found, never turn up a new unsupported leaf.
+fn affine_codegen_supported_visiting(registry: &TypeRegistry, ty: &Ty, visiting: &mut Vec<String>) -> bool {
     if !registry.is_affine(ty) {
         return true;
     }
     match ty {
-        Ty::Box(inner) => affine_codegen_supported(registry, inner),
+        Ty::Box(inner) => affine_codegen_supported_visiting(registry, inner, visiting),
         Ty::Tcp | Ty::TcpListener => true,
         Ty::Named(name, args) => {
+            if visiting.iter().any(|v| v == name.as_str()) {
+                return true;
+            }
             if let Some(fields) = registry.struct_fields(name) {
                 let type_params = registry.struct_type_params(name).unwrap_or(&[]);
                 let subst = zip_type_params(type_params, args);
-                fields
+                visiting.push(name.clone());
+                let result = fields
                     .iter()
-                    .all(|f| affine_codegen_supported(registry, &substitute_ty(&f.ty, &subst)))
+                    .all(|f| affine_codegen_supported_visiting(registry, &substitute_ty(&f.ty, &subst), visiting));
+                visiting.pop();
+                result
             } else if let Some(variants) = registry.enum_variants(name) {
                 let type_params = registry.enum_type_params(name).unwrap_or(&[]);
                 let subst = zip_type_params(type_params, args);
-                variants.iter().all(|v| {
+                visiting.push(name.clone());
+                let result = variants.iter().all(|v| {
                     v.payload
                         .iter()
-                        .all(|t| affine_codegen_supported(registry, &substitute_ty(t, &subst)))
-                })
+                        .all(|t| affine_codegen_supported_visiting(registry, &substitute_ty(t, &subst), visiting))
+                });
+                visiting.pop();
+                result
             } else {
                 false
             }
@@ -589,8 +620,89 @@ fn agg_byte_size_operand(ty: &Ty, registry: &TypeRegistry) -> String {
 /// left here that needs a bespoke ctor-name check the way there used to
 /// be (a struct/variant construction is syntactically just `Expr::Call`,
 /// walked exactly like any other call below).
+/// True iff `ty`, expanded through direct (non-pointer) struct/enum field
+/// containment, transitively contains itself — the shape LLVM itself
+/// refuses at codegen time ("identified structure type 'X' is recursive":
+/// an infinite-size aggregate). `Box`/`Ref`/`Thread`/`Channel`/`Sandbox`/
+/// `Tcp`/`TcpListener`/`File`/`Fn` fields break the cycle on purpose —
+/// they're a fixed-size handle regardless of what's behind them, the same
+/// "pointer, not inline storage" reasoning `llvm_ty`'s `Ty::Box`/`Ty::Ref`
+/// arm documents — so only a field inlined directly into the aggregate's
+/// own byte layout can make it infinitely sized. `Vector`/`Matrix`
+/// inline their element `n`/`r*c` times (`llvm_ty`'s own `[len x elem]`
+/// lowering), so an element cycle is exactly as fatal as a struct-field
+/// one and is walked the same way. Mirrors
+/// `TypeRegistry::is_affine_visiting`'s "track names on the current path,
+/// a repeat is the cycle" shape (`ast.rs`, same 2026-08-27 pass this
+/// guards the codegen-only half of).
+fn has_cyclic_layout(ty: &Ty, registry: &TypeRegistry, visiting: &mut Vec<String>) -> bool {
+    match ty {
+        Ty::Named(name, args) => {
+            if visiting.iter().any(|v| v == name.as_str()) {
+                return true;
+            }
+            if let Some(fields) = registry.struct_fields(name) {
+                let subst = zip_type_params(registry.struct_type_params(name).unwrap_or(&[]), args);
+                visiting.push(name.clone());
+                let result = fields.iter().any(|f| has_cyclic_layout(&substitute_ty(&f.ty, &subst), registry, visiting));
+                visiting.pop();
+                result
+            } else if let Some(variants) = registry.enum_variants(name) {
+                let subst = zip_type_params(registry.enum_type_params(name).unwrap_or(&[]), args);
+                visiting.push(name.clone());
+                let result = variants
+                    .iter()
+                    .any(|v| v.payload.iter().any(|t| has_cyclic_layout(&substitute_ty(t, &subst), registry, visiting)));
+                visiting.pop();
+                result
+            } else {
+                // Unknown name -- typeck.rs reports this separately; no
+                // cycle to report from here.
+                false
+            }
+        }
+        Ty::Vector(elem, _) | Ty::Matrix(elem, _, _) => has_cyclic_layout(elem, registry, visiting),
+        // Every other `Ty` is either a plain scalar (nothing to recurse
+        // into) or a pointer-ish handle whose own size never depends on
+        // what it points to, so it can't be part of an infinite-size
+        // cycle regardless of what's behind it.
+        _ => false,
+    }
+}
+
 pub fn check_supported(program: &Program) -> Result<(), CodegenError> {
     let registry = TypeRegistry::build(program);
+    // Reject a cyclic struct/enum *declaration* itself, before any
+    // function signature or body is even walked — the same "reject,
+    // don't leak the backend's own error text" standard every other
+    // `check_supported` rejection already holds itself to, rather than
+    // letting `struct A { b: B } struct B { a: A }` reach real LLVM
+    // codegen and surface a raw `clang`/LLVM "identified structure type
+    // is recursive" error. `box`/`&` back-references remain fine (they
+    // don't recurse past a pointer field — see `has_cyclic_layout`'s doc
+    // comment), so this only fires on a genuinely infinite-size shape.
+    for s in &program.structs {
+        let mut visiting = vec![s.name.clone()];
+        if s.fields.iter().any(|f| has_cyclic_layout(&f.ty, &registry, &mut visiting)) {
+            return unsupported(format!(
+                "`{}` is a cyclic struct type -- one of its fields eventually contains `{}` \
+                 again with no `box`/`&` indirection in between, which has no finite size; wrap \
+                 the back-reference in `box {}` (or `&{}`) to break the cycle",
+                s.name, s.name, s.name, s.name
+            ));
+        }
+    }
+    for e in &program.enums {
+        let mut visiting = vec![e.name.clone()];
+        if e.variants.iter().any(|v| v.payload.iter().any(|t| has_cyclic_layout(t, &registry, &mut visiting))) {
+            return unsupported(format!(
+                "`{}` is a cyclic enum type -- one of its variants eventually contains `{}` \
+                 again with no `box`/`&` indirection in between, which has no finite size; wrap \
+                 the back-reference in `box {}` (or `&{}`) to break the cycle",
+                e.name, e.name, e.name, e.name
+            ));
+        }
+    }
     for f in &program.fns {
         for p in &f.params {
             llvm_ty(&p.ty, &registry)?;
