@@ -1,0 +1,15 @@
+{{- /* Only makes sense with >1 replica -- for the default single-
+StatefulSet-replica shape there is nothing to keep "disrupted down to." */ -}}
+{{- if and (eq .Values.db.mode "postgres") (gt (.Values.replicaCount | int) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "nirdosha.fullname" . }}
+  labels:
+    {{- include "nirdosha.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "nirdosha.selectorLabels" . | nindent 6 }}
+{{- end }}

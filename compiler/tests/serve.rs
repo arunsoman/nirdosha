@@ -373,3 +373,303 @@ fn otel_port_without_a_token_is_rejected_at_cli_startup() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--otel-token"), "expected the error to mention --otel-token, got: {stderr}");
 }
+
+// ---- Kubernetes compliance: /healthz, /readyz, /metrics, SIGTERM, ------
+// ---- token files, and the postgres --db fail-fast guard ---------------
+// (KUBERNETES.md's P0/P1/P2 rows)
+
+#[test]
+fn healthz_returns_200_immediately() {
+    let port = start_server(None);
+    let (status, body) = http_request(port, "GET", "/healthz", "", None);
+    assert_eq!(status, 200);
+    assert!(body.contains("\"status\":\"ok\""), "body was: {body}");
+}
+
+#[test]
+fn readyz_returns_200_with_no_db_configured() {
+    let port = start_server(None);
+    let (status, body) = http_request(port, "GET", "/readyz", "", None);
+    assert_eq!(status, 200, "body was: {body}");
+    assert!(body.contains("\"status\":\"ready\""), "body was: {body}");
+    assert!(body.contains("not configured"), "body was: {body}");
+}
+
+#[test]
+fn readyz_reports_real_db_connectivity_when_db_is_configured() {
+    let port = free_port();
+    let program = Arc::new(build_program(SRC));
+    let db_path = std::env::temp_dir().join(format!("nirdosha-test-readyz-db-{port}.db"));
+    let transact_log = std::env::temp_dir().join(format!("nirdosha-test-readyz-transact-{port}.db"));
+    let workflow_log = std::env::temp_dir().join(format!("nirdosha-test-readyz-workflow-{port}.db"));
+    let db_path_str = db_path.to_string_lossy().into_owned();
+    std::thread::spawn(move || {
+        nirdosha::serve::run(
+            program,
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            transact_log,
+            workflow_log,
+            None,
+            Some(db_path_str),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("serve::run should not fail to bind");
+    });
+    for _ in 0..100 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (status, body) = http_request(port, "GET", "/readyz", "", None);
+    assert_eq!(status, 200, "body was: {body}");
+    assert!(body.contains("db: ok"), "expected a real `SELECT 1` check against the configured --db, body was: {body}");
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn metrics_endpoint_reports_prometheus_text_format_with_real_counts() {
+    let port = start_server(None);
+    let _ = http_request(port, "GET", "/", "", None); // 200
+    let _ = http_request(port, "POST", "/api/no_such_fn", "{}", None); // 404
+    let (status, body) = http_request(port, "GET", "/metrics", "", None);
+    assert_eq!(status, 200);
+    assert!(body.contains("# TYPE nirdosha_requests_total counter"), "body was: {body}");
+    assert!(body.contains("nirdosha_responses_total{class=\"2xx\"}"), "body was: {body}");
+    assert!(body.contains("nirdosha_responses_total{class=\"4xx\"}"), "body was: {body}");
+    let total_line = body
+        .lines()
+        .find(|l| l.starts_with("nirdosha_requests_total "))
+        .unwrap_or_else(|| panic!("total counter line missing from: {body}"));
+    let total: u64 = total_line.trim_start_matches("nirdosha_requests_total ").trim().parse().expect("counter value must parse as an integer");
+    assert!(total >= 2, "expected at least the 2 prior requests counted (not counting this /metrics call), got {total}");
+}
+
+#[test]
+fn db_flag_pointed_at_postgres_is_rejected_with_a_clear_error_not_silently_misused() {
+    let port = free_port();
+    let program = Arc::new(build_program(SRC));
+    let transact_log = std::env::temp_dir().join(format!("nirdosha-test-pgreject-transact-{port}.db"));
+    let workflow_log = std::env::temp_dir().join(format!("nirdosha-test-pgreject-workflow-{port}.db"));
+    let result = nirdosha::serve::run(
+        program,
+        "127.0.0.1",
+        port,
+        None,
+        None,
+        transact_log.clone(),
+        workflow_log.clone(),
+        None,
+        Some("postgres://user:pass@localhost/db".to_string()),
+        None,
+        None,
+        None,
+        None,
+    );
+    let err = result.expect_err("a postgres:// --db value must be rejected outright, not passed to rusqlite::Connection::open");
+    assert!(err.contains("--db"), "error should name the flag, got: {err}");
+    assert!(err.contains("Postgres") || err.contains("postgres"), "error should explain the gap, got: {err}");
+    for p in [
+        transact_log,
+        workflow_log,
+        std::path::PathBuf::from(format!("{}.lock", std::env::temp_dir().join(format!("nirdosha-test-pgreject-transact-{port}.db")).display())),
+    ] {
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(format!("{}.lock", std::env::temp_dir().join(format!("nirdosha-test-pgreject-workflow-{port}.db")).display()));
+    }
+}
+
+/// The actual `KUBERNETES.md` "politeness gap" fix: a real subprocess,
+/// sent a real `SIGTERM`, must exit promptly and cleanly (exit code 0)
+/// instead of requiring the orchestrator to wait out a full
+/// `terminationGracePeriodSeconds` and escalate to `SIGKILL`. Durability
+/// under a hard kill is already proven elsewhere
+/// (`tests/transact_process_kill.rs`) — this test is specifically about
+/// the *polite* path this change adds.
+#[test]
+fn sigterm_causes_prompt_graceful_shutdown() {
+    let exe = env!("CARGO_BIN_EXE_nirdosha");
+    let mut src_file = std::env::temp_dir();
+    src_file.push(format!("nirdosha_test_sigterm_{}.nir", std::process::id()));
+    std::fs::write(&src_file, SRC).expect("write temp source file");
+    let port = free_port();
+
+    let mut child = std::process::Command::new(exe)
+        .arg("serve")
+        .arg(&src_file)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("nirdosha serve should launch");
+
+    let mut up = false;
+    for _ in 0..150 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            up = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(up, "server never came up");
+
+    let pid = child.id();
+    let kill_status = std::process::Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
+    assert!(kill_status.map(|s| s.success()).unwrap_or(false), "sending SIGTERM to the child should succeed");
+
+    let start = Instant::now();
+    let exit_status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait should not error") {
+            break status;
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("process did not exit within 5s of SIGTERM -- the shutdown-flag poll loop should notice within ~200ms");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(exit_status.success(), "a clean SIGTERM shutdown should exit 0, got {exit_status:?}");
+
+    let _ = std::fs::remove_file(&src_file);
+    for suffix in [".transact.db", ".transact.db.lock", ".workflow.db", ".workflow.db.lock"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", src_file.display()));
+    }
+}
+
+#[test]
+fn presence_token_and_presence_token_file_are_mutually_exclusive() {
+    let exe = env!("CARGO_BIN_EXE_nirdosha");
+    let mut src_file = std::env::temp_dir();
+    src_file.push(format!("nirdosha_test_presence_conflict_{}.nir", std::process::id()));
+    std::fs::write(&src_file, SRC).expect("write temp source file");
+    let mut token_file = std::env::temp_dir();
+    token_file.push(format!("nirdosha_test_presence_token_{}.txt", std::process::id()));
+    std::fs::write(&token_file, "secret\n").expect("write token file");
+
+    let output = std::process::Command::new(exe)
+        .arg("serve")
+        .arg(&src_file)
+        .arg("--port")
+        .arg(free_port().to_string())
+        .arg("--presence-token")
+        .arg("raw-secret")
+        .arg("--presence-token-file")
+        .arg(&token_file)
+        .output()
+        .expect("nirdosha serve should launch");
+    let _ = std::fs::remove_file(&src_file);
+    let _ = std::fs::remove_file(&token_file);
+
+    assert!(!output.status.success(), "passing both --presence-token and --presence-token-file must be rejected");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("mutually exclusive"), "expected a clear conflict error, got: {stderr}");
+}
+
+/// End-to-end: `--presence-token-file` must authenticate a real request
+/// exactly the way `--presence-token`'s raw value already does — proving
+/// the file-based flag isn't just accepted at parse time but actually
+/// wired through to `handle_presence`'s constant-time comparison.
+#[test]
+fn presence_token_file_authenticates_a_real_presence_request() {
+    let exe = env!("CARGO_BIN_EXE_nirdosha");
+    let mut src_file = std::env::temp_dir();
+    src_file.push(format!("nirdosha_test_presence_file_{}.nir", std::process::id()));
+    std::fs::write(&src_file, SRC).expect("write temp source file");
+    let mut token_file = std::env::temp_dir();
+    token_file.push(format!("nirdosha_test_presence_token_ok_{}.txt", std::process::id()));
+    // Trailing newline on purpose -- exercises `read_token_file`'s
+    // exactly-one-newline trim (the common `echo secret > file`/
+    // Kubernetes Secret shape).
+    std::fs::write(&token_file, "presence-secret\n").expect("write token file");
+    let port = free_port();
+
+    let mut child = std::process::Command::new(exe)
+        .arg("serve")
+        .arg(&src_file)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--presence-token-file")
+        .arg(&token_file)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("nirdosha serve should launch");
+
+    let mut up = false;
+    for _ in 0..150 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            up = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(up, "server never came up");
+
+    let (wrong_status, _) = http_request(port, "POST", "/api/_presence_connect", r#"{"subject":"alice"}"#, Some("Bearer not-the-secret"));
+    assert_eq!(wrong_status, 401, "a token that doesn't match the file's content must be rejected");
+
+    let (right_status, right_body) =
+        http_request(port, "POST", "/api/_presence_connect", r#"{"subject":"alice"}"#, Some("Bearer presence-secret"));
+    assert_eq!(right_status, 200, "the trimmed file content must authenticate successfully, body was: {right_body}");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&src_file);
+    let _ = std::fs::remove_file(&token_file);
+    for suffix in [".transact.db", ".transact.db.lock", ".workflow.db", ".workflow.db.lock"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", src_file.display()));
+    }
+}
+
+#[test]
+fn otel_token_file_satisfies_the_otel_port_all_or_nothing_check() {
+    let exe = env!("CARGO_BIN_EXE_nirdosha");
+    let mut src_file = std::env::temp_dir();
+    src_file.push(format!("nirdosha_test_otel_token_file_{}.nir", std::process::id()));
+    std::fs::write(&src_file, SRC).expect("write temp source file");
+    let mut token_file = std::env::temp_dir();
+    token_file.push(format!("nirdosha_test_otel_token_{}.txt", std::process::id()));
+    std::fs::write(&token_file, "otel-secret").expect("write token file"); // no trailing newline this time
+    let port = free_port();
+    let otel_port = free_port();
+
+    let mut child = std::process::Command::new(exe)
+        .arg("serve")
+        .arg(&src_file)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--otel-port")
+        .arg(otel_port.to_string())
+        .arg("--otel-token-file")
+        .arg(&token_file)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("nirdosha serve should launch");
+
+    let mut up = false;
+    for _ in 0..150 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            up = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(up, "`--otel-port` with `--otel-token-file` (no raw --otel-token) must be accepted, not rejected as 'no token'");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&src_file);
+    let _ = std::fs::remove_file(&token_file);
+    for suffix in [".transact.db", ".transact.db.lock", ".workflow.db", ".workflow.db.lock"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", src_file.display()));
+    }
+}

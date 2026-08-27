@@ -1,0 +1,101 @@
+name: docker
+
+# Publishes ghcr.io/protobox/nirdosha-runtime — KUBERNETES.md's P0 item
+# ("no published nirdosha binary/base image exists yet"), and protobox's
+# plugins/languages/nirdosha.py's own `docker_image` field, which already
+# names this target. Separate from release.yml (which cross-compiles the
+# raw binaries for the curl-installer/manual-download path) because this
+# one needs Docker Buildx + registry auth, not a Rust target matrix.
+#
+# Multi-arch (amd64/arm64) via a single `docker buildx build --platform`
+# invocation, using QEMU emulation for the arm64 leg — release.yml's own
+# per-arch native cross-compilation is faster but would need a second,
+# differently-shaped job here just to reuse those binaries inside a
+# multi-arch manifest; a plain emulated buildx build is simpler and this
+# image is published once per tag, not on every commit, so the extra
+# build time is an acceptable trade here.
+#
+# Signed (cosign, keyless via GitHub OIDC — no key material to manage or
+# leak) and SBOM'd (syft, attached as an attestation) on every publish —
+# KUBERNETES.md's "SBOM / image signing (Sigstore, SLSA)" row.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write # cosign keyless signing
+
+env:
+  IMAGE: ghcr.io/protobox/nirdosha-runtime
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (for the arm64 leg)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          ref="${GITHUB_REF_NAME}"
+          if [[ "$ref" == v* ]]; then
+            echo "tags=${IMAGE}:${ref},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=${IMAGE}:sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          # Referenced by digest for signing/SBOM below, so both attach
+          # to the exact manifest list that was actually pushed, not a
+          # tag that could move.
+          provenance: false
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the published image (keyless, Sigstore/Fulcio+Rekor)
+        run: |
+          cosign sign --yes "${IMAGE}@${{ steps.build.outputs.digest }}"
+
+      - name: Generate SBOM (syft) and attach as an attestation
+        uses: anchore/sbom-action@v0
+        with:
+          image: "${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
+          format: spdx-json
+          output-file: nirdosha-runtime.sbom.spdx.json
+
+      - name: Attest the SBOM to the published image (cosign)
+        run: |
+          cosign attest --yes --predicate nirdosha-runtime.sbom.spdx.json --type spdxjson "${IMAGE}@${{ steps.build.outputs.digest }}"
+
+      - name: Upload SBOM as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nirdosha-runtime-sbom
+          path: nirdosha-runtime.sbom.spdx.json

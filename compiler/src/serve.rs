@@ -52,7 +52,9 @@
 //! cache to consult.
 
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rust_decimal::Decimal;
 use serde_json::Value as JsonVal;
@@ -106,6 +108,143 @@ fn read_limited_body(request: &mut tiny_http::Request) -> Result<String, (u16, S
         Ok(body) => Ok(body),
         Err(e) => Err((400, json_err(&format!("request body is not valid UTF-8: {e}")))),
     }
+}
+
+/// `NIRDOSHA_LOG_FORMAT=json` switches this server's own lifecycle log
+/// lines (bind, migration, crash replay, shutdown -- NOT per-request
+/// errors, which already carry their own status/body) from the plain
+/// `eprintln!` text every one of them used before, to one-line JSON
+/// objects a log pipeline (Loki/ELK/CloudWatch) can parse without a
+/// regex (`KUBERNETES.md`'s "Observability" row: `--format=json` already
+/// existed for the *interpreter's* diagnostics, but nothing covered
+/// `serve`'s own lifecycle log). An env var rather than a new `run()`
+/// parameter deliberately: every existing test in `tests/*.rs` calls
+/// `serve::run(...)` positionally with today's exact argument list, and
+/// `main.rs::cmd_serve` is the only real caller that would ever need to
+/// pass this — same seam `NIRDOSHA_BIN`/`NIRDOSHA_TEST_ROLE_MAPPING_TTL_MS`
+/// already use for exactly this "operator/CLI wants to flip a behavior
+/// without changing every test call site" reason. `false` (plain text)
+/// is the default -- byte-for-byte the same output this server always
+/// produced.
+fn log_json_enabled() -> bool {
+    std::env::var("NIRDOSHA_LOG_FORMAT").map(|v| v.eq_ignore_ascii_case("json")).unwrap_or(false)
+}
+
+/// One lifecycle log line, in whichever format `log_json_enabled()`
+/// selects. `level` is a bare word (`"info"`/`"error"`) so a JSON
+/// consumer can filter on it without parsing free text.
+fn log_lifecycle(level: &str, msg: &str) {
+    if log_json_enabled() {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        println!(
+            "{}",
+            serde_json::json!({"ts": now, "level": level, "component": "nirdosha-serve", "msg": msg})
+        );
+    } else {
+        eprintln!("nirdosha serve: {msg}");
+    }
+}
+
+/// Process-lifetime request counters behind `GET /metrics`
+/// (`KUBERNETES.md`'s "Observability" row: "Net-new -- request
+/// counts/latencies from `serve.rs`'s dispatch loop would be the natural
+/// first cut"). Plain `AtomicU64`s, not a `Mutex`-guarded struct: this
+/// server handles one request at a time on one thread (this module's own
+/// doc comment), so there is never real contention to protect against —
+/// atomics are just the cheapest way to get interior mutability from a
+/// `&Metrics` shared across loop iterations without restructuring the
+/// loop into something that owns `&mut self`. Deliberately hand-rolled
+/// Prometheus text exposition format rather than pulling in the
+/// `prometheus` crate: five counters/gauges is well under the complexity
+/// where that dependency earns its cost, and the exposition format
+/// itself is a stable, trivial-to-hand-write text protocol.
+struct Metrics {
+    requests_total: AtomicU64,
+    responses_2xx: AtomicU64,
+    responses_4xx: AtomicU64,
+    responses_5xx: AtomicU64,
+    responses_other: AtomicU64,
+    latency_ms_sum: AtomicU64,
+    started_at: Instant,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        Self {
+            requests_total: AtomicU64::new(0),
+            responses_2xx: AtomicU64::new(0),
+            responses_4xx: AtomicU64::new(0),
+            responses_5xx: AtomicU64::new(0),
+            responses_other: AtomicU64::new(0),
+            latency_ms_sum: AtomicU64::new(0),
+            started_at: Instant::now(),
+        }
+    }
+
+    fn record(&self, status: u16, elapsed: Duration) {
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+        self.latency_ms_sum.fetch_add(elapsed.as_millis() as u64, Ordering::Relaxed);
+        let bucket = match status {
+            200..=299 => &self.responses_2xx,
+            400..=499 => &self.responses_4xx,
+            500..=599 => &self.responses_5xx,
+            _ => &self.responses_other,
+        };
+        bucket.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Prometheus text exposition format (v0.0.4) -- `# HELP`/`# TYPE`
+    /// then one sample per line, the minimum a real `/metrics` scrape
+    /// target needs to be valid input to `promtool check metrics` or a
+    /// live Prometheus scrape.
+    fn render(&self) -> String {
+        let total = self.requests_total.load(Ordering::Relaxed);
+        let sum_ms = self.latency_ms_sum.load(Ordering::Relaxed);
+        let avg_ms = if total > 0 { sum_ms as f64 / total as f64 } else { 0.0 };
+        format!(
+            "# HELP nirdosha_requests_total Total HTTP requests handled since process start.\n\
+             # TYPE nirdosha_requests_total counter\n\
+             nirdosha_requests_total {total}\n\
+             # HELP nirdosha_responses_total HTTP responses by status class.\n\
+             # TYPE nirdosha_responses_total counter\n\
+             nirdosha_responses_total{{class=\"2xx\"}} {}\n\
+             nirdosha_responses_total{{class=\"4xx\"}} {}\n\
+             nirdosha_responses_total{{class=\"5xx\"}} {}\n\
+             nirdosha_responses_total{{class=\"other\"}} {}\n\
+             # HELP nirdosha_request_latency_ms_sum Sum of request handling latency in milliseconds.\n\
+             # TYPE nirdosha_request_latency_ms_sum counter\n\
+             nirdosha_request_latency_ms_sum {sum_ms}\n\
+             # HELP nirdosha_request_latency_ms_avg Mean request handling latency in milliseconds.\n\
+             # TYPE nirdosha_request_latency_ms_avg gauge\n\
+             nirdosha_request_latency_ms_avg {avg_ms:.3}\n\
+             # HELP nirdosha_uptime_seconds Seconds since this process started serving.\n\
+             # TYPE nirdosha_uptime_seconds gauge\n\
+             nirdosha_uptime_seconds {}\n",
+            self.responses_2xx.load(Ordering::Relaxed),
+            self.responses_4xx.load(Ordering::Relaxed),
+            self.responses_5xx.load(Ordering::Relaxed),
+            self.responses_other.load(Ordering::Relaxed),
+            self.started_at.elapsed().as_secs(),
+        )
+    }
+}
+
+/// `SIGTERM`/`SIGINT` -> a shared flag the request loop below polls
+/// between requests (`KUBERNETES.md`'s "Health & lifecycle" row: durability
+/// already survives a hard `SIGKILL` today -- `tests/transact_process_kill.rs`
+/// -- so this closes the *politeness* gap, not a correctness one: stop
+/// accepting new connections and exit promptly instead of waiting out a
+/// full `terminationGracePeriodSeconds` SIGKILL on every rolling restart).
+/// `signal_hook::flag::register` is async-signal-safe (it only sets an
+/// `AtomicBool`, no allocation, no locking) -- the one safe way to react
+/// to a signal from Rust without a full async runtime.
+fn install_shutdown_signal_handlers() -> Result<Arc<AtomicBool>, String> {
+    let flag = Arc::new(AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        signal_hook::flag::register(sig, Arc::clone(&flag))
+            .map_err(|e| format!("failed to install shutdown signal handler: {e}"))?;
+    }
+    Ok(flag)
 }
 
 /// Starts serving `program` on `port` and blocks forever (one request at
@@ -201,7 +340,7 @@ pub fn run(
             let token = otel_token.expect("cmd_serve requires --otel-token whenever --otel-port is set");
             crate::observability::spawn_otel_port_listener(Arc::clone(&t), p, token)
                 .map_err(|e| format!("failed to bind --otel-port {p}: {e}"))?;
-            eprintln!("nirdosha serve: APM port listening on http://127.0.0.1:{p} (dormant until an APM client connects)");
+            log_lifecycle("info", &format!("APM port listening on http://127.0.0.1:{p} (dormant until an APM client connects)"));
             Some(t)
         }
         None => None,
@@ -215,6 +354,35 @@ pub fn run(
     // arity cap (which only constrains `.nir`-authored calls). `None`
     // (the default) leaves every table exactly as it always rendered:
     // one unpaginated fetch, no new route reachable at all.
+    // `KUBERNETES.md`'s "State, data & horizontal scaling" row: unlike
+    // `--transact-log`/`--workflow-log` (`durability::LogTarget`) and
+    // `db_connect(...)` (`dbconn::DbConn`), this route talks to SQLite
+    // directly (`rusqlite::Connection::open`, right below) and has no
+    // Postgres branch at all -- a real gap in this codebase, not a
+    // protobox config gap (see that doc's own writeup). Rather than let a
+    // `postgres://...` value silently fall through to
+    // `rusqlite::Connection::open` (which would try to create a garbage
+    // local file literally named that URL and fail confusingly, or
+    // succeed and silently serve an empty, wrong database), fail fast
+    // here with a clear, actionable error -- the documented "explicitly
+    // scope multi-replica deployments to not rely on this feature" half
+    // of that row's two options, chosen over extending this route to
+    // Postgres itself (a materially larger, separately-scoped rewrite:
+    // `dispatch_table_query`/`load_role_mapping`/the view-gated
+    // pass-through-on-omit step in `dispatch` all build raw SQL and read
+    // back `rusqlite::types::Value` directly).
+    if let Some(p) = &db_path {
+        if p.starts_with("postgres://") || p.starts_with("postgresql://") {
+            return Err(format!(
+                "--db {p}: the generic /_nirdosha/table/<name> browser and role-mapping cache do not \
+                 support Postgres yet (see KUBERNETES.md's \"State, data & horizontal scaling\" row -- \
+                 a real gap in this codebase, not a protobox config gap). Point --db at a local SQLite \
+                 file instead, and do not rely on this feature for a >1-replica deployment; \
+                 --transact-log/--workflow-log and a program's own db_connect(...) calls already \
+                 support postgres:// for that."
+            ));
+        }
+    }
     let table_db: Option<Arc<std::sync::Mutex<rusqlite::Connection>>> = match &db_path {
         Some(p) => match rusqlite::Connection::open(p) {
             Ok(conn) => Some(Arc::new(std::sync::Mutex::new(conn))),
@@ -243,7 +411,7 @@ pub fn run(
         match crate::migrate::plan_and_apply(&program, &conn, &migrations_dir, &applied_at) {
             Ok(applied) => {
                 for f in &applied {
-                    eprintln!("migrate: applied {f}");
+                    log_lifecycle("info", &format!("migrate: applied {f}"));
                 }
             }
             Err(e) => return Err(format!("schema migration failed: {e}")),
@@ -279,7 +447,7 @@ pub fn run(
         match replay_interp.replay_pending_transactions() {
             Ok(outcomes) => {
                 for o in &outcomes {
-                    eprintln!("transact replay: {o:?}");
+                    log_lifecycle("info", &format!("transact replay: {o:?}"));
                 }
             }
             Err(e) => return Err(format!("transact durability log error during startup crash replay: {e}")),
@@ -290,7 +458,7 @@ pub fn run(
         match replay_interp.replay_pending_workflow_actions() {
             Ok(outcomes) => {
                 for o in &outcomes {
-                    eprintln!("workflow replay: {o:?}");
+                    log_lifecycle("info", &format!("workflow replay: {o:?}"));
                 }
             }
             Err(e) => return Err(format!("workflow log error during startup crash replay: {e}")),
@@ -298,11 +466,106 @@ pub fn run(
     }
 
     let server = tiny_http::Server::http((host, port)).map_err(|e| format!("failed to bind {host}:{port}: {e}"))?;
-    eprintln!("nirdosha serve: listening on http://{host}:{port}  (GET / for the UI, POST /api/<fn> for the API)");
+    log_lifecycle("info", &format!("listening on http://{host}:{port}  (GET / for the UI, POST /api/<fn> for the API)"));
 
-    for mut request in server.incoming_requests() {
+    // `KUBERNETES.md`'s "Health & lifecycle" row: stop accepting new
+    // connections and exit promptly on SIGTERM/SIGINT instead of forcing
+    // the orchestrator to wait out a full `terminationGracePeriodSeconds`
+    // and SIGKILL every rolling restart. Checked once at the top of every
+    // loop iteration, BEFORE the next `recv_timeout` call -- this server
+    // handles exactly one request at a time (module doc above), so "drain
+    // in-flight requests" here just means "finish whatever request is
+    // already inside this loop body," which happens for free by not
+    // interrupting it; the check below only ever skips picking up a *new*
+    // one once the flag is set.
+    let shutdown = install_shutdown_signal_handlers()?;
+    let metrics = Metrics::new();
+    // Bounded poll interval so the loop notices `shutdown` promptly even
+    // with no traffic arriving -- `recv_timeout` (unlike
+    // `incoming_requests()`/`recv()`) returns `Ok(None)` on a plain
+    // timeout instead of blocking forever, which is exactly the seam this
+    // needs and the only reason the loop below no longer uses
+    // `server.incoming_requests()`.
+    const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            log_lifecycle("info", "shutdown signal received, no request in flight -- exiting");
+            break;
+        }
+        let mut request = match server.recv_timeout(SHUTDOWN_POLL_INTERVAL) {
+            Ok(Some(r)) => r,
+            Ok(None) => continue, // no request within this poll window -- loop back to the shutdown check
+            Err(e) => {
+                log_lifecycle("error", &format!("error receiving request: {e}"));
+                continue;
+            }
+        };
+        let request_started_at = Instant::now();
         let method = request.method().clone();
         let url = request.url().to_string();
+
+        if method == tiny_http::Method::Get && url == "/healthz" {
+            // Liveness: answers the instant the listener is bound, no
+            // dependency check -- `KUBERNETES.md`'s own stated contract
+            // ("no dependency check needed for liveness specifically").
+            // By the time this loop can even run, migration + crash
+            // replay (both above, before `Server::http` binds at all)
+            // have already succeeded, so there is nothing further to
+            // verify here.
+            let mut resp = tiny_http::Response::from_string(r#"{"status":"ok"}"#)
+                .with_status_code(200)
+                .with_header(header("Content-Type", "application/json"));
+            for h in cors_headers() {
+                resp.add_header(h);
+            }
+            let _ = request.respond(resp);
+            metrics.record(200, request_started_at.elapsed());
+            continue;
+        }
+
+        if method == tiny_http::Method::Get && url == "/readyz" {
+            // Readiness (and, with a longer `failureThreshold`, a startup
+            // probe -- `KUBERNETES.md`'s own note that these can share a
+            // route): unlike `/healthz`, this genuinely checks the one
+            // thing that can go degraded *after* a successful startup --
+            // the `--db`-backed table/role-cache connection, if one was
+            // configured. No `--db` at all trivially passes (nothing to
+            // check), matching the same all-or-nothing posture every
+            // other `--db`-gated feature in this file already takes.
+            let (ready, detail) = match &table_db {
+                Some(db) => match db.lock() {
+                    Ok(conn) => match conn.query_row("SELECT 1", [], |_| Ok(())) {
+                        Ok(()) => (true, "db: ok".to_string()),
+                        Err(e) => (false, format!("db: {e}")),
+                    },
+                    Err(_) => (false, "db: mutex poisoned".to_string()),
+                },
+                None => (true, "db: not configured".to_string()),
+            };
+            let status = if ready { 200 } else { 503 };
+            let body = serde_json::json!({"status": if ready {"ready"} else {"not_ready"}, "detail": detail}).to_string();
+            let mut resp =
+                tiny_http::Response::from_string(body).with_status_code(status).with_header(header("Content-Type", "application/json"));
+            for h in cors_headers() {
+                resp.add_header(h);
+            }
+            let _ = request.respond(resp);
+            metrics.record(status, request_started_at.elapsed());
+            continue;
+        }
+
+        if method == tiny_http::Method::Get && url == "/metrics" {
+            let mut resp = tiny_http::Response::from_string(metrics.render())
+                .with_status_code(200)
+                .with_header(header("Content-Type", "text/plain; version=0.0.4"));
+            for h in cors_headers() {
+                resp.add_header(h);
+            }
+            let _ = request.respond(resp);
+            metrics.record(200, request_started_at.elapsed());
+            continue;
+        }
 
         if method == tiny_http::Method::Options {
             let mut resp = tiny_http::Response::from_string("").with_status_code(204);
@@ -310,6 +573,7 @@ pub fn run(
                 resp.add_header(h);
             }
             let _ = request.respond(resp);
+            metrics.record(204, request_started_at.elapsed());
             continue;
         }
 
@@ -327,6 +591,7 @@ pub fn run(
                 resp.add_header(h);
             }
             let _ = request.respond(resp);
+            metrics.record(200, request_started_at.elapsed());
             continue;
         }
 
@@ -335,11 +600,13 @@ pub fn run(
                 let body = match read_limited_body(&mut request) {
                     Ok(b) => b,
                     Err(status_body) => {
-                        let mut resp = tiny_http::Response::from_string(status_body.1).with_status_code(status_body.0);
+                        let status = status_body.0;
+                        let mut resp = tiny_http::Response::from_string(status_body.1).with_status_code(status);
                         for h in cors_headers() {
                             resp.add_header(h);
                         }
                         let _ = request.respond(resp);
+                        metrics.record(status, request_started_at.elapsed());
                         continue;
                     }
                 };
@@ -370,6 +637,7 @@ pub fn run(
                     resp.add_header(h);
                 }
                 let _ = request.respond(resp);
+                metrics.record(status, request_started_at.elapsed());
                 continue;
             }
             if url == "/api/_presence_connect" || url == "/api/_presence_disconnect" {
@@ -377,11 +645,13 @@ pub fn run(
                 let body = match read_limited_body(&mut request) {
                     Ok(b) => b,
                     Err(status_body) => {
-                        let mut resp = tiny_http::Response::from_string(status_body.1).with_status_code(status_body.0);
+                        let status = status_body.0;
+                        let mut resp = tiny_http::Response::from_string(status_body.1).with_status_code(status);
                         for h in cors_headers() {
                             resp.add_header(h);
                         }
                         let _ = request.respond(resp);
+                        metrics.record(status, request_started_at.elapsed());
                         continue;
                     }
                 };
@@ -399,17 +669,20 @@ pub fn run(
                     resp.add_header(h);
                 }
                 let _ = request.respond(resp);
+                metrics.record(status, request_started_at.elapsed());
                 continue;
             }
             if let Some(fn_name) = url.strip_prefix("/api/") {
                 let body = match read_limited_body(&mut request) {
                     Ok(b) => b,
                     Err(status_body) => {
-                        let mut resp = tiny_http::Response::from_string(status_body.1).with_status_code(status_body.0);
+                        let status = status_body.0;
+                        let mut resp = tiny_http::Response::from_string(status_body.1).with_status_code(status);
                         for h in cors_headers() {
                             resp.add_header(h);
                         }
                         let _ = request.respond(resp);
+                        metrics.record(status, request_started_at.elapsed());
                         continue;
                     }
                 };
@@ -457,6 +730,7 @@ pub fn run(
                     resp.add_header(h);
                 }
                 let _ = request.respond(resp);
+                metrics.record(status, request_started_at.elapsed());
                 continue;
             }
         }
@@ -466,7 +740,9 @@ pub fn run(
             resp.add_header(h);
         }
         let _ = request.respond(resp);
+        metrics.record(404, request_started_at.elapsed());
     }
+    log_lifecycle("info", "server stopped accepting requests, exiting cleanly");
     Ok(())
 }
 

@@ -1,0 +1,16 @@
+# NOT a strategic-merge overlay on top of ../../base -- the sqlite base
+# renders a StatefulSet and this mode needs a Deployment (a different
+# `kind` entirely, which Kustomize patches can't convert between
+# cleanly). This is a sibling static render instead
+# (`nirdosha-postgres.yaml`, generated the same way the base's own
+# nirdosha-sqlite.yaml is — see that file's own comment), standing in
+# for the Helm chart's `--set db.mode=postgres --set replicaCount=N
+# --set db.postgresSecretName=...` invocation. You must create the
+# `nirdosha-postgres` Secret (transact-log-url/workflow-log-url keys)
+# yourself before applying this — see KUBERNETES.md's P1 remediation
+# item.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: default
+resources:
+  - nirdosha-postgres.yaml

@@ -1,0 +1,21 @@
+apiVersion: v2
+name: nirdosha
+description: |
+  One process serves both the API and a UI generated from a single .nir
+  program (`nirdosha serve`) — see KUBERNETES.md in the repo root for the
+  compliance matrix this chart implements, and PROTOBOX_INTEGRATION.md
+  for how protobox's own `plugins/deploy_targets/kubernetes.py` renders
+  the same shape programmatically for a generated project. This chart is
+  for a human operator running nirdosha directly, without protobox.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/arunsoman/nirdosha
+sources:
+  - https://github.com/arunsoman/nirdosha
+keywords:
+  - nirdosha
+  - low-code
+  - crud
+maintainers:
+  - name: nirdosha
