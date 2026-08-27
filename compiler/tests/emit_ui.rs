@@ -385,7 +385,7 @@ fn theme_overrides_only_the_sections_it_sets() {
     // neutral-derived role (`--md-surface`) is still the only value
     // present, not overwritten to empty/garbage.
     assert!(!html.contains("--neutral-"));
-    assert!(html.contains("--md-surface: #fdfbff;"), "the baked-in MD3 light default should be untouched");
+    assert!(html.contains("--md-surface: #ffffff;"), "the baked-in MD3 light default should be untouched");
     // Exactly 2: the baked-in light `:root` default plus the baked-in
     // dark `@media` default -- both pre-existing, neither theme-driven.
     // A third occurrence would mean a neutral-derived override leaked in

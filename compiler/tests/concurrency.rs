@@ -1,7 +1,16 @@
-//! Tests for `spawn`/`join`/`thread <T>` (goal.md rows 2-3): the first,
-//! real-OS-thread-backed implementation of a Java-virtual-threads-style
-//! concurrency API. Race-freedom isn't implemented in this file's subject
-//! at all -- it's `ownership.rs` reusing its existing move-checker on
+//! Tests for `spawn`/`join`/`thread <T>` (goal.md rows 2-3) -- the
+//! language-level API, at real-OS-thread-backed correctness. Since when
+//! `spawn` started running on `thread_pool.rs`'s reused worker pool
+//! instead of one fresh `std::thread::spawn` per call (see that module's
+//! own doc comment for the full "why not literal Java-style virtual
+//! threads" reasoning), the resource-usage/reuse properties specifically
+//! have their own dedicated coverage in `tests/thread_pool_reuse.rs` and
+//! `thread_pool.rs`'s own unit tests -- this file stays about the
+//! *language-level contract* (a real thread runs the computation, `join`
+//! blocks and consumes the handle exactly once, a panic surfaces as
+//! `ThreadPanicked`), unaffected by how many physical OS threads end up
+//! backing it. Race-freedom isn't implemented in this file's subject at
+//! all -- it's `ownership.rs` reusing its existing move-checker on
 //! `spawn`'s arguments and on `join`'s handle (see `src/ownership.rs`'s
 //! `Expr::Spawn`/`Expr::Join` arms) -- so several tests here exist to pin
 //! that *that* is where the guarantee comes from, not anything thread-

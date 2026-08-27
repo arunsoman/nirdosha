@@ -53,7 +53,7 @@ fn list_shipment_inner(conn: db) -> Result(json, ErrorCode) {
 }
 
 fn list_shipment() -> Result(json, ErrorCode) requires(public) {
-    return match db_connect("measure_shipment.db") {
+    return match db_connect("/home/arun/Downloads/nirdosha/examples/measure_shipment.db") {
         Ok(conn) => list_shipment_inner(conn),
         Err(e) => Err(DbError(e)),
     }
@@ -73,7 +73,7 @@ fn create_shipment_inner(conn: db, s: Shipment) -> Result(i64, ErrorCode) {
 }
 
 fn create_shipment(s: Shipment) -> Result(i64, ErrorCode) requires(public) {
-    return match db_connect("measure_shipment.db") {
+    return match db_connect("/home/arun/Downloads/nirdosha/examples/measure_shipment.db") {
         Ok(conn) => create_shipment_inner(conn, s),
         Err(e) => Err(DbError(e)),
     }
@@ -93,7 +93,7 @@ fn delete_shipment_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
 }
 
 fn delete_shipment(id: i64) -> Result(i64, ErrorCode) requires(public) {
-    return match db_connect("measure_shipment.db") {
+    return match db_connect("/home/arun/Downloads/nirdosha/examples/measure_shipment.db") {
         Ok(conn) => delete_shipment_inner(conn, id),
         Err(e) => Err(DbError(e)),
     }

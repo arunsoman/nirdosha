@@ -59,7 +59,7 @@ fn list_invoiceline_inner(conn: db) -> Result(json, ErrorCode) {
 }
 
 fn list_invoice_line() -> Result(json, ErrorCode) requires(public) {
-    return match db_connect("money_invoice.db") {
+    return match db_connect("/home/arun/Downloads/nirdosha/examples/money_invoice.db") {
         Ok(conn) => list_invoiceline_inner(conn),
         Err(e) => Err(DbError(e)),
     }
@@ -83,7 +83,7 @@ fn create_invoiceline_inner(conn: db, line: InvoiceLine) -> Result(i64, ErrorCod
 }
 
 fn create_invoice_line(line: InvoiceLine) -> Result(i64, ErrorCode) requires(public) {
-    return match db_connect("money_invoice.db") {
+    return match db_connect("/home/arun/Downloads/nirdosha/examples/money_invoice.db") {
         Ok(conn) => create_invoiceline_inner(conn, line),
         Err(e) => Err(DbError(e)),
     }
@@ -103,7 +103,7 @@ fn delete_invoiceline_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
 }
 
 fn delete_invoice_line(id: i64) -> Result(i64, ErrorCode) requires(public) {
-    return match db_connect("money_invoice.db") {
+    return match db_connect("/home/arun/Downloads/nirdosha/examples/money_invoice.db") {
         Ok(conn) => delete_invoiceline_inner(conn, id),
         Err(e) => Err(DbError(e)),
     }

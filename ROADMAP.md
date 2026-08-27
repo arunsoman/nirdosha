@@ -387,6 +387,49 @@ messages.
   Needs a deliberate decision on which path (fragile-but-reuses-proven-
   logic vs. self-contained-but-newly-written) before landing.
 
+- **2026-08-27 — Default web-app style: real Nirdosha brand, not generic
+  Material Design 3.** `ui_gen_template.html`'s token *values* replaced
+  (names kept, so a per-project `--theme` override still works
+  unmodified) — navy/amber derived from `assets/brand/nirdosha-logo.png`
+  (sampled: navy `#1f1a52`, amber `#f89a1c`, the one accent that stays
+  byte-identical light/dark), IBM Plex Sans + IBM Plex Mono (Google
+  Fonts — the one deliberate network dependency this template now takes
+  on, degrading to a system sans-serif stack if the fetch fails), radii
+  pulled from Material's 28px pill down to 6-10px echoing the logo's own
+  squared brace glyph, brand icon embedded in the app-bar
+  (`ui_gen.rs::logo_data_uri`, same `include_bytes!`-at-compile-time
+  pattern `favicon_data_uri` already used). Signature element: the
+  active nav item gets a solid amber left-border bracket instead of a
+  filled pill, and every `:focus-visible` ring switched from primary-navy
+  to the amber accent specifically (a distinct color for "this is
+  interactive" was a real legibility improvement, not just brand
+  matching). Verified live via real screenshots on both demo apps (dark
+  mode; light mode reasoned through the same token structure, not
+  separately screenshotted), not just reading the CSS.
+  - **Real bug found and fixed along the way:** both demo apps'
+    `db_connect("money_invoice.db")`/`db_connect("measure_shipment.db")`
+    calls used a bare relative filename — resolved against the *server
+    process's* cwd at connect time, not the app's own source location.
+    Restarting either server from a different working directory (which
+    happened repeatedly this session) silently opened a **different**
+    SQLite file than the one `--db`'s auto-migration touched — the app's
+    own CRUD functions and the `/_nirdosha/table/<name>` browse route
+    disagreed on row count as a result, caught by actually checking that
+    route's response rather than trusting the CRUD API alone worked.
+    Fixed by hardcoding the absolute path in both `.nir` files.
+  - **Environment note, not a code issue:** mid-verification, `cargo
+    test --release` started failing with real compile errors
+    (`src/pool.rs`, `E0015`/`E0308`) that trace to an r2d2 connection-
+    pooling change neither authored nor requested this session
+    (`compiler/Cargo.toml`'s `r2d2`/`r2d2_sqlite`/`r2d2_postgres`
+    additions, `src/pool.rs` itself untracked, both modified after this
+    session's own last clean full-suite run) — concurrent work landing
+    in the same working tree from elsewhere, mid-edit and currently
+    broken. Not touched here (not this session's to fix); this session's
+    own changes were full-suite-verified *before* that landed, plus
+    live-verified after via running servers built from that clean state.
+    Re-run `cargo test` once that pooling work finishes or is reverted.
+
 ---
 
 ## Standards & compliance posture
@@ -1282,6 +1325,129 @@ of Track B has landed.*
   feature (also `[OPEN]`, same `WORKFLOW.md` §9 review) or a hand-
   written `Escalated` transition in the workflow's own states — left to
   the app author, not something `sla` alone would automate.
+- `[DONE]` **A16. `spawn` created a brand-new real OS thread on every
+  single call, unconditionally — no reuse, and a real OS-level failure
+  to create one (`RLIMIT_NPROC`/`kernel.threads-max` exhaustion under
+  heavy load) was an uncatchable process panic, not a `.nir`-catchable
+  error.** Surfaced by a direct question: could `spawn` be made "dirt
+  cheap," the way Java's virtual threads or Go's goroutines let a
+  developer not think about the cost of spawning one? Verified directly:
+  `Expr::Spawn` (`interpreter.rs`) called the free-function
+  `std::thread::spawn` — which panics the whole process on failure,
+  Rust's own documented behavior — with no pooling, no reuse, one fresh
+  OS thread (default stack, real `pthread_create` cost) per `spawn`,
+  forever.
+
+  **Researched properly before building anything** (real prior art, not
+  guessed): Java's virtual threads work because the JVM controls its own
+  continuation representation at the bytecode level — a mechanism
+  unavailable to ahead-of-time-compiled Rust. Rust itself *had* green
+  threads before 1.0 and removed them deliberately (blocking I/O still
+  blocked the whole carrier thread; FFI/embedding got hard; stacks made
+  big enough to be safe lost their whole size advantage). The unsafe
+  stackful-coroutine crates that survive in the Rust ecosystem today
+  (`may`, etc.) are explicitly documented as capable of real undefined
+  behavior via thread-local storage — directly contradicting this
+  project's own memory-safety guarantees. Even Java's own fully-
+  resourced implementation still fights "carrier thread pinning" today
+  (a virtual thread blocked in a native/FFI call freezes its carrier) —
+  and this interpreter calls blocking native code (SQLite, TLS, Redis,
+  raw sockets) constantly, with zero cooperation points anywhere, so a
+  naive port would reintroduce exactly that failure mode with none of
+  the JVM's years of engineering behind it. Modern Rust's own real
+  answer to cheap M:N concurrency is `async`/`.await` + an executor like
+  Tokio (stackless task scheduling, not stackful green threads) — correct,
+  and how production Rust systems actually do this, but a from-scratch
+  rewrite of the interpreter's entire execution model (every blocking
+  builtin becoming a cooperative yield point), far too large and far too
+  risky to a correctness-critical, already-shipped subsystem to attempt
+  in one pass.
+
+  **2026-08-27 — built**, the safe, proven, 100%-Rust middle path: a
+  self-tuning, reused-worker OS thread pool (`thread_pool.rs`, new
+  module) backing `spawn` — `.nir`-visible behavior byte-for-byte
+  unchanged (no new grammar; `thread`/`spawn`/`join`/`chan` mean exactly
+  what they always meant), only the underlying resource cost changes.
+  `submit` never leaves a job waiting behind other work purely because
+  every worker is busy — no idle worker means a brand-new one is spawned
+  immediately, just for that job — the one property that structurally
+  rules out the classic bounded-thread-pool self-deadlock (a worker
+  blocked in `join` waiting on a child that can never get a worker to
+  run it). Idle workers retire after 10s of no work, so real OS thread
+  count tracks actual concurrent demand, not the lifetime total of
+  `spawn` calls. `thread_pool.rs`'s own module doc has the full design
+  rationale, including the exact deadlock-shaped bug this specific eager-
+  growth property avoids.
+
+  **The one genuinely delicate part, and a real bug found and fixed
+  along the way**: `DeadlockRegistry` (the existing, already-shipped
+  deadlock detector `ROADMAP.md` doesn't have its own entry for because
+  it long predates this file) was keyed by `std::thread::ThreadId` —
+  sound only when one OS thread's whole lifetime corresponds to exactly
+  one logical `spawn`, which stops being true the moment a worker is
+  reused for a second, later, unrelated task. Re-keyed to a new logical
+  `TaskId`, decoupled from whichever physical thread executes it at any
+  moment (a clean simplification in passing: the old `main_thread_id`
+  field's `OnceLock`-captured-on-whichever-thread-calls-`run_main`-first
+  fragility, documented at length in its own doc comment, is gone
+  entirely — `TaskId::MAIN` is just `0`, a real constant now). Found via
+  a new, real 200-level-deep recursive `.nir` spawn/join chain test (the
+  exact shape a naive bounded pool deadlocks on, run through the *actual*
+  parser/typeck/ownership/interpreter pipeline, not a synthetic Rust-only
+  check): a task must stay registered as "live" for as long as any
+  joiner might still be mid-check for it, not just until its own closure
+  finishes computing a result — unregistering too early (either right
+  after computing a result, or via the poll loop's old "unblock after
+  every timeout, re-register next iteration" flicker) let a finished-
+  but-not-yet-joined task transiently vanish from the coarse "is
+  everyone blocked" check's universe, producing an intermittent false
+  deadlock report under real scheduling pressure. Fixed by (1) moving
+  unregistration to the *joining* side (`PooledTaskHandle`'s own `Drop`
+  impl, firing only once a result has actually been consumed, or a
+  handle is abandoned) and (2) keeping a waiter continuously registered
+  across poll iterations instead of flickering on/off — the second half
+  of the fix applies equally to `Expr::Recv`'s identically-shaped loop,
+  a latent soundness gap in the *pre-existing* detector this session's
+  own new deep-chain test is what actually exposed, not something the
+  pooling change introduced on its own.
+
+  **What changed for the worse, on purpose, and why it's better**: a
+  real OS-level thread-creation failure is now `ErrorKind::
+  ThreadSpawnFailed` — a clean, catchable `.nir`-level `Err`, exercised
+  via an injectable-spawner unit test (not by actually exhausting real
+  OS threads, slow and flaky) — instead of the prior uncatchable process
+  panic. This is the literal "doesn't crumble under heavy load" fix: hitting
+  the OS thread ceiling used to kill the whole server; now it's a
+  recoverable error a `.nir` program can `match` on.
+
+  **What this deliberately does not solve, disclosed, not hidden**: a
+  task that calls a genuinely long *blocking* operation (a slow
+  `db_query`, a `recv` waiting on a real external `tcp` peer) still ties
+  up one real OS worker thread for that duration — pooling changes
+  *reuse between tasks*, not the cost of blocking itself. True cheapness
+  during blocking I/O specifically needs the async/Tokio rewrite named
+  above, a real, scoped, explicitly-not-attempted next step, not
+  papered over as already solved.
+
+  **Verified**: every pre-existing `tests/concurrency.rs` (9)/
+  `tests/deadlock.rs` (6)/`tests/sandbox_channels.rs` (8) test re-run
+  green, unmodified — proving the language-level contract is untouched.
+  New `thread_pool.rs` unit tests (7: reuse across sequential bursts,
+  idle-timeout shrink, the exact bounded-pool-deadlock shape proven
+  impossible via a 50-level Rust-level chain, injected spawn-failure
+  handling, panic containment). New `tests/thread_pool_reuse.rs` (5,
+  through the real `.nir` pipeline): 500 sequential spawn/join pairs
+  reuse ≤5 live workers; 500 genuinely concurrent spawns resolve
+  correctly; a real 200-level recursive `.nir` spawn/join chain resolves
+  without a false deadlock (repeated 28 times clean during development,
+  after being the exact test that first caught the false-positive race
+  above); a genuine `join`-cycle is still correctly detected alongside
+  unrelated successful spawns; **5,000 total spawns across 50 waves of
+  100 concurrent tasks complete correctly in well under a second, with
+  the live worker count staying near one wave's width instead of
+  growing with the lifetime total** — the direct, at-scale demonstration
+  of the actual "dirt cheap" claim. Full `cargo test` (all 64 test
+  binaries) reverified green.
 
 ---
 

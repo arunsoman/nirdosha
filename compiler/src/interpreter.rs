@@ -146,10 +146,13 @@ pub enum Value {
     /// static distinction corresponds to at the value level, even though
     /// nothing here currently depends on telling the two apart at runtime.
     Ref(Box<Value>),
-    /// A handle to a real OS thread running a spawned computation. The
+    /// A handle to a spawned computation — logically a single "thread,"
+    /// but not necessarily its own dedicated, freshly-created OS thread
+    /// underneath: `spawn` runs it on `thread_pool.rs`'s reused worker
+    /// pool (`PooledTaskHandle`'s own doc comment). The
     /// `Mutex<Option<..>>` wrapper exists for exactly one reason: `join`
-    /// needs to *take* the `JoinHandle` out (handles aren't `Clone` — a
-    /// thread can only be joined once, by design, matching `Ty::Thread`'s
+    /// needs to *take* the handle out (handles aren't `Clone` — a thread
+    /// can only be joined once, by design, matching `Ty::Thread`'s
     /// affine-ness), but this interpreter's `Env` clones every `Value` on
     /// read (documented above), so the handle needs a container that's
     /// cheap to clone (an `Arc`) while still letting exactly one clone
@@ -157,7 +160,7 @@ pub enum Value {
     /// has to be `Send` to be moved into a spawned thread's own captured
     /// arguments (e.g. a function spawning another function and handing
     /// it a thread handle), and `Rc` isn't.
-    Thread(Arc<Mutex<Option<ThreadHandle>>>),
+    Thread(Arc<Mutex<Option<PooledTaskHandle>>>),
     /// A handle to an unbounded, multi-producer multi-consumer message
     /// queue. `Arc`, not `Rc` (same reason as `Value::Thread`): has to be
     /// `Send` to cross into a spawned thread's captured arguments. Unlike
@@ -252,10 +255,70 @@ pub enum Value {
     Fn(Arc<str>),
 }
 
-/// A spawned computation's raw join handle. Its own alias, not just inline
-/// in `Value::Thread`, purely to keep clippy's `type_complexity` lint (and
-/// human readers) from tripping over four levels of generic nesting.
-type ThreadHandle = std::thread::JoinHandle<Result<Value, RuntimeError>>;
+/// The result a spawned task's job closure delivers once it finishes —
+/// `Ok(Ok(value))` for a normal return, `Ok(Err(runtime_error))` for a
+/// clean `.nir`-level error, or `Err(panic_payload)` if the task's
+/// closure itself panicked (`std::panic::catch_unwind`'s own payload
+/// type, `thread_pool.rs::worker_loop` catches it so one task panicking
+/// never takes its worker down). Named, not just inlined, for the same
+/// clippy `type_complexity` reason `ThreadHandle` (this type's
+/// predecessor, before `spawn` started running on `thread_pool.rs`'s
+/// reused workers instead of a dedicated `std::thread::spawn` per call)
+/// already had.
+type TaskOutcome = Result<Result<Value, RuntimeError>, Box<dyn std::any::Any + Send>>;
+
+/// `join`'s side of a spawned task, once `Expr::Spawn` hands it off to
+/// `thread_pool.rs`. `task_id` is what `DeadlockRegistry` tracks this
+/// task as (see `TaskId`'s own doc comment for why that's not simply
+/// "whichever `ThreadId` runs it" anymore); `result_rx` is the receiving
+/// end of a one-shot channel the job closure sends its `TaskOutcome`
+/// into right before it finishes — `join` polls it with
+/// `recv_timeout(DEADLOCK_POLL_INTERVAL)`, the same periodic-recheck
+/// shape `Expr::Recv`'s own wait already uses (a genuine improvement
+/// over the old `JoinHandle`-based `is_finished()` + `sleep` poll this
+/// replaces: a channel gives a real blocking-with-timeout primitive,
+/// `JoinHandle` never did).
+#[derive(Debug)]
+pub struct PooledTaskHandle {
+    task_id: TaskId,
+    result_rx: std::sync::mpsc::Receiver<TaskOutcome>,
+    /// Kept so `Drop` can unregister `task_id` — see the impl below for
+    /// why unregistration lives here, on the *receiving* side, rather
+    /// than in the spawned task's own closure right after it computes
+    /// its result.
+    registry: Arc<DeadlockRegistry>,
+}
+
+/// Found the hard way, via a real 200-level-deep recursive spawn/join
+/// chain that intermittently reported a false deadlock: if the spawned
+/// task's own closure called `spawn_finished` (removing `task_id` from
+/// `DeadlockRegistry::live_spawned`) right after computing its result —
+/// even *after* sending that result, which closes one race but not this
+/// one — there is a real window between "result sent" and "the joiner's
+/// own poll loop actually consumes it," during which the task has
+/// already vanished from the universe `check_and_register`'s coarse
+/// fallback considers, while the joiner is still correctly registered as
+/// `BlockedOn::Join(task_id)`. If, at that exact instant, every *other*
+/// live task also happens to be legitimately mid-wait (routine for a
+/// deep chain unwinding from the bottom up, where many levels finish in
+/// quick succession), the coarse check sees "everyone live is blocked"
+/// and reports a deadlock that was never real — the task that would have
+/// proven otherwise had already stopped counting as live.
+///
+/// The fix: don't unregister until the join side has actually consumed
+/// the result (this `Drop` impl, which only runs once `join`'s own local
+/// `handle: PooledTaskHandle` binding goes out of scope — *after*
+/// `result_rx.recv_timeout` has already returned the value) — or, for a
+/// handle that's never joined at all, once every `Arc` to it is dropped
+/// (ordinary affine-handle cleanup, the same timing every other
+/// `Value::Thread` lifecycle question already resolves to). Either way,
+/// `task_id` now stays "live" for its *entire* relevant lifetime, never
+/// vanishing from the universe while a joiner might still be mid-check.
+impl Drop for PooledTaskHandle {
+    fn drop(&mut self) {
+        self.registry.spawn_finished(self.task_id);
+    }
+}
 
 /// The shared state behind a `Value::Channel` — SANDBOXING.md's "one
 /// primitive, multiple transports" decision, made real: `send`/`recv`'s
@@ -586,31 +649,46 @@ impl Drop for ChannelInner {
 /// same pattern `tracer`/`sandbox_exe` already use — never across two
 /// independent runs (e.g. two concurrent `nirdosha serve` requests), each
 /// of which gets its own fresh registry from `Interpreter::new`.
+/// Identifies one *logical* spawned computation — deliberately **not**
+/// `std::thread::ThreadId` (what this used to be keyed by, before
+/// `spawn` started reusing worker threads via `thread_pool.rs`). Once a
+/// worker can execute more than one logical `spawn` over its lifetime,
+/// its `ThreadId` stops being a valid stand-in for "which spawned task
+/// is this" — two *sequential* tasks on the same reused worker are fine
+/// (the first is fully finished, unregistered, before the second
+/// starts), but the registry's bookkeeping needs an identity that means
+/// "this one spawn call," independent of which physical thread ends up
+/// running it or when. `TaskId(0)` is reserved for the main run (`MAIN`)
+/// — a real constant now, not a `OnceLock` captured lazily on whichever
+/// thread happens to call `run_main`/`call_named` first (see the old
+/// `main_thread_id` field's doc comment, in git history, for the
+/// fragility this replaces: capturing "which real OS thread is main" at
+/// the wrong moment was a real, previously-hard-to-diagnose bug source
+/// — a logical constant has no such moment to get wrong).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct TaskId(u64);
+
+impl TaskId {
+    pub(crate) const MAIN: TaskId = TaskId(0);
+}
+
+#[derive(Debug)]
 struct DeadlockRegistry {
-    /// **Not** captured at registry construction — `Interpreter::new`
-    /// (and so `DeadlockRegistry::new`) often runs on a throwaway setup
-    /// thread, not the thread that actually executes `.nir` code:
-    /// `run_main_on_big_stack`/`call_named_on_big_stack` construct the
-    /// interpreter on the *caller's* thread but then move it into a
-    /// freshly `std::thread::spawn`ed worker with a bigger stack
-    /// (`run_on_big_stack`) before ever calling `main`/the named
-    /// function — verified the hard way: capturing this at construction
-    /// made a plain `recv(chan)`-with-no-`send` program still hang
-    /// forever, silently, because `std::thread::current().id()` at
-    /// `new()` time never matched the id `check_and_register` later saw.
-    /// Set instead by `Interpreter::run_main`/`call_named` — the two
-    /// entry points a genuine top-level run always goes through and
-    /// `Expr::Spawn`'s own handler never does (it calls the lower-level
-    /// `Interpreter::call` directly) — the first time either actually
-    /// runs, on whichever real OS thread that turns out to be.
-    main_thread_id: std::sync::OnceLock<std::thread::ThreadId>,
-    /// Spawned threads currently alive — inserted at the top of
-    /// `Expr::Spawn`'s closure, removed once it returns. Doesn't include
-    /// `main_thread_id`; the whole-universe check adds that separately.
-    live_spawned: Mutex<HashSet<std::thread::ThreadId>>,
-    /// Every thread (main or spawned) currently blocked on `recv`/`join`,
+    /// Mints a fresh, globally-unique-within-this-registry `TaskId` for
+    /// each `spawn` — starts at 1 so 0 stays reserved for `TaskId::MAIN`.
+    next_task_id: std::sync::atomic::AtomicU64,
+    /// Spawned tasks currently alive — inserted synchronously by
+    /// `Expr::Spawn`'s handler the instant it decides to spawn (before
+    /// `thread_pool.rs` has necessarily even picked a worker for it, let
+    /// alone started running it — registration no longer depends on
+    /// *which* thread will eventually execute this task, only that the
+    /// task now exists), removed once its closure finishes. Doesn't
+    /// include `TaskId::MAIN`; the whole-universe check adds that
+    /// separately.
+    live_spawned: Mutex<HashSet<TaskId>>,
+    /// Every task (main or spawned) currently blocked on `recv`/`join`,
     /// and what it's waiting on.
-    blocked: Mutex<HashMap<std::thread::ThreadId, BlockedOn>>,
+    blocked: Mutex<HashMap<TaskId, BlockedOn>>,
 }
 
 /// How often a thread blocked on `recv`/`join` comes back up for air to
@@ -633,62 +711,61 @@ enum BlockedOn {
     /// Blocked in `recv` — *which* channel isn't tracked; see
     /// `DeadlockRegistry`'s own doc comment for why (alias analysis).
     Recv,
-    /// Blocked joining a specific thread — a precise edge, unlike `Recv`.
-    Join(std::thread::ThreadId),
+    /// Blocked joining a specific task — a precise edge, unlike `Recv`.
+    Join(TaskId),
 }
 
 impl DeadlockRegistry {
     fn new() -> Self {
         DeadlockRegistry {
-            main_thread_id: std::sync::OnceLock::new(),
+            next_task_id: std::sync::atomic::AtomicU64::new(1),
             live_spawned: Mutex::new(HashSet::new()),
             blocked: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Idempotent — safe to call more than once (e.g. `run_main` calling
-    /// `self.call(...)`, which never itself calls this). Only the first
-    /// call on any given registry actually sets anything.
-    fn mark_main_thread(&self) {
-        self.main_thread_id.get_or_init(|| std::thread::current().id());
+    fn mint_task_id(&self) -> TaskId {
+        TaskId(self.next_task_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Registers `id` as live — called by the *parent*, synchronously,
-    /// immediately after `std::thread::spawn` returns, using the new
-    /// `JoinHandle`'s own `.thread().id()`. **Must not** be done by
-    /// having the *child* register itself as its first action instead —
-    /// verified the hard way: `std::thread::spawn` returning in the
-    /// parent doesn't mean the child's closure has started running yet,
-    /// so a parent that immediately calls `recv`/`join` after spawning
-    /// can (and, under real scheduling, sometimes does) run its own
-    /// `check_and_register` before the child ever reaches a
-    /// self-registering line — the exact race that made ordinary,
-    /// correct `spawn` + `recv` programs intermittently report a false
-    /// deadlock. A `JoinHandle`'s `ThreadId` is assigned at OS thread-
-    /// creation time, available synchronously the instant `spawn`
-    /// returns, which is what makes registering here race-free.
-    fn spawn_started(&self, id: std::thread::ThreadId) {
+    /// the instant it decides to spawn, before `thread_pool.rs` has even
+    /// picked a worker for it. **Must not** be done by having the
+    /// spawned task register itself as its own first action instead —
+    /// verified the hard way (pre-pooling, but the same reasoning still
+    /// applies): a parent that immediately calls `recv`/`join` right
+    /// after spawning can race ahead of the task's own first line of
+    /// code, which used to be the exact race that made ordinary, correct
+    /// `spawn` + `recv` programs intermittently report a false deadlock.
+    /// A minted `TaskId` is available synchronously the instant it's
+    /// minted — trivially race-free, and (unlike the old `ThreadId`-based
+    /// version of this comment) no longer depends on a real OS thread
+    /// having been created at all yet.
+    fn spawn_started(&self, id: TaskId) {
         self.live_spawned.lock().unwrap().insert(id);
     }
 
-    fn spawn_finished(&self) {
-        self.live_spawned.lock().unwrap().remove(&std::thread::current().id());
+    fn spawn_finished(&self, id: TaskId) {
+        self.live_spawned.lock().unwrap().remove(&id);
     }
 
-    /// Registers the current thread as about to block on `on`, then
-    /// checks whether that provably makes the situation permanent (see
-    /// the two checks in this type's own doc comment). On `Err`, the
-    /// current thread's own registration is removed again (it's not
-    /// actually going to block — it's about to return this error
-    /// instead) and the caller must **not** proceed to the real,
-    /// potentially-blocking call. Any *other* thread named in the
-    /// returned message is left registered as blocked — accurate, not
-    /// stale, since a thread genuinely inside an unresolvable `recv`/
-    /// `join` wait will never call this registry again to say otherwise.
-    /// On `Ok(())`, the registration stays in place and the caller must
-    /// call `unblock` once its real wait returns.
-    fn check_and_register(&self, on: BlockedOn) -> Result<(), String> {
-        let me = std::thread::current().id();
+    /// Registers `me` as about to block on `on`, then checks whether
+    /// that provably makes the situation permanent (see the two checks
+    /// in this type's own doc comment). On `Err`, `me`'s own
+    /// registration is removed again (it's not actually going to block —
+    /// it's about to return this error instead) and the caller must
+    /// **not** proceed to the real, potentially-blocking call. Any
+    /// *other* task named in the returned message is left registered as
+    /// blocked — accurate, not stale, since a task genuinely inside an
+    /// unresolvable `recv`/`join` wait will never call this registry
+    /// again to say otherwise. On `Ok(())`, the registration stays in
+    /// place and the caller must call `unblock(me)` once its real wait
+    /// returns. `me` is `TaskId::MAIN` for the top-level run, or a
+    /// spawned task's own minted `TaskId` — never derived from
+    /// `std::thread::current()`, since with worker reuse the physical
+    /// thread executing `me` right now carries no information about
+    /// which logical task that is.
+    fn check_and_register(&self, me: TaskId, on: BlockedOn) -> Result<(), String> {
         let mut blocked = self.blocked.lock().unwrap();
         blocked.insert(me, on);
 
@@ -716,7 +793,7 @@ impl DeadlockRegistry {
             blocked.remove(&me);
             let chain = cycle.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(" -> ");
             return Err(format!(
-                "deadlock: {} thread(s) waiting on each other via `join`, in a cycle: {chain} -> {:?}",
+                "deadlock: {} task(s) waiting on each other via `join`, in a cycle: {chain} -> {:?}",
                 cycle.len(),
                 cycle[0]
             ));
@@ -726,15 +803,11 @@ impl DeadlockRegistry {
         // blocked? See the type's own doc comment for why this is sound
         // and what it deliberately doesn't catch.
         let mut universe: HashSet<_> = self.live_spawned.lock().unwrap().iter().copied().collect();
-        // Falls back to treating `me` as main if somehow never set (should
-        // never happen for a real top-level run — see this field's own
-        // doc comment) — sound either way: worst case this just narrows
-        // the universe by one thread that was going to be `me` regardless.
-        universe.insert(*self.main_thread_id.get().unwrap_or(&me));
+        universe.insert(TaskId::MAIN);
         if universe.iter().all(|t| blocked.contains_key(t)) {
             blocked.remove(&me);
             return Err(format!(
-                "deadlock: all {} live thread(s) are permanently blocked on `recv`/`join`, none left running to ever unblock any of them",
+                "deadlock: all {} live task(s) are permanently blocked on `recv`/`join`, none left running to ever unblock any of them",
                 universe.len()
             ));
         }
@@ -742,8 +815,8 @@ impl DeadlockRegistry {
         Ok(())
     }
 
-    fn unblock(&self) {
-        self.blocked.lock().unwrap().remove(&std::thread::current().id());
+    fn unblock(&self, me: TaskId) {
+        self.blocked.lock().unwrap().remove(&me);
     }
 }
 
@@ -930,11 +1003,11 @@ impl Drop for SandboxChild {
     }
 }
 
-/// Manual, not derived: `JoinHandle` has no `PartialEq`, so `Value` can't
-/// derive it once `Thread` exists. Two thread handles are equal only if
-/// they're literally the same handle (`Arc::ptr_eq`) — there's no
-/// sensible *value* equality for "is this running computation the same
-/// as that one" otherwise.
+/// Manual, not derived: `PooledTaskHandle` (an `mpsc::Receiver` inside)
+/// has no `PartialEq`, so `Value` can't derive it once `Thread` exists.
+/// Two thread handles are equal only if they're literally the same
+/// handle (`Arc::ptr_eq`) — there's no sensible *value* equality for "is
+/// this running computation the same as that one" otherwise.
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -1074,6 +1147,16 @@ pub enum ErrorKind {
     /// own panic payload isn't `Display`-friendly in general, so this
     /// carries a best-effort message rather than the raw payload.
     ThreadPanicked { message: String },
+    /// `spawn`'s own failure category, mirroring `SandboxSpawnFailed`
+    /// below — `thread_pool.rs::ThreadPool::submit` couldn't get a real
+    /// OS thread created at all (genuine resource exhaustion:
+    /// `RLIMIT_NPROC`/`kernel.threads-max`). Before `spawn` ran on a
+    /// reused worker pool, this case was an **uncatchable process
+    /// panic** (the free-function `std::thread::spawn` panics on
+    /// failure) — the whole reason `thread_pool.rs::ThreadPool::submit`
+    /// is fallible at all is to turn that into this: a normal,
+    /// `.nir`-catchable error instead of a crash.
+    ThreadSpawnFailed { message: String },
     /// Defense in depth, not a case `ownership.rs` should ever let
     /// through: joining a handle that was already joined. Kept as a real,
     /// structured runtime error (matching this file's existing pattern —
@@ -1202,6 +1285,9 @@ impl std::fmt::Display for RuntimeError {
             }
             ErrorKind::ThreadPanicked { message } => {
                 write!(f, "{line}:{col}: spawned thread panicked: {message}")
+            }
+            ErrorKind::ThreadSpawnFailed { message } => {
+                write!(f, "{line}:{col}: failed to spawn thread: {message}")
             }
             ErrorKind::AlreadyJoined => write!(f, "{line}:{col}: this thread was already joined"),
             ErrorKind::SandboxSpawnFailed { message } => {
@@ -3631,6 +3717,26 @@ pub struct Interpreter {
     /// already use — never a `pub` builder, since nothing outside this
     /// file's own `Expr::Spawn` handler should ever inject one.
     deadlock_registry: Arc<DeadlockRegistry>,
+    /// Which logical spawned task *this* `Interpreter` instance *is* —
+    /// `TaskId::MAIN` by default (the top-level run), overwritten by
+    /// `Expr::Spawn`'s handler on the fresh `Interpreter` it constructs
+    /// for each spawned task's job closure, using the `TaskId`
+    /// `DeadlockRegistry::mint_task_id` minted for it. Every
+    /// `check_and_register`/`unblock` call site in this file passes
+    /// `self.current_task` instead of deriving an identity from
+    /// `std::thread::current()` — see `TaskId`'s own doc comment for why
+    /// that stopped being valid once workers are reused.
+    current_task: TaskId,
+    /// The reused-worker pool `spawn` runs every task on — see
+    /// `thread_pool.rs`'s own module doc for the full design rationale.
+    /// `Interpreter::new`'s default constructs a fresh pool (correct for
+    /// a standalone run); `Expr::Spawn`'s handler shares the *same* pool
+    /// with every spawned task's own fresh `Interpreter`
+    /// (`Arc::clone(&self.thread_pool)`), the same pattern
+    /// `deadlock_registry` already uses and for the same reason: a task
+    /// spawning more tasks needs them all landing in one shared pool, not
+    /// each starting its own.
+    thread_pool: Arc<crate::thread_pool::ThreadPool>,
 }
 
 /// Past this many nested `call()`s, fail cleanly instead of overflowing
@@ -3791,6 +3897,8 @@ impl Interpreter {
             workflow_log_path: default_workflow_log_path(),
             workflow_log_cell: std::cell::OnceCell::new(),
             deadlock_registry: Arc::new(DeadlockRegistry::new()),
+            current_task: TaskId::MAIN,
+            thread_pool: crate::thread_pool::ThreadPool::new(),
         }
     }
 
@@ -3798,6 +3906,25 @@ impl Interpreter {
     /// `Expr::Spawn`'s handler, in this same file, ever calls this.
     fn with_deadlock_registry(mut self, registry: Arc<DeadlockRegistry>) -> Self {
         self.deadlock_registry = registry;
+        self
+    }
+
+    /// Not `pub` — same reasoning as `with_deadlock_registry`, and always
+    /// called alongside it (`Expr::Spawn`'s handler sets both on the same
+    /// freshly-constructed child `Interpreter`).
+    fn with_current_task(mut self, task: TaskId) -> Self {
+        self.current_task = task;
+        self
+    }
+
+    /// Not `pub` — same reasoning as `with_deadlock_registry`: every
+    /// spawned task must share the *same* pool as whoever spawned it
+    /// (so a task that itself spawns more tasks lands them in one shared
+    /// pool, not a fresh one per level of nesting), never a `pub`
+    /// builder an outside caller could point at a different pool by
+    /// mistake.
+    fn with_thread_pool(mut self, pool: Arc<crate::thread_pool::ThreadPool>) -> Self {
+        self.thread_pool = pool;
         self
     }
 
@@ -3835,11 +3962,23 @@ impl Interpreter {
         self
     }
 
+    /// Real OS worker threads `spawn` is currently backed by, right now
+    /// — a test/diagnostic seam only (mirrors `thread_pool.rs::
+    /// ThreadPool::live_worker_count`, which this just forwards to), for
+    /// proving reuse actually happens under a real `.nir` program's
+    /// `spawn` calls, not just `thread_pool.rs`'s own isolated unit
+    /// tests. Not meaningful to call concurrently with in-flight
+    /// `spawn`s from another thread (the number it returns is a
+    /// snapshot, not a synchronization point).
+    pub fn thread_pool_live_worker_count(&self) -> usize {
+        self.thread_pool.live_worker_count()
+    }
+
     pub fn run_main(&self) -> Result<Value, RuntimeError> {
-        // Always the real top-level entry point for a root interpreter's
-        // execution thread — see `DeadlockRegistry::main_thread_id`'s doc
-        // comment for why this can't be captured any earlier.
-        self.deadlock_registry.mark_main_thread();
+        // `self.current_task` is already `TaskId::MAIN` by construction
+        // (`Interpreter::new`'s default) — nothing to mark here anymore;
+        // see `TaskId`'s own doc comment for why that stopped needing a
+        // lazily-captured, easy-to-get-wrong runtime identity.
         let span = Span { line: 0, col: 0 };
         self.call("main", &[], span)
     }
@@ -3862,7 +4001,6 @@ impl Interpreter {
     /// `run_main` already uses one — there's no real call-site source
     /// position for "the CLI asked for this."
     pub fn call_named(&self, name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
-        self.deadlock_registry.mark_main_thread();
         self.call(name, args, Span { line: 0, col: 0 })
     }
 
@@ -5745,33 +5883,47 @@ impl Interpreter {
                     for a in arg_exprs {
                         vals.push(self.eval_expr(a, env)?);
                     }
-                    // Everything moved into the closure is owned, not
-                    // borrowed from `self`/`env` — `std::thread::spawn`
-                    // requires `'static`, and this is also the concrete,
-                    // checkable form of the race-freedom claim: the spawned
-                    // thread gets its *own* independent copy of the program
-                    // (a cheap `Arc` clone) and its *own* values (already
-                    // proven, by `ownership.rs`, to have been moved out of
-                    // the spawning side — see this file's module doc).
+                    // Everything moved into the job closure is owned, not
+                    // borrowed from `self`/`env` — `thread_pool.rs`'s `Job`
+                    // requires `'static`, same as `std::thread::spawn`
+                    // always did, and this is also the concrete, checkable
+                    // form of the race-freedom claim: the spawned task gets
+                    // its *own* independent copy of the program (a cheap
+                    // `Arc` clone) and its *own* values (already proven, by
+                    // `ownership.rs`, to have been moved out of the
+                    // spawning side — see this file's module doc).
                     let program = Arc::clone(&self.program);
                     let source = Arc::clone(&self.source);
                     let sandbox_exe = self.sandbox_exe.clone();
-                    // Observability layer 1: a spawned thread's own fresh
+                    // Observability layer 1: a spawned task's own fresh
                     // `Interpreter` inherits the same `tracer` via a cheap
                     // `Arc::clone`, the exact way `sandbox_exe` already
                     // threads through (see `tracer`'s doc comment) — every
-                    // thread's spans land in the same exporter/file.
+                    // task's spans land in the same exporter/file.
                     let tracer = self.tracer.clone();
                     let name = name.clone();
                     let call_span = *span;
                     // Same `Arc::clone` pattern as `tracer`/`sandbox_exe`
-                    // above — the child shares the *same* registry, not a
-                    // fresh one, so a `join`-cycle or "everyone's blocked"
-                    // condition spanning parent and child is actually
-                    // visible (see `DeadlockRegistry`'s doc comment).
+                    // above — the child shares the *same* registry and the
+                    // *same* pool, not fresh ones, so a `join`-cycle or
+                    // "everyone's blocked" condition spanning parent and
+                    // child is actually visible (see `DeadlockRegistry`'s
+                    // doc comment), and a task that itself spawns more
+                    // tasks lands them in the one shared pool.
                     let deadlock_registry = Arc::clone(&self.deadlock_registry);
                     let deadlock_registry_child = Arc::clone(&deadlock_registry);
-                    let handle = std::thread::spawn(move || {
+                    let thread_pool = Arc::clone(&self.thread_pool);
+                    // Minted and registered *before* `submit` is even
+                    // called — see `DeadlockRegistry::spawn_started`'s doc
+                    // comment for why this ordering is what makes
+                    // registration race-free now that a real OS thread
+                    // isn't necessarily created synchronously at all
+                    // (an idle pool worker might just be handed this job
+                    // instead).
+                    let task_id = deadlock_registry.mint_task_id();
+                    deadlock_registry.spawn_started(task_id);
+                    let (result_tx, result_rx) = std::sync::mpsc::channel::<TaskOutcome>();
+                    let job: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
                         let mut interp = Interpreter::new(program, source);
                         if let Some(exe) = sandbox_exe {
                             interp = interp.with_sandbox_exe(exe);
@@ -5779,21 +5931,51 @@ impl Interpreter {
                         if let Some(t) = tracer {
                             interp = interp.with_tracer(t);
                         }
-                        interp = interp.with_deadlock_registry(Arc::clone(&deadlock_registry_child));
-                        let result = interp.call(&name, &vals, call_span);
-                        deadlock_registry_child.spawn_finished();
-                        result
+                        interp = interp
+                            .with_deadlock_registry(Arc::clone(&deadlock_registry_child))
+                            .with_current_task(task_id)
+                            .with_thread_pool(Arc::clone(&thread_pool));
+                        // Contained here, not left to `thread_pool.rs`'s own
+                        // worker loop, so this closure can deliver the
+                        // panic payload itself as part of `TaskOutcome`,
+                        // matching `join`'s pre-pooling `JoinHandle::join`
+                        // panic handling exactly (same three-way
+                        // `Ok(Ok)`/`Ok(Err)`/`Err(panic)` shape) — the
+                        // pool's own `catch_unwind` around the whole job is
+                        // a second, redundant safety net in case sending on
+                        // an already-disconnected channel itself panicked,
+                        // not the primary mechanism.
+                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| interp.call(&name, &vals, call_span)));
+                        // Deliberately does **not** call `spawn_finished`
+                        // here — unregistering `task_id` happens on the
+                        // *receiving* side instead, via
+                        // `PooledTaskHandle`'s own `Drop` impl (see its
+                        // doc comment for the false-deadlock this fixes:
+                        // a task must stay "live" for as long as a
+                        // joiner might still be mid-check for it, not
+                        // just until its own closure finishes computing
+                        // a result).
+                        let _ = result_tx.send(outcome); // no receiver (handle dropped without join) is a harmless no-op
                     });
-                    // Registered here, synchronously in the *parent*,
-                    // right after `spawn` returns — not inside the
-                    // child's own closure. See `DeadlockRegistry::
-                    // spawn_started`'s doc comment for the race this
-                    // avoids: counts as "live" (part of the whole-
-                    // universe check) from this instant, for as long as
-                    // it could still possibly call `send`, not just while
-                    // it's actually inside a recv/join.
-                    deadlock_registry.spawn_started(handle.thread().id());
-                    Ok(Value::Thread(Arc::new(Mutex::new(Some(handle)))))
+                    if let Err(e) = self.thread_pool.submit(job) {
+                        // The job never ran at all -- undo the optimistic
+                        // "live" registration above (no `PooledTaskHandle`
+                        // is ever returned on this path, so its `Drop`
+                        // will never fire to do this instead), the same
+                        // way a `std::thread::spawn` that panicked on
+                        // resource exhaustion never got to run its
+                        // closure either (the difference: this is a
+                        // clean, catchable `.nir`-level error instead of
+                        // a process abort — see `thread_pool.rs`'s own
+                        // module doc for why that's the actual point of
+                        // this whole change).
+                        deadlock_registry.spawn_finished(task_id);
+                        return Err(Signal::Err(RuntimeError {
+                            kind: ErrorKind::ThreadSpawnFailed { message: e.to_string() },
+                            span: *span,
+                        }));
+                    }
+                    Ok(Value::Thread(Arc::new(Mutex::new(Some(PooledTaskHandle { task_id, result_rx, registry: deadlock_registry })))))
                 },
                 outcome_of_signal_result,
             ),
@@ -5814,8 +5996,25 @@ impl Interpreter {
                             let handle = slot.lock().unwrap().take();
                             match handle {
                                 None => Err(Signal::Err(RuntimeError { kind: ErrorKind::AlreadyJoined, span: *span })),
-                                Some(h) => {
-                                    let finish = |h: ThreadHandle| match h.join() {
+                                // Bound as a whole `handle`, not
+                                // destructured into `task_id`/`result_rx`
+                                // directly — `PooledTaskHandle` has a
+                                // `Drop` impl now (see its own doc
+                                // comment), and Rust doesn't allow moving
+                                // fields out of a type that implements
+                                // `Drop`. `task_id` is `Copy` (cheap to
+                                // read out); `result_rx`'s methods all
+                                // take `&self`, so borrowing through
+                                // `handle` is all this needs — `handle`
+                                // itself only actually drops (running
+                                // `PooledTaskHandle::drop`, unregistering
+                                // `task_id` from `DeadlockRegistry`) once
+                                // this whole match arm finishes, i.e.
+                                // *after* the result has already been
+                                // consumed below.
+                                Some(handle) => {
+                                    let task_id = handle.task_id;
+                                    let finish = |outcome: TaskOutcome| match outcome {
                                         Ok(Ok(result)) => Ok(result),
                                         Ok(Err(runtime_err)) => Err(Signal::Err(runtime_err)),
                                         Err(panic_payload) => {
@@ -5827,58 +6026,104 @@ impl Interpreter {
                                             Err(Signal::Err(RuntimeError { kind: ErrorKind::ThreadPanicked { message }, span: *span }))
                                         }
                                     };
-                                    // Fast path: a thread that already
-                                    // finished makes `.join()` return
-                                    // near-instantly — registering that as
-                                    // "blocked" at all would falsely flag
-                                    // completely ordinary "spawn, do other
-                                    // work, join later" code.
-                                    if h.is_finished() {
-                                        return finish(h);
+                                    // Fast path: a task that already
+                                    // finished has its outcome sitting in
+                                    // the channel already — registering
+                                    // that as "blocked" at all would
+                                    // falsely flag completely ordinary
+                                    // "spawn, do other work, join later"
+                                    // code.
+                                    if let Ok(outcome) = handle.result_rx.try_recv() {
+                                        return finish(outcome);
                                     }
-                                    let target_id = h.thread().id();
                                     // Poll rather than a single check-then-
                                     // block-forever — see `DEADLOCK_POLL_
                                     // INTERVAL`'s doc comment: a deadlock
-                                    // among *other* threads can finish
-                                    // forming after this thread already
-                                    // committed to waiting, and `join` (a
-                                    // real `JoinHandle::join`) has no
-                                    // timed variant to fall back on the
-                                    // way `recv_timeout` gives `Expr::Recv`
-                                    // — so instead of one blocking call,
-                                    // this loop *is* the wait, checked
-                                    // between short sleeps.
+                                    // among *other* tasks can finish
+                                    // forming after this one already
+                                    // committed to waiting. Unlike the old
+                                    // `JoinHandle`-based version of this
+                                    // (no timed variant, so it had to poll
+                                    // via `is_finished()` + `sleep`), a
+                                    // channel gives a real blocking-with-
+                                    // timeout primitive — the same
+                                    // `recv_timeout` shape `Expr::Recv`
+                                    // already uses.
                                     loop {
-                                        if h.is_finished() {
-                                            return finish(h);
-                                        }
-                                        // Registered against the real
-                                        // target's own `ThreadId` — a
-                                        // precise edge, unlike `recv`'s
-                                        // coarser one (see
+                                        // Registered against the target's
+                                        // own `TaskId` — a precise edge,
+                                        // unlike `recv`'s coarser one (see
                                         // `DeadlockRegistry`'s doc
-                                        // comment).
-                                        if let Err(message) = self.deadlock_registry.check_and_register(BlockedOn::Join(target_id)) {
+                                        // comment). Deliberately **not**
+                                        // paired with an `unblock` after
+                                        // every timeout below — staying
+                                        // continuously registered for the
+                                        // task's *whole* wait, not
+                                        // flickering unregistered-then-
+                                        // reregistered every
+                                        // `DEADLOCK_POLL_INTERVAL`, is
+                                        // load-bearing: found the hard way,
+                                        // via a real 200-level-deep
+                                        // recursive spawn/join chain, that
+                                        // flickering let many independent,
+                                        // unsynchronized waiters' brief
+                                        // "just unregistered, about to
+                                        // re-register" gaps occasionally
+                                        // all miss each other at once,
+                                        // making the coarse "is everyone
+                                        // live currently blocked" check
+                                        // transiently see the *entire*
+                                        // universe as blocked even though
+                                        // nothing was actually deadlocked —
+                                        // re-`insert`ing the same
+                                        // `(task_id, BlockedOn)` pair on
+                                        // every loop iteration below is a
+                                        // harmless no-op, not a fresh
+                                        // registration, so there is no
+                                        // correctness reason to have ever
+                                        // cleared it in between.
+                                        if let Err(message) = self.deadlock_registry.check_and_register(self.current_task, BlockedOn::Join(task_id)) {
                                             // Race guard, same reasoning as
                                             // `Expr::Recv`'s own: the check
                                             // itself takes real time, during
                                             // which the target can finish.
                                             // `check_and_register`'s `Err`
                                             // path already removed this
-                                            // thread's own registration.
-                                            if h.is_finished() {
-                                                return finish(h);
+                                            // task's own registration.
+                                            if let Ok(outcome) = handle.result_rx.try_recv() {
+                                                return finish(outcome);
                                             }
-                                            // A proven-permanent deadlock
-                                            // can never resolve — drop
-                                            // detaches the OS thread instead
-                                            // of hanging this one on it too.
-                                            drop(h);
                                             return Err(Signal::Err(RuntimeError { kind: ErrorKind::Deadlock { message }, span: *span }));
                                         }
-                                        std::thread::sleep(DEADLOCK_POLL_INTERVAL);
-                                        self.deadlock_registry.unblock();
+                                        let poll_result = handle.result_rx.recv_timeout(DEADLOCK_POLL_INTERVAL);
+                                        match poll_result {
+                                            Ok(outcome) => {
+                                                self.deadlock_registry.unblock(self.current_task);
+                                                return finish(outcome);
+                                            }
+                                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                                self.deadlock_registry.unblock(self.current_task);
+                                                // The sender is dropped only
+                                                // after it sends — reachable
+                                                // only if the job's own
+                                                // thread was torn down
+                                                // without running to
+                                                // completion at all (not a
+                                                // normal `.nir`-level
+                                                // outcome), same "shouldn't
+                                                // happen, but a clean error
+                                                // beats a silent hang"
+                                                // posture as everywhere else
+                                                // in this file.
+                                                return Err(Signal::Err(RuntimeError {
+                                                    kind: ErrorKind::ThreadPanicked {
+                                                        message: "the spawned task's worker was lost before it could report a result".to_string(),
+                                                    },
+                                                    span: *span,
+                                                }));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -6013,9 +6258,16 @@ impl Interpreter {
                                 // one-shot check isn't enough (a deadlock
                                 // among *other* threads can finish forming
                                 // after this thread already committed to
-                                // waiting).
+                                // waiting). Deliberately stays
+                                // continuously registered across timeout
+                                // iterations rather than `unblock`-ing
+                                // after every one and re-registering next
+                                // time around — see `Expr::Join`'s own,
+                                // identically-shaped loop for the exact
+                                // false-positive this flickering caused,
+                                // found via a real deep recursive chain.
                                 loop {
-                                    if let Err(message) = self.deadlock_registry.check_and_register(BlockedOn::Recv) {
+                                    if let Err(message) = self.deadlock_registry.check_and_register(self.current_task, BlockedOn::Recv) {
                                         // Race guard: `check_and_register`
                                         // itself takes real time: a value
                                         // can legitimately arrive in that
@@ -6028,11 +6280,14 @@ impl Interpreter {
                                         return Err(Signal::Err(RuntimeError { kind: ErrorKind::Deadlock { message }, span: *span }));
                                     }
                                     let poll_result = inner.recv_timeout(DEADLOCK_POLL_INTERVAL);
-                                    self.deadlock_registry.unblock();
                                     match poll_result {
-                                        Ok(Some(v)) => return Ok(v),
-                                        Ok(None) => continue, // timed out -- loop back and re-check for deadlock
+                                        Ok(Some(v)) => {
+                                            self.deadlock_registry.unblock(self.current_task);
+                                            return Ok(v);
+                                        }
+                                        Ok(None) => continue, // timed out -- stay registered, loop back and re-check for deadlock
                                         Err(e) => {
+                                            self.deadlock_registry.unblock(self.current_task);
                                             return Err(Signal::Err(RuntimeError {
                                                 kind: ErrorKind::ChannelIoError { message: e.to_string() },
                                                 span: *span,

@@ -584,7 +584,7 @@ real, separate feature, not shipped here.
 ## 7. Concurrency & I/O
 
 ```
-spawn f(args)              // real OS thread, returns thread T
+spawn f(args)              // returns thread T, backed by a real, reused OS worker thread
 join(t)                    // blocks, consumes the handle, returns T
 let c: chan T = chan
 send(c, v)                 // never blocks (unbounded queue)
@@ -609,6 +609,28 @@ sandboxed process as a real cross-process transport (a Unix domain
 socket under the hood). Race-freedom for concurrent code comes entirely
 from the ownership checker — an affine value moved into `spawn`/`send`
 can never be touched by the sender again.
+
+**`spawn` is backed by a self-tuning, reused-worker OS thread pool
+(`thread_pool.rs`), not one fresh `std::thread::spawn` per call** —
+`.nir`-visible behavior is unchanged (still a real OS thread runs each
+`spawn`'d computation; `join` still blocks and consumes the handle
+exactly once, same affine semantics), but the runtime cost is not "one
+new OS thread, every time": a program that spawns many short-lived tasks
+over its lifetime reuses a small, roughly-peak-concurrency-sized set of
+real threads instead of paying a fresh thread-creation cost for each
+one, and a genuine OS-level failure to create a thread (real resource
+exhaustion under heavy load) is now a clean, catchable runtime error
+(`ErrorKind::ThreadSpawnFailed`) instead of an uncatchable process
+panic. **This is deliberately not Java-style virtual threads** —
+see `thread_pool.rs`'s own module doc comment for the full reasoning
+(Rust has no safe primitive for stackful continuation-switching the way
+the JVM does; the actually-correct Rust answer, an async rewrite of the
+whole interpreter, is a disclosed, scoped, not-yet-started next step,
+not attempted here) — a `spawn`'d task that calls a genuinely long
+blocking operation (a slow `db_query`, a `recv` waiting on a real
+external peer) still ties up one real worker thread for that duration,
+same as before this existed; what changed is reuse between tasks, not
+the cost of blocking itself.
 
 ---
 

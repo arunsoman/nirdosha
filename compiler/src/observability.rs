@@ -190,6 +190,7 @@ pub fn error_kind_name(kind: &crate::interpreter::ErrorKind) -> &'static str {
         DivByZero => "DivByZero",
         MissingReturn { .. } => "MissingReturn",
         ThreadPanicked { .. } => "ThreadPanicked",
+        ThreadSpawnFailed { .. } => "ThreadSpawnFailed",
         AlreadyJoined => "AlreadyJoined",
         SandboxSpawnFailed { .. } => "SandboxSpawnFailed",
         AlreadySandboxStopped => "AlreadySandboxStopped",
