@@ -738,37 +738,61 @@ of Track B has landed.*
   before the backfill was added). Two new in-process reproduction tests
   in `tests/transact_durability.rs` plus the two now-passing existing
   negative controls. Full `cargo test` (700+ tests) reverified green.
-- `[OPEN]` **A2. Deployment story for the interpreted path** —
+- `[PARTIAL]` **A2. Deployment story for the interpreted path** —
   containerize `nirdosha serve` + source properly; secrets/JWKS
   handling; this is buildable now, independent of Track B. The simple
   case (copy a folder to a machine, run it, no orchestration) is now
   covered by **A6**'s `nirdosha init` below — a bundled executable +
-  `run.sh`/`run.bat` launcher. Containerization/real secrets management
-  for an actual production deployment is still open here. **Horizontal
-  scaling specifically is no longer just a missing-tooling gap here** —
-  see **A17** below: `workflow`/`transact`'s durability logs had no
-  multi-instance story at all (a real correctness wall, since fixed for
-  the Postgres case, `[DONE]`); what's left open in *this* item is purely
-  containers/orchestration/secrets, not durability correctness.
-  **2026-08-27 — full Kubernetes-specific breakdown done: see
+  `run.sh`/`run.bat` launcher. **Horizontal scaling specifically is no
+  longer just a missing-tooling gap here** — see **A17** below:
+  `workflow`/`transact`'s durability logs had no multi-instance story at
+  all (a real correctness wall, since fixed for the Postgres case,
+  `[DONE]`).
+  **2026-08-27 — full Kubernetes-specific breakdown done, then P0/P2/P3
+  and most of P1 actually implemented and locally verified: see
   `KUBERNETES.md`.** Source-verified compliance matrix (container/image,
   12-factor config, health/lifecycle probes, state/horizontal-scaling,
   networking, observability, security posture, deployment manifests)
-  plus a dependency-ordered P0→P3 remediation plan. Headline finding not
-  otherwise captured above: `serve.rs`'s `--db <path>` auxiliary layer
-  (the generic table-browser route + `RoleMappingCache`) opens a bare
-  `rusqlite::Connection` directly, bypassing `dbconn.rs`'s
-  Postgres-capable `DbConn` abstraction entirely (`serve.rs:218`) — this
-  stays single-instance even after A17's durability-log fix and even if
-  a project's own `db_connect(...)` literal is pointed at Postgres. Real
-  P1-tier gap, distinct from the general "no containers yet" P0 gap this
-  item already tracked. Companion positioning doc, same date:
-  `KUBERNETES_ADVANTAGE.md` — the case for nirdosha over a mainstream
-  k8s-targeted language (Go/Java/Node/Python) once this item's gaps
-  close: built-in kill-tested `transact` durability, a `workflow`
-  audit trail with no extra stateful service, one-process UI+API
-  footprint, compiled/enforced RBAC, and proven memory/overflow safety
-  with no GC.
+  plus a dependency-ordered P0→P3 remediation plan, then the plan itself
+  executed same day: repo-root `Dockerfile` (non-root, read-only-rootfs-
+  ready, multi-arch build via `.github/workflows/docker.yml`, cosign
+  signing + SBOM), `/healthz`/`/readyz`/`/metrics` added to `serve.rs`
+  with real integration tests, `SIGTERM`-triggered graceful shutdown
+  verified against a real subprocess + real signal, structured JSON
+  logs (`NIRDOSHA_LOG_FORMAT=json`), a Helm chart AND a Kustomize
+  base + Postgres-multi-replica overlay (`deploy/helm/nirdosha/`,
+  `deploy/kustomize/`), and protobox's own `kubernetes.py` deploy
+  target. Verified live end-to-end, not just built: `docker run` boots
+  the built image, `/healthz`/`/readyz`/`/metrics`/`POST /api/ping` all
+  answer correctly from the host, `docker stop` exits cleanly in ~0.4s,
+  UID 10001 non-root confirmed inside the container — this also caught
+  and fixed a real build/runtime base-image mismatch (`rust:1-slim-
+  trixie` build stage vs. a first `bookworm` runtime stage that failed
+  to even boot, `GLIBC_2.39'/`GLIBCXX_3.4.31' not found; both stages now
+  pinned to `trixie`).
+  What's still genuinely open, per `KUBERNETES.md`'s own remediation-
+  order section: (1) **P1's one disclosed gap** — `serve.rs`'s `--db
+  <path>` auxiliary layer (the generic table-browser route +
+  `RoleMappingCache`) opens a bare `rusqlite::Connection` directly,
+  bypassing `dbconn.rs`'s Postgres-capable `DbConn` abstraction entirely
+  (`serve.rs:218`) — this stays single-instance even after A17's
+  durability-log fix and even if a project's own `db_connect(...)`
+  literal is pointed at Postgres; judged too large a rewrite to fold into
+  this pass, so `--db postgres://...` now fails fast with a clear error
+  instead of being silently misused, rather than left silently broken;
+  (2) the built image has never actually been pushed to a real
+  `ghcr.io/protobox/nirdosha-runtime` registry from CI — the workflow
+  lints clean but that leg is unexercised; (3) P2's OTel Layer 2b (real
+  OTLP export) — tracked separately under **A3** below, never claimed
+  done here; (4) P3's mTLS via service-mesh sidecar — deliberately not
+  built into nirdosha itself, by design, consistent with TLS-for-`serve`
+  already being deferred to a reverse proxy, not a gap. Companion
+  positioning doc, same date: `KUBERNETES_ADVANTAGE.md` — the case for
+  nirdosha over a mainstream k8s-targeted language (Go/Java/Node/Python)
+  once this item's remaining gaps close: built-in kill-tested `transact`
+  durability, a `workflow` audit trail with no extra stateful service,
+  one-process UI+API footprint, compiled/enforced RBAC, and proven
+  memory/overflow safety with no GC.
 - `[OPEN]` **A3. Observability wired to something real** — the OTel
   tracer (`observability.rs`) exists; connect it to an actual
   collector/backend for a real deployment. Layer 2a is now done:

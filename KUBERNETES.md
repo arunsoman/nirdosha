@@ -148,7 +148,10 @@ otherwise), P3 done except mTLS (deliberately, by design — see below).**
 **P0 — make it schedulable at all — ✅ done.**
 - ✅ `ghcr.io/protobox/nirdosha-runtime`'s `Dockerfile` written, built,
   and smoke-tested locally (multi-stage: `rust:1-slim-trixie` build +
-  `python:3.12-slim-bookworm` runtime with `pytest`/`requests` baked
+  `python:3.12-slim-trixie` runtime, matching the build stage's Debian
+  release — see the "Container & image" table above for why a
+  bookworm runtime was tried first and genuinely failed to boot — with
+  `pytest`/`requests` baked
   in). `.github/workflows/docker.yml` publishes it on every `v*` tag
   (multi-arch, signed, SBOM'd) — lints clean, not yet run against the
   real registry.

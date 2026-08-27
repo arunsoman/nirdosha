@@ -195,14 +195,21 @@ already contains a bundled `nirdosha` binary and launcher. Once code
 generation (§3) has populated `<project-name>.nir`, the whole folder can be
 copied to a target machine (same OS/arch) and run with `./run.sh` — no
 separate `nirdosha` install needed there. Real production hardening
-(containerization, secrets management) is still open — `ROADMAP.md` Track
-A2. For running this on Kubernetes specifically — container image,
-health/readiness probes, graceful shutdown, and (the part that actually
-needs care) what changes once a project runs more than one replica —
-see `KUBERNETES.md`. For the case *for* nirdosha over a mainstream
-backend language for a k8s-targeted protobox project — built-in
-kill-tested transaction durability, a workflow audit trail with no
-extra service to run, one-process UI+API, compiled/enforced RBAC — see
+(containerization, orchestration manifests) is now largely built —
+`ROADMAP.md` Track A2, `[PARTIAL]`: a repo-root `Dockerfile`, a Helm
+chart, and a Kustomize base + Postgres-multi-replica overlay
+(`deploy/helm/nirdosha/`, `deploy/kustomize/`) all exist and are
+verified live (container boots, health endpoints answer, graceful
+`SIGTERM` shutdown confirmed against a real signal). For running this
+on Kubernetes specifically — the full compliance matrix, exactly which
+P0–P3 remediation items landed vs. what's still genuinely open (the
+one disclosed gap: `serve --db`'s table-browser/role-mapping layer has
+no Postgres option, so it stays single-instance even once the business
+DB and durability logs are pointed at Postgres) — see `KUBERNETES.md`.
+For the case *for* nirdosha over a mainstream backend language for a
+k8s-targeted protobox project — built-in kill-tested transaction
+durability, a workflow audit trail with no extra service to run,
+one-process UI+API, compiled/enforced RBAC — see
 `KUBERNETES_ADVANTAGE.md`.
 
 ## 8. Known gotchas checklist
@@ -234,14 +241,18 @@ extra service to run, one-process UI+API, compiled/enforced RBAC — see
   IdP registry") — `serve` takes exactly one `--jwks-file`/`--issuer`/
   `--audience` triple; a protobox project needing multiple trusted IdPs
   isn't supported yet.
-- **Containerized/production deployment story** (`ROADMAP.md` Track A2) —
-  `init`'s bundled-folder handoff (§7) covers "copy and run," not
-  orchestration, secrets rotation, or horizontal scaling. Full
-  Kubernetes-specific gap breakdown (container image, probes, graceful
-  shutdown, and — the sharpest one — `serve --db`'s table-browser/
-  role-mapping layer having no Postgres option, so it stays
-  single-instance even once the business DB and durability logs are
-  pointed at Postgres) in `KUBERNETES.md`.
+- **Containerized/production deployment story** (`ROADMAP.md` Track A2,
+  `[PARTIAL]`) — `init`'s bundled-folder handoff (§7) covers "copy and
+  run"; container image, health/readiness probes, graceful shutdown,
+  Helm chart, and Kustomize manifests are now built and locally
+  verified (`KUBERNETES.md`'s P0/P2/P3 remediation items). Still
+  genuinely open: the built image has never been pushed to a real
+  registry from CI (workflow lints clean, unexercised), and — the
+  sharpest remaining gap — `serve --db`'s table-browser/role-mapping
+  layer has no Postgres option, so it stays single-instance even once
+  the business DB and durability logs are pointed at Postgres (it now
+  fails fast with a clear error instead of being silently misused).
+  Full detail in `KUBERNETES.md`.
 - **Business-rule parameters (thresholds, boundary operators, currency)
   have no elicitation or config-store path** (`ROADMAP.md` Track A9) —
   `nirdosha init` (§2) only scaffolds identity/communications fixtures
