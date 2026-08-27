@@ -37,11 +37,21 @@ Argus needed `stable` vs. `volatile` fields as a language-visible
 distinction because *any* guardian state could need to survive a crash.
 Nirdosha only needs one thing to survive a crash: "did `network` already
 run for this `transact`, and what did it return." That's narrow enough to
-be an interpreter-owned runtime service (a real, synchronous, file-backed
-SQLite log — `src/transact_log.rs`), invisible in syntax — the same way
-`rand_seed` is a per-`Interpreter` field, not a language construct. Row 6
-(goal.md) stays honored: a program that never uses `transact` never touches
-the filesystem for this at all.
+be an interpreter-owned runtime service (a real, synchronous, durability
+log — `src/transact_log.rs` — file-backed SQLite by default, or a shared
+Postgres database when `--transact-log`/`with_transact_log_path` is given
+a `postgres://`/`postgresql://` value, or a real Raft-replicated SQLite
+cluster via `rqlite://`/`rqlites://` (`src/rqlite.rs`, `ROADMAP.md`'s
+Phase 2 — for a deployment that wants multi-instance without a Postgres
+dependency); see `src/durability.rs` and `ROADMAP.md`'s multi-instance
+fix for why the Postgres/rqlite options exist: `txn_id`'s idempotency
+guarantee is only process-lifetime with a local SQLite file, since two
+`nirdosha serve` replicas each have their own
+independent one), invisible in syntax — the same way `rand_seed` is a
+per-`Interpreter` field, not a language construct. Row 6 (goal.md) stays
+honored: a program that never uses `transact` never touches the
+filesystem for this at all (and never touches the network for it either,
+in the Postgres case).
 
 **3. Retry and timeout as "fundamentally expected," not bolted on later.**
 A network call that can time out or transiently fail is the normal case,
@@ -319,11 +329,22 @@ above is locked as the *target*.
    replay's own `network` re-invocation from a `"pending"` row honors it
    too, not just the live path.
 3. **The durability log itself.** ✅ Done — `src/transact_log.rs`, a real,
-   synchronous, file-backed SQLite log (`PRAGMA synchronous = FULL`),
-   owned by the `Interpreter` (`Option`-free: a program using `transact`
-   can't forget to turn it on, no flag to omit — only *where* it lives is
-   configurable, via `--transact-log <path>` or `Interpreter::
-   with_transact_log_path`). Also added along the way, once the durability
+   synchronous, durability log, owned by the `Interpreter` (`Option`-free:
+   a program using `transact` can't forget to turn it on, no flag to
+   omit — only *where* it lives is configurable, via `--transact-log
+   <path>` or `Interpreter::with_transact_log_path`). File-backed SQLite
+   (`PRAGMA synchronous = FULL`) by default; **2026-08-27 — multi-instance
+   fix (`ROADMAP.md`):** a `postgres://`/`postgresql://` value for
+   `--transact-log` instead shares one real Postgres database across every
+   `nirdosha serve` replica (`src/durability.rs`), so `txn_id`'s
+   idempotency guarantee holds fleet-wide, not just within one process;
+   an `rqlite://`/`rqlites://` value (Phase 2, `src/rqlite.rs`) gets the
+   same fleet-wide guarantee via a real Raft-replicated SQLite cluster
+   instead, for a deployment that wants multi-instance without taking on
+   Postgres — a local SQLite file is still the default and remains
+   explicitly single-instance; a same-file second process is now refused
+   at startup rather than silently diverging (`src/instance_lock.rs`). Also added
+   along the way, once the durability
    log made the gap concrete: the `precheck` slot, the mandatory `txn_id`
    idempotency key, the durable-scalar restriction on everything that
    crosses the boundary, and `commit`/`compensate`'s retry-and-trap

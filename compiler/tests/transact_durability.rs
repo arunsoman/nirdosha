@@ -91,7 +91,7 @@ fn successful_transact_ends_with_a_committed_log_row() {
         }
     "#;
     assert_eq!(run_with_log(src, &log_path), Ok(Value::Bool(true)));
-    let tlog = TransactLog::open(&log_path).expect("log file should exist and open");
+    let tlog = TransactLog::open(&nirdosha::durability::LogTarget::Sqlite(log_path.clone())).expect("log file should exist and open");
     let unresolved = tlog.list_unresolved().expect("list_unresolved should succeed");
     assert!(unresolved.is_empty(), "a successfully committed transact should leave no unresolved row: {unresolved:?}");
 }
@@ -114,7 +114,7 @@ fn compensated_transact_ends_with_a_compensated_log_row() {
         }
     "#;
     assert_eq!(run_with_log(src, &log_path), Ok(Value::Bool(false)));
-    let tlog = TransactLog::open(&log_path).expect("log file should exist and open");
+    let tlog = TransactLog::open(&nirdosha::durability::LogTarget::Sqlite(log_path.clone())).expect("log file should exist and open");
     assert!(tlog.list_unresolved().expect("list_unresolved should succeed").is_empty());
 }
 
@@ -252,7 +252,7 @@ fn commit_that_always_fails_traps_with_commit_pending_not_a_silent_true_or_false
         Ok(v) => panic!("expected a trap, got Ok({v:?}) -- commit's exhausted retries must never resolve to a guessed bool"),
     }
 
-    let tlog = TransactLog::open(&log_path).expect("log file should exist and open");
+    let tlog = TransactLog::open(&nirdosha::durability::LogTarget::Sqlite(log_path.clone())).expect("log file should exist and open");
     let unresolved = tlog.list_unresolved().expect("list_unresolved should succeed");
     assert_eq!(unresolved.len(), 1, "the row should be left non-terminal, eligible for replay");
     assert_eq!(unresolved[0].state, "commit_pending");
@@ -309,7 +309,7 @@ fn network_retry_recovers_from_a_transient_trap_and_the_log_still_lands_committe
     let n: i64 = conn.query_row("SELECT n FROM counter WHERE id = 1", [], |r| r.get(0)).expect("counter row should exist");
     assert_eq!(n, 3, "network's call_api should have been attempted exactly 3 times (fail, fail, succeed)");
 
-    let tlog = TransactLog::open(&log_path).expect("log file should exist and open");
+    let tlog = TransactLog::open(&nirdosha::durability::LogTarget::Sqlite(log_path.clone())).expect("log file should exist and open");
     assert!(tlog.list_unresolved().expect("list_unresolved should succeed").is_empty());
 }
 
@@ -345,7 +345,7 @@ fn network_timeout_traps_with_the_specific_error_kind_and_leaves_the_row_pending
         Ok(v) => panic!("expected a timeout trap, got Ok({v:?})"),
     }
 
-    let tlog = TransactLog::open(&log_path).expect("log file should exist and open");
+    let tlog = TransactLog::open(&nirdosha::durability::LogTarget::Sqlite(log_path.clone())).expect("log file should exist and open");
     let unresolved = tlog.list_unresolved().expect("list_unresolved should succeed");
     assert_eq!(unresolved.len(), 1);
     assert_eq!(unresolved[0].state, "pending", "network never confirmed -- must stay pending, eligible for replay");
@@ -392,7 +392,7 @@ fn replay_honors_the_captured_retry_budget_for_a_pending_network_row() {
     "#
     );
     let program = build_program(&src);
-    let tlog = TransactLog::open(&log_path).expect("open should succeed");
+    let tlog = TransactLog::open(&nirdosha::durability::LogTarget::Sqlite(log_path.clone())).expect("open should succeed");
     tlog.begin_pending(
         "txn-retry",
         "call_api",
@@ -475,7 +475,7 @@ fn replay_resumes_a_commit_pending_row_to_committed() {
         fn main() -> unit {}
     "#;
     let program = build_program(src);
-    let tlog = TransactLog::open(&log_path).expect("open should succeed");
+    let tlog = TransactLog::open(&nirdosha::durability::LogTarget::Sqlite(log_path.clone())).expect("open should succeed");
     tlog.begin_pending(
         "txn-1",
         "call_api",
@@ -511,7 +511,7 @@ fn replay_resumes_a_compensate_pending_row_to_compensated() {
         fn main() -> unit {}
     "#;
     let program = build_program(src);
-    let tlog = TransactLog::open(&log_path).expect("open should succeed");
+    let tlog = TransactLog::open(&nirdosha::durability::LogTarget::Sqlite(log_path.clone())).expect("open should succeed");
     tlog.begin_pending(
         "txn-2",
         "call_api",
@@ -554,7 +554,7 @@ fn replay_resumes_network_from_pending_but_reports_stuck_when_commit_args_were_n
         fn main() -> unit {}
     "#;
     let program = build_program(src);
-    let tlog = TransactLog::open(&log_path).expect("open should succeed");
+    let tlog = TransactLog::open(&nirdosha::durability::LogTarget::Sqlite(log_path.clone())).expect("open should succeed");
     tlog.begin_pending(
         "txn-3",
         "call_api",
@@ -618,7 +618,7 @@ fn replay_reconstructs_commit_args_from_network_and_txn_id_when_the_crash_landed
         fn main() -> unit {}
     "#;
     let program = build_program(src);
-    let tlog = TransactLog::open(&log_path).expect("open should succeed");
+    let tlog = TransactLog::open(&nirdosha::durability::LogTarget::Sqlite(log_path.clone())).expect("open should succeed");
     tlog.begin_pending(
         "txn-6",
         "call_api",
@@ -664,7 +664,7 @@ fn replay_reconstructs_compensate_args_from_network_and_txn_id_when_the_crash_la
         fn main() -> unit {}
     "#;
     let program = build_program(src);
-    let tlog = TransactLog::open(&log_path).expect("open should succeed");
+    let tlog = TransactLog::open(&nirdosha::durability::LogTarget::Sqlite(log_path.clone())).expect("open should succeed");
     tlog.begin_pending(
         "txn-7",
         "call_api",
@@ -756,7 +756,7 @@ fn a_pre_fix_log_file_missing_commit_arg_kinds_still_opens_and_migrates_cleanly(
     // `commit_arg_kinds`/`compensate_arg_kinds` -- this is the exact
     // failure this session's own full-suite run hit once ("no such
     // column: commit_arg_kinds") before the `ALTER TABLE` backfill existed.
-    let tlog = TransactLog::open(&log_path).expect("opening a pre-fix log file must succeed, not error");
+    let tlog = TransactLog::open(&nirdosha::durability::LogTarget::Sqlite(log_path.clone())).expect("opening a pre-fix log file must succeed, not error");
     let unresolved = tlog.list_unresolved().expect("list_unresolved must succeed against the migrated schema");
     assert_eq!(unresolved.len(), 1);
     assert_eq!(unresolved[0].txn_id, "txn-legacy");
@@ -806,7 +806,7 @@ fn replay_resumes_pending_straight_to_compensated_when_verify_is_false_and_no_co
         fn main() -> unit {}
     "#;
     let program = build_program(src);
-    let tlog = TransactLog::open(&log_path).expect("open should succeed");
+    let tlog = TransactLog::open(&nirdosha::durability::LogTarget::Sqlite(log_path.clone())).expect("open should succeed");
     tlog.begin_pending(
         "txn-4",
         "call_api",
@@ -840,7 +840,7 @@ fn replay_leaves_a_still_failing_network_at_pending_for_the_next_attempt() {
         fn main() -> unit {}
     "#;
     let program = build_program(src);
-    let tlog = TransactLog::open(&log_path).expect("open should succeed");
+    let tlog = TransactLog::open(&nirdosha::durability::LogTarget::Sqlite(log_path.clone())).expect("open should succeed");
     tlog.begin_pending(
         "txn-5",
         "call_api_traps",
@@ -921,6 +921,6 @@ fn network_slot_talks_to_a_real_separate_process_over_tcp() {
     assert_eq!(received.len(), 1, "the gateway should have been contacted exactly once");
     assert!(!received[0].is_empty(), "the real `txn_id` idempotency key should have reached the far side");
 
-    let tlog = TransactLog::open(&log_path).expect("log file should exist and open");
+    let tlog = TransactLog::open(&nirdosha::durability::LogTarget::Sqlite(log_path.clone())).expect("log file should exist and open");
     assert!(tlog.list_unresolved().expect("list_unresolved should succeed").is_empty());
 }

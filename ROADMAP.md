@@ -625,7 +625,31 @@ of Track B has landed.*
   case (copy a folder to a machine, run it, no orchestration) is now
   covered by **A6**'s `nirdosha init` below — a bundled executable +
   `run.sh`/`run.bat` launcher. Containerization/real secrets management
-  for an actual production deployment is still open here.
+  for an actual production deployment is still open here. **Horizontal
+  scaling specifically is no longer just a missing-tooling gap here** —
+  see **A17** below: `workflow`/`transact`'s durability logs had no
+  multi-instance story at all (a real correctness wall, since fixed for
+  the Postgres case, `[DONE]`); what's left open in *this* item is purely
+  containers/orchestration/secrets, not durability correctness.
+  **2026-08-27 — full Kubernetes-specific breakdown done: see
+  `KUBERNETES.md`.** Source-verified compliance matrix (container/image,
+  12-factor config, health/lifecycle probes, state/horizontal-scaling,
+  networking, observability, security posture, deployment manifests)
+  plus a dependency-ordered P0→P3 remediation plan. Headline finding not
+  otherwise captured above: `serve.rs`'s `--db <path>` auxiliary layer
+  (the generic table-browser route + `RoleMappingCache`) opens a bare
+  `rusqlite::Connection` directly, bypassing `dbconn.rs`'s
+  Postgres-capable `DbConn` abstraction entirely (`serve.rs:218`) — this
+  stays single-instance even after A17's durability-log fix and even if
+  a project's own `db_connect(...)` literal is pointed at Postgres. Real
+  P1-tier gap, distinct from the general "no containers yet" P0 gap this
+  item already tracked. Companion positioning doc, same date:
+  `KUBERNETES_ADVANTAGE.md` — the case for nirdosha over a mainstream
+  k8s-targeted language (Go/Java/Node/Python) once this item's gaps
+  close: built-in kill-tested `transact` durability, a `workflow`
+  audit trail with no extra stateful service, one-process UI+API
+  footprint, compiled/enforced RBAC, and proven memory/overflow safety
+  with no GC.
 - `[OPEN]` **A3. Observability wired to something real** — the OTel
   tracer (`observability.rs`) exists; connect it to an actual
   collector/backend for a real deployment. Layer 2a is now done:
@@ -1448,6 +1472,145 @@ of Track B has landed.*
   growing with the lifetime total** — the direct, at-scale demonstration
   of the actual "dirt cheap" claim. Full `cargo test` (all 64 test
   binaries) reverified green.
+- `[DONE]` **A17. `workflow`/`transact`'s durability logs had no
+  multi-instance story at all — a correctness wall, not just missing
+  tooling.** A2 (above) filed "horizontal scaling for a workflow/transact
+  app" as a missing-tooling bullet, next to containerization and secrets
+  management — that undersold it. `workflow_log.rs`/`transact_log.rs`
+  each unconditionally opened a local `rusqlite::Connection` to a file
+  path: run two `nirdosha serve` replicas behind a load balancer and each
+  has its own independent, diverging workflow-state file —
+  `workflow_instance.id` (SQLite `AUTOINCREMENT`) collides across
+  replicas, and a retried request that lands on a different replica than
+  its first attempt sees no row for its `txn_id` at all, silently
+  defeating `transact`'s idempotency guarantee. Fixed in three phases,
+  same session:
+
+  - **Phase 0 — fail fast (`src/instance_lock.rs`).** A second process
+    pointed at the exact same SQLite durability file now refuses to
+    start, loudly, instead of silently diverging — an OS-level exclusive
+    lock (`PRAGMA locking_mode=EXCLUSIVE` on a tiny sidecar `<path>.lock`
+    file, held for `serve::run`'s whole process lifetime, acquired once
+    up front rather than inside `WorkflowLog`/`TransactLog::open` itself
+    — those stay callable any number of times per process, which
+    `interpreter.rs`'s per-request `Interpreter` construction and
+    `tests/transact_process_kill.rs`'s own live-inspection-while-serving
+    pattern both depend on; a real bug this session's own full test run
+    caught before landing). **Explicitly does not** solve the actual
+    cross-machine case (two replicas, two independent files, never
+    touching the same filesystem at all — nothing for a local lock to
+    contend on) — only the same-host "started twice" accident (a stuck
+    old process during a restart, an operator running `serve` twice by
+    hand). Verified live, not just by unit test: two real `nirdosha
+    serve` processes pointed at the same `--transact-log` file — the
+    second refuses to start with a clear error, the first keeps serving
+    unaffected.
+  - **Phase 1 — real multi-instance via Postgres (`src/durability.rs`).**
+    `--transact-log`/`--workflow-log` accept a `postgres://`/
+    `postgresql://` value (parsed by the new `LogTarget`, reusing
+    `pool.rs`'s existing generic `PoolRegistry` — the exact "any future
+    pooled resource gets this for free" case that module's own doc
+    comment named) — every replica then shares one real Postgres
+    database: `workflow_instance.id` comes from a real `BIGSERIAL`
+    sequence (no per-file counter to collide), and `transact_log`'s
+    `txn_id`-keyed idempotency guarantee holds fleet-wide instead of
+    per-process. `workflow_log.rs`/`transact_log.rs` each dispatch on a
+    3-way `Backend` enum (`Sqlite`/`Postgres`/`PostgresTls`, mirroring
+    `dbconn.rs::DbConn`'s own shape) — every one of the ~25 query methods
+    across both files got a parallel Postgres implementation (real
+    `BIGSERIAL`/`BOOLEAN` columns in place of SQLite's `AUTOINCREMENT`/
+    0-1 `INTEGER`), not a stub. A local SQLite file is still the default
+    and remains explicitly single-instance (an inherent property of an
+    embedded, per-file database, not a nirdosha gap) — Phase 0's lock is
+    what makes that limit loud instead of silently dangerous. Verified
+    live against a real local Postgres server, not just read from docs:
+    7 new `#[ignore]`d integration tests
+    (`tests/durability_postgres.rs`, run the same way `tests/postgres.rs`
+    already documents) including a direct proof that two independent
+    `WorkflowLog`/`TransactLog` handles sharing one Postgres database
+    never collide on `instance_id` and do see each other's `txn_id` rows;
+    plus two real `nirdosha serve` processes on the same Postgres
+    database, both starting and serving concurrent requests correctly.
+    Full `cargo test` (all 65 test binaries) reverified green throughout.
+  - **Phase 2 — SQLite-native replication via rqlite (`src/rqlite.rs`).**
+    Real prior art, not reinvented: **rqlite** already replicates SQLite
+    correctly via real **Raft** consensus (Ongaro & Ousterhout, *"In
+    Search of an Understandable Consensus Algorithm,"* 2014) — every
+    write goes through an elected leader and isn't acknowledged until a
+    majority of replicas have it in their log. This module is
+    deliberately just an HTTP client speaking rqlite's `/db/execute`/
+    `/db/query` wire protocol (hand-rolled raw HTTP over `TcpStream`/
+    `native_tls`, the same choice `interpreter.rs::http_request`/
+    `https_request` already made, for the same "no extra runtime
+    dependency" reason) — not a reimplementation of consensus itself;
+    see below for why hand-rolling that would have been the wrong call.
+    `--transact-log`/`--workflow-log` accept `rqlite://`/`rqlites://`
+    (a third `LogTarget` variant); every replica then shares one
+    Raft-replicated SQLite database instead of Postgres, for a deployment
+    that wants multi-instance without taking on a Postgres dependency.
+    Because rqlite *is* SQLite under the hood, every `?`/`?N`-placeholder
+    SQL string `Backend::Sqlite`'s own arms already use works here
+    verbatim — unlike Postgres, no parallel dialect was needed, only a
+    third `Backend::Rqlite(RqliteClient)` arm per method reusing the
+    exact same query text. Verified live against a **real 3-node rqlite
+    cluster** (`rqlited` built from source, Raft-joined, not simulated):
+    the client's leader-redirect-following logic exercised for real by
+    pointing `WorkflowLog`/`TransactLog` at a follower node directly (this
+    rqlite build transparently proxies rather than issuing an HTTP
+    redirect — confirmed by inspecting the raw response before trusting
+    it, not assumed); `?N` numbered-placeholder SQL confirmed to work
+    unmodified through rqlite's HTTP API (a real, not hypothetical, risk
+    given `transact_log.rs`'s SQLite arms use `?1`/`?2`/etc.); two real
+    `nirdosha serve` processes, each pointed at a *different* node of the
+    same cluster, both starting and serving concurrent requests
+    correctly, one of them even correctly surfacing a stale
+    cross-replica `transact` row from an earlier test run as `Stuck` on
+    crash-replay — direct proof the shared-log/crash-replay path works
+    end to end over rqlite, not just the individual query methods in
+    isolation. 7 new `#[ignore]`d integration tests
+    (`tests/durability_rqlite.rs`, same convention as
+    `tests/durability_postgres.rs`), including the same
+    never-collide-on-`instance_id`/see-each-other's-`txn_id` proof Phase
+    1's own Postgres tests give. Full `cargo test` (66 test binaries)
+    reverified green throughout.
+
+    **Why prior art (rqlite), not a hand-rolled Raft implementation:**
+    a from-scratch consensus implementation inside nirdosha itself
+    (`openraft` + a custom SQLite-backed state machine — essentially
+    rebuilding what `dqlite` already is, in Rust) was the other option on
+    the table and was deliberately not chosen — a multi-day scope with
+    exactly the correctness subtleties the literature below exists to
+    warn about, in a subsystem where getting it wrong means silent data
+    corruption, not a crash. Real prior art either way:
+    - **rqlite** and **dqlite** — the two established SQLite-via-Raft
+      systems; rqlite chosen here for its plain HTTP API (fits this
+      codebase's existing "hand-rolled raw HTTP, no client SDK" pattern)
+      over dqlite's C-library/FFI surface.
+    - **cr-sqlite** (vlcn.io) — the alternative design: CRDTs (Shapiro et
+      al., *"Conflict-free Replicated Data Types,"* 2011) instead of a
+      leader — multiple concurrent writers, merges commutative by
+      construction, availability over strong consistency under
+      partition. Not chosen: `workflow`/`transact`'s durability
+      contract wants linearizable reads (`level=strong`), not
+      eventual-consistency merge semantics.
+    - **Litestream** is *not* a solution here despite often coming up in
+      the same breath — single-writer WAL shipping to object storage for
+      backup/point-in-time recovery, not multi-writer replication.
+    - Underlying theory: Lamport's Paxos (*"The Part-Time Parliament,"*
+      1998), Brewer's CAP theorem (why "just replicate the file" can't
+      give strong consistency *and* availability once the network can
+      partition, full stop), Google's Chubby (Burrows, 2006) and Spanner
+      papers. Kleppmann's *Designing Data-Intensive Applications*
+      synthesizes all of it; his *"How to do distributed locking"* post
+      specifically debunks naive lock-based fixes (Redlock) via the
+      fencing-token problem — relevant because a lock, not consensus,
+      is the wrong tool for this specific job, for exactly the reasons
+      that post lays out.
+    - Postgres (Phase 1) still gets the same guarantee at one more
+      remove — a real production Postgres deployment (managed, or
+      self-hosted behind Patroni, which itself leans on etcd/Consul for
+      leader election) already has this solved too; Phase 2 exists for
+      the deployments that specifically don't want that dependency.
 
 ---
 

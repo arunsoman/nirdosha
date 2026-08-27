@@ -143,7 +143,7 @@ fn link_transition_mints_a_single_use_token_that_advances_the_state() {
     // exposes it (it's delivered via `send_email`'s `vars` in real usage,
     // via `link_Verify`), so a test has to go around the language the
     // same way an email provider's webhook payload would.
-    let wlog = WorkflowLog::open(&log_path).expect("workflow log should open");
+    let wlog = WorkflowLog::open(&nirdosha::durability::LogTarget::Sqlite(log_path.clone())).expect("workflow log should open");
     let (_, token) = wlog
         .find_unconsumed_link(instance_id, "Verify")
         .expect("query should succeed")
@@ -221,7 +221,7 @@ fn replay_resumes_an_action_that_was_logged_but_never_dispatched() {
     // `mark_ran`" -- write the pending row directly, the same shape
     // `Interpreter::run_workflow_actions` would have written.
     {
-        let wlog = WorkflowLog::open(&workflow_log_path).expect("workflow log should open");
+        let wlog = WorkflowLog::open(&nirdosha::durability::LogTarget::Sqlite(workflow_log_path.clone())).expect("workflow log should open");
         let args_json = serde_json::json!([99]).to_string();
         wlog.begin_pending_action(1, "ReplayDemo", "SomeState", "entry", 0, "mark_ran", &args_json, 0)
             .expect("begin_pending_action should succeed");
@@ -245,7 +245,7 @@ fn replay_resumes_an_action_that_was_logged_but_never_dispatched() {
     // `mark_ran` really ran (a real, separate SQLite file it created) --
     // and the pending row is gone, so a second replay finds nothing left.
     assert!(observe_db.exists(), "replay should have actually dispatched mark_ran");
-    let wlog = WorkflowLog::open(&workflow_log_path).expect("workflow log should reopen");
+    let wlog = WorkflowLog::open(&nirdosha::durability::LogTarget::Sqlite(workflow_log_path.clone())).expect("workflow log should reopen");
     assert!(wlog.list_pending_actions().expect("query should succeed").is_empty());
 }
 
@@ -258,7 +258,7 @@ fn replay_reports_stuck_for_a_callee_that_no_longer_exists() {
     let program = build_program("fn unrelated() -> bool { return true }");
     let workflow_log_path = temp_path("replay-stuck");
     {
-        let wlog = WorkflowLog::open(&workflow_log_path).expect("workflow log should open");
+        let wlog = WorkflowLog::open(&nirdosha::durability::LogTarget::Sqlite(workflow_log_path.clone())).expect("workflow log should open");
         let args_json = serde_json::json!([1]).to_string();
         wlog.begin_pending_action(2, "ReplayDemo", "SomeState", "entry", 0, "mark_ran", &args_json, 0)
             .expect("begin_pending_action should succeed");
@@ -275,7 +275,7 @@ fn replay_reports_stuck_for_a_callee_that_no_longer_exists() {
         other => panic!("expected Stuck, got {other:?}"),
     }
     // Left exactly as it was -- still pending, not silently dropped.
-    let wlog = WorkflowLog::open(&workflow_log_path).expect("workflow log should reopen");
+    let wlog = WorkflowLog::open(&nirdosha::durability::LogTarget::Sqlite(workflow_log_path.clone())).expect("workflow log should reopen");
     assert_eq!(wlog.list_pending_actions().expect("query should succeed").len(), 1);
 }
 

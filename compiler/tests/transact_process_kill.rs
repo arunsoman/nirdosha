@@ -268,7 +268,8 @@ fn kill_mid_transaction_under_concurrent_load_converges_after_two_real_crashes()
     assert_ne!(killed_pid2, child3.id(), "sanity: the final check must run against a genuinely new process too");
 
     // ---- The durability log must be fully resolved -- A1's actual ask ----
-    let tlog = TransactLog::open(&transact_log).expect("the durability log should still open after two real crashes");
+    let tlog = TransactLog::open(&nirdosha::durability::LogTarget::Sqlite(transact_log.clone()))
+        .expect("the durability log should still open after two real crashes");
     let unresolved = tlog.list_unresolved().expect("list_unresolved should succeed");
     assert!(unresolved.is_empty(), "crash replay left unresolved rows after two real SIGKILLs: {unresolved:?}");
 

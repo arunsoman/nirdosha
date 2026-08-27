@@ -129,8 +129,8 @@ pub fn run(
     port: u16,
     auth: Option<AuthConfig>,
     identity_base: Option<&str>,
-    transact_log_path: std::path::PathBuf,
-    workflow_log_path: std::path::PathBuf,
+    transact_log_path: impl Into<crate::durability::LogTarget>,
+    workflow_log_path: impl Into<crate::durability::LogTarget>,
     presence_token: Option<String>,
     db_path: Option<String>,
     theme: Option<&crate::ui_gen::Theme>,
@@ -138,6 +138,37 @@ pub fn run(
     otel_port: Option<u16>,
     otel_token: Option<String>,
 ) -> Result<(), String> {
+    // `impl Into<LogTarget>` on the two params above so every existing
+    // `PathBuf`-passing caller (every test in this repo included) keeps
+    // compiling unchanged -- resolved to a concrete `LogTarget` once,
+    // right here, since everything below needs the concrete type.
+    let transact_log_path: crate::durability::LogTarget = transact_log_path.into();
+    let workflow_log_path: crate::durability::LogTarget = workflow_log_path.into();
+    // Phase 0 (`ROADMAP.md`'s multi-instance fix): refuse to start a
+    // second `nirdosha serve` process pointed at the same SQLite
+    // durability file -- acquired once, here, for the server's whole
+    // lifetime (this function never returns under normal operation:
+    // the request loop below runs until the process is killed), entirely
+    // separate from `TransactLog::open`/`WorkflowLog::open`'s own
+    // per-request opens (`workflow_log.rs`'s own doc comment explains why
+    // those stay unlocked). Postgres targets are skipped -- multiple
+    // replicas sharing one Postgres database is the *intended*
+    // multi-instance story there, not a mistake to refuse
+    // (`instance_lock.rs`'s own doc comment covers exactly what this
+    // guard does and doesn't protect against). Deduplicated by path so
+    // an operator who happens to point `--transact-log`/`--workflow-log`
+    // at the same file gets one lock, not two conflicting with each
+    // other from this same process.
+    let mut locked_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut _instance_locks: Vec<crate::instance_lock::InstanceLock> = Vec::new();
+    for target in [&transact_log_path, &workflow_log_path] {
+        if let crate::durability::LogTarget::Sqlite(path) = target {
+            if !locked_paths.contains(path) {
+                _instance_locks.push(crate::instance_lock::InstanceLock::acquire(path)?);
+                locked_paths.push(path.clone());
+            }
+        }
+    }
     let registry = crate::ast::TypeRegistry::build(&program);
     let effects = crate::effects::infer_effects(&program, &registry);
     let server_table_api = db_path.is_some();
@@ -834,7 +865,7 @@ fn dispatch_table_query(
 fn resolve_identity(
     auth_header: Option<&str>,
     auth: Option<&AuthConfig>,
-    workflow_log_path: &std::path::Path,
+    workflow_log_path: &crate::durability::LogTarget,
 ) -> Result<Option<Value>, (u16, String)> {
     match (auth_header, auth) {
         (Some(h), Some(cfg)) => match h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("bearer ")) {
@@ -879,7 +910,7 @@ fn resolve_identity(
 /// failed request — `notify`/`send_email`'s own `ByRole` lookup, not this
 /// call, is where that kind of failure should surface, if it ever
 /// matters to a particular request at all.
-fn upsert_identity_directory(identity: &Value, now: i64, workflow_log_path: &std::path::Path) {
+fn upsert_identity_directory(identity: &Value, now: i64, workflow_log_path: &crate::durability::LogTarget) {
     let Value::Struct(_, fields) = identity else { return };
     let (Value::Str(subject), Value::Str(claims_json)) = (&fields[0], &fields[5]) else { return };
     match crate::workflow_log::WorkflowLog::open(workflow_log_path) {
@@ -906,7 +937,7 @@ fn handle_presence(
     body: &str,
     auth_header: Option<&str>,
     presence_token: Option<&String>,
-    workflow_log_path: &std::path::Path,
+    workflow_log_path: &crate::durability::LogTarget,
     online: bool,
 ) -> (u16, String) {
     let Some(expected) = presence_token else {
@@ -1023,8 +1054,8 @@ fn dispatch(
     body: &str,
     auth_header: Option<&str>,
     auth: Option<&AuthConfig>,
-    transact_log_path: &std::path::Path,
-    workflow_log_path: &std::path::Path,
+    transact_log_path: &crate::durability::LogTarget,
+    workflow_log_path: &crate::durability::LogTarget,
     table_db: Option<&std::sync::Mutex<rusqlite::Connection>>,
     tracer: Option<&Arc<crate::observability::Tracer>>,
     role_mapping: Option<&std::sync::Mutex<RoleMappingCache>>,
@@ -1184,8 +1215,8 @@ fn dispatch(
 
     let program_arc = Arc::clone(program);
     let mut interp = Interpreter::new(program_arc, Arc::from(""))
-        .with_transact_log_path(transact_log_path.to_path_buf())
-        .with_workflow_log_path(workflow_log_path.to_path_buf());
+        .with_transact_log_path(transact_log_path.clone())
+        .with_workflow_log_path(workflow_log_path.clone());
     if let Some(t) = tracer {
         interp = interp.with_tracer(Arc::clone(t));
     }

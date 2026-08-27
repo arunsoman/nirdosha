@@ -3,15 +3,18 @@ pub mod codegen;
 pub mod contract_check;
 pub mod crud_gen;
 pub mod dbconn;
+pub mod durability;
 pub mod effects;
 pub mod extraction_schema;
 pub mod init;
+pub mod instance_lock;
 pub mod interpreter;
 pub mod migrate;
 pub mod observability;
 pub mod ownership;
 pub mod parser;
 pub mod pool;
+pub mod rqlite;
 pub mod thread_pool;
 pub mod refine;
 pub mod serve;
@@ -65,7 +68,7 @@ pub fn run_with_tracer(src: &str, tracer: Option<std::sync::Arc<observability::T
 pub fn run_with_tracer_and_transact_log(
     src: &str,
     tracer: Option<std::sync::Arc<observability::Tracer>>,
-    transact_log_path: Option<std::path::PathBuf>,
+    transact_log_path: Option<durability::LogTarget>,
 ) -> Result<Value, String> {
     run_with_tracer_transact_and_workflow_log(src, tracer, transact_log_path, None)
 }
@@ -78,8 +81,8 @@ pub fn run_with_tracer_and_transact_log(
 pub fn run_with_tracer_transact_and_workflow_log(
     src: &str,
     tracer: Option<std::sync::Arc<observability::Tracer>>,
-    transact_log_path: Option<std::path::PathBuf>,
-    workflow_log_path: Option<std::path::PathBuf>,
+    transact_log_path: Option<durability::LogTarget>,
+    workflow_log_path: Option<durability::LogTarget>,
 ) -> Result<Value, String> {
     let toks = Lexer::new(src)
         .tokenize()
@@ -203,7 +206,7 @@ pub fn run_diagnostic_with_tracer(
 pub fn run_diagnostic_with_tracer_and_transact_log(
     src: &str,
     tracer: Option<std::sync::Arc<observability::Tracer>>,
-    transact_log_path: Option<std::path::PathBuf>,
+    transact_log_path: Option<durability::LogTarget>,
 ) -> Result<Value, RunFailure> {
     run_diagnostic_with_tracer_transact_and_workflow_log(src, tracer, transact_log_path, None)
 }
@@ -213,8 +216,8 @@ pub fn run_diagnostic_with_tracer_and_transact_log(
 pub fn run_diagnostic_with_tracer_transact_and_workflow_log(
     src: &str,
     tracer: Option<std::sync::Arc<observability::Tracer>>,
-    transact_log_path: Option<std::path::PathBuf>,
-    workflow_log_path: Option<std::path::PathBuf>,
+    transact_log_path: Option<durability::LogTarget>,
+    workflow_log_path: Option<durability::LogTarget>,
 ) -> Result<Value, RunFailure> {
     let toks = Lexer::new(src).tokenize().map_err(|e| RunFailure::Diagnostics(vec![Diagnostic::Lex(e)]))?;
     let program =

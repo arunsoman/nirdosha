@@ -3695,7 +3695,7 @@ pub struct Interpreter {
     /// `<source-file>.transact.db` (or `--transact-log <path>`) instead
     /// -- a stable, program-derived path a restart can find again, which
     /// is the whole point for real CLI/server usage.
-    transact_log_path: std::path::PathBuf,
+    transact_log_path: crate::durability::LogTarget,
     /// The actual open connection, lazy -- see `Interpreter::transact_log`
     /// (this file) for why: only a program that actually contains a
     /// `transact` ever touches the filesystem for this at all.
@@ -3704,7 +3704,7 @@ pub struct Interpreter {
     /// store -- default is a unique per-instance temp file
     /// (`default_workflow_log_path`); `main.rs`'s `serve` command
     /// overrides it via `with_workflow_log_path`/`--workflow-log <path>`.
-    workflow_log_path: std::path::PathBuf,
+    workflow_log_path: crate::durability::LogTarget,
     workflow_log_cell: std::cell::OnceCell<Arc<WorkflowLog>>,
     /// Real deadlock detection for this program run's `chan`/`thread`
     /// use — see `DeadlockRegistry`'s own doc comment for what's actually
@@ -3892,9 +3892,9 @@ impl Interpreter {
             fn_effects: std::cell::OnceCell::new(),
             rng: std::cell::RefCell::new(None),
             call_depth: std::cell::Cell::new(0),
-            transact_log_path: default_transact_log_path(),
+            transact_log_path: default_transact_log_path().into(),
             transact_log_cell: std::cell::OnceCell::new(),
-            workflow_log_path: default_workflow_log_path(),
+            workflow_log_path: default_workflow_log_path().into(),
             workflow_log_cell: std::cell::OnceCell::new(),
             deadlock_registry: Arc::new(DeadlockRegistry::new()),
             current_task: TaskId::MAIN,
@@ -3934,22 +3934,28 @@ impl Interpreter {
     }
 
     /// Overrides `transact_log_path`'s default (a unique per-instance
-    /// temp file) with a stable, caller-chosen path -- `main.rs`'s `run`/
-    /// `serve` commands use this to point at `<source-file>.transact.db`
-    /// (or an explicit `--transact-log <path>`), so a restart's crash
-    /// replay (`replay_pending_transactions`) can actually find the
-    /// previous run's pending rows. Same builder shape as
-    /// `with_sandbox_exe`/`with_tracer`.
-    pub fn with_transact_log_path(mut self, path: std::path::PathBuf) -> Self {
-        self.transact_log_path = path;
+    /// temp file) with a stable, caller-chosen target -- `main.rs`'s
+    /// `run`/`serve` commands use this to point at
+    /// `<source-file>.transact.db` (or an explicit `--transact-log
+    /// <path>`), so a restart's crash replay
+    /// (`replay_pending_transactions`) can actually find the previous
+    /// run's pending rows. Same builder shape as `with_sandbox_exe`/
+    /// `with_tracer`. Accepts `impl Into<LogTarget>` so every existing
+    /// `PathBuf`-passing call site (every test in this repo included)
+    /// keeps compiling unchanged -- a bare `PathBuf` always means "SQLite
+    /// file," the same as before `LogTarget` existed; `main.rs`'s CLI
+    /// parsing is the only caller that ever constructs the other variant
+    /// (`LogTarget::from_cli_arg`, `ROADMAP.md`'s multi-instance fix).
+    pub fn with_transact_log_path(mut self, target: impl Into<crate::durability::LogTarget>) -> Self {
+        self.transact_log_path = target.into();
         self
     }
 
     /// Same role as `with_transact_log_path`, for `WORKFLOW.md`'s durable
     /// store -- `main.rs`'s `serve` command uses this to point at
     /// `<source-file>.workflow.db` (or an explicit `--workflow-log <path>`).
-    pub fn with_workflow_log_path(mut self, path: std::path::PathBuf) -> Self {
-        self.workflow_log_path = path;
+    pub fn with_workflow_log_path(mut self, target: impl Into<crate::durability::LogTarget>) -> Self {
+        self.workflow_log_path = target.into();
         self
     }
 
@@ -4476,8 +4482,8 @@ impl Interpreter {
         Ok(log)
     }
 
-    fn transact_log_err(&self, e: rusqlite::Error, span: Span) -> RuntimeError {
-        RuntimeError { kind: ErrorKind::TransactLogUnavailable { message: e.to_string() }, span }
+    fn transact_log_err(&self, e: String, span: Span) -> RuntimeError {
+        RuntimeError { kind: ErrorKind::TransactLogUnavailable { message: e }, span }
     }
 
     /// Same "open once, lazily, only if a program actually needs it"

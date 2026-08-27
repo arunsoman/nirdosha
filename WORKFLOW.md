@@ -18,9 +18,12 @@ doesn't need a new runtime.** `workflow` is a compiler-stage desugaring —
 every `workflow` block becomes ordinary `fn`/`enum`/`struct` declarations
 (`workflow_lower.rs`) that flow through every existing pass (typeck, the
 interpreter, `nirdosha serve`'s automatic `POST /api/<fn>` RPC exposure)
-unchanged. The only genuinely new runtime pieces are: a durable SQLite
-store for instance state (`workflow_log.rs`, modeled directly on
-`transact_log.rs`), and four new interpreter builtins
+unchanged. The only genuinely new runtime pieces are: a durable store
+for instance state (`workflow_log.rs`, modeled directly on
+`transact_log.rs` — SQLite-file-backed by default, or a shared Postgres
+database (`src/durability.rs`) or a Raft-replicated SQLite cluster
+(`src/rqlite.rs`) for multi-instance deployments, `ROADMAP.md`'s
+multi-instance fix), and four new interpreter builtins
 (`send_email`/`send_sms`/`send_push`/`notify`) for the notification
 actions the design conversation specifically asked for.
 
@@ -161,9 +164,11 @@ not a change to it.
 
 ## Runtime protocol (`interpreter.rs`, `workflow_log.rs`)
 
-1. `__workflow_start`: creates the `workflow_instance` row (durable,
-   SQLite — `workflow_log.rs`, modeled directly on `transact_log.rs`'s
-   open/write shape), state = the first-declared state. Runs that
+1. `__workflow_start`: creates the `workflow_instance` row (durable —
+   `workflow_log.rs`, modeled directly on `transact_log.rs`'s open/write
+   shape; SQLite-file-backed by default, or a shared Postgres database or
+   Raft-replicated SQLite cluster for multi-instance, see that module's
+   own doc comment), state = the first-declared state. Runs that
    state's `on_entry` actions.
 2. `__workflow_advance`: looks up the instance's current state; a
    missing instance or an event with no matching transition out of that

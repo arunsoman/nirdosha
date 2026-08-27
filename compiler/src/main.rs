@@ -38,7 +38,16 @@ fn main() -> ExitCode {
     // -- a stable, program-derived path a restart's crash replay can
     // actually find again (`Interpreter::new`'s own default, a random
     // per-instance temp file, exists only for callers with no real source
-    // file at all, e.g. `nirdosha::run(src: &str)`).
+    // file at all, e.g. `nirdosha::run(src: &str)`). A `postgres://`/
+    // `postgresql://` value here (or for `--workflow-log` below) selects a
+    // real, shared Postgres database instead of a local file
+    // (`durability::LogTarget::from_cli_arg`) -- `ROADMAP.md`'s
+    // multi-instance fix: the one way `nirdosha serve` can run more than
+    // one replica against the same durability state at all. `rqlite://`/
+    // `rqlites://` is the same idea via a real, Raft-replicated SQLite
+    // cluster (`rqlite.rs`) instead of Postgres -- `ROADMAP.md`'s Phase 2,
+    // for a deployment that wants multi-instance without a Postgres
+    // dependency.
     let transact_log_path: Option<String> =
         raw.iter().find_map(|a| a.strip_prefix("--transact-log=").map(String::from));
     // `--workflow-log=<path>` (`workflow { ... }`'s durable store,
@@ -171,10 +180,18 @@ fn cmd_interpret(
     // otherwise `<source-file>.transact.db` -- a stable, program-derived
     // default so a restart's crash replay finds the previous run's
     // pending rows without the caller having to remember a flag.
-    let transact_log = std::path::PathBuf::from(transact_log_path.unwrap_or_else(|| format!("{path}.transact.db")));
+    // `LogTarget::from_cli_arg` (`ROADMAP.md`'s multi-instance fix): a
+    // `postgres://`/`postgresql://` value selects the shared Postgres
+    // backend, `rqlite://`/`rqlites://` selects a Raft-replicated SQLite
+    // cluster, instead of a local file -- the default-derived name above
+    // is never one of those, so it always falls through to the original
+    // SQLite-file behavior unchanged.
+    let transact_log =
+        nirdosha::durability::LogTarget::from_cli_arg(&transact_log_path.unwrap_or_else(|| format!("{path}.transact.db")));
     // `workflow { ... }`'s durable store: same default-path convention as
     // `transact_log` above (`WORKFLOW.md`).
-    let workflow_log = std::path::PathBuf::from(workflow_log_path.unwrap_or_else(|| format!("{path}.workflow.db")));
+    let workflow_log =
+        nirdosha::durability::LogTarget::from_cli_arg(&workflow_log_path.unwrap_or_else(|| format!("{path}.workflow.db")));
     if format_json {
         return match nirdosha::run_diagnostic_with_tracer_transact_and_workflow_log(
             &src,
@@ -747,10 +764,18 @@ fn cmd_serve(
     // isolation) — never a fresh temp file per request, which would
     // scatter a durable transaction's rows across files nothing ever
     // replays together, and would leak one file per request forever.
-    let transact_log = std::path::PathBuf::from(transact_log_path.unwrap_or_else(|| format!("{path}.transact.db")));
+    // `LogTarget::from_cli_arg` (`ROADMAP.md`'s multi-instance fix): a
+    // `postgres://`/`postgresql://` value for `--transact-log`/
+    // `--workflow-log` selects the shared Postgres backend, `rqlite://`/
+    // `rqlites://` a Raft-replicated SQLite cluster, instead of a local
+    // file -- either is a real fix for running more than one `nirdosha
+    // serve` replica against the same durability state.
+    let transact_log =
+        nirdosha::durability::LogTarget::from_cli_arg(&transact_log_path.unwrap_or_else(|| format!("{path}.transact.db")));
     // `workflow { ... }`'s durable store: same one-stable-path-for-the-
     // server's-lifetime reasoning as `transact_log` above.
-    let workflow_log = std::path::PathBuf::from(workflow_log_path.unwrap_or_else(|| format!("{path}.workflow.db")));
+    let workflow_log =
+        nirdosha::durability::LogTarget::from_cli_arg(&workflow_log_path.unwrap_or_else(|| format!("{path}.workflow.db")));
     match nirdosha::serve::run(
         std::sync::Arc::new(program),
         &host,
