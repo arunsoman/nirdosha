@@ -348,17 +348,29 @@ fn is_date_like_field_name(name: &str) -> bool {
 /// Maps one `name: ty` (a struct field, or a CRUD action's own param) to
 /// a form control. `Option(T)` unwraps to `T`'s control with
 /// `required = false`. A bare reference to another struct in this same
-/// program (e.g. `create_todo(t: Todo)`'s `t`) expands one level deep
-/// into that struct's own fields (`control = "struct"`, `nested` holds
-/// them) — the common `create_<S>(x: S)` convention would otherwise
-/// render as a single unfillable blob. `depth` caps that expansion at
-/// two levels, which also makes it cycle-safe against a self-referential
-/// struct without needing a separate visited-set. Anything still left —
-/// enum references, affine handles (`box`/`thread`/`chan`/`sandbox`/
-/// `tcp`/`file`), `Result`, `Fn`, deeper-than-cap nesting — renders
-/// `readonly` instead of guessing; a stated v1 limit, not a silent
-/// misrender.
-fn build_field(program: &Program, name: &str, ty: &Ty, depth: u8) -> FieldSpec {
+/// program (e.g. `create_todo(t: Todo)`'s `t`) expands into that
+/// struct's own fields (`control = "struct"`, `nested` holds them) — the
+/// common `create_<S>(x: S)` convention would otherwise render as a
+/// single unfillable blob. `visiting` (struct names on the current
+/// expansion path) is real cycle protection, not a flat depth cap
+/// (2026-08-27 — a flat `depth < 2` cap used to reject a legitimate
+/// `Order -> LineItem -> Product -> Category` schema exactly as
+/// unconditionally as an actually-cyclic one; `struct A { b: B } struct
+/// B { a: A }` typechecks today with no cycle check at declaration time,
+/// confirmed empirically via `emit-ast`, so this is the one place that
+/// still has to guard against it). A name reappearing on `visiting`
+/// falls back to `readonly` — same "not expressible, don't guess"
+/// policy the enum/affine-handle/`Result`/`Fn` cases below already have,
+/// just reached by a real cycle instead of an arbitrary depth number.
+/// `build_field` for every caller building one independent top-level
+/// field (a struct's own field, a CRUD action's param) rather than
+/// recursing itself -- same "fresh guard per independent tree" reasoning
+/// `serve.rs::decode_value_root` documents.
+fn build_field_root(program: &Program, name: &str, ty: &Ty) -> FieldSpec {
+    build_field(program, name, ty, &mut Vec::new())
+}
+
+fn build_field(program: &Program, name: &str, ty: &Ty, visiting: &mut Vec<String>) -> FieldSpec {
     let base = |control, required| FieldSpec {
         name: name.to_string(),
         control,
@@ -404,7 +416,7 @@ fn build_field(program: &Program, name: &str, ty: &Ty, depth: u8) -> FieldSpec {
         }
         Ty::Bool => base("checkbox", false),
         Ty::Named(n, args) if n == "Option" && args.len() == 1 => {
-            let mut inner = build_field(program, name, &args[0], depth);
+            let mut inner = build_field(program, name, &args[0], visiting);
             inner.required = false;
             inner
         }
@@ -459,25 +471,28 @@ fn build_field(program: &Program, name: &str, ty: &Ty, depth: u8) -> FieldSpec {
                     }
                 }
             }
-            if depth < 2 {
-                if let Some(s) = resolve_struct(program, n) {
-                    return FieldSpec {
-                        name: name.to_string(),
-                        control: "struct",
-                        required: true,
-                        label: n.clone(),
-                        display_label: None,
-                        nested: s.fields.iter().map(|f| build_field(program, &f.name, &f.ty, depth + 1)).collect(),
-                        options: vec![],
-                        view_roles: vec![],
-                        view_claim: None,
-                        edit_roles: vec![],
-                        edit_claim: None,
-                        pattern: None,
-                        min: None,
-                        max: None,
-                    };
-                }
+            if !visiting.iter().any(|v| v == n)
+                && let Some(s) = resolve_struct(program, n)
+            {
+                visiting.push(n.clone());
+                let nested = s.fields.iter().map(|f| build_field(program, &f.name, &f.ty, visiting)).collect();
+                visiting.pop();
+                return FieldSpec {
+                    name: name.to_string(),
+                    control: "struct",
+                    required: true,
+                    label: n.clone(),
+                    display_label: None,
+                    nested,
+                    options: vec![],
+                    view_roles: vec![],
+                    view_claim: None,
+                    edit_roles: vec![],
+                    edit_claim: None,
+                    pattern: None,
+                    min: None,
+                    max: None,
+                };
             }
             base("readonly", false)
         }
@@ -520,7 +535,7 @@ fn build_action(program: &Program, effects: &HashMap<String, FnEffects>, kind: &
         .params
         .iter()
         .filter(|p| !matches!(&p.ty, Ty::Named(n, args) if n == "VerifiedIdentity" && args.is_empty()))
-        .map(|p| build_field(program, &p.name, &p.ty, 0))
+        .map(|p| build_field_root(program, &p.name, &p.ty))
         .collect();
     Some(Action {
         kind,
@@ -956,7 +971,7 @@ fn build_screens(program: &Program, effects: &HashMap<String, FnEffects>) -> Vec
             continue; // no convention fn at all -- not a screen, just a data type
         }
         let is_singular = !actions.iter().any(|a| a.kind == "list") && actions.iter().any(|a| a.kind == "get" || a.kind == "update");
-        let mut fields: Vec<FieldSpec> = s.fields.iter().map(|f| build_field(program, &f.name, &f.ty, 0)).collect();
+        let mut fields: Vec<FieldSpec> = s.fields.iter().map(|f| build_field_root(program, &f.name, &f.ty)).collect();
 
         // `screen <Struct> { field <name> { label: "...", view: role(...),
         // edit: role(...) } }` — display-label and RBAC-gate overrides,
@@ -1005,7 +1020,7 @@ fn build_workflow_queues(program: &Program, effects: &HashMap<String, FnEffects>
         ) else {
             continue;
         };
-        let data_fields: Vec<FieldSpec> = w.data.iter().map(|f| build_field(program, &f.name, &f.ty, 0)).collect();
+        let data_fields: Vec<FieldSpec> = w.data.iter().map(|f| build_field_root(program, &f.name, &f.ty)).collect();
         queues.push(WorkflowQueue {
             name: w.name.clone(),
             title: to_display_label(&w.name),

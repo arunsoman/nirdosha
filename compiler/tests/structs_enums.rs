@@ -528,6 +528,90 @@ fn non_affine_struct_program_is_accepted_by_codegen() {
     );
 }
 
+// ---- codegen: cyclic struct/enum types are rejected cleanly, not
+// leaked as a raw LLVM/clang error (ROADMAP.md, 2026-08-27: `nirdosha
+// build` on `struct A { b: B } struct B { a: A }` used to surface
+// "identified structure type 'CycleA' is recursive" straight from
+// clang instead of a nirdosha-level diagnostic) ----
+
+#[test]
+fn a_directly_cyclic_struct_pair_is_rejected_by_check_supported() {
+    let src = r#"
+        struct CycleA {
+            b: CycleB,
+        }
+        struct CycleB {
+            a: CycleA,
+        }
+        fn echo(a: CycleA) -> CycleA {
+            return a
+        }
+        fn main() {
+            print("unreachable")
+        }
+    "#;
+    let program = parse_ok(src);
+    // A directly self-referential struct pair typechecks today (no cycle
+    // check at struct-declaration time, ast.rs::TypeRegistry's own doc
+    // comment) — `check_supported` is where this must be caught.
+    typecheck(&program).expect("should typecheck cleanly");
+    let err = nirdosha::codegen::check_supported(&program)
+        .expect_err("an infinite-size cyclic struct must be rejected, not handed to LLVM");
+    let msg = err.to_string();
+    assert!(msg.contains("cyclic"), "expected a clean cyclic-type diagnostic, got: {msg}");
+    assert!(msg.contains("CycleA"), "expected the offending type name in the message, got: {msg}");
+    assert!(
+        !msg.to_lowercase().contains("clang") && !msg.to_lowercase().contains("llvm"),
+        "must not leak the backend's own error text, got: {msg}"
+    );
+}
+
+#[test]
+fn a_directly_cyclic_enum_is_rejected_by_check_supported() {
+    let src = r#"
+        enum Tree {
+            Leaf,
+            Node(Tree, Tree),
+        }
+        fn main() {
+            print("unreachable")
+        }
+    "#;
+    let program = parse_ok(src);
+    typecheck(&program).expect("should typecheck cleanly");
+    let err = nirdosha::codegen::check_supported(&program)
+        .expect_err("an infinite-size cyclic enum must be rejected, not handed to LLVM");
+    assert!(err.to_string().contains("cyclic"), "expected a clean cyclic-type diagnostic, got: {err}");
+}
+
+#[test]
+fn a_box_indirected_self_referential_struct_still_compiles() {
+    // The same self-reference, but through `box` — a real cons-list
+    // shape (finite size: one pointer word regardless of what's behind
+    // it), so this must stay accepted, not caught by the cyclic-layout
+    // guard above.
+    let src = r#"
+        struct Node {
+            val: i64,
+            next: box Node,
+        }
+        fn main() {
+            print("ok")
+        }
+    "#;
+    let program = parse_ok(src);
+    typecheck(&program).expect("should typecheck cleanly");
+    assert!(
+        nirdosha::codegen::check_supported(&program).is_ok(),
+        "a box-indirected self-referential struct is finite-size and must be accepted"
+    );
+    let report = nirdosha::smt::analyze(&program);
+    assert!(
+        nirdosha::codegen::emit_llvm_ir(&program, &report).is_ok(),
+        "a box-indirected self-referential struct should emit LLVM IR cleanly, not stack-overflow"
+    );
+}
+
 // ---- worked example ----------------------------------------------------------
 
 #[test]

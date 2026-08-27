@@ -430,6 +430,125 @@ messages.
     live-verified after via running servers built from that clean state.
     Re-run `cargo test` once that pooling work finishes or is reverted.
 
+- **2026-08-27 — JSON API boundary: struct nesting depth cap removed,
+  replaced with real cycle detection.** `serve.rs::decode_value`/
+  `ui_gen.rs::build_field` used a flat `depth >= 2` ceiling that rejected
+  *any* fourth level of struct nesting unconditionally — a legitimate
+  `Order -> LineItem -> Product -> Category` schema exactly as hard as an
+  actually-cyclic one. Replaced with `DecodeGuard`/`visiting` — a set of
+  struct names on the current expansion path; a name reappearing is a
+  real cycle (clear error / `readonly` fallback, not a crash), anything
+  else expands as deep as the schema genuinely goes.
+  `serve.rs`'s side additionally keeps `MAX_DECODE_DEPTH` (64) as an
+  independent backstop, since JSON *input* depth is caller-controlled
+  regardless of whether the `.nir` program's own struct graph is cyclic
+  (a deeply-nested plain JSON body doesn't need a cyclic type to exist).
+  Verified live: a real 4-level `Order`/`LineItem`/`Product`/`Category`
+  round-trips through `nirdosha serve` now; full test suite green.
+  - **Real, more serious bug found while testing the fix, and fixed
+    separately:** `ast.rs::TypeRegistry::is_affine` had its *own*
+    unguarded recursion into struct/enum field types, with a doc comment
+    explicitly dismissing the cyclic case ("no well-typed program could
+    ever reach this path" — reasoning that only holds for *constructing
+    a value*, not for merely *declaring a function whose signature
+    mentions the type*, which needs no value at all).
+    `struct A { b: B } struct B { a: A }` typechecks today (no cycle
+    check at struct-declaration time) and a bare `fn echo(a: A) -> A` is
+    all it takes to reach `is_affine` on it — confirmed empirically:
+    `nirdosha emit-ui`/`serve` on exactly that shape aborted with a real
+    stack overflow, not a hang or a clean diagnostic, reachable by any
+    author who wrote a mutually-recursive struct pair, no adversarial
+    input required. Fixed the same way (`is_affine_visiting`, an
+    internal cycle-guarded helper behind the unchanged public
+    `is_affine` signature — no ripple through its 10 external call
+    sites in `codegen.rs`/`ownership.rs`/`typeck.rs`).
+  - **Adjacent finding, fixed same day:** `nirdosha build` on the same
+    cyclic-struct shape didn't crash, but surfaced a raw `clang` error
+    ("identified structure type 'CycleA' is recursive") instead of a
+    clean nirdosha-level diagnostic. Fixed with a `check_supported` guard
+    (`codegen.rs::has_cyclic_layout`) that walks every struct/enum
+    declaration's fields/payloads through direct (non-pointer) `Ty::Named`
+    containment — `box`/`&`/`chan`/etc. fields break the walk on purpose
+    (fixed-size handle regardless of what's behind them), so a genuine
+    cons-list shape (`struct Node { next: box Node }`) still compiles;
+    only a truly infinite-size cycle is rejected, with the offending type
+    name and a "wrap it in `box`/`&`" fix in the message — same "reject,
+    don't leak the backend's own error text" standard every other
+    `check_supported` rejection holds itself to.
+    - **Second bug found while verifying the fix, fixed in the same
+      pass:** once box-indirected self-reference was correctly let
+      through, it hit a *second*, pre-existing unguarded recursion —
+      `codegen.rs::affine_codegen_supported` walks a struct's fields to
+      decide if its affine leaves are all `nir_free`/`nir_tcp_stop`-able,
+      with no cycle guard of its own; `struct Node { next: box Node }`
+      sent it into `Node -> box Node -> Node -> ...` forever, a real
+      stack overflow confirmed empirically (not a hang or clean error)
+      the moment the first guard stopped masking it. Fixed the same
+      `_visiting`-parameter shape as `is_affine_visiting`
+      (`affine_codegen_supported_visiting`, unchanged public signature,
+      its one external call site untouched); a repeat on the path
+      returns "supported" here (not "unsupported" the way the cyclic-type
+      guard does), since every step across the repeat was a `box` — the
+      one affine leaf already torn down — so a second pass can only
+      re-confirm the first, never surface a new unsupported leaf.
+    - Verified live: `nirdosha build` on the exact `CycleA`/`CycleB`
+      shape now fails with the clean nirdosha diagnostic (no `clang`/LLVM
+      text in it); the same shape rewritten with `box` back-references
+      compiles and runs correctly; three new regression tests
+      (`structs_enums.rs`: a direct struct cycle rejected, a direct enum
+      cycle rejected, a box-indirected self-reference still compiles and
+      emits IR); full suite green.
+
+- `[OPEN]` **A16. `json` onto real LLVM codegen — scoped, not started.**
+  Requested directly (`nirdosha` chat, 2026-08-27). Structurally a
+  different problem than `dec128`'s own outstanding codegen gap
+  (A-numbered entry above): `dec128` is a flat 128-bit scalar; `json` is
+  a dynamically-shaped, arbitrarily-nested heap tree (`Value::
+  Json(Arc<serde_json::Value>)`) — nothing else in the compiled subset
+  has that shape (`struct`/`enum`/`Vector`/`Matrix` are all sized at
+  compile time; `json` never is).
+
+  Three real pieces:
+  1. **Representation** — low risk. `Ty::Json` lowers to a plain `ptr`,
+     the same "opaque, never freed" treatment `str` already gets (`json`
+     is non-affine — freely readable, no cleanup point — same as `str`).
+  2. **A hand-written JSON parser + tree + accessors in
+     `runtime_kernels.rs`** — hits the identical wall `dec128`'s own
+     entry does: that file is a dependency-free freestanding `rustc
+     --crate-type staticlib` build (`build.rs`'s own doc comment: "no
+     circular-dependency risk from a sub-crate"), so it can't `use
+     serde_json` any more than it could `use rust_decimal`. Lower
+     correctness risk than hand-rolled decimal math, though — JSON
+     parsing is a bounded, well-known algorithm. ~9 runtime functions
+     (`nir_json_parse`/`_get`/`_get_str`/`_get_i64`/`_get_f64`/
+     `_get_bool`/`_array_len`/`_array_get`/`_set_str`), each mirroring
+     `interpreter.rs`'s own logic (same "duplicate it, catch divergence
+     with parity tests" precedent the f64 linalg kernels already use).
+  3. **The actual pivotal piece: a genuinely new codegen capability —
+     constructing a `Result` value from a fallible runtime call.** 7 of
+     the 8 real JSON accessors return `Result(_, str)`. Nothing in
+     `codegen.rs` today can build an `Ok`/`Err` enum value from a runtime
+     call's success/failure flag (confirmed: no `construct_result_from_
+     call`-shaped function anywhere in `codegen.rs`) — this is the exact
+     same unresolved gap already blocking `dec_from_str`'s own compiled
+     path. **Solve this once, first, as its own primitive — it unblocks
+     both `dec_from_str` and every fallible `json_*` accessor**, not
+     json-specific work.
+
+  **Disclosed scope caveat:** `json`'s real producers — `db_query`/
+  `db_execute`, `http_get`/`http_post`, `nirdosha serve` itself — are all
+  still interpreter-only too. Compiling bare `json_parse`/accessors alone
+  only unlocks a literal `json_parse("...")` on a hardcoded string (an
+  embedded-config case); the "real app" case needs `db`/`http` compiled
+  too, a separate, much bigger lift not scoped here.
+
+  Not started this session — the depth-cap fix and the `is_affine` crash
+  it surfaced (this file's own entry just above) took the remaining time
+  budget instead. Next actual step: prototype the `Result`-from-runtime-
+  call codegen primitive on `dec_from_str` (smaller, already-fully-
+  designed surface — see the `dec128` codegen entry above) before
+  building the JSON parser on top of it.
+
 ---
 
 ## Standards & compliance posture
