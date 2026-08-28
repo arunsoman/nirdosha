@@ -3,21 +3,27 @@ name: docker
 # Publishes ghcr.io/protobox/nirdosha-runtime — KUBERNETES.md's P0 item
 # ("no published nirdosha binary/base image exists yet"), and protobox's
 # plugins/languages/nirdosha.py's own `docker_image` field, which already
-# names this target. Separate from release.yml (which cross-compiles the
-# raw binaries for the curl-installer/manual-download path) because this
-# one needs Docker Buildx + registry auth, not a Rust target matrix.
+# names this target — plus ghcr.io/protobox/nirdosha-presence-gateway
+# (`presence-gateway/`, ROADMAP.md Track A5's own image, added
+# 2026-08-28: the two images share this one workflow, matrixed, rather
+# than a second near-duplicate file, since every step past "which
+# Dockerfile/image name" is identical). Separate from release.yml (which
+# cross-compiles the raw `nirdosha` binary for the curl-installer/manual-
+# download path) because this one needs Docker Buildx + registry auth,
+# not a Rust target matrix.
 #
 # Multi-arch (amd64/arm64) via a single `docker buildx build --platform`
-# invocation, using QEMU emulation for the arm64 leg — release.yml's own
-# per-arch native cross-compilation is faster but would need a second,
-# differently-shaped job here just to reuse those binaries inside a
-# multi-arch manifest; a plain emulated buildx build is simpler and this
-# image is published once per tag, not on every commit, so the extra
-# build time is an acceptable trade here.
+# invocation per image, using QEMU emulation for the arm64 leg —
+# release.yml's own per-arch native cross-compilation is faster but would
+# need a second, differently-shaped job here just to reuse those binaries
+# inside a multi-arch manifest; a plain emulated buildx build is simpler
+# and each image is published once per tag, not on every commit, so the
+# extra build time is an acceptable trade here.
 #
 # Signed (cosign, keyless via GitHub OIDC — no key material to manage or
-# leak) and SBOM'd (syft, attached as an attestation) on every publish —
-# KUBERNETES.md's "SBOM / image signing (Sigstore, SLSA)" row.
+# leak) and SBOM'd (syft, attached as an attestation) on every publish,
+# for both images — KUBERNETES.md's "SBOM / image signing (Sigstore,
+# SLSA)" row.
 
 on:
   push:
@@ -30,12 +36,25 @@ permissions:
   packages: write
   id-token: write # cosign keyless signing
 
-env:
-  IMAGE: ghcr.io/protobox/nirdosha-runtime
-
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
+    strategy:
+      # One image's build failing shouldn't cancel the other's -- they're
+      # independent artifacts with independent consumers (protobox's own
+      # nirdosha.py names only the runtime image; presence-gateway is an
+      # optional, separately-opted-into sidecar, ROADMAP.md A5).
+      fail-fast: false
+      matrix:
+        include:
+          - name: runtime
+            image: ghcr.io/protobox/nirdosha-runtime
+            dockerfile: Dockerfile
+            sbom_file: nirdosha-runtime.sbom.spdx.json
+          - name: presence-gateway
+            image: ghcr.io/protobox/nirdosha-presence-gateway
+            dockerfile: presence-gateway/Dockerfile
+            sbom_file: nirdosha-presence-gateway.sbom.spdx.json
     steps:
       - uses: actions/checkout@v4
 
@@ -54,6 +73,8 @@ jobs:
 
       - name: Compute tags
         id: tags
+        env:
+          IMAGE: ${{ matrix.image }}
         run: |
           ref="${GITHUB_REF_NAME}"
           if [[ "$ref" == v* ]]; then
@@ -66,8 +87,13 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
+          # Both Dockerfiles need the repo root as their build context —
+          # `presence-gateway/Dockerfile` also `COPY`s `compiler/`'s
+          # manifest for its `[dev-dependencies]` path resolution (that
+          # Dockerfile's own doc comment), not just `presence-gateway/`
+          # itself.
           context: .
-          file: Dockerfile
+          file: ${{ matrix.dockerfile }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
@@ -81,21 +107,21 @@ jobs:
 
       - name: Sign the published image (keyless, Sigstore/Fulcio+Rekor)
         run: |
-          cosign sign --yes "${IMAGE}@${{ steps.build.outputs.digest }}"
+          cosign sign --yes "${{ matrix.image }}@${{ steps.build.outputs.digest }}"
 
       - name: Generate SBOM (syft) and attach as an attestation
         uses: anchore/sbom-action@v0
         with:
-          image: "${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
+          image: "${{ matrix.image }}@${{ steps.build.outputs.digest }}"
           format: spdx-json
-          output-file: nirdosha-runtime.sbom.spdx.json
+          output-file: ${{ matrix.sbom_file }}
 
       - name: Attest the SBOM to the published image (cosign)
         run: |
-          cosign attest --yes --predicate nirdosha-runtime.sbom.spdx.json --type spdxjson "${IMAGE}@${{ steps.build.outputs.digest }}"
+          cosign attest --yes --predicate ${{ matrix.sbom_file }} --type spdxjson "${{ matrix.image }}@${{ steps.build.outputs.digest }}"
 
       - name: Upload SBOM as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nirdosha-runtime-sbom
-          path: nirdosha-runtime.sbom.spdx.json
+          name: nirdosha-${{ matrix.name }}-sbom
+          path: ${{ matrix.sbom_file }}

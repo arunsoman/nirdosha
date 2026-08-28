@@ -63,9 +63,47 @@ auth:
 # `--presence-token-file`/`--otel-token-file` — Secret-mounted, never a
 # bare CLI value (KUBERNETES.md's "Secrets sourced from files, not bare
 # CLI values" row; this same compliance change added the -file flags).
+#
+# Setting `presence.enabled: true` alone used to be a silent trap: it
+# wired `--presence-token-file` onto the `nirdosha` container so
+# `notify()`'s presence routes stopped 404ing, but nothing in this chart
+# ever deployed the WebSocket gateway (`presence-gateway/`, repo root)
+# those routes exist *for* — `identity_presence` would still never gain
+# an "online" row, so `notify()` still always silently took the offline
+# path, just with no error anywhere to say so (ROADMAP.md Track A5's own
+# "this doesn't error, it just never does the push-it-live half of its
+# job" framing, reproduced one layer up in this chart). `presence.enabled`
+# now deploys the gateway as a sidecar in the same Pod (`_pod.tpl`) —
+# same "one Pod, no separate service to keep in sync" shape this chart
+# already takes for the app's own UI+API — reusing the *same*
+# `auth.jwksSecretName`/`issuer`/`audience` the main container validates
+# against (it's the same identity provider issuing the same bearer
+# tokens; nothing to duplicate). `presence.enabled: true` therefore
+# requires `auth.enabled: true` too — validated at render time
+# (`_helpers.tpl::nirdosha.validatePresence`), the same "fail loudly, not
+# silently misconfigured" posture `validateReplicaMode` already takes for
+# `db.mode`.
 presence:
   enabled: false
   tokenSecretName: ""
+  gateway:
+    image:
+      repository: ghcr.io/protobox/nirdosha-presence-gateway
+      tag: latest
+      pullPolicy: IfNotPresent
+    # The WS gateway's own listen port inside the Pod — distinct from the
+    # main container's 8080, exposed as a second port on the same
+    # Service (`service.yaml`) so a browser reaches it at
+    # `ws://<service>:<gatewayPort>/ws`.
+    port: 8090
+  # Redis is where `notify()`'s live-push events actually flow
+  # (`nirdosha:push:<subject>`, WORKFLOW.md's presence-bridge section) —
+  # a separate, already-running Redis this chart does not deploy for you
+  # (the same "bring your own Postgres" posture `db.postgresSecretName`
+  # already takes for `db.mode=postgres`). Required when `presence.enabled`.
+  redis:
+    host: ""
+    port: 6379
 
 otel:
   enabled: false

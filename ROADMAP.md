@@ -860,16 +860,40 @@ of Track B has landed.*
   serve`, real Redis, real `mock_issue_token`-minted tokens), all green,
   `cargo clippy --all-targets` clean.
 
+  **2026-08-28, same day — wired into the deployment story too, not left
+  as a Dockerfile nobody actually deploys:** `deploy/helm/nirdosha/`
+  bumped to `0.2.0`; `presence.enabled: true` now deploys this crate's
+  image as a sidecar in the same Pod as `nirdosha serve` (`_pod.tpl`),
+  reusing the main container's `auth.jwksSecretName`/`issuer`/`audience`
+  and `presence.tokenSecretName` (no new Secret needed — same identity
+  provider, same tokens), with a new `presence.redis.host` value for
+  `notify()`'s live-push transport. This closed a real, freshly-created
+  trap: `presence.enabled: true` alone already wired
+  `--presence-token-file` onto the main container (so the routes stopped
+  404ing) but deployed no actual gateway — indistinguishable from
+  `presence.enabled: false` except for a token file nobody read.
+  `presence.enabled` without `auth.enabled` or `presence.redis.host` now
+  `fail`s at Helm render time (`nirdosha.validatePresence`), the same
+  posture `validateReplicaMode` already takes for `db.mode`. Verified
+  live under the *exact* `securityContext` this chart applies (arbitrary
+  non-owning UID, read-only rootfs, no writable mount at all) — a real
+  `notify()` round-trip still worked. `deploy/kustomize/`'s two static
+  renders regenerated from the bumped chart per each file's own
+  "regenerate, don't hand-edit" comment (`helm template`); no dedicated
+  Kustomize overlay for presence specifically, consistent with `auth`/
+  `otel` (the main chart's other optional toggles) also having none.
+  `.github/workflows/docker.yml` matrixed to also multi-arch-build+sign+
+  SBOM this image on the same trigger as the runtime image.
+
   **What's disclosed, not silently left out** (this crate's own README,
   "What's not here" section): no TLS termination (same `[N/A]`,
   delegate-to-the-platform posture `nirdosha serve` itself takes); one
   dedicated Redis `SUBSCRIBE` per WebSocket connection rather than a
   shared/fan-out subscription (simple and correct, `O(connections)` — a
   real thing to revisit only if it becomes an actual bottleneck at a
-  scale this hasn't been tested against); no Helm chart/Kustomize
-  manifests of its own yet, unlike the main runtime's `deploy/helm/`/
-  `deploy/kustomize/` — a `Dockerfile` only, a natural near-term
-  follow-up flagged here so it doesn't quietly stay unowned.
+  scale this hasn't been tested against); neither this image nor the
+  main runtime one has actually been pushed to the real registry from a
+  live tag push yet (workflow lints clean, unexercised for real).
   `send_email`/`send_sms`/`send_push` and every other part of `workflow`
   were already, and remain, unaffected and fully functional without any
   of this.

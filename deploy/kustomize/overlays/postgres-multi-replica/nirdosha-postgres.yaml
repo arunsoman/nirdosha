@@ -8,7 +8,7 @@ metadata:
     app.kubernetes.io/name: nirdosha
     app.kubernetes.io/instance: nirdosha
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: nirdosha-0.1.0
+    helm.sh/chart: nirdosha-0.2.0
 spec:
   minAvailable: 1
   selector:
@@ -25,7 +25,7 @@ metadata:
     app.kubernetes.io/name: nirdosha
     app.kubernetes.io/instance: nirdosha
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: nirdosha-0.1.0
+    helm.sh/chart: nirdosha-0.2.0
 ---
 # Source: nirdosha/templates/service.yaml
 apiVersion: v1
@@ -36,7 +36,7 @@ metadata:
     app.kubernetes.io/name: nirdosha
     app.kubernetes.io/instance: nirdosha
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: nirdosha-0.1.0
+    helm.sh/chart: nirdosha-0.2.0
 spec:
   type: ClusterIP
   selector:
@@ -56,7 +56,7 @@ metadata:
     app.kubernetes.io/name: nirdosha
     app.kubernetes.io/instance: nirdosha
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: nirdosha-0.1.0
+    helm.sh/chart: nirdosha-0.2.0
 spec:
   replicas: 3
   selector:

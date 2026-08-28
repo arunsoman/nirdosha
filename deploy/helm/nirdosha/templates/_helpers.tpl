@@ -45,3 +45,26 @@ durability log.
 {{- fail "db.mode=postgres requires db.postgresSecretName (a Secret with transact-log-url/workflow-log-url keys)" -}}
 {{- end -}}
 {{- end -}}
+
+{{- /*
+`presence.enabled` deploys the presence-gateway sidecar
+(`presence-gateway/`, repo root) -- it independently verifies every
+WebSocket client's identity token, so it needs the same JWKS/issuer/
+audience the main container validates against, and a real Redis to
+subscribe to (`notify()`'s live-push transport). Both fail fast at
+render time, the same "disclosed, not a silent trap" posture
+`validateReplicaMode` already takes -- `presence.enabled: true` with
+either missing used to be exactly that trap: the token flag gets wired
+onto the main container, the routes stop 404ing, but nothing ever
+actually made `notify()`'s live-push path work.
+*/ -}}
+{{- define "nirdosha.validatePresence" -}}
+{{- if .Values.presence.enabled -}}
+{{- if not .Values.auth.enabled -}}
+{{- fail "presence.enabled requires auth.enabled (the presence gateway verifies WebSocket clients against the same jwksSecretName/issuer/audience the main container uses)" -}}
+{{- end -}}
+{{- if not .Values.presence.redis.host -}}
+{{- fail "presence.enabled requires presence.redis.host (notify()'s live-push transport -- a Redis this chart does not deploy for you, same 'bring your own' posture db.postgresSecretName already takes)" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

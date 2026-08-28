@@ -8,7 +8,7 @@ description: |
   the same shape programmatically for a generated project. This chart is
   for a human operator running nirdosha directly, without protobox.
 type: application
-version: 0.1.0
+version: 0.2.0
 appVersion: "0.1.0"
 home: https://github.com/arunsoman/nirdosha
 sources:

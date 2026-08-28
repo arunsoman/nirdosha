@@ -28,3 +28,20 @@ NOTE: auth.enabled=false — every request is unauthenticated and every
 auth.enabled=true with a real jwksSecretName/issuer/audience before
 exposing this outside a trusted network.
 {{- end }}
+
+{{- if .Values.presence.enabled }}
+
+`workflow`'s notify() live-push path is enabled: the presence-gateway
+sidecar is deployed alongside nirdosha, reachable at
+  ws://{{ include "nirdosha.fullname" . }}:{{ .Values.presence.gateway.port }}/ws
+from inside the cluster (port-forward or Ingress it the same way as the
+main http port if browsers need to reach it directly). See
+presence-gateway/README.md for the client protocol.
+{{- else }}
+
+NOTE: presence.enabled=false — notify() will always silently take the
+offline (send_email) path; nothing terminates a live browser WebSocket
+connection. Set presence.enabled=true (with auth.enabled=true and
+presence.redis.host set) to enable real-time push. See ROADMAP.md Track
+A5 / WORKFLOW.md's presence-bridge section.
+{{- end }}
