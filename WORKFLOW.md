@@ -277,12 +277,30 @@ builtin).
   `--presence-token` configured means the two routes 404 and `notify`
   always takes the offline path — a feature not opted into costs nothing,
   the same framing `TRANSACT.md`'s row 6 already establishes.
+  **2026-08-28 — the external WS gateway this bridge names now exists:**
+  `presence-gateway/` (repo root, its own crate — `README.md` there has
+  the full protocol/design writeup), a small standalone process that
+  terminates real browser WebSocket connections, independently verifies
+  each one's identity token (its own `--jwks-file`/`--issuer`/
+  `--audience`, deliberately not sharing code with `interpreter.rs`'s
+  JWT verifier — see that crate's `src/jwt.rs` doc comment for why),
+  calls `_presence_connect`/`_disconnect` as connections open/close
+  (correctly ref-counted per subject for multi-tab), and relays each
+  `nirdosha:push:<subject>` publish to the right live connection.
+  Verified live end-to-end, not just built: a real `nirdosha serve`, a
+  real Redis, a real browser-shaped `WebSocket` client, and a real
+  `notify()` call round-trip correctly, both as a plain binary and as a
+  built Docker image (`docker stop` shuts it down gracefully within
+  Docker's default timeout, confirmed by the client actually receiving a
+  clean close frame, not a connection reset).
 
 ## Deliberate non-goals (disclosed, not silently dropped)
 
 - **This repository does not terminate WebSocket connections and adds no
-  new transport.** `notify`'s real-time path is a Redis `PUBLISH` — an
-  external WS gateway process is assumed, not built here.
+  new transport.** `notify`'s real-time path is a Redis `PUBLISH` — a
+  separate crate does the terminating (`presence-gateway/`, immediately
+  above), deliberately kept out of `compiler/` itself; nothing here
+  changes.
 - **At-least-once notification delivery, never exactly-once**, the same
   honest limit `TRANSACT.md`'s own `network` idempotency-key section
   already discloses for the same underlying reason (no purely local

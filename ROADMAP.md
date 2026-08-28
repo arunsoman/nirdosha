@@ -810,22 +810,69 @@ of Track B has landed.*
   (2026-08-23) was a breaking language change shipped in one session —
   need a real policy before a deployed critical app can trust future
   changes won't silently break it.
-- `[OPEN]` **A5. `workflow`'s real-time presence gateway.** `notify()`
+- `[DONE]` **A5. `workflow`'s real-time presence gateway.** `notify()`
   (`WORKFLOW.md`) publishes to `nirdosha:push:<subject>` (Redis) and
   reads `identity_presence` — both real — but nothing in this repo
-  terminates a live browser WebSocket/SSE connection, and that's the
+  terminated a live browser WebSocket/SSE connection, and that's the
   only thing that could ever legitimately call the two routes that
   populate `identity_presence` (`_presence_connect`/`_presence_disconnect`)
-  or subscribe to those Redis channels. Net effect today: `identity_presence`
-  never has an "online" row, so `notify()` always silently takes the
-  offline (`send_email`) path — it doesn't error, it just never does the
-  "push it live" half of its job. Needs a small standalone service
-  (outside `compiler/`) that: terminates the real client connections,
-  calls `_presence_connect`/`_presence_disconnect` as they open/close
-  (bearer-token-authenticated via `--presence-token`), and subscribes to
-  each `nirdosha:push:<subject>` channel to relay to the right live
-  connection. `send_email`/`send_sms`/`send_push` and every other part
-  of `workflow` are unaffected and fully functional without this.
+  or subscribe to those Redis channels. Net effect before this: `identity_presence`
+  never had an "online" row, so `notify()` always silently took the
+  offline (`send_email`) path — it didn't error, it just never did the
+  "push it live" half of its job.
+
+  **2026-08-28 — built: `presence-gateway/` (repo root, its own crate —
+  `README.md` there has the full protocol/design writeup, `WORKFLOW.md`'s
+  presence-bridge section has the pointer).** A small standalone
+  service, deliberately kept out of `compiler/` (own `Cargo.toml`'s doc
+  comment: `nirdosha` is a `[dev-dependencies]`-only dependency, used
+  purely by its own tests, so the shipped binary stays free of
+  z3/postgres/rusqlite) that: terminates real browser WebSocket
+  connections; independently verifies each one's identity token against
+  its own `--jwks-file`/`--issuer`/`--audience` (a real `jsonwebtoken`-
+  based verifier, not a second hand-rolled one — deliberately not
+  reusing `interpreter.rs`'s `pub(crate)` verifier, `src/jwt.rs`'s own
+  doc comment has the reasoning); calls `_presence_connect`/
+  `_presence_disconnect` as connections open/close, correctly
+  ref-counted per subject (`src/registry.rs`) so a second open tab
+  neither re-announces nor is the one that marks a subject offline when
+  it alone closes; and subscribes to each `nirdosha:push:<subject>`
+  channel to relay to the right live connection — with the
+  subscribe-before-ack ordering that actually matters enforced
+  deliberately (an earlier version of this code acked "connected" before
+  subscribing, and a `notify()` call issued right after could be
+  silently lost to Redis pub/sub's no-persistence-for-late-subscribers
+  semantics; caught by this crate's own integration test, not left as a
+  latent bug).
+
+  Verified live end-to-end, repeatedly, not just built: a real `nirdosha
+  serve`, a real Redis, a real browser-shaped `WebSocket` client (Node's
+  own global `WebSocket`, not a mocked stand-in), and a real `notify()`
+  call round-trip correctly — as a plain release binary, and again as a
+  built Docker image (own `Dockerfile`, confirmed non-root/UID 10002,
+  90.7MB), including `docker stop`'s graceful-SIGTERM path: the client
+  actually receives a clean WS close frame, not a connection reset, and
+  a subsequent `notify()` call correctly falls back offline afterward
+  (proving `_presence_disconnect` really ran, not just that the socket
+  dropped). `cargo test`: 5 unit tests (ref-counting) + 5 real-service
+  integration tests (`compiler/tests/mq.rs`/`serve.rs`'s own "verify
+  against something real" discipline — a real in-process `nirdosha
+  serve`, real Redis, real `mock_issue_token`-minted tokens), all green,
+  `cargo clippy --all-targets` clean.
+
+  **What's disclosed, not silently left out** (this crate's own README,
+  "What's not here" section): no TLS termination (same `[N/A]`,
+  delegate-to-the-platform posture `nirdosha serve` itself takes); one
+  dedicated Redis `SUBSCRIBE` per WebSocket connection rather than a
+  shared/fan-out subscription (simple and correct, `O(connections)` — a
+  real thing to revisit only if it becomes an actual bottleneck at a
+  scale this hasn't been tested against); no Helm chart/Kustomize
+  manifests of its own yet, unlike the main runtime's `deploy/helm/`/
+  `deploy/kustomize/` — a `Dockerfile` only, a natural near-term
+  follow-up flagged here so it doesn't quietly stay unowned.
+  `send_email`/`send_sms`/`send_push` and every other part of `workflow`
+  were already, and remain, unaffected and fully functional without any
+  of this.
 - `[PARTIAL]` **A6. Identity admin console: multi-IdP registry, role
   mapping + cache, roles/ACL introspection, opt-in scaffolding.**
   Prompted by a real gap: `requires(role: "compliance_officer")` and a
