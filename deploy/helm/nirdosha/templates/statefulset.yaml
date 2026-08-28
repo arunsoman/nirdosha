@@ -1,4 +1,5 @@
 {{- include "nirdosha.validateReplicaMode" . -}}
+{{- include "nirdosha.validatePresence" . -}}
 {{- if eq .Values.db.mode "sqlite" }}
 apiVersion: apps/v1
 kind: StatefulSet

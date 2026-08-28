@@ -119,8 +119,13 @@ default stop timeout.
   O(connections) Redis subscriptions rather than one shared subscription
   fanned out in-process. Worth revisiting only if that specifically
   becomes a real bottleneck at a scale this hasn't been tested against.
-- **No Helm chart / Kustomize manifests of its own yet** — unlike the
-  main `nirdosha` runtime (`deploy/helm/`, `deploy/kustomize/`), this
-  crate ships a `Dockerfile` only. A natural follow-up, not attempted in
-  this pass so it doesn't quietly stay unowned (see `ROADMAP.md` Track
-  A5).
+- **No Helm chart / Kustomize manifests of its own** — by design, not an
+  omission: it deploys as a sidecar *inside* the main `deploy/helm/
+  nirdosha/` chart (`presence.enabled: true`, `_pod.tpl`) rather than as
+  a second chart with its own Service/scaling story to keep in sync. No
+  dedicated Kustomize overlay either, consistent with `auth`/`otel` (the
+  main chart's other optional toggles) also having none — `deploy/
+  kustomize/` only captures the two replica-mode archetypes; every
+  feature toggle is a Helm-`--set` knob. `.github/workflows/docker.yml`
+  publishes this image (multi-arch, signed, SBOM'd) on the same trigger
+  as the main runtime image.

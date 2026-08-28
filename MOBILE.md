@@ -260,11 +260,12 @@ v1 API... is future, dedicated-adapter work"). Needs: a concrete FCM/
 APNs adapter behind that same `push_provider_config` pattern, and a new
 mechanism for a native app to register its device token against a
 subject (doesn't exist in any form today). Note this sidesteps
-`ROADMAP.md` Track A6's presence-gateway gap entirely — that gap is
-about routing `notify()` to a *live WebSocket* for a connected browser;
-a native app's push path never needs a live connection or the
-`identity_presence`/`--presence-token` machinery at all, it just needs
-a registered device token and a real provider adapter.
+`ROADMAP.md` Track A5's presence-gateway machinery entirely (`[DONE]`,
+`presence-gateway/`) — that machinery is about routing `notify()` to a
+*live WebSocket* for a connected browser; a native app's push path never
+needs a live connection or the `identity_presence`/`--presence-token`
+machinery at all, it just needs a registered device token and a real
+provider adapter.
 
 **Offline action queue with replay-safe retry** (`D5`). `txn_id`
 (`TRANSACT.md`) is a genuine, shipped idempotency mechanism, but it's

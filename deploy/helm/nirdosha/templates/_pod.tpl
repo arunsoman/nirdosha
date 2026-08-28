@@ -117,6 +117,64 @@ spec:
           mountPath: /etc/nirdosha/otel
           readOnly: true
         {{- end }}
+    {{- if .Values.presence.enabled }}
+    - name: presence-gateway
+      image: "{{ .Values.presence.gateway.image.repository }}:{{ .Values.presence.gateway.image.tag }}"
+      imagePullPolicy: {{ .Values.presence.gateway.image.pullPolicy }}
+      args:
+        - --nirdosha-base-url
+        - http://127.0.0.1:8080
+        - --presence-token-file
+        - /etc/nirdosha/presence/token
+        - --jwks-file
+        - /etc/nirdosha/jwks/jwks.json
+        - --issuer
+        - {{ .Values.auth.issuer | quote }}
+        - --audience
+        - {{ .Values.auth.audience | quote }}
+        - --host
+        - 0.0.0.0
+        - --port
+        - {{ .Values.presence.gateway.port | quote }}
+        - --redis-host
+        - {{ .Values.presence.redis.host | quote }}
+        - --redis-port
+        - {{ .Values.presence.redis.port | quote }}
+      ports:
+        - name: presence
+          containerPort: {{ .Values.presence.gateway.port }}
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      resources:
+        {{- toYaml .Values.resources | nindent 8 }}
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: presence
+        initialDelaySeconds: 2
+        periodSeconds: 10
+        failureThreshold: 3
+      readinessProbe:
+        httpGet:
+          path: /readyz
+          port: presence
+        initialDelaySeconds: 1
+        periodSeconds: 5
+        failureThreshold: 10
+      # Same two Secret volumes the main container already mounts above
+      # (`jwks`/`presence-token`, both conditionally defined below since
+      # `validatePresence` already guarantees `auth.enabled` whenever this
+      # sidecar exists) -- the gateway verifies the exact same tokens
+      # against the exact same JWKS, so there is nothing of its own to
+      # duplicate.
+      volumeMounts:
+        - name: jwks
+          mountPath: /etc/nirdosha/jwks
+          readOnly: true
+        - name: presence-token
+          mountPath: /etc/nirdosha/presence
+          readOnly: true
+    {{- end }}
   volumes:
     {{- if eq .Values.db.mode "postgres" }}
     - name: data
