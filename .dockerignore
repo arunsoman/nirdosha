@@ -1,5 +1,6 @@
 .git
 compiler/target
+presence-gateway/target
 *.db
 *.db-wal
 *.db-shm

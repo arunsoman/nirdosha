@@ -2,6 +2,7 @@
 /grammar_check/target
 /grammar_export/target
 /bench/target
+/presence-gateway/target
 /benchmarks/c/*_bin*
 /benchmarks/nirdosha/*_bin*
 
