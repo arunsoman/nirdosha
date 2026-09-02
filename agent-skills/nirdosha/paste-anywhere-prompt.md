@@ -13,10 +13,12 @@ below exactly — Nirdosha's syntax is stricter and less forgiving than
 most languages you've seen, and small deviations (using `::`, using
 `str` as a function parameter, adding a semicolon, using `for`,
 putting a multi-statement block or a `return` inside a `match` arm,
-using `+=`, or using `/* */` block comments) will produce code that
-doesn't compile. A "Quick reference: wrong vs. right" section below
-has a verified bad/good pair for every one of these — check your draft
-against it before presenting anything as final.
+using `+=`, using `/* */` block comments, a trailing comma in a call's
+arguments, or putting `if`/`match` directly on the right of a plain
+`x = ...` reassignment) will produce code that doesn't compile. A
+"Quick reference: wrong vs. right" section below has a verified
+bad/good pair for every one of these — check your draft against it
+before presenting anything as final.
 
 
 
@@ -33,7 +35,16 @@ generate *valid* Nirdosha on the first try.
 1. **No `::` token exists anywhere in the lexer.** Enum variants are
    flat, unqualified calls: `Some(5)`, `None()`, `Circle(r)` — never
    `EnumName::Variant`. A zero-payload variant still needs `()` at the
-   call site: `None()`, not bare `None`.
+   call site: `None()`, not bare `None`. This flat namespace is
+   *program-wide*, including two built-in prelude enums you didn't
+   declare: `CurrencyCode` (every active ISO 4217 code — `USD`, `EUR`,
+   `SAR`, `INR`, ...) and `UnitCode` (`Second`, `Metre`, `Each`, ...).
+   An enum you write with a variant that happens to match one of those
+   — `enum ReportType { SAR, ... }` for "Suspicious Activity Report",
+   say — collides and fails to compile (`` `SAR` is already used as a
+   function/builtin/constructor name ``). Check any 2-4-letter
+   all-caps variant name, or a common unit word, against those two
+   lists before using it.
 2. **`str` cannot be a function's parameter or return type** — checked
    recursively through `Result`/`Option`/generics/`box`/`&`/`thread`/
    `chan`/`Vector`/`Matrix`/`fn` types. Use a real `enum` for
@@ -204,8 +215,33 @@ generate *valid* Nirdosha on the first try.
       There is no default third option — every `fn` with no `requires(...)`
       at all is exactly this "open" case, the warning just makes that
       visible instead of silent.
-
-## Quick reference: wrong vs. right
+13. **No trailing comma anywhere except a `struct`/`enum` field list.**
+    A call's argument list (`f(a, b,)`), a `fn`'s own parameter list
+    (`fn f(a: i64, b: i64,)`), and an array/matrix literal
+    (`[1, 2, 3,]`) all reject a trailing comma before the closing
+    delimiter — `expected an expression, found RParen`/`RBracket`, or
+    (for params) a bogus "expected identifier" once the parser tries
+    to read a nonexistent next parameter. Only `struct`/`enum`
+    declarations tolerate one.
+14. **A plain reassignment's right-hand side can't start with `if`,
+    `match`, or `transact` directly** — only a `let` binding or
+    `return` can. `x = if cond { 1 } else { 2 }` is a parse error
+    (`expected an expression, found If`), because `x = ...`'s
+    right-hand side is parsed by a rule that never re-enters the
+    top-level dispatch those three keywords need; a `let`'s value and
+    a `return`'s value *do* go through that dispatch, which is why
+    rule 9's `let x: i64 = if ... { ... } else { ... }` idiom works
+    fine while the "same" thing on a bare reassignment doesn't. Fix:
+    wrap it in parens — `x = (if cond { 1 } else { 2 })` — since a
+    parenthesized expression is re-parsed from the top and does see
+    `if`/`match`/`transact` again. Needed most often accumulating a
+    value across loop iterations, e.g. `total = (if v > 0 { total + v } else { total })`.
+15. **A call's result can't be followed by `.field` or `[index]`.**
+    `source_label(t.source).value` and `lookup(k)[0]` are both parse
+    errors — postfix field/index access only ever applies to a
+    primary expression, and the parser never gives a call's own
+    result another pass through that rule. Bind the call to a `let`
+    first: `let s: Text = source_label(t.source)` then use `s.value`.
 
 A fast-scan companion to the rules above — every pair below is
 verified against the real compiler, not hypothetical.
@@ -341,6 +377,32 @@ json_get_i64(db_query_result, "price_cents")
 json_array_get(db_query_result, 0)   // then json_get_i64 on THAT
 ```
 
+**Trailing comma (rule 13)**
+```nirdosha
+// WRONG -- parse error: expected an expression, found RParen
+create_widget(name, price,)
+// RIGHT -- no trailing comma in a call's arguments (same for a fn's
+// own parameter list, and an array/matrix literal)
+create_widget(name, price)
+```
+
+**`if`/`match` on a reassignment's right-hand side (rule 14)**
+```nirdosha
+// WRONG -- parse error: expected an expression, found If
+total = if v > 0 { total + v } else { total }
+// RIGHT -- wrap it in parens so it's re-parsed from the top
+total = (if v > 0 { total + v } else { total })
+```
+
+**Field/index access after a call (rule 15)**
+```nirdosha
+// WRONG -- parse error: expected `)`, found Dot
+let s: str = source_label(t.source).value
+// RIGHT -- bind the call's result first
+let label: Text = source_label(t.source)
+let s: str = label.value
+```
+
 ## Types
 
 | Type | Spelling | Notes |
@@ -358,7 +420,7 @@ json_array_get(db_query_result, 0)   // then json_get_i64 on THAT
 | `tcp` / `tcp_listener` | | Affine. Real sockets. |
 | `file` | | Affine. `open(path, mode)`; `mode` is `"r"`, `"w"`, or `"a"`. |
 | `db` | | Affine. `db_connect(conn_str) -> Result(db, str)`; `stop(conn)` closes it once. See the Ownership section below for a real sharp edge here. |
-| `Vector(T, N)` / `Matrix(T, R, C)` | | `N`/`R`/`C` are compile-time literal ints. `Vector(f64,3) ≠ Vector(f64,4)` — different types. |
+| `Vector(T, N)` / `Matrix(T, R, C)` | | `N`/`R`/`C` are compile-time literal ints. `Vector(f64,3) ≠ Vector(f64,4)` — different types. Built *only* via a bracket literal — `[1.0, 2.0, 3.0]` for a `Vector`, `[[1.0, 2.0], [3.0, 4.0]]` for a `Matrix` (a same-shaped array of `Vector`s of plain scalars, never nested deeper) — `Vector(1.0, 2.0, 3.0)`-as-a-call is a parse error. Read with `v[i]` (one index) / `m[r, c]` (one bracket group, comma-separated — never chained `m[r][c]`). There is no indexed-*assignment* form at all (`=`'s left-hand side must be a plain variable name), so a cell can't be mutated in place — accumulate scalars in plain locals across a loop and build the literal once at the end. |
 | `Option(T)` | `Some(x)` / `None()` | Prelude generic enum, always available. |
 | `Result(T, E)` | `Ok(x)` / `Err(e)` | Prelude generic enum, always available. |
 
@@ -516,6 +578,10 @@ let v: i64 = recv(c)                       // blocks until a value arrives -- if
 
 let s: sandbox = sandbox worker(args)      // real separate OS process
 let code: i64 = stop(s)                    // kills if still running
+// `worker` must return `unit` -- a sandboxed function's own return
+// value has no way back across a real process boundary. Send a
+// result back over a `chan T` argument instead (freely crosses the
+// process boundary; see the `chan` row above and Concurrency & I/O).
 
 let conn: tcp = connect("host", 8080)
 let l: tcp_listener = listen(8080)
@@ -574,7 +640,13 @@ let price: i64 = match db_query(conn, "SELECT price_cents FROM item WHERE id = ?
 
 **JSON**: `json_parse(s: str) -> Result(json, str)` ·
 `json_get_str/i64/f64/bool(j: json, key: str) -> Result(T, str)` ·
-`json_array_len(j: json) -> i64` · `json_array_get(j: json, i: i64) -> Result(json, str)`.
+`json_array_len(j: json) -> Result(i64, str)` · `json_array_get(j: json, i: i64) -> Result(json, str)` ·
+`json_get(j: json, key: str) -> Result(json, str)` ·
+`json_set_str(doc: json, key: str, value: str) -> Result(json, str)`
+(sets `key` on a JSON object, or starts a fresh object if `doc` is
+`null`). Every one of these is fallible — including `json_array_len`,
+which looks like it should just be a plain `i64` but isn't — so every
+call needs a `match`/`Ok`/`Err` unwrap, no exceptions.
 
 **HTTP** (client-only): `http_get(host: str, port: i64, path: str) -> Result(HttpResponse, str)` ·
 `http_post(host: str, port: i64, path: str, body: str) -> Result(HttpResponse, str)` ·
@@ -586,9 +658,22 @@ let price: i64 = match db_query(conn, "SELECT price_cents FROM item WHERE id = ?
 
 **Privileged functions**: `fn transfer(amount: i64) -> i64 requires(role: "admin") { ... }`
 gates the function's *value*, not just its behavior — you cannot call
-it or take its value directly. The only way to get a callable value is
-`acquire transfer(proof)` where `proof` is a `RoleView`/`ClaimView`
-from `check_role`/`extract_claim`. A third `requires(...)` kind,
+it or take its value directly. The only way to even attempt getting a
+callable value is `acquire transfer(proof)`, where `proof` is a
+`RoleView`/`ClaimView` from `check_role`/`extract_claim` — but
+`acquire` itself is fallible: it type-checks to
+`Result(fn(...) -> ..., str)`, not a bare callable, since the runtime
+still has to confirm the proof actually satisfies the requirement.
+Unwrap it like any other `Result` before calling it:
+```nirdosha
+fn invoke_admin_action_helper(role_view: RoleView, n: i64) -> i64 requires(public) {
+    return match acquire transfer(role_view) {
+        Ok(f) => f(n),
+        Err(e) => -1,
+    }
+}
+```
+A third `requires(...)` kind,
 `requires(public)`, does the opposite — it does **not** gate the
 function (no `acquire` needed, callable exactly as normally) and exists
 purely to silence rule 12's warning on a `fn` you're deliberately
@@ -701,10 +786,17 @@ call) are acceptable for this check.
 
 A `Diagnostic` (from `--format=json`) or a `type error: ...` line (from
 `emit-ui`) names the exact rule violated — read it and fix the named
-issue rather than guessing. If you don't have shell access (a plain
-chat interface), self-check your output line-by-line against the 9
-rules above before presenting it, and say plainly that it hasn't been
-run through the real compiler.
+issue rather than guessing. **Known gap:** on at least one type error
+kind (`DuplicateConstructor` — two enums, or an enum and the prelude's
+`CurrencyCode`/`UnitCode`, declaring the same variant name — rule 1's
+last paragraph), `--format=json` itself panics instead of emitting the
+`Diagnostic`, instead of the failure it's supposed to report cleanly.
+If `--format=json` produces no JSON at all and dies with a Rust panic,
+re-run plain `nirdosha emit-ui file.nir` (no `--format=json`) — the
+same error still reports fine there. If you don't have shell access (a
+plain chat interface), self-check your output line-by-line against the
+15 rules above before presenting it, and say plainly that it hasn't
+been run through the real compiler.
 
 ## Where to go deeper
 
