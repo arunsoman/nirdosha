@@ -5,6 +5,7 @@
 [![docs](https://img.shields.io/badge/docs-LANGUAGE.md-blue)](./LANGUAGE.md)
 [![Contributing](https://img.shields.io/badge/CONTRIBUTING-read-blue)](./CONTRIBUTING.md)
 [![Roadmap](https://img.shields.io/badge/ROADMAP-view-purple)](./PUBLIC_ROADMAP.md)
+[![Sponsor](https://img.shields.io/badge/%E2%9D%A4-Sponsor-ea4aaa)](https://github.com/sponsors/arunsoman)
 
 > **A systems language designed for LLMs to write, with a grammar so
 > constrained the model can't emit invalid syntax.** No garbage collector,
