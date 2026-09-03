@@ -91,7 +91,7 @@ fn start_server() -> u16 {
     let transact_log = std::env::temp_dir().join(format!("nirdosha-workflow-ownership-transact-{port}.db"));
     let workflow_log = std::env::temp_dir().join(format!("nirdosha-workflow-ownership-workflow-{port}.db"));
     std::thread::spawn(move || {
-        nirdosha::serve::run(program, "127.0.0.1", port, Some(auth), None, transact_log, workflow_log, None, None, None, None, None, None, false, None)
+        nirdosha::serve::run(program, "127.0.0.1", port, Some(auth), None, transact_log, workflow_log, None, None, None, None, None, None)
             .expect("serve::run should not fail to bind");
     });
     for _ in 0..100 {

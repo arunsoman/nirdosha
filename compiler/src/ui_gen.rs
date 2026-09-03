@@ -1064,41 +1064,6 @@ fn field_json(f: &FieldSpec) -> serde_json::Value {
     })
 }
 
-/// The demo-mode login screen's "what can I try" catalog — every role/
-/// claim string `typeck::collect_role_claim_strings` found anywhere in
-/// the program, so a visitor picks from what's actually gated instead
-/// of guessing. Shape mirrors `field_json`'s "one flat JSON object,
-/// plain strings" convention: `{"roles": [...], "claims": [{"key":...,
-/// "value":...}, ...]}`.
-fn identity_catalog_json(roles: &[String], claims: &[(String, String)]) -> String {
-    let value = serde_json::json!({
-        "roles": roles,
-        "claims": claims.iter().map(|(k, v)| serde_json::json!({"key": k, "value": v})).collect::<Vec<_>>(),
-    });
-    serde_json::to_string(&value).expect("role/claim catalog is built from plain strings, always serializes")
-}
-
-/// A small, always-visible app-bar badge naming which identity mode
-/// this server is running in — the user-visible half of "the system
-/// understands if it's running in demo or production mode" (the other
-/// half is `IDENTITY_CATALOG`'s bootstrap check re-validating any
-/// `localStorage`-cached identity against `GET /api/_whoami` before
-/// trusting it, since a demo server's ephemeral signing key is
-/// different on every restart). Plain server-rendered HTML, not a JS
-/// decision — it's known at `generate()` time and should never flash
-/// unstyled/absent before JS runs. Empty string for neither mode
-/// (`nirdosha emit-ui`'s static-file output, or a real-identity server
-/// with no `--oidc-*` SSO configured) — today's byte-identical app-bar.
-fn mode_badge_html(demo_mode: bool, production_mode: bool) -> String {
-    if demo_mode {
-        r#"<span class="mode-badge mode-badge-demo" title="No --jwks-file/--issuer/--audience configured -- self-service sign-in mints a real but ephemeral, per-process token, never a stand-in for production identity.">Demo Mode</span>"#.to_string()
-    } else if production_mode {
-        r#"<span class="mode-badge mode-badge-production" title="Real identity provider configured -- sign-in redirects to your organization's own hosted login.">Production</span>"#.to_string()
-    } else {
-        String::new()
-    }
-}
-
 fn metrics_json(metrics: &[Metric]) -> String {
     let value = serde_json::json!(metrics
         .iter()
@@ -1170,26 +1135,11 @@ fn manifest_json(screens: &[Screen]) -> String {
 /// deliberate, disclosed degradation, not a broken feature, for any
 /// screen whose author-written `list_<struct>` does custom joins/logic
 /// the generic endpoint can't see.
-///
-/// `demo_mode`/`production_mode` pick the generated login screen's
-/// third and fourth branches (`IDENTITY_BASE`'s own POST-to-a-mock-
-/// identity-server flow stays first, unconditionally, and is untouched
-/// by either): `demo_mode` shows the self-service role/claim picker
-/// backed by `serve.rs`'s `/api/_demo_login` (only meaningful, and only
-/// ever true, when `nirdosha serve` has no real `--jwks-file`/
-/// `--issuer`/`--audience` configured); `production_mode` shows a
-/// "Sign in with SSO" redirect backed by `serve.rs`'s `/auth/login`
-/// (only true when the `--oidc-*` flags are configured, which itself
-/// requires the real identity trio). Both `false` — `nirdosha emit-ui`'s
-/// static-file mode, no server behind either route — falls back to the
-/// original free-text stub, unchanged.
 pub fn generate(
     program: &Program,
     effects: &HashMap<String, FnEffects>,
     identity_base: Option<&str>,
     server_table_api: bool,
-    demo_mode: bool,
-    production_mode: bool,
     theme: Option<&Theme>,
 ) -> String {
     let screens = build_screens(program, effects);
@@ -1201,18 +1151,12 @@ pub fn generate(
         Some(url) => serde_json::to_string(url).expect("a URL string always serializes"),
         None => "null".to_string(),
     };
-    let (all_roles, all_claims) = crate::typeck::collect_role_claim_strings(program);
-    let identity_catalog = identity_catalog_json(&all_roles, &all_claims);
     TEMPLATE
         .replace("__NIRDOSHA_MANIFEST__", &manifest)
         .replace("__NIRDOSHA_STATS__", &stats)
         .replace("__NIRDOSHA_CHARTS__", &charts)
         .replace("__NIRDOSHA_WORKFLOWS__", &workflows)
         .replace("__NIRDOSHA_IDENTITY_BASE__", &identity_base_js)
-        .replace("__NIRDOSHA_IDENTITY_CATALOG__", &identity_catalog)
-        .replace("__NIRDOSHA_DEMO_MODE__", if demo_mode { "true" } else { "false" })
-        .replace("__NIRDOSHA_PRODUCTION_MODE__", if production_mode { "true" } else { "false" })
-        .replace("__NIRDOSHA_MODE_BADGE__", &mode_badge_html(demo_mode, production_mode))
         .replace("__NIRDOSHA_SERVER_TABLE_API__", if server_table_api { "true" } else { "false" })
         .replace("__NIRDOSHA_THEME_OVERRIDE__", &theme_override_css(theme))
         .replace("__NIRDOSHA_HTML_CLASS__", &theme_html_class(theme))

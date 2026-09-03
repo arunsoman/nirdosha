@@ -118,25 +118,14 @@ fn print_usage() {
     eprintln!("                             [--identity-base URL] [--db PATH]");
     eprintln!("                             [--presence-token TOKEN | --presence-token-file PATH]");
     eprintln!("                             [--otel-port PORT (--otel-token TOKEN | --otel-token-file PATH)]");
-    eprintln!("                             [--oidc-client-id ID --oidc-redirect-uri URL --oidc-authorize-endpoint URL");
-    eprintln!("                              --oidc-token-endpoint URL (--oidc-client-secret SECRET | -file PATH)]");
     eprintln!("                                      run the program as a real HTTP service (UI at GET /,");
     eprintln!("                                      API at POST /api/<fn>, plus GET /healthz, /readyz, /metrics");
     eprintln!("                                      for Kubernetes probes/scraping) -- see src/serve.rs");
-    eprintln!("                                      (no --jwks-file/--issuer/--audience: demo mode -- the login");
-    eprintln!("                                       screen shows every role/claim the program declares, and");
-    eprintln!("                                       self-picking one actually works via a real, ephemeral-signed");
-    eprintln!("                                       token, never a stand-in for production identity)");
-    eprintln!("                                      (--oidc-*: production mode's real OIDC Authorization Code +");
-    eprintln!("                                       PKCE redirect to the identity provider's own hosted login --");
-    eprintln!("                                       requires --jwks-file/--issuer/--audience too, SSO validates");
-    eprintln!("                                       on top of a real token, it doesn't replace one)");
     eprintln!("                                      (--otel-port: a second, loopback-only APM port, dynamically");
     eprintln!("                                       enabled only while a token-authenticated client is connected");
     eprintln!("                                       -- observability layer 2a, requires --otel-token(-file))");
-    eprintln!("                                      (--*-token-file/--oidc-client-secret-file: read a Secret-");
-    eprintln!("                                       mounted file instead of a raw CLI value, which leaks via");
-    eprintln!("                                       /proc/<pid>/cmdline in a Pod)");
+    eprintln!("                                      (--*-token-file: read a Secret-mounted file instead of a raw");
+    eprintln!("                                       CLI value, which leaks via /proc/<pid>/cmdline in a Pod)");
 }
 
 fn read_source(path: &str) -> Result<String, ExitCode> {
@@ -634,10 +623,7 @@ fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
     };
     let registry = nirdosha::ast::TypeRegistry::build(&program);
     let effects = nirdosha::effects::infer_effects(&program, &registry);
-    // `emit-ui` produces a static file, no server behind either
-    // `/api/_demo_login` or `/auth/login` -- both false, same as
-    // `identity_base: None`/`server_table_api: false` right above.
-    let html = nirdosha::ui_gen::generate(&program, &effects, None, false, false, false, theme.as_ref());
+    let html = nirdosha::ui_gen::generate(&program, &effects, None, false, theme.as_ref());
     match output {
         Some(out) => match std::fs::write(&out, html) {
             Ok(()) => {
@@ -666,22 +652,12 @@ fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
 /// `/_nirdosha/table/<snake>` pagination/sort/filter/search route
 /// (`serve.rs`'s own doc comment on `dispatch_table_query`) against the
 /// SQLite file at `PATH`; omitted, every table renders exactly as it
-/// always has (one unpaginated fetch). `--jwks-file`/`--issuer`/
-/// `--audience` are all-or-nothing, and pick the identity mode by their
-/// presence, not a separate flag: absent, the server runs in **demo
-/// mode** (`AuthConfig::demo()` — an ephemeral, per-process signing key;
-/// the generated login screen shows every role/claim the program
-/// declares, and self-picking one actually mints and verifies a real
-/// token, not just a client-side preview); given, the server validates
-/// real bearer tokens against them, and a `requires`-gated handler is
-/// simply unreachable without one (every caller gets 401) — an honest
+/// always has (one unpaginated fetch). `--jwks-file`/
+/// `--issuer`/`--audience` are all-or-nothing: without them, any
+/// `Authorization: Bearer` header is rejected with a clear 500 rather
+/// than silently accepted or silently ignored, and any `requires`-gated
+/// handler is simply unreachable (every caller gets 401) — an honest
 /// failure mode, not a security hole disguised as "it just worked."
-/// `--oidc-*` (client-id/redirect-uri/authorize-endpoint/token-endpoint,
-/// requiring the real jwks/issuer/audience trio too) additionally turns
-/// the login screen into a real OIDC Authorization Code + PKCE redirect
-/// to the identity provider's own hosted login (`serve.rs`'s `GET
-/// /auth/login`/`GET /auth/callback`) — **production mode** — instead of
-/// the mock-POST flow `--identity-base` still provides on its own.
 /// `--otel-port`/`--otel-token` are observability layer 2a
 /// (`observability.rs`'s "Rollout layers 2-4" section): a second,
 /// loopback-only listener a token-bearing APM client connects to, live-
@@ -708,19 +684,6 @@ fn cmd_serve(
     let mut otel_port: Option<u16> = None;
     let mut otel_token: Option<String> = None;
     let mut otel_token_file: Option<String> = None;
-    // Production mode's real OIDC Authorization Code + PKCE redirect
-    // flow — only meaningful (and only accepted, see the all-or-nothing
-    // check below) alongside the real `--jwks-file`/`--issuer`/
-    // `--audience` trio. `--oidc-client-secret`/`-file` mirrors the
-    // `--presence-token`/`-file` pattern above; unlike that pair, the
-    // secret itself stays optional even once the other four are given —
-    // a public, PKCE-only client registration needs none at all.
-    let mut oidc_client_id: Option<String> = None;
-    let mut oidc_client_secret: Option<String> = None;
-    let mut oidc_client_secret_file: Option<String> = None;
-    let mut oidc_redirect_uri: Option<String> = None;
-    let mut oidc_authorize_endpoint: Option<String> = None;
-    let mut oidc_token_endpoint: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--host" => host = args.next().unwrap_or(host),
@@ -731,12 +694,6 @@ fn cmd_serve(
             "--audience" => audience = args.next(),
             "--identity-base" => identity_base = args.next(),
             "--db" => db_path = args.next(),
-            "--oidc-client-id" => oidc_client_id = args.next(),
-            "--oidc-client-secret" => oidc_client_secret = args.next(),
-            "--oidc-client-secret-file" => oidc_client_secret_file = args.next(),
-            "--oidc-redirect-uri" => oidc_redirect_uri = args.next(),
-            "--oidc-authorize-endpoint" => oidc_authorize_endpoint = args.next(),
-            "--oidc-token-endpoint" => oidc_token_endpoint = args.next(),
             // `WORKFLOW.md`'s presence bridge: the service token an
             // external WS gateway presents to `_presence_connect`/
             // `_presence_disconnect` (machine-to-machine, distinct from a
@@ -772,7 +729,7 @@ fn cmd_serve(
     }
     let Some(path) = input else {
         eprintln!(
-            "usage: nirdosha serve <file.nir> [--host 127.0.0.1] [--port 8080] [--jwks-file P --issuer S --audience S] [--identity-base URL] [--db PATH] [--theme theme.json] [--presence-token TOKEN | --presence-token-file PATH] [--otel-port PORT (--otel-token TOKEN | --otel-token-file PATH)] [--oidc-client-id ID --oidc-redirect-uri URL --oidc-authorize-endpoint URL --oidc-token-endpoint URL (--oidc-client-secret SECRET | --oidc-client-secret-file PATH)]"
+            "usage: nirdosha serve <file.nir> [--host 127.0.0.1] [--port 8080] [--jwks-file P --issuer S --audience S] [--identity-base URL] [--db PATH] [--theme theme.json] [--presence-token TOKEN | --presence-token-file PATH] [--otel-port PORT (--otel-token TOKEN | --otel-token-file PATH)]"
         );
         return ExitCode::FAILURE;
     };
@@ -825,44 +782,6 @@ fn cmd_serve(
         eprintln!("--otel-port requires --otel-token or --otel-token-file (an unauthenticated APM port would leak call timing/error-rate data to anyone who can reach it)");
         return ExitCode::FAILURE;
     }
-    let oidc_client_secret = match (oidc_client_secret, oidc_client_secret_file) {
-        (Some(_), Some(_)) => {
-            eprintln!("--oidc-client-secret and --oidc-client-secret-file are mutually exclusive — pass at most one");
-            return ExitCode::FAILURE;
-        }
-        (Some(s), None) => Some(s),
-        (None, Some(f)) => match read_token_file(&f) {
-            Ok(s) => Some(s),
-            Err(msg) => {
-                eprintln!("{msg}");
-                return ExitCode::FAILURE;
-            }
-        },
-        (None, None) => None,
-    };
-    // All-or-nothing on the four *required* SSO flags (the secret stays
-    // separately optional, checked above — see its own doc comment on
-    // `OidcSsoConfig`). SSO is a layer on top of real token validation,
-    // never a replacement for it, so it's only accepted alongside the
-    // real `--jwks-file`/`--issuer`/`--audience` trio.
-    let oidc_flags_given =
-        oidc_client_id.is_some() || oidc_redirect_uri.is_some() || oidc_authorize_endpoint.is_some() || oidc_token_endpoint.is_some();
-    let sso = match (oidc_client_id, oidc_redirect_uri, oidc_authorize_endpoint, oidc_token_endpoint) {
-        (None, None, None, None) => None,
-        (Some(client_id), Some(redirect_uri), Some(authorize_endpoint), Some(token_endpoint)) => {
-            Some(nirdosha::serve::OidcSsoConfig { client_id, client_secret: oidc_client_secret, redirect_uri, authorize_endpoint, token_endpoint })
-        }
-        _ => {
-            eprintln!(
-                "--oidc-client-id/--oidc-redirect-uri/--oidc-authorize-endpoint/--oidc-token-endpoint must be given together, or not at all"
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    if oidc_flags_given && (jwks_file.is_none() || issuer.is_none() || audience.is_none()) {
-        eprintln!("--oidc-* flags require --jwks-file/--issuer/--audience too — SSO validates on top of a real token, it doesn't replace one");
-        return ExitCode::FAILURE;
-    }
     let src = match read_source(&path) {
         Ok(s) => s,
         Err(code) => return code,
@@ -882,14 +801,6 @@ fn cmd_serve(
             return ExitCode::FAILURE;
         }
     };
-    // Demo mode is exactly "no real identity flags given" — computed
-    // before the match below consumes `jwks_file`/`issuer`/`audience`,
-    // from the same flag-presence check that already decides which arm
-    // fires. Never inferred from `auth`'s own shape afterward: this is
-    // the one, single source of truth for the mode, and `AuthConfig`
-    // itself stays a plain 3-field JWKS/issuer/audience bag whether it
-    // came from a real file or from `AuthConfig::demo()`.
-    let demo_mode = jwks_file.is_none() && issuer.is_none() && audience.is_none();
     let auth = match (jwks_file, issuer, audience) {
         (Some(path), Some(issuer), Some(audience)) => match std::fs::read_to_string(&path) {
             Ok(jwks_json) => Some(nirdosha::serve::AuthConfig { jwks_json, issuer, audience }),
@@ -898,14 +809,7 @@ fn cmd_serve(
                 return ExitCode::FAILURE;
             }
         },
-        // Demo mode: an ephemeral, per-process signing key instead of no
-        // `AuthConfig` at all -- see `AuthConfig::demo()`'s own doc
-        // comment for why. This also retires the old behavior where any
-        // request carrying a `Bearer` header 500'd whenever no identity
-        // flags were configured, even for an ungated function --
-        // `resolve_identity`'s `(Some(_), None) => 500` arm is now
-        // unreachable from this CLI, since `auth` is never `None` here.
-        (None, None, None) => Some(nirdosha::serve::AuthConfig::demo()),
+        (None, None, None) => None,
         _ => {
             eprintln!("--jwks-file/--issuer/--audience must be given together, or not at all");
             return ExitCode::FAILURE;
@@ -943,8 +847,6 @@ fn cmd_serve(
         theme_path.as_deref(),
         otel_port,
         otel_token,
-        demo_mode,
-        sso,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {

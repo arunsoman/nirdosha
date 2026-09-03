@@ -1822,18 +1822,7 @@ pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
 /// required argument, not a hidden wall-clock read, so this stays
 /// deterministic — `effects.rs` classifies `mock_issue_token` as pure
 /// via its default arm, same as the `json_*` builtins.
-///
-/// `pub(crate)` (mirroring `validate_oidc_token`'s own visibility)
-/// specifically so `serve.rs::handle_demo_login` can call it directly
-/// from Rust — `Interpreter::call_named` only resolves program-declared
-/// `fn`s, never a raw builtin by name, so there is no path from outside
-/// this file into `eval_builtin`'s dispatch table otherwise. This is
-/// what powers `nirdosha serve`'s demo mode (no `--jwks-file`/
-/// `--issuer`/`--audience` configured): the server mints its own
-/// ephemeral-secret-signed token for a self-declared identity, then
-/// re-verifies it through the exact same `validate_oidc_token` a real
-/// IdP's token goes through.
-pub(crate) fn mock_issue_token(
+fn mock_issue_token(
     subject: &str,
     issuer: &str,
     audience: &str,
@@ -2267,7 +2256,7 @@ pub(crate) fn db_row_to_json(row: &rusqlite::Row, column_names: &[String]) -> ru
 /// actually put on the wire. Returns `Err` if any component contains
 /// newlines, which would let an attacker inject arbitrary headers or
 /// split the request.
-fn build_http_request(method: &str, host: &str, path: &str, body: Option<&str>, content_type: &str) -> Result<Vec<u8>, String> {
+fn build_http_request(method: &str, host: &str, path: &str, body: Option<&str>) -> Result<Vec<u8>, String> {
     // Prevent request-line / header injection. `method` is supplied by the
     // compiler as a fixed literal, but validate it anyway; `host` and `path`
     // come from user-provided `str` values and must not contain line breaks.
@@ -2289,7 +2278,7 @@ fn build_http_request(method: &str, host: &str, path: &str, body: Option<&str>, 
     );
     let req_body_bytes = body.unwrap_or("").as_bytes();
     if body.is_some() {
-        request.push_str(&format!("Content-Type: {content_type}\r\nContent-Length: {}\r\n", req_body_bytes.len()));
+        request.push_str(&format!("Content-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n", req_body_bytes.len()));
     }
     request.push_str("\r\n");
     let mut request_bytes = request.into_bytes();
@@ -2405,7 +2394,7 @@ fn http_request(host: &str, port: i64, method: &str, path: &str, body: Option<&s
         Ok(p) => p,
         Err(_) => return result_err(format!("port {port} is not a valid 0-65535 TCP port")),
     };
-    let request = match build_http_request(method, host, path, body, "text/plain; charset=utf-8") {
+    let request = match build_http_request(method, host, path, body) {
         Ok(r) => r,
         Err(e) => return result_err(e),
     };
@@ -2429,7 +2418,7 @@ fn https_request(host: &str, port: i64, method: &str, path: &str, body: Option<&
         Ok(p) => p,
         Err(_) => return result_err(format!("port {port} is not a valid 0-65535 TCP port")),
     };
-    let request = match build_http_request(method, host, path, body, "text/plain; charset=utf-8") {
+    let request = match build_http_request(method, host, path, body) {
         Ok(r) => r,
         Err(e) => return result_err(e),
     };
@@ -2446,65 +2435,6 @@ fn https_request(host: &str, port: i64, method: &str, path: &str, body: Option<&
         Err(e) => return result_err(format!("TLS handshake failed: {e}")),
     };
     send_and_receive(stream, &request)
-}
-
-/// `serve.rs`'s OIDC token-exchange step (production mode's `GET
-/// /auth/callback`) needs a real outbound HTTPS POST with a
-/// `Content-Type: application/x-www-form-urlencoded` body (the OAuth2
-/// standard shape for a token endpoint) — `https_request` above already
-/// has every piece of that machinery, just hardcoded to the `.nir`-facing
-/// `https_post` builtin's `text/plain` content type and `Value`-shaped
-/// return. Rather than duplicate the TLS-connect/send/receive plumbing,
-/// this is the same body with a caller-chosen `content_type` and a plain
-/// Rust `Result<(u16, String), String>` return (`serve.rs` is Rust
-/// infrastructure calling this directly, not `.nir` code going through
-/// `eval_builtin`, so there's no reason to round-trip through a Nirdosha
-/// `Value` here just to immediately unwrap it again).
-pub(crate) fn https_post_with_content_type(host: &str, port: i64, path: &str, content_type: &str, body: &str) -> Result<(u16, String), String> {
-    let port = u16::try_from(port).map_err(|_| format!("port {port} is not a valid 0-65535 TCP port"))?;
-    let request = build_http_request("POST", host, path, Some(body), content_type)?;
-    let tcp = std::net::TcpStream::connect((host, port)).map_err(|e| e.to_string())?;
-    let connector = native_tls::TlsConnector::new().map_err(|e| format!("failed to initialize TLS: {e}"))?;
-    let stream = connector.connect(host, tcp).map_err(|e| format!("TLS handshake failed: {e}"))?;
-    status_body_from_value(send_and_receive(stream, &request))
-}
-
-/// Plain-HTTP sibling of `https_post_with_content_type` above, same
-/// reasoning — an `--oidc-token-endpoint` pointed at an internal
-/// service behind a TLS-terminating proxy (or, in this repo's own test
-/// suite, a loopback-only mock IdP double) is a normal deployment shape
-/// this shouldn't hard-refuse; a real external token endpoint should
-/// still be `https://` in practice, which is on the operator supplying
-/// `--oidc-token-endpoint`, not enforced here.
-pub(crate) fn http_post_with_content_type(host: &str, port: i64, path: &str, content_type: &str, body: &str) -> Result<(u16, String), String> {
-    let port = u16::try_from(port).map_err(|_| format!("port {port} is not a valid 0-65535 TCP port"))?;
-    let request = build_http_request("POST", host, path, Some(body), content_type)?;
-    let stream = std::net::TcpStream::connect((host, port)).map_err(|e| e.to_string())?;
-    status_body_from_value(send_and_receive(stream, &request))
-}
-
-/// Shared by `https_post_with_content_type`/`http_post_with_content_type`
-/// above — unwraps `send_and_receive`'s `Result(HttpResponse, str)`
-/// `Value` into a plain Rust `Result<(u16, String), String>`, since both
-/// callers are Rust infrastructure (`serve.rs`) immediately unwrapping
-/// it again, not `.nir` code that needs the Nirdosha-shaped value.
-fn status_body_from_value(v: Value) -> Result<(u16, String), String> {
-    match v {
-        Value::Enum(name, variant, payload) if name.as_ref() == "Result" && variant.as_ref() == "Ok" => match &payload[0] {
-            Value::Struct(_, fields) => match (&fields[0], &fields[1]) {
-                (Value::Int(status), Value::Str(body)) => {
-                    Ok((u16::try_from(*status).map_err(|_| format!("HTTP status {status} out of range"))?, body.to_string()))
-                }
-                _ => unreachable!("parse_http_response always builds HttpResponse{{i64,str}}"),
-            },
-            _ => unreachable!("parse_http_response's Ok payload is always an HttpResponse struct"),
-        },
-        Value::Enum(name, variant, payload) if name.as_ref() == "Result" && variant.as_ref() == "Err" => match &payload[0] {
-            Value::Str(msg) => Err(msg.to_string()),
-            _ => unreachable!("parse_http_response's Err payload is always a str"),
-        },
-        _ => unreachable!("send_and_receive always returns a Result(HttpResponse, str)"),
-    }
 }
 
 fn as_f64(v: &Value) -> f64 {

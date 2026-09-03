@@ -21,7 +21,7 @@ fn emit_ui(src: &str) -> String {
     check_ownership(&program).expect("ownership check should succeed");
     let registry = TypeRegistry::build(&program);
     let effects = infer_effects(&program, &registry);
-    generate(&program, &effects, None, false, false, false, None)
+    generate(&program, &effects, None, false, None)
 }
 
 #[test]
@@ -372,7 +372,7 @@ fn theme_overrides_only_the_sections_it_sets() {
         radius: Some(ThemeRadius { control: "2px".to_string(), card: "6px".to_string() }),
         ..Default::default()
     };
-    let html = generate(&program, &effects, None, false, false, false, Some(&theme));
+    let html = generate(&program, &effects, None, false, Some(&theme));
 
     // The theme's own tokens appear, both the raw ramp step and the
     // semantic role it's mapped to for a light-mode primary...
@@ -412,7 +412,7 @@ fn theme_value_containing_markup_is_dropped_not_injected() {
         fonts: Some(ThemeFonts { sans: "</style><script>alert(1)</script>".to_string(), display: "Inter".to_string(), mono: None }),
         ..Default::default()
     };
-    let out = generate(&program, &effects, None, false, false, false, Some(&theme));
+    let out = generate(&program, &effects, None, false, Some(&theme));
     // The base template legitimately has its own <script> (the baked-in
     // renderer) -- what must NOT happen is the theme's payload landing
     // verbatim in the output as a second, injected one.
@@ -444,7 +444,7 @@ fn brand_theme_with_dark_mode(dark_mode: Option<&str>) -> nirdosha::ui_gen::Them
 fn dark_mode_media_is_the_default_strategy() {
     let (program, effects) = fixture_program();
     let theme = brand_theme_with_dark_mode(None);
-    let html = generate(&program, &effects, None, false, false, false, Some(&theme));
+    let html = generate(&program, &effects, None, false, Some(&theme));
     assert_eq!(html.matches("@media (prefers-color-scheme: dark)").count(), 2, "the baked-in default plus this theme's own dark override");
     assert!(html.contains("--md-primary: #eeeeee;"), "dark step (300) should land inside the media-query block");
 }
@@ -453,7 +453,7 @@ fn dark_mode_media_is_the_default_strategy() {
 fn dark_mode_class_uses_root_dot_dark_not_media_query() {
     let (program, effects) = fixture_program();
     let theme = brand_theme_with_dark_mode(Some("class"));
-    let html = generate(&program, &effects, None, false, false, false, Some(&theme));
+    let html = generate(&program, &effects, None, false, Some(&theme));
     assert!(html.contains(":root.dark {"));
     assert!(html.contains("--md-primary: #eeeeee;"));
     // Only the template's own pre-existing baked-in media block remains
@@ -465,7 +465,7 @@ fn dark_mode_class_uses_root_dot_dark_not_media_query() {
 fn dark_mode_always_writes_dark_values_into_base_root() {
     let (program, effects) = fixture_program();
     let theme = brand_theme_with_dark_mode(Some("always"));
-    let html = generate(&program, &effects, None, false, false, false, Some(&theme));
+    let html = generate(&program, &effects, None, false, Some(&theme));
     assert!(!html.contains(":root.dark"));
     assert_eq!(html.matches("@media (prefers-color-scheme: dark)").count(), 1, "only the baked-in block -- no theme-driven one");
     // The dark-step color (300 -> #eeeeee) lands directly in the base
@@ -477,7 +477,7 @@ fn dark_mode_always_writes_dark_values_into_base_root() {
 fn dark_mode_none_emits_no_dark_override_at_all() {
     let (program, effects) = fixture_program();
     let theme = brand_theme_with_dark_mode(Some("none"));
-    let html = generate(&program, &effects, None, false, false, false, Some(&theme));
+    let html = generate(&program, &effects, None, false, Some(&theme));
     assert!(!html.contains(":root.dark"));
     assert!(!html.contains("--md-primary: #eeeeee;"), "the dark-step color should never appear anywhere");
     assert_eq!(html.matches("@media (prefers-color-scheme: dark)").count(), 1, "only the baked-in block");

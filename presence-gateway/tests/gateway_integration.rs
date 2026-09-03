@@ -82,8 +82,6 @@ fn start_nirdosha_serve(workflow_log: std::path::PathBuf) -> u16 {
             None,
             None,
             None,
-            false,
-            None,
         )
         .expect("serve::run should not fail to bind");
     });
