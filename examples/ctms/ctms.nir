@@ -2620,4 +2620,140 @@ fn chart_card_crypto_by_mcc() -> Result(json, ErrorCode) requires(public) {
     return match db_connect("ctms.db") { Ok(conn) => chart_card_crypto_by_mcc_inner(conn), Err(e) => Err(DbError(e)) }
 }
 
+// ---- Module 8: RTFDS (Real-Time Fraud Detection Management System) -----
+//
+// RTFDS Home and RTFDS Retention & Reporting fold into the one
+// dashboard{} block below.
+
+module "RTFDS" {
+    struct RtfdsEvent {
+        id: i64,
+        event_type: str,
+        user_ref: str,
+        device_ref: str,
+        ip_address: str,
+        risk_tier: str,
+        action_taken: str,
+        occurred_unix: i64,
+    }
+
+    struct DeviceLink {
+        id: i64,
+        device_ref: str,
+        linked_account_ref: str,
+        linked_ip: str,
+    }
+}
+
+fn list_rtfds_event_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS rtfds_event (id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, user_ref TEXT, device_ref TEXT, ip_address TEXT, risk_tier TEXT, action_taken TEXT, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, event_type, user_ref, device_ref, ip_address, risk_tier, action_taken, occurred_unix FROM rtfds_event ORDER BY occurred_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_rtfds_event() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_rtfds_event_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_rtfds_event_inner(conn: db, e: RtfdsEvent) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS rtfds_event (id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, user_ref TEXT, device_ref TEXT, ip_address TEXT, risk_tier TEXT, action_taken TEXT, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO rtfds_event (event_type, user_ref, device_ref, ip_address, risk_tier, action_taken, occurred_unix) VALUES (?, ?, ?, ?, ?, ?, ?)", e.event_type, e.user_ref, e.device_ref, e.ip_address, e.risk_tier, e.action_taken, e.occurred_unix) { Ok(n) => Ok(n), Err(err) => Err(DbError(err)) }
+    stop conn
+    return result
+}
+fn create_rtfds_event(e: RtfdsEvent) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => create_rtfds_event_inner(conn, e), Err(err) => Err(DbError(err)) }
+}
+// Real-Time Action Console -- Track E4 show_result decisioning action,
+// folded into the same queue screen rather than a separate live-action
+// console Nirdosha has no dedicated construct for.
+fn override_rtfds_action_inner(conn: db, id: i64, new_action: Text) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS rtfds_event (id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, user_ref TEXT, device_ref TEXT, ip_address TEXT, risk_tier TEXT, action_taken TEXT, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let updated: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE rtfds_event SET action_taken = ? WHERE id = ?", new_action.value, id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let result: Result(json, ErrorCode) = match updated {
+        Ok(n) => match db_query(conn, "SELECT id, action_taken FROM rtfds_event WHERE id = ?", id) {
+            Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(e),
+    }
+    stop conn
+    return result
+}
+fn override_rtfds_action(id: i64, new_action: Text) -> Result(json, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => override_rtfds_action_inner(conn, id, new_action), Err(e) => Err(DbError(e)) }
+}
+
+// `override_rtfds_action` (Real-Time Action Console) is a real,
+// reachable `POST /api/override_rtfds_action` fn, but deliberately not
+// wired as a `screen` row action here: a screen action's row-button
+// convention auto-fills only its *first* param from the row (the same
+// "sole id param" shape `delete_<S>` uses), so a genuinely two-param
+// action (`id`, `new_action`) has no button-shaped home on a plain
+// `screen` the way it does on a `workspace` panel (whose own actions
+// DO support a real multi-field form, Track E1's own convention) --
+// this queue has no natural workspace to attach one to. A disclosed
+// gap in today's `screen` action shape, not silently routed around.
+screen RtfdsEvent {
+    title: "Session/Fraud Alert Queue"
+}
+
+fn create_device_link_inner(conn: db, l: DeviceLink) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS device_link (id INTEGER PRIMARY KEY AUTOINCREMENT, device_ref TEXT, linked_account_ref TEXT, linked_ip TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO device_link (device_ref, linked_account_ref, linked_ip) VALUES (?, ?, ?)", l.device_ref, l.linked_account_ref, l.linked_ip) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_device_link(l: DeviceLink) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => create_device_link_inner(conn, l), Err(e) => Err(DbError(e)) }
+}
+// Session/Device Linkage View -- Track E2 graph visual: nodes are
+// distinct devices/accounts, edges are recorded links between them.
+fn graph_device_linkage_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS device_link (id INTEGER PRIMARY KEY AUTOINCREMENT, device_ref TEXT, linked_account_ref TEXT, linked_ip TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(json, ErrorCode) = match db_query(
+        conn,
+        "SELECT json_object('nodes', (SELECT json_group_array(json_object('id', device_ref, 'label', device_ref)) FROM (SELECT DISTINCT device_ref FROM device_link)), 'edges', (SELECT json_group_array(json_object('source', device_ref, 'target', linked_account_ref)) FROM device_link)) AS value"
+    ) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") {
+                Ok(s) => match json_parse(s) { Ok(v) => Ok(v), Err(e) => Err(DbError(e)) },
+                Err(e) => Err(DbError(e)),
+            },
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn graph_device_linkage() -> Result(json, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => graph_device_linkage_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
+screen DeviceLink {
+    title: "Session/Device Linkage View"
+}
+
+fn stat_blocked_attempt_count_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS rtfds_event (id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, user_ref TEXT, device_ref TEXT, ip_address TEXT, risk_tier TEXT, action_taken TEXT, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM rtfds_event WHERE action_taken = 'blocked'") {
+        Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn stat_blocked_attempt_count() -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => stat_blocked_attempt_count_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn chart_rtfds_by_risk_tier_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS rtfds_event (id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, user_ref TEXT, device_ref TEXT, ip_address TEXT, risk_tier TEXT, action_taken TEXT, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT risk_tier AS label, COUNT(*) AS value FROM rtfds_event GROUP BY risk_tier") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn chart_rtfds_by_risk_tier() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => chart_rtfds_by_risk_tier_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
 fn main() {}
