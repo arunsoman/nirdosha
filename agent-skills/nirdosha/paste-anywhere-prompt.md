@@ -743,6 +743,40 @@ extra syntax — see the `screen`/`dashboard` DSL in `LANGUAGE.md` §11 if
 you need to customize that generated UI (custom labels, field
 validation, role-gated visibility, dashboard tiles/charts).
 
+**This naming match has to be exact, and getting it wrong is silent —
+compiles fine, runs fine, the struct just never gets a screen at all.**
+`<struct_snake_case>` means the *struct's own* name, snake_cased —
+`struct CompliancePolicy` needs `list_compliance_policy`/
+`create_compliance_policy`, not `list_policy`/`create_policy`, even
+though the latter reads perfectly naturally on its own. A PRD or spec
+that names its operations `ingest_transaction`/`make_alert` instead of
+`create_transaction`/`create_alert` is describing the same CRUD action
+under a more natural-sounding verb — translate it to the convention
+name (or add a thin wrapper under the convention name that calls the
+existing one) rather than transcribing the PRD's verb literally, or
+`ui_gen.rs`'s own "no convention fn at all → not a screen, just a data
+type" logic drops that struct from the generated UI with **no error,
+no warning** — nothing points at the missing screen; it's simply absent
+from the nav rail. This is the exact same "compiles clean, wrong at
+runtime" hazard class as `db_query`'s array-result footgun above, just
+one layer up (UI generation, not the interpreter) — if a struct you
+expect to see a screen for doesn't show up in `nirdosha serve`'s nav,
+check every one of its CRUD function names against this convention
+before assuming something else is wrong.
+
+A second, related nav-visibility surprise: a screen's nav entry is only
+ever *hidden* from an identity that fails its role/claim check if the
+struct has a `list_`/`get_`/`update_` action to check in the first
+place — a struct with *only* a `create_<struct>` function (no read
+action at all) has nothing to gate the nav item on, so it shows
+unconditionally, to every identity, signed in or not, regardless of
+`create_<struct>`'s own `requires(...)`. That inner action still
+enforces its own gate correctly when actually called — only the nav
+*entry's visibility* is unconditional. If a struct should stay hidden
+from the nav until a specific role can act on it, give it a real
+`list_<struct>`/`get_<struct>` under that same role, not just a
+`create_<struct>`.
+
 Multi-step approval / state-machine flows (KYC onboarding, purchase
 approvals, maker-checker) have their own construct: `workflow Name {
 data { field: Ty, ... } state Name { on_entry { ... } on Event ->
