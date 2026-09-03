@@ -579,6 +579,136 @@ fn heatmap_transaction_geo() -> Result(json, ErrorCode) requires(public) {
     }
 }
 
+// ---- CompliancePolicy: CRUD (Module 6's Policy Management Engine),
+// plus Track E4's "simulate before apply" action. --------------------
+
+struct CompliancePolicy {
+    id: i64,
+    name: str,
+    threshold_cents: i64,
+    active: bool,
+}
+
+fn list_compliance_policy_inner(conn: db) -> Result(json, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS compliance_policy (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, threshold_cents INTEGER, active INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, name, threshold_cents, active FROM compliance_policy ORDER BY id") {
+        Ok(r) => Ok(r),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return rows
+}
+
+fn list_compliance_policy() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") {
+        Ok(conn) => list_compliance_policy_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn create_compliance_policy_inner(conn: db, p: CompliancePolicy) -> Result(i64, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS compliance_policy (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, threshold_cents INTEGER, active INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO compliance_policy (name, threshold_cents, active) VALUES (?, ?, ?)", p.name, p.threshold_cents, p.active) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn create_compliance_policy(p: CompliancePolicy) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => create_compliance_policy_inner(conn, p),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn update_compliance_policy_inner(conn: db, p: CompliancePolicy) -> Result(i64, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS compliance_policy (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, threshold_cents INTEGER, active INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE compliance_policy SET name = ?, threshold_cents = ?, active = ? WHERE id = ?", p.name, p.threshold_cents, p.active, p.id) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn update_compliance_policy(p: CompliancePolicy) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => update_compliance_policy_inner(conn, p),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn delete_compliance_policy_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "DELETE FROM compliance_policy WHERE id = ?", id) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn delete_compliance_policy(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => delete_compliance_policy_inner(conn, id),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+// Track E4's own worked example (`UI_CONSTRUCTS.md` SS4), applied for
+// real: how many transactions would breach *this* policy's threshold if
+// it were active right now -- run against the same `txn` table the real
+// apply path would use, without ever touching `compliance_policy`
+// itself. `id` here names the policy being simulated, not a transaction.
+fn simulate_policy_threshold_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS compliance_policy (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, threshold_cents INTEGER, active INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let c2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS txn (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, amount_cents INTEGER, geo_country TEXT, created_unix INTEGER, geo_lat REAL, geo_lng REAL)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(json, ErrorCode) = match db_query(
+        conn,
+        "SELECT (SELECT name FROM compliance_policy WHERE id = ?) AS policy, (SELECT threshold_cents FROM compliance_policy WHERE id = ?) AS threshold_cents, (SELECT COUNT(*) FROM txn WHERE amount_cents > (SELECT threshold_cents FROM compliance_policy WHERE id = ?)) AS would_flag_count",
+        id, id, id
+    ) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(one) => Ok(one),
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn simulate_policy_threshold(id: i64) -> Result(json, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => simulate_policy_threshold_inner(conn, id),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+screen CompliancePolicy {
+    title: "Policy Management Engine"
+    action "Simulate" -> simulate_policy_threshold {
+        style: "outlined"
+        show_result: true
+    }
+}
+
 dashboard {
     tile "Open Matters" -> stat_open_matters
     tile "High-Risk Wallets" -> stat_high_risk_wallet_count

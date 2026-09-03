@@ -537,3 +537,91 @@ fn field_render_value_must_be_a_string_literal() {
     "#;
     assert_eq!(first_type_error(src), TypeErrorKind::InvalidFieldValidationExpr { key: "render".to_string() });
 }
+
+// ── Track E4: `action { show_result: true }` ────────────────────────────
+
+#[test]
+fn show_result_true_on_a_result_json_returning_action_typechecks_cleanly() {
+    let src = r#"
+        struct Policy {
+            id: i64,
+        }
+        enum ErrorCode {
+            Bad,
+        }
+        fn simulate_policy(id: i64) -> Result(json, ErrorCode) requires(public) {
+            return match json_parse("[]") {
+                Ok(v) => Ok(v),
+                Err(e) => Err(Bad()),
+            }
+        }
+        fn main() {}
+
+        screen Policy {
+            action "Simulate" -> simulate_policy {
+                style: "outlined"
+                show_result: true
+            }
+        }
+    "#;
+    let program = parse_ok(src);
+    typecheck(&program).expect("show_result: true on a Result(json, _)-returning fn should typecheck cleanly");
+}
+
+#[test]
+fn show_result_false_needs_no_particular_return_type() {
+    let src = r#"
+        struct Policy {
+            id: i64,
+        }
+        fn restock_policy(id: i64) -> i64 { return id }
+        fn main() {}
+
+        screen Policy {
+            action "Restock" -> restock_policy {
+                show_result: false
+            }
+        }
+    "#;
+    let program = parse_ok(src);
+    typecheck(&program).expect("show_result: false should impose no shape requirement, same as its absence");
+}
+
+#[test]
+fn show_result_true_on_a_non_json_result_action_is_rejected() {
+    let src = r#"
+        struct Policy {
+            id: i64,
+        }
+        fn restock_policy(id: i64) -> i64 { return id }
+        fn main() {}
+
+        screen Policy {
+            action "Restock" -> restock_policy {
+                show_result: true
+            }
+        }
+    "#;
+    assert!(matches!(
+        first_type_error(src),
+        TypeErrorKind::ShowResultRequiresJsonResult { fn_name, .. } if fn_name == "restock_policy"
+    ));
+}
+
+#[test]
+fn show_result_value_must_be_a_bool_literal() {
+    let src = r#"
+        struct Policy {
+            id: i64,
+        }
+        fn restock_policy(id: i64) -> i64 { return id }
+        fn main() {}
+
+        screen Policy {
+            action "Restock" -> restock_policy {
+                show_result: "yes"
+            }
+        }
+    "#;
+    assert_eq!(first_type_error(src), TypeErrorKind::InvalidFieldValidationExpr { key: "show_result".to_string() });
+}

@@ -113,8 +113,10 @@ independent of Tracks A–D — see
 - [DONE] `field { render: "countdown" }` — a live SLA countdown chip on
   a table field, ticking client-side with zero added network traffic
   (`LANGUAGE.md` §11)
-- [OPEN] Two smaller DSL extensions on top of it (preview actions, a
-  workflow stepper) — see `ROADMAP.md` Track E
+- [DONE] `action { show_result: true }` — a "Simulate"/"Preview" action
+  shows its own JSON return value in a modal instead of just refreshing
+  the row (`LANGUAGE.md` §11)
+- [OPEN] A workflow stage stepper — see `ROADMAP.md` Track E
 
 ---
 

@@ -182,6 +182,13 @@ struct Action {
     /// client must confirm with the user before calling `fn`, the same
     /// way delete already always does (unconditionally, client-side).
     confirm: Option<String>,
+    /// `action "..." -> fn { show_result: true }` (`ROADMAP.md` Track
+    /// E4) — already proven by `typeck.rs::check_action_show_result` to
+    /// only be `true` on a fn returning `Result(json, _)`. `false` (the
+    /// default — every CRUD action, and a custom action that didn't set
+    /// it) keeps today's plain row/panel-refresh-on-success behavior
+    /// unchanged.
+    show_result: bool,
 }
 
 /// One dashboard tile or chart — same shape either way (a label, a
@@ -676,6 +683,7 @@ fn build_action(program: &Program, effects: &HashMap<String, FnEffects>, kind: &
         label: None,
         style: None,
         confirm: None,
+        show_result: false,
     })
 }
 
@@ -693,6 +701,7 @@ fn build_custom_action(
     action.label = Some(decl.label.clone());
     action.style = kv_str(&decl.entries, "style").map(str::to_string);
     action.confirm = kv_str(&decl.entries, "confirm").map(str::to_string);
+    action.show_result = kv_bool(&decl.entries, "show_result");
     Some(action)
 }
 
@@ -719,6 +728,15 @@ fn kv_num(entries: &[(String, Expr)], key: &str) -> Option<f64> {
         Expr::Float(n, _) => Some(*n),
         _ => None,
     })
+}
+
+/// `kv_str`'s boolean sibling, for `action <name> { show_result: ... }`
+/// (`ROADMAP.md` Track E4) — `typeck.rs::check_action_show_result`
+/// already proved the value is an `Expr::Bool` when present; `false`
+/// (never `None`) covers both "absent" and "declared false" alike, since
+/// neither needs a rendering difference from today's default.
+fn kv_bool(entries: &[(String, Expr)], key: &str) -> bool {
+    entries.iter().find(|(k, _)| k == key).is_some_and(|(_, v)| matches!(v, Expr::Bool(true, _)))
 }
 
 /// `kv_str`'s sibling for `field <name> { view: role(...) }`/`{ edit:
@@ -1306,7 +1324,7 @@ fn workspaces_json(workspaces: &[Workspace]) -> String {
                     "requiredRole": a.required_role, "requiredClaim": a.required_claim,
                     "badges": a.effect_badges,
                     "params": a.params.iter().map(field_json).collect::<Vec<_>>(),
-                    "label": a.label, "style": a.style, "confirm": a.confirm,
+                    "label": a.label, "style": a.style, "confirm": a.confirm, "showResult": a.show_result,
                 })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         }))
@@ -1403,7 +1421,7 @@ fn manifest_json(screens: &[Screen]) -> String {
                     "requiredRole": a.required_role, "requiredClaim": a.required_claim,
                     "badges": a.effect_badges,
                     "params": a.params.iter().map(field_json).collect::<Vec<_>>(),
-                    "label": a.label, "style": a.style, "confirm": a.confirm,
+                    "label": a.label, "style": a.style, "confirm": a.confirm, "showResult": a.show_result,
                 })).collect::<Vec<_>>(),
             })
         })

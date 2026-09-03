@@ -347,6 +347,15 @@ __NIRDOSHA_THEME_SCRIPT__
      no new theme tokens (`ROADMAP.md` Track E3). */
   .countdown { font-variant-numeric: tabular-nums; }
   .countdown-overdue { color: var(--md-error); font-weight: 500; }
+  /* Track E4: action { show_result: true } -- native <dialog>, styled
+     to match every other `.card` surface in this file. */
+  .result-modal { max-width: 560px; width: 90%; border: none; padding: 20px; }
+  .result-modal::backdrop { background: color-mix(in srgb, black 40%, transparent); }
+  .result-modal-body {
+    white-space: pre-wrap; word-break: break-word; max-height: 60vh; overflow: auto;
+    margin: 0; font-size: 13px; background: var(--md-surface-variant);
+    padding: 12px; border-radius: var(--md-radius-sm);
+  }
   .row-actions { display: flex; gap: 6px; }
   .stub-note {
     font-size: 12px; color: var(--md-on-surface-variant); background: var(--md-surface-variant);
@@ -547,6 +556,28 @@ function showSnackbar(msg, isError) {
   el.hidden = false;
   clearTimeout(snackbarTimer);
   snackbarTimer = setTimeout(() => { el.hidden = true; }, 4000);
+}
+
+// ---- Track E4: action { show_result: true } -- preview/simulate
+// actions. No existing modal/dialog primitive to reuse -- confirmed by
+// inspection: only the transient, auto-dismissing snackbar above
+// exists, unsuitable for a persistent, possibly multi-line JSON result
+// (`ROADMAP.md` Track E4). A native `<dialog>` element instead: built-in
+// show/close semantics, zero external dependency, same "no external
+// library" stance every other renderer in this file already has.
+function showResultModal(title, value) {
+  const prior = document.getElementById("result-modal");
+  if (prior) prior.close();
+  const dialog = document.createElement("dialog");
+  dialog.id = "result-modal";
+  dialog.className = "card result-modal";
+  const closeBtn = el("button", { class: "btn btn-outlined", text: "Close", onclick: () => dialog.close() });
+  dialog.appendChild(el("h2", { class: "screen-sub", text: title, style: "margin:0 0 12px;" }));
+  dialog.appendChild(el("pre", { class: "result-modal-body", text: JSON.stringify(value, null, 2) }));
+  dialog.appendChild(el("div", { style: "display:flex;justify-content:flex-end;margin-top:12px;" }, [closeBtn]));
+  dialog.addEventListener("close", () => dialog.remove());
+  document.body.appendChild(dialog);
+  dialog.showModal();
 }
 
 // ---- API call, Result(T,E)-shaped: {ok: ...} | {err: ...} ----
@@ -1021,7 +1052,11 @@ async function renderListScreen(screen, root, openWorkspace) {
           const idParam = action.params[0];
           const payload = idParam ? { [idParam.name]: row[idParam.name] } : row;
           const r = await callFn(action.fn, payload);
-          if (r !== null) { showSnackbar(`${action.label || action.fn} done.`); load(); }
+          if (r !== null) {
+            showSnackbar(`${action.label || action.fn} done.`);
+            if (action.showResult) showResultModal(action.label || action.fn, r);
+            load();
+          }
         });
         tds.push(el("td", {}, [btn]));
       }
@@ -1623,6 +1658,7 @@ async function renderPanel(panel, container, id) {
           const r = await callFn(action.fn, { ...idValues, ...vals });
           if (r !== null) {
             showSnackbar(`${action.label || action.fn} done.`);
+            if (action.showResult) showResultModal(action.label || action.fn, r);
             formEl.remove(); formEl = null;
             await reload();
           }

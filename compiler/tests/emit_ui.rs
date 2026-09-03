@@ -730,3 +730,51 @@ fn field_render_countdown_reaches_the_manifest_and_client_wiring() {
     assert!(html.contains(r#"f.render === "countdown""#));
     assert!(html.contains("countdown-overdue"));
 }
+
+// ── Track E4: `action { show_result: true }` ────────────────────────────
+
+#[test]
+fn action_show_result_reaches_the_manifest_and_client_wiring() {
+    let src = r#"
+        struct Text {
+            value: str,
+        }
+        struct Policy {
+            id: i64,
+            threshold_cents: i64,
+        }
+        fn list_policy() -> Text { return Text("[]") }
+
+        fn simulate_policy_threshold(id: i64) -> Result(json, Text) requires(public) {
+            return match json_parse("[]") {
+                Ok(v) => Ok(v),
+                Err(e) => Err(Text(e)),
+            }
+        }
+
+        screen Policy {
+            action "Simulate" -> simulate_policy_threshold {
+                style: "outlined"
+                show_result: true
+            }
+        }
+
+        fn main() {}
+    "#;
+    let html = emit_ui(src);
+
+    assert!(html.contains(r#""fn":"simulate_policy_threshold""#));
+    assert!(html.contains(r#""showResult":true"#));
+
+    // Client-side wiring: the result modal exists and is actually wired
+    // into the custom-action click handler.
+    assert!(html.contains("function showResultModal(title, value)"));
+    assert!(html.contains("if (action.showResult) showResultModal(action.label || action.fn, r);"));
+    assert!(html.contains("dialog.showModal();"));
+}
+
+#[test]
+fn an_action_with_no_show_result_key_still_serializes_it_as_false() {
+    let html = emit_ui(include_str!("../../examples/ui_todo.nir"));
+    assert!(html.contains(r#""showResult":false"#));
+}
