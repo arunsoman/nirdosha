@@ -461,15 +461,22 @@ impl Parser {
     }
 
     /// `dashboard_decl ::= "dashboard" "{" dashboard_item* "}"`
-    /// `dashboard_item ::= ("tile" | "chart") STRING "->" IDENT`
-    /// Same first-token-text dispatch as `screen`'s body; `tile`/`chart`
-    /// are reserved only as a dashboard body's leading item keyword.
+    /// `dashboard_item ::= ("tile" | "chart") STRING "->" IDENT
+    ///                   | "visual" STRING "->" IDENT ("{" kv_entry* "}")?`
+    /// (`ROADMAP.md` Track E2) Same first-token-text dispatch as
+    /// `screen`'s body; `tile`/`chart`/`visual` are reserved only as a
+    /// dashboard body's leading item keyword. `visual`'s trailing
+    /// `{ kv_entry* }` is optional, the same "label+target alone is a
+    /// valid, body-less item" shape `action_decl` already has —
+    /// unlike `tile`/`chart`, whose `entries` field always stays empty
+    /// since neither has a body at all.
     fn parse_dashboard_decl(&mut self) -> PResult<DashboardDecl> {
         let span = self.span();
         self.expect(&Tok::Dashboard, "`dashboard`")?;
         self.expect(&Tok::LBrace, "`{`")?;
         let mut tiles = Vec::new();
         let mut charts = Vec::new();
+        let mut visuals = Vec::new();
         while self.peek().tok != Tok::RBrace {
             let kw = self.expect_ident()?;
             let item_span = self.span();
@@ -478,23 +485,37 @@ impl Parser {
                     let label = self.expect_str_lit("a tile/chart label")?;
                     self.expect(&Tok::Arrow, "`->`")?;
                     let target_fn = self.expect_ident()?;
-                    let m = MetricRef { label, target_fn, span: item_span };
+                    let m = MetricRef { label, target_fn, entries: Vec::new(), span: item_span };
                     if kw == "tile" {
                         tiles.push(m);
                     } else {
                         charts.push(m);
                     }
                 }
+                "visual" => {
+                    let label = self.expect_str_lit("a visual label")?;
+                    self.expect(&Tok::Arrow, "`->`")?;
+                    let target_fn = self.expect_ident()?;
+                    let mut entries = Vec::new();
+                    if self.peek().tok == Tok::LBrace {
+                        self.bump();
+                        while self.peek().tok != Tok::RBrace {
+                            entries.push(self.parse_kv_entry()?);
+                        }
+                        self.expect(&Tok::RBrace, "`}`")?;
+                    }
+                    visuals.push(MetricRef { label, target_fn, entries, span: item_span });
+                }
                 other => {
                     return Err(ParseError {
-                        message: format!("expected `tile` or `chart`, found identifier `{other}`"),
+                        message: format!("expected `tile`, `chart`, or `visual`, found identifier `{other}`"),
                         span: item_span,
                     });
                 }
             }
         }
         self.expect(&Tok::RBrace, "`}`")?;
-        Ok(DashboardDecl { tiles, charts, span })
+        Ok(DashboardDecl { tiles, charts, visuals, span })
     }
 
     /// `workspace_decl ::= "workspace" IDENT "{" workspace_item* "}"`

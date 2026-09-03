@@ -410,6 +410,19 @@ pub enum TypeErrorKind {
     /// `ui_gen_template.html`'s `renderWorkspace` (`callFn(source,
     /// {id})`, expecting a JSON array/object back) actually calls.
     PanelSourceWrongShape { workspace: String, panel: String, fn_name: String },
+
+    // ---- Track E2's `render:` DSL (on `visual` and, reused, `panel`) ---
+    /// `visual "..." -> fn { render: "..." }` or `panel "..." { render:
+    /// "..." }` whose `render` value is a string literal, but not one of
+    /// the closed set (`"graph"`/`"heatmap"`/`"timeline"`)
+    /// `ui_gen_template.html`'s `renderDashboard`/`renderPanel` actually
+    /// know how to draw. `context` is a pre-formatted description of
+    /// where this fired (`"visual \"...\""` or `"panel \"...\" in
+    /// workspace ..."`), since the same check serves both. A
+    /// non-string-literal `render` value is caught by the existing, more
+    /// general `InvalidFieldValidationExpr { key: "render" }` instead —
+    /// this variant only ever fires once that shape check already passed.
+    UnknownRenderValue { context: String, render: String },
     /// A user `fn`'s parameter or return type is (or contains) `str` —
     /// the "enum favoring" rule: `str` may not cross a user function's
     /// call boundary, so categorical string data belongs in a real
@@ -758,6 +771,9 @@ impl std::fmt::Display for TypeError {
             TypeErrorKind::InvalidFieldValidationExpr { key } if key == "label" => {
                 write!(f, "{line}:{col}: `label` must be a string literal")
             }
+            TypeErrorKind::InvalidFieldValidationExpr { key } if key == "render" => {
+                write!(f, "{line}:{col}: `render` must be a string literal")
+            }
             TypeErrorKind::InvalidFieldValidationExpr { key } => {
                 write!(f, "{line}:{col}: `{key}` must be an int or float literal")
             }
@@ -819,6 +835,11 @@ impl std::fmt::Display for TypeError {
                 f,
                 "{line}:{col}: `panel \"{panel}\"` in `workspace {workspace}` — `source: {fn_name}` must take exactly one \
                  `i64` parameter and return `Result(json, _)`"
+            ),
+            TypeErrorKind::UnknownRenderValue { context, render } => write!(
+                f,
+                "{line}:{col}: {context} {{ render: \"{render}\" }} — not a recognized render kind; \
+                 use one of \"graph\", \"heatmap\", \"timeline\""
             ),
             TypeErrorKind::StrInFnSignature { fn_name, param_name: Some(param_name) } => write!(
                 f,
@@ -1523,6 +1544,34 @@ impl<'a> Checker<'a> {
         for c in &dash.charts {
             self.check_metric_ref("chart", c);
         }
+        for v in &dash.visuals {
+            self.check_metric_ref("visual", v);
+            for (key, value) in &v.entries {
+                if key == "render" {
+                    self.check_render_expr(format!("`visual \"{}\"`", v.label), value);
+                }
+            }
+        }
+    }
+
+    /// `visual "..." -> fn { render: "..." }` or `panel "..." { render:
+    /// "..." }` (`ROADMAP.md` Track E2) — value must be a string literal
+    /// from the closed vocabulary `ui_gen_template.html`'s
+    /// `renderDashboard`/`renderPanel` actually know how to draw. Unlike
+    /// `check_format_expr`, there's no backing struct field to
+    /// cross-check a type against — neither a visual nor a panel is
+    /// attached to any one struct's field. `context` is a pre-formatted,
+    /// already-backtick-quoted description for the error message, since
+    /// this one check serves two different callers with different
+    /// surrounding syntax.
+    fn check_render_expr(&mut self, context: String, value: &Expr) {
+        let Expr::Str(render, _) = value else {
+            self.error(TypeErrorKind::InvalidFieldValidationExpr { key: "render".to_string() }, value.span());
+            return;
+        };
+        if !matches!(render.as_str(), "graph" | "heatmap" | "timeline") {
+            self.error(TypeErrorKind::UnknownRenderValue { context, render: render.clone() }, value.span());
+        }
     }
 
     /// `workspace <Name> { subject: <Struct> panel "..." { source: <fn>
@@ -1594,6 +1643,14 @@ impl<'a> Checker<'a> {
             }
             for action in &panel.actions {
                 self.check_fn_ref("action", &Expr::Ident(action.target_fn.clone(), action.span));
+            }
+            // `panel "..." { render: "..." }` (Track E2) — same closed
+            // vocabulary `visual`'s own `render` gets, reusing
+            // `check_render_expr` rather than a second check.
+            for (key, value) in &panel.entries {
+                if key == "render" {
+                    self.check_render_expr(format!("`panel \"{}\"` in `workspace {}`", panel.title, ws.name), value);
+                }
             }
         }
     }

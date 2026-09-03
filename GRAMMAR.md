@@ -187,6 +187,15 @@ kv_entry       ::= ident ":" expr
 
 dashboard_decl ::= "dashboard" "{" dashboard_item* "}"
 dashboard_item ::= ("tile" | "chart") string "->" ident
+                  | "visual" string "->" ident ("{" kv_entry* "}")?
+
+// `visual "<label>" -> <fn> { render: "graph"|"heatmap"|"timeline" }`
+// (`ROADMAP.md` Track E2, `examples/ctms/UI_CONSTRUCTS.md` §2) --
+// `visual` is contextual, same "reserved only as this one leading
+// keyword" treatment `tile`/`chart` already get, not a globally
+// reserved token. `render`'s value is typechecked against a closed
+// vocabulary (`typeck.rs::check_dashboard`) but stays an ordinary
+// `kv_entry` here -- no separate mini-grammar per chart kind.
 
 // `workspace Name { subject: Struct panel "..." { ... } }`
 // (`ROADMAP.md` Track E1, `examples/ctms/UI_CONSTRUCTS.md` §1) -- a

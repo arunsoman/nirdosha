@@ -186,7 +186,10 @@ fn stat_and_chart_functions_are_derived_as_dashboard_metrics() {
     assert!(html.contains(r#""fn":"stat_open_cases","label":"Open Cases""#));
     // Gated stat carries the role.
     assert!(html.contains(r#""fn":"stat_total_leakage_cents""#));
-    assert!(html.contains(r#""label":"Total Leakage Cents","requiredClaim":null,"requiredRole":"analyst","requiresLogin":true"#));
+    // (`render` -- Track E2 -- sorts alphabetically between `label` and
+    // `requiredClaim`; always `"bar_chart"` here since this metric has
+    // no declared `visual` entry.)
+    assert!(html.contains(r#""label":"Total Leakage Cents","render":"bar_chart","requiredClaim":null,"requiredRole":"analyst","requiresLogin":true"#));
     // Chart derived from a zero-arg `json`-returning `chart_` fn.
     assert!(html.contains(r#""fn":"chart_leakage_by_service","label":"Leakage By Service""#));
     // Non-matching fns must not leak into either metric list.
@@ -586,4 +589,106 @@ fn workspace_and_panel_render_into_the_manifest() {
 fn a_program_with_no_workspace_block_renders_an_empty_workspaces_array() {
     let html = emit_ui(include_str!("../../examples/ui_todo.nir"));
     assert!(html.contains("const WORKSPACES = [];"), "no workspace block should mean a literally empty array, same as WORKFLOWS already does");
+}
+
+// ── Track E2: `visual`/`render:` (dashboard + workspace panel) ─────────
+
+#[test]
+fn visual_and_panel_render_reach_the_manifest() {
+    let src = r#"
+        struct Text {
+            value: str,
+        }
+
+        struct Case {
+            id: i64,
+            status: str,
+        }
+
+        fn get_case(id: i64) -> Case { return Case(id, "open") }
+
+        fn list_alerts_for_case(case_id: i64) -> Result(json, Text) {
+            return match json_parse("[]") {
+                Ok(v) => Ok(v),
+                Err(e) => Err(Text(e)),
+            }
+        }
+
+        fn graph_wallet_clusters() -> Result(json, Text) requires(public) {
+            return match json_parse("{}") {
+                Ok(v) => Ok(v),
+                Err(e) => Err(Text(e)),
+            }
+        }
+        fn stat_open_cases() -> i64 { return 3 }
+        fn chart_leakage_by_service() -> Result(json, Text) {
+            return match json_parse("[]") {
+                Ok(v) => Ok(v),
+                Err(e) => Err(Text(e)),
+            }
+        }
+
+        dashboard {
+            tile "Open Cases" -> stat_open_cases
+            chart "Leakage" -> chart_leakage_by_service
+            visual "Wallet Clusters" -> graph_wallet_clusters {
+                render: "graph"
+            }
+        }
+
+        workspace CaseInvestigation {
+            subject: Case
+            panel "Alerts" {
+                source: list_alerts_for_case
+                render: "timeline"
+            }
+        }
+
+        fn main() {}
+    "#;
+    let html = emit_ui(src);
+
+    // The pre-existing gap this pass also closed: a declared tile/chart
+    // no longer silently ignored by ui_gen -- `chart_leakage_by_service`
+    // is *also* naming-convention-derived, so this specifically proves
+    // the merge path (not just the visual-only path) works.
+    assert!(html.contains(r#""label":"Open Cases""#));
+    assert!(html.contains(r#""label":"Leakage""#));
+
+    // `visual` itself: present in the same CHARTS array, no second
+    // top-level JSON array, `render` carried through.
+    assert!(html.contains(r#""label":"Wallet Clusters""#));
+    assert!(html.contains(r#""fn":"graph_wallet_clusters""#));
+    assert!(html.contains(r#""render":"graph""#));
+    // A plain `chart_`-convention entry still defaults to bar_chart,
+    // unaffected by Track E2 existing.
+    assert!(html.contains(r#""render":"bar_chart""#));
+
+    // Panel `render` reaches the WORKSPACES array.
+    assert!(html.contains(r#""render":"timeline""#));
+
+    // Client-side wiring for the new render kinds exists.
+    assert!(html.contains("function renderForceGraph(data)"));
+    assert!(html.contains("function renderHeatGrid(data)"));
+    assert!(html.contains("function renderTimelineList(data)"));
+    assert!(html.contains(r#"chart.render === "graph""#));
+    assert!(html.contains(r#"panel.render === "graph""#));
+}
+
+#[test]
+fn a_declared_tile_label_now_overrides_the_inferred_one() {
+    // The pre-existing gap Track E2 closed, isolated: before this,
+    // `ui_gen.rs` never read `program.dashboard` at all -- a declared
+    // `dashboard { tile "<label>" -> stat_fn }` entry's own label was
+    // silently discarded in favor of the naming-convention-inferred one.
+    let src = r#"
+        fn stat_widgets() -> i64 { return 3 }
+        dashboard {
+            tile "Custom Widget Label" -> stat_widgets
+        }
+        fn main() {}
+    "#;
+    let html = emit_ui(src);
+    assert!(html.contains(r#""label":"Custom Widget Label""#));
+    assert!(!html.contains(r#""label":"Widgets""#));
 }

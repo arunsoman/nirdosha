@@ -111,8 +111,12 @@ ActionDecl: () = {
 KvEntry: () = { IDENT ":" Expr => () };
 
 DashboardDecl: () = { "dashboard" "{" DashboardItem* "}" => () };
-// ("tile" | "chart") STRING "->" IDENT -- both contextual, same shape.
-DashboardItem: () = { IDENT STR "->" IDENT => () };
+// ("tile" | "chart") STRING "->" IDENT -- all three contextual, same
+// shape; `visual`'s trailing `{ kv_entry* }` is optional (Track E2).
+DashboardItem: () = {
+    IDENT STR "->" IDENT => (),
+    IDENT STR "->" IDENT "{" KvEntry* "}" => (),
+};
 
 // ---- `module "Name" { ... }` -- nav grouping, not scoping --------------
 

@@ -85,6 +85,7 @@ kv-entry       ::= ident ws ":" ws expr
 
 dashboard-decl ::= "dashboard" ws "{" ws (dashboard-item ws)* "}"
 dashboard-item ::= ("tile" | "chart") ws str-lit ws "->" ws ident
+                  | "visual" ws str-lit ws "->" ws ident (ws "{" ws (kv-entry ws)* "}")?
 
 # `workspace Name { subject: Struct panel "..." { ... } }` -- Track E1's
 # composite multi-panel screen. `action-decl` inside `panel-item` is

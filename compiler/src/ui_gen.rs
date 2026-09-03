@@ -70,7 +70,7 @@ use std::collections::{BTreeSet, HashMap};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 
-use crate::ast::{Effect, Expr, Field, FnDecl, Program, Requirement, ScreenDecl, Ty};
+use crate::ast::{Effect, Expr, Field, FnDecl, MetricRef, Program, Requirement, ScreenDecl, Ty};
 use crate::effects::FnEffects;
 
 /// Prepended to every `Program.structs` by `ast::prelude_structs()` —
@@ -189,7 +189,11 @@ struct Action {
 ///   usually one `db_query` call, no Nirdosha-side data wrangling
 ///   needed. Rendered as a simple inline-SVG bar chart, no external
 ///   charting library (this file's own "self-contained, no external
-///   deps" stance).
+///   deps" stance) — unless `render` says otherwise (below).
+/// - A declared `dashboard { visual "..." -> fn { render: "..." } }`
+///   item (`ROADMAP.md` Track E2) has no naming-convention equivalent
+///   at all — always explicitly declared, never inferred — and sets
+///   `render` to something other than `BarChart`.
 ///
 /// Same role/claim/login gating machinery as `Action` — a metric can be
 /// just as sensitive as any other call.
@@ -199,6 +203,43 @@ struct Metric {
     requires_login: bool,
     required_role: Option<String>,
     required_claim: Option<(String, String)>,
+    render: MetricRender,
+}
+
+/// `visual "..." -> fn { render: "..." }`'s closed vocabulary
+/// (`typeck.rs::check_visual_render_expr` already proved the string
+/// literal is one of these three, or this is `BarChart` — every
+/// `stat_`/`chart_`-convention metric and every declared `tile`/`chart`
+/// item defaults here, unchanged behavior from before Track E2 existed).
+#[derive(Clone, Copy, PartialEq)]
+enum MetricRender {
+    BarChart,
+    Graph,
+    Heatmap,
+    Timeline,
+}
+
+impl MetricRender {
+    fn as_str(self) -> &'static str {
+        match self {
+            MetricRender::BarChart => "bar_chart",
+            MetricRender::Graph => "graph",
+            MetricRender::Heatmap => "heatmap",
+            MetricRender::Timeline => "timeline",
+        }
+    }
+    fn from_kv(entries: &[(String, Expr)]) -> MetricRender {
+        match kv_str(entries, "render") {
+            Some("graph") => MetricRender::Graph,
+            Some("heatmap") => MetricRender::Heatmap,
+            Some("timeline") => MetricRender::Timeline,
+            // Already proven by typeck to be one of the three above, or
+            // absent — an unrecognized string never reaches this trust
+            // boundary (same "typeck already proved well-formedness"
+            // posture every other `kv_str` consumer in this file has).
+            _ => MetricRender::BarChart,
+        }
+    }
 }
 
 /// One derived screen: a user `struct` plus whichever CRUD-convention
@@ -234,6 +275,44 @@ struct Panel {
     title: String,
     source: Action,
     actions: Vec<Action>,
+    render: PanelRender,
+}
+
+/// `panel "..." { render: "..." }`'s closed vocabulary (`ROADMAP.md`
+/// Track E2) — `Table` (the default: `renderPanel`'s original plain-
+/// table rendering, unchanged for a panel that never sets `render`)
+/// plus the same three kinds `MetricRender` gives `visual`, reused
+/// unchanged client-side (`renderForceGraph`/`renderHeatGrid`/
+/// `renderTimelineList` don't care whether they were called from
+/// `renderDashboard` or `renderPanel`).
+#[derive(Clone, Copy, PartialEq)]
+enum PanelRender {
+    Table,
+    Graph,
+    Heatmap,
+    Timeline,
+}
+
+impl PanelRender {
+    fn as_str(self) -> &'static str {
+        match self {
+            PanelRender::Table => "table",
+            PanelRender::Graph => "graph",
+            PanelRender::Heatmap => "heatmap",
+            PanelRender::Timeline => "timeline",
+        }
+    }
+    /// Same trust posture as `MetricRender::from_kv` — typeck already
+    /// proved `render`, if present, is one of the three explicit kinds;
+    /// absent (or, defensively, anything else) means the default.
+    fn from_kv(entries: &[(String, Expr)]) -> PanelRender {
+        match kv_str(entries, "render") {
+            Some("graph") => PanelRender::Graph,
+            Some("heatmap") => PanelRender::Heatmap,
+            Some("timeline") => PanelRender::Timeline,
+            _ => PanelRender::Table,
+        }
+    }
 }
 
 /// `workspace <Name> { subject: <Struct> panel "..." { ... } }` — a
@@ -702,6 +781,22 @@ fn is_chart_return_ty(ty: &Ty) -> bool {
     }
 }
 
+/// One `Metric` from a zero-arg fn — shared by every path that builds
+/// one (naming-convention inference below, and `apply_declared_metrics`/
+/// `build_visuals` for the declared-block path), so gating derivation
+/// (`fn_role_gate`/`fn_requires_login`) stays in exactly one place.
+fn build_metric_from_fn(f: &FnDecl, label: String, render: MetricRender) -> Metric {
+    let (required_role, required_claim) = fn_role_gate(f);
+    Metric {
+        label,
+        fn_name: f.name.clone(),
+        requires_login: fn_requires_login(f) || required_role.is_some() || required_claim.is_some(),
+        required_role,
+        required_claim,
+        render,
+    }
+}
+
 /// Shared by `build_stats`/`build_charts`: every zero-arg fn whose name
 /// starts with `prefix` and whose return type passes `return_ok`
 /// becomes one `Metric`, labeled from the rest of its name.
@@ -710,25 +805,51 @@ fn build_metrics(program: &Program, prefix: &str, return_ok: impl Fn(&Ty) -> boo
         .fns
         .iter()
         .filter(|f| f.name.starts_with(prefix) && f.params.is_empty() && return_ok(&f.ret))
-        .map(|f| {
-            let (required_role, required_claim) = fn_role_gate(f);
-            Metric {
-                label: to_title_case(f.name.strip_prefix(prefix).unwrap_or(&f.name)),
-                fn_name: f.name.clone(),
-                requires_login: fn_requires_login(f) || required_role.is_some() || required_claim.is_some(),
-                required_role,
-                required_claim,
-            }
-        })
+        .map(|f| build_metric_from_fn(f, to_title_case(f.name.strip_prefix(prefix).unwrap_or(&f.name)), MetricRender::BarChart))
         .collect()
 }
 
+/// A declared `dashboard { tile/chart "<label>" -> <fn> }` entry
+/// (`typeck.rs::check_dashboard` already proved `<fn>` resolves) applied
+/// on top of naming-convention inference, which already ran (`metrics`
+/// is `build_metrics`'s own output) — the "additive, for the handful of
+/// things a naming convention can't express" layer this whole
+/// declarative DSL exists for (this file's own module doc comment),
+/// finally actually wired in: a fn naming-convention inference *also*
+/// picked up gets its label overridden by the declared one; a fn it
+/// didn't (any name, not just `stat_`/`chart_`-prefixed) gets added as a
+/// new entry.
+fn apply_declared_metrics(program: &Program, declared: &[MetricRef], metrics: &mut Vec<Metric>) {
+    for d in declared {
+        if let Some(existing) = metrics.iter_mut().find(|m| m.fn_name == d.target_fn) {
+            existing.label = d.label.clone();
+        } else if let Some(f) = find_fn(program, &d.target_fn) {
+            metrics.push(build_metric_from_fn(f, d.label.clone(), MetricRender::BarChart));
+        }
+    }
+}
+
 fn build_stats(program: &Program) -> Vec<Metric> {
-    build_metrics(program, "stat_", is_stat_return_ty)
+    let mut metrics = build_metrics(program, "stat_", is_stat_return_ty);
+    if let Some(dash) = &program.dashboard {
+        apply_declared_metrics(program, &dash.tiles, &mut metrics);
+    }
+    metrics
 }
 
 fn build_charts(program: &Program) -> Vec<Metric> {
-    build_metrics(program, "chart_", is_chart_return_ty)
+    let mut metrics = build_metrics(program, "chart_", is_chart_return_ty);
+    let Some(dash) = &program.dashboard else { return metrics };
+    apply_declared_metrics(program, &dash.charts, &mut metrics);
+    // `visual` (Track E2) has no naming-convention counterpart at all --
+    // always a new entry, never a label-only override of one already
+    // found above.
+    for v in &dash.visuals {
+        if let Some(f) = find_fn(program, &v.target_fn) {
+            metrics.push(build_metric_from_fn(f, v.label.clone(), MetricRender::from_kv(&v.entries)));
+        }
+    }
+    metrics
 }
 
 /// One `screen <Struct> { field <name> { view/edit: ... } }` field's
@@ -1115,7 +1236,8 @@ fn build_workspaces(program: &Program, effects: &HashMap<String, FnEffects>) -> 
             };
             let Some(source) = build_action(program, effects, "source", source_fn) else { continue };
             let actions: Vec<Action> = pd.actions.iter().filter_map(|a| build_custom_action(program, effects, a)).collect();
-            panels.push(Panel { title: pd.title.clone(), source, actions });
+            let render = PanelRender::from_kv(&pd.entries);
+            panels.push(Panel { title: pd.title.clone(), source, actions, render });
         }
 
         let title = kv_str(&wd.entries, "title").map(str::to_string).unwrap_or_else(|| to_display_label(&wd.name));
@@ -1146,6 +1268,7 @@ fn workspaces_json(workspaces: &[Workspace]) -> String {
             "subjectFields": w.subject_fields.iter().map(field_json).collect::<Vec<_>>(),
             "panels": w.panels.iter().map(|p| serde_json::json!({
                 "title": p.title,
+                "render": p.render.as_str(),
                 "sourceFn": p.source.fn_name,
                 // Guaranteed exactly one param by `typeck.rs::
                 // check_workspace`'s shape check before `ui_gen` ever
@@ -1222,6 +1345,12 @@ fn metrics_json(metrics: &[Metric]) -> String {
         .map(|m| serde_json::json!({
             "label": m.label, "fn": m.fn_name, "requiresLogin": m.requires_login,
             "requiredRole": m.required_role, "requiredClaim": m.required_claim,
+            // Always present (also on `STATS`/plain `chart_`-convention
+            // entries, always `"bar_chart"` there) rather than a second
+            // JSON shape just for `visual` items -- the client ignores
+            // it entirely for a tile, and a plain chart's own default
+            // renders byte-for-byte the same as before this key existed.
+            "render": m.render.as_str(),
         }))
         .collect::<Vec<_>>());
     serde_json::to_string(&value).expect("stats/charts manifest is built from plain strings/bools, always serializes")

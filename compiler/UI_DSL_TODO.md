@@ -471,17 +471,22 @@ established: these are closed by design, not gaps waiting on a future
 session — a request to widen any of them is a request for a different
 DSL, not a bug report against this one.
 
-- **One chart type, permanently: the inline-SVG bar chart.**
+- **`chart`, permanently one type: the inline-SVG bar chart.**
   `chart_<name>()` (naming-convention inference) and a declared
   `dashboard { chart "..." -> ... }` entry both render through the same
-  `renderChart` in `ui_gen_template.html`, which draws one shape — a
+  `renderBarChart` in `ui_gen_template.html`, which draws one shape — a
   horizontal bar per `{label, value}` pair — from whatever `chart_<name>`
-  resolved to. No line/scatter/heatmap/treemap/geo/3D chart exists or is
-  planned, and no charting library dependency (Recharts, D3, Victory, or
-  anything else) ever gets pulled in — `ui_gen.rs`'s own doc comment
-  already calls this out as "self-contained, no external charting
-  library." A `chart_<name>` fn that wants a different visual shape has
-  no DSL escape hatch for it.
+  resolved to. No line/scatter/treemap/3D chart exists or is planned for
+  `chart` itself, and no charting library dependency (Recharts, D3,
+  Victory, or anything else) ever gets pulled in — `ui_gen.rs`'s own doc
+  comment already calls this out as "self-contained, no external
+  charting library." **Updated 2026-09-03 (Track E2)**: `chart_<name>`
+  itself still has no DSL escape hatch, but a *separate*
+  `dashboard`/`panel` item now does — `visual "..." -> fn { render:
+  "graph" | "heatmap" | "timeline" }` (`LANGUAGE.md` §11c) — three more
+  inline-SVG shapes, still zero external dependency, still no line/
+  scatter/treemap/3D and no real physics/basemap (disclosed there, not
+  restated here).
 - **Four built-in animations, fixed, nothing else.** `fade-in`/
   `slide-up`/`scale-in`/`pop` (LANGUAGE.md §11b) are the entire
   `@keyframes` vocabulary `ui_gen_template.html` ships — a screen's

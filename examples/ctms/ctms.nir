@@ -39,6 +39,28 @@ struct Transaction {
     matter_id: i64,
     amount_cents: i64,
     geo_country: str,
+    created_unix: i64,
+    geo_lat: f64,
+    geo_lng: f64,
+}
+
+// A wallet's own cluster-graph neighbors (Track E2's `render: "graph"`,
+// Module 7's Wallet Cluster Graph). Deliberately its own struct/table,
+// not folded into `Transaction` -- a wallet-to-wallet link isn't a
+// transaction, it's an inferred relationship between two wallets
+// (shared cluster, common counterparty, etc.), real CTMS's own "hop"
+// concept (`UI_CONSTRUCTS.md` SS2's worked example).
+struct Wallet {
+    id: i64,
+    address: str,
+    risk_score: i64,
+}
+
+struct WalletLink {
+    id: i64,
+    source_wallet_id: i64,
+    target_wallet_id: i64,
+    hop_count: i64,
 }
 
 // ---- Matter: CRUD, SQLite-backed ---------------------------------------
@@ -145,12 +167,22 @@ fn delete_matter(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
 // ---- Transaction: seed/query only -- no screen of its own, it's only
 // ever browsed through a Matter's own workspace panel below. ------------
 
+// `CREATE TABLE IF NOT EXISTS` repeated inline in every `txn`-touching
+// fn below, not factored into a shared helper: `db` is affine with "no
+// borrowing story yet" (`examples/db.nir`'s own doc comment) -- passing
+// `conn` into a helper fn moves it away from the caller for good, so
+// each fn that needs it re-issues the (idempotent) statement itself,
+// the same repetition every other example in this codebase already has.
 fn create_transaction_inner(conn: db, t: Transaction) -> Result(i64, ErrorCode) {
-    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS txn (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, amount_cents INTEGER, geo_country TEXT)") {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS txn (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, amount_cents INTEGER, geo_country TEXT, created_unix INTEGER, geo_lat REAL, geo_lng REAL)") {
         Ok(n) => n,
         Err(e) => -1,
     }
-    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO txn (matter_id, amount_cents, geo_country) VALUES (?, ?, ?)", t.matter_id, t.amount_cents, t.geo_country) {
+    let result: Result(i64, ErrorCode) = match db_execute(
+        conn,
+        "INSERT INTO txn (matter_id, amount_cents, geo_country, created_unix, geo_lat, geo_lng) VALUES (?, ?, ?, ?, ?, ?)",
+        t.matter_id, t.amount_cents, t.geo_country, t.created_unix, t.geo_lat, t.geo_lng
+    ) {
         Ok(n) => Ok(n),
         Err(e) => Err(DbError(e)),
     }
@@ -165,15 +197,27 @@ fn create_transaction(t: Transaction) -> Result(i64, ErrorCode) requires(role: "
     }
 }
 
-// The Investigation Workspace's first panel source: exactly one `i64`
-// param, `Result(json, _)` return -- `typeck.rs::check_workspace`'s
-// required shape (LANGUAGE.md SS15).
+// The Investigation Workspace's "Transactions" panel source -- shaped
+// as `{ts, label}[]` (Track E2's timeline contract, `LANGUAGE.md`
+// SS11c) rather than raw columns, since this fn's only consumer is that
+// one `panel { render: "timeline" }`. Exactly one `i64` param,
+// `Result(json, _)` return -- `typeck.rs::check_workspace`'s required
+// shape (LANGUAGE.md SS15). `||`/`CAST` below are ordinary SQL, executed
+// server-side by SQLite -- Nirdosha's own expression grammar still has
+// no `str` concatenation operator at all (`UI_CONSTRUCTS.md` SS7's own
+// disclosed limit); this sidesteps it by pushing the formatting into the
+// query text, the same way `stat_`/`chart_` conventions already lean on
+// SQL column aliasing instead of Nirdosha-side data wrangling.
 fn list_transaction_for_matter_inner(conn: db, matter_id: i64) -> Result(json, ErrorCode) {
-    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS txn (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, amount_cents INTEGER, geo_country TEXT)") {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS txn (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, amount_cents INTEGER, geo_country TEXT, created_unix INTEGER, geo_lat REAL, geo_lng REAL)") {
         Ok(n) => n,
         Err(e) => -1,
     }
-    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, amount_cents, geo_country FROM txn WHERE matter_id = ? ORDER BY id", matter_id) {
+    let rows: Result(json, ErrorCode) = match db_query(
+        conn,
+        "SELECT created_unix AS ts, (CAST(amount_cents AS TEXT) || ' cents -- ' || geo_country) AS label FROM txn WHERE matter_id = ? ORDER BY created_unix",
+        matter_id
+    ) {
         Ok(r) => Ok(r),
         Err(e) => Err(DbError(e)),
     }
@@ -237,6 +281,261 @@ fn add_matter_note(matter_id: i64, body: Text) -> Result(i64, ErrorCode) require
     }
 }
 
+// ---- Wallet: CRUD (its own screen), plus WalletLink seed data for the
+// Wallet Cluster Graph below. --------------------------------------------
+
+fn list_wallet_inner(conn: db) -> Result(json, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet (id INTEGER PRIMARY KEY AUTOINCREMENT, address TEXT, risk_score INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, address, risk_score FROM wallet ORDER BY id") {
+        Ok(r) => Ok(r),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return rows
+}
+
+fn list_wallet() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") {
+        Ok(conn) => list_wallet_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn get_wallet_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet (id INTEGER PRIMARY KEY AUTOINCREMENT, address TEXT, risk_score INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let row: Result(json, ErrorCode) = match db_query(conn, "SELECT id, address, risk_score FROM wallet WHERE id = ?", id) {
+        Ok(r) => match json_array_get(r, 0) {
+            Ok(one) => Ok(one),
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return row
+}
+
+fn get_wallet(id: i64) -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") {
+        Ok(conn) => get_wallet_inner(conn, id),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn create_wallet_inner(conn: db, w: Wallet) -> Result(i64, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet (id INTEGER PRIMARY KEY AUTOINCREMENT, address TEXT, risk_score INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO wallet (address, risk_score) VALUES (?, ?)", w.address, w.risk_score) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn create_wallet(w: Wallet) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => create_wallet_inner(conn, w),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn update_wallet_inner(conn: db, w: Wallet) -> Result(i64, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet (id INTEGER PRIMARY KEY AUTOINCREMENT, address TEXT, risk_score INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE wallet SET address = ?, risk_score = ? WHERE id = ?", w.address, w.risk_score, w.id) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn update_wallet(w: Wallet) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => update_wallet_inner(conn, w),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn delete_wallet_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "DELETE FROM wallet WHERE id = ?", id) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn delete_wallet(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => delete_wallet_inner(conn, id),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn create_wallet_link_inner(conn: db, l: WalletLink) -> Result(i64, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet_link (id INTEGER PRIMARY KEY AUTOINCREMENT, source_wallet_id INTEGER, target_wallet_id INTEGER, hop_count INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO wallet_link (source_wallet_id, target_wallet_id, hop_count) VALUES (?, ?, ?)", l.source_wallet_id, l.target_wallet_id, l.hop_count) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn create_wallet_link(l: WalletLink) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => create_wallet_link_inner(conn, l),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+// ---- Dashboard: tiles + Track E2's `visual`/`render` ------------------
+
+fn stat_open_matters_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM matter WHERE status = 'open'") {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") {
+                Ok(n) => Ok(n),
+                Err(e) => Ok(0),
+            },
+            Err(e) => Ok(0),
+        },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn stat_open_matters() -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") {
+        Ok(conn) => stat_open_matters_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn stat_high_risk_wallet_count_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet (id INTEGER PRIMARY KEY AUTOINCREMENT, address TEXT, risk_score INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM wallet WHERE risk_score >= 70") {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") {
+                Ok(n) => Ok(n),
+                Err(e) => Ok(0),
+            },
+            Err(e) => Ok(0),
+        },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn stat_high_risk_wallet_count() -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") {
+        Ok(conn) => stat_high_risk_wallet_count_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+// `render: "graph"`'s required `{"nodes":[...], "edges":[...]}` envelope
+// (`LANGUAGE.md` SS11c) is built entirely in SQL -- SQLite's own bundled
+// `json_object`/`json_group_array` functions -- since Nirdosha itself has
+// no builtin to combine two `db_query` results into one nested JSON
+// object. The one `db_query` call returns a single row whose one column
+// IS that envelope, stringified; `json_get_str` reads the string back
+// out, `json_parse` turns it back into a real `json` value (not a
+// further-nested string) before this fn returns it. A real,
+// non-obvious finding from actually testing this against the compiled
+// `db_query` path, not assumed from the SQL alone.
+fn graph_wallet_clusters_inner(conn: db) -> Result(json, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet (id INTEGER PRIMARY KEY AUTOINCREMENT, address TEXT, risk_score INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let c2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet_link (id INTEGER PRIMARY KEY AUTOINCREMENT, source_wallet_id INTEGER, target_wallet_id INTEGER, hop_count INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(json, ErrorCode) = match db_query(
+        conn,
+        "SELECT json_object('nodes', (SELECT json_group_array(json_object('id', id, 'label', address, 'risk', risk_score)) FROM wallet), 'edges', (SELECT json_group_array(json_object('source', source_wallet_id, 'target', target_wallet_id, 'weight', hop_count)) FROM wallet_link)) AS value"
+    ) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") {
+                Ok(s) => match json_parse(s) {
+                    Ok(v) => Ok(v),
+                    Err(e) => Err(DbError(e)),
+                },
+                Err(e) => Err(DbError(e)),
+            },
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn graph_wallet_clusters() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") {
+        Ok(conn) => graph_wallet_clusters_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+// `render: "heatmap"`'s `[{"lat","lng","weight","label"?}]` contract --
+// one point per transaction, weighted by its own amount.
+fn heatmap_transaction_geo_inner(conn: db) -> Result(json, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS txn (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, amount_cents INTEGER, geo_country TEXT, created_unix INTEGER, geo_lat REAL, geo_lng REAL)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT geo_lat AS lat, geo_lng AS lng, amount_cents AS weight, geo_country AS label FROM txn") {
+        Ok(r) => Ok(r),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return rows
+}
+
+fn heatmap_transaction_geo() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") {
+        Ok(conn) => heatmap_transaction_geo_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+dashboard {
+    tile "Open Matters" -> stat_open_matters
+    tile "High-Risk Wallets" -> stat_high_risk_wallet_count
+    visual "Wallet Clusters" -> graph_wallet_clusters {
+        render: "graph"
+    }
+    visual "Transaction Geography" -> heatmap_transaction_geo {
+        render: "heatmap"
+    }
+}
+
 // ---- The Investigation Workspace itself --------------------------------
 // `Matter` already gets a real screen from the CRUD naming convention
 // above (`list_matter`/`create_matter`/`update_matter`/`delete_matter`/
@@ -249,6 +548,7 @@ workspace CaseInvestigation {
 
     panel "Transactions" {
         source: list_transaction_for_matter
+        render: "timeline"
     }
     panel "Notes" {
         source: list_matter_note
