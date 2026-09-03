@@ -172,11 +172,54 @@ fn delete_matter(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
 // `field { render: "countdown" }` is an ordinary `kv_entry` inside the
 // same `field <name> { ... }` block `label`/`pattern`/`min`/`max`
 // already use (`LANGUAGE.md` SS11c/SS3).
+// Decision Panel / Case Export -- Track E4 preview-shaped actions on the
+// Matter Queue screen itself, alongside its Track E3 SLA countdown.
+fn record_matter_decision_inner(conn: db, id: i64, resolution: Text, justification: Text) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE matter SET status = ? WHERE id = ?", resolution.value, id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let confirm: Result(json, ErrorCode) = match result {
+        Ok(n) => match db_query(conn, "SELECT id, status FROM matter WHERE id = ?", id) {
+            Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(e),
+    }
+    stop conn
+    return confirm
+}
+fn record_matter_decision(id: i64, resolution: Text, justification: Text) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => record_matter_decision_inner(conn, id, resolution, justification),
+        Err(e) => Err(DbError(e)),
+    }
+}
+fn export_matter_dossier_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    // A real dossier would bundle a signed PDF/CSV/JSON artifact --
+    // Nirdosha has no file/blob type yet (`MOBILE.md`'s D3 already names
+    // this same gap). This returns the JSON summary a real one would be
+    // built from, honestly short of the real deliverable, not silently
+    // pretending to produce one.
+    let result: Result(json, ErrorCode) = match db_query(conn, "SELECT id, subject_name, status, risk_score FROM matter WHERE id = ?", id) {
+        Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn export_matter_dossier(id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") { Ok(conn) => export_matter_dossier_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
 screen Matter {
     title: "Matter Queue"
     field sla_deadline_unix {
         label: "SLA"
         render: "countdown"
+    }
+    action "Export Dossier" -> export_matter_dossier {
+        style: "outlined"
+        show_result: true
     }
 }
 
@@ -719,6 +762,9 @@ dashboard {
     visual "Transaction Geography" -> heatmap_transaction_geo {
         render: "heatmap"
     }
+    visual "Case Linking / Entity Graph" -> graph_case_links {
+        render: "graph"
+    }
 }
 
 // ---- Track E5: the Case Workflow/Stage Tracker (Module 3) -------------
@@ -758,6 +804,38 @@ workflow CaseLifecycle {
 // `get_matter` -- zero extra syntax needed for that half) -- this
 // `workspace` block is the only new construct this file exercises.
 
+// Evidence Management -- a third Investigation Workspace panel.
+struct MatterEvidence {
+    id: i64,
+    matter_id: i64,
+    evidence_type: str,
+    uploader: str,
+    content_hash: str,
+    version_number: i64,
+}
+
+fn list_matter_evidence_for_matter_inner(conn: db, matter_id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter_evidence (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, evidence_type TEXT, uploader TEXT, content_hash TEXT, version_number INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, evidence_type, uploader, content_hash, version_number FROM matter_evidence WHERE matter_id = ? ORDER BY id", matter_id) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_matter_evidence_for_matter(matter_id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") { Ok(conn) => list_matter_evidence_for_matter_inner(conn, matter_id), Err(e) => Err(DbError(e)) }
+}
+fn add_matter_evidence_inner(conn: db, matter_id: i64, evidence_type: Text, uploader: Text, content_hash: Text) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter_evidence (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, evidence_type TEXT, uploader TEXT, content_hash TEXT, version_number INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO matter_evidence (matter_id, evidence_type, uploader, content_hash, version_number) VALUES (?, ?, ?, ?, 1)", matter_id, evidence_type.value, uploader.value, content_hash.value) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn add_matter_evidence(matter_id: i64, evidence_type: Text, uploader: Text, content_hash: Text) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => add_matter_evidence_inner(conn, matter_id, evidence_type, uploader, content_hash),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
 workspace CaseInvestigation {
     title: "Investigation Workspace"
     subject: Matter
@@ -772,6 +850,167 @@ workspace CaseInvestigation {
             style: "filled"
         }
     }
+    panel "Evidence" {
+        source: list_matter_evidence_for_matter
+        action "Add Evidence" -> add_matter_evidence {
+            style: "outlined"
+        }
+    }
+    panel "Decision" {
+        source: list_matter_note
+        action "Record Decision" -> record_matter_decision {
+            style: "filled"
+            confirm: "Record this resolution? This closes the decision step."
+            show_result: true
+        }
+    }
+}
+
+// Escalation & Regulatory Referral.
+struct MatterEscalation {
+    id: i64,
+    matter_id: i64,
+    reason: str,
+    target: str,
+    referral_status: str,
+    regulator_response: str,
+}
+
+fn list_matter_escalation_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter_escalation (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, reason TEXT, target TEXT, referral_status TEXT, regulator_response TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, matter_id, reason, target, referral_status, regulator_response FROM matter_escalation ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_matter_escalation() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_matter_escalation_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_matter_escalation_inner(conn: db, e: MatterEscalation) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter_escalation (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, reason TEXT, target TEXT, referral_status TEXT, regulator_response TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO matter_escalation (matter_id, reason, target, referral_status, regulator_response) VALUES (?, ?, ?, ?, ?)", e.matter_id, e.reason, e.target, e.referral_status, e.regulator_response) { Ok(n) => Ok(n), Err(err) => Err(DbError(err)) }
+    stop conn
+    return result
+}
+fn create_matter_escalation(e: MatterEscalation) -> Result(i64, ErrorCode) requires(role: "supervisor") {
+    return match db_connect("ctms.db") { Ok(conn) => create_matter_escalation_inner(conn, e), Err(err) => Err(DbError(err)) }
+}
+fn update_matter_escalation_inner(conn: db, e: MatterEscalation) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter_escalation (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, reason TEXT, target TEXT, referral_status TEXT, regulator_response TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE matter_escalation SET matter_id = ?, reason = ?, target = ?, referral_status = ?, regulator_response = ? WHERE id = ?", e.matter_id, e.reason, e.target, e.referral_status, e.regulator_response, e.id) { Ok(n) => Ok(n), Err(err) => Err(DbError(err)) }
+    stop conn
+    return result
+}
+fn update_matter_escalation(e: MatterEscalation) -> Result(i64, ErrorCode) requires(role: "supervisor") {
+    return match db_connect("ctms.db") { Ok(conn) => update_matter_escalation_inner(conn, e), Err(err) => Err(DbError(err)) }
+}
+
+screen MatterEscalation {
+    title: "Escalation & Regulatory Referral"
+}
+
+// Case Linking / Entity Graph -- Track E2 visual.
+struct MatterLink {
+    id: i64,
+    source_matter_id: i64,
+    target_matter_id: i64,
+    link_reason: str,
+}
+
+fn create_matter_link_inner(conn: db, l: MatterLink) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter_link (id INTEGER PRIMARY KEY AUTOINCREMENT, source_matter_id INTEGER, target_matter_id INTEGER, link_reason TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO matter_link (source_matter_id, target_matter_id, link_reason) VALUES (?, ?, ?)", l.source_matter_id, l.target_matter_id, l.link_reason) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_matter_link(l: MatterLink) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") { Ok(conn) => create_matter_link_inner(conn, l), Err(e) => Err(DbError(e)) }
+}
+fn graph_case_links_inner(conn: db) -> Result(json, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let c2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter_link (id INTEGER PRIMARY KEY AUTOINCREMENT, source_matter_id INTEGER, target_matter_id INTEGER, link_reason TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(json, ErrorCode) = match db_query(
+        conn,
+        "SELECT json_object('nodes', (SELECT json_group_array(json_object('id', id, 'label', subject_name, 'risk', risk_score)) FROM matter), 'edges', (SELECT json_group_array(json_object('source', source_matter_id, 'target', target_matter_id)) FROM matter_link)) AS value"
+    ) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") {
+                Ok(s) => match json_parse(s) { Ok(v) => Ok(v), Err(e) => Err(DbError(e)) },
+                Err(e) => Err(DbError(e)),
+            },
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn graph_case_links() -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") { Ok(conn) => graph_case_links_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
+// SLA / Workload Routing Config.
+struct SlaRoutingRule {
+    id: i64,
+    severity_tier: str,
+    sla_minutes: i64,
+    jurisdiction_scope: str,
+    skillset_required: str,
+}
+
+fn list_sla_routing_rule_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS sla_routing_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, severity_tier TEXT, sla_minutes INTEGER, jurisdiction_scope TEXT, skillset_required TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, severity_tier, sla_minutes, jurisdiction_scope, skillset_required FROM sla_routing_rule ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_sla_routing_rule() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_sla_routing_rule_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_sla_routing_rule_inner(conn: db, r: SlaRoutingRule) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS sla_routing_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, severity_tier TEXT, sla_minutes INTEGER, jurisdiction_scope TEXT, skillset_required TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO sla_routing_rule (severity_tier, sla_minutes, jurisdiction_scope, skillset_required) VALUES (?, ?, ?, ?)", r.severity_tier, r.sla_minutes, r.jurisdiction_scope, r.skillset_required) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_sla_routing_rule(r: SlaRoutingRule) -> Result(i64, ErrorCode) requires(role: "supervisor") {
+    return match db_connect("ctms.db") { Ok(conn) => create_sla_routing_rule_inner(conn, r), Err(e) => Err(DbError(e)) }
+}
+fn update_sla_routing_rule_inner(conn: db, r: SlaRoutingRule) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS sla_routing_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, severity_tier TEXT, sla_minutes INTEGER, jurisdiction_scope TEXT, skillset_required TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE sla_routing_rule SET severity_tier = ?, sla_minutes = ?, jurisdiction_scope = ?, skillset_required = ? WHERE id = ?", r.severity_tier, r.sla_minutes, r.jurisdiction_scope, r.skillset_required, r.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_sla_routing_rule(r: SlaRoutingRule) -> Result(i64, ErrorCode) requires(role: "supervisor") {
+    return match db_connect("ctms.db") { Ok(conn) => update_sla_routing_rule_inner(conn, r), Err(e) => Err(DbError(e)) }
+}
+
+screen SlaRoutingRule {
+    title: "SLA / Workload Routing Config"
+}
+
+// Case Analytics Dashboard tiles + Case Linking graph, folded into the
+// one program-wide `dashboard { }` block below.
+fn stat_resolved_matter_count_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM matter WHERE status = 'resolved'") {
+        Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn stat_resolved_matter_count() -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => stat_resolved_matter_count_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn chart_matters_by_status_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT status AS label, COUNT(*) AS value FROM matter GROUP BY status") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn chart_matters_by_status() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => chart_matters_by_status_inner(conn), Err(e) => Err(DbError(e)) }
 }
 
 // =========================================================================
