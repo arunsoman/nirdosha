@@ -2350,4 +2350,274 @@ fn stat_pending_compliance_obligation_count() -> Result(i64, ErrorCode) requires
     return match db_connect("ctms.db") { Ok(conn) => stat_pending_compliance_obligation_count_inner(conn), Err(e) => Err(DbError(e)) }
 }
 
+// ---- Module 7: Crypto Risk Monitoring (Phase 2) -------------------------
+//
+// Wallet Watchlist and Wallet Cluster Graph: already built (Track E2's
+// own `Wallet`/`WalletLink`/`graph_wallet_clusters` worked example) --
+// not rebuilt. Crypto Risk Home and Card-Crypto Monitoring Dashboard
+// fold into the one dashboard{} block below.
+
+module "Crypto Risk" {
+    struct CardCryptoTxn {
+        id: i64,
+        card_ref: str,
+        merchant_name: str,
+        mcc_code: str,
+        amount_cents: i64,
+        occurred_unix: i64,
+        risk_priority: str,
+    }
+
+    struct MerchantEntry {
+        id: i64,
+        merchant_name: str,
+        entry_kind: str,
+        keyword: str,
+    }
+
+    struct TravelRuleCheck {
+        id: i64,
+        wallet_address: str,
+        counterparty_info: str,
+        validation_status: str,
+        checked_unix: i64,
+    }
+
+    struct CryptoComplianceReport {
+        id: i64,
+        report_kind: str,
+        schedule_rule: str,
+        dispatch_history: str,
+    }
+
+    struct WalletSanctionsHit {
+        id: i64,
+        wallet_address: str,
+        list_source: str,
+        match_confidence: i64,
+        status: str,
+    }
+
+    struct CryptoLegalHold {
+        id: i64,
+        wallet_address: str,
+        status: str,
+        applied_unix: i64,
+    }
+}
+
+fn list_card_crypto_txn_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS card_crypto_txn (id INTEGER PRIMARY KEY AUTOINCREMENT, card_ref TEXT, merchant_name TEXT, mcc_code TEXT, amount_cents INTEGER, occurred_unix INTEGER, risk_priority TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, card_ref, merchant_name, mcc_code, amount_cents, occurred_unix, risk_priority FROM card_crypto_txn ORDER BY occurred_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_card_crypto_txn() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_card_crypto_txn_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_card_crypto_txn_inner(conn: db, t: CardCryptoTxn) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS card_crypto_txn (id INTEGER PRIMARY KEY AUTOINCREMENT, card_ref TEXT, merchant_name TEXT, mcc_code TEXT, amount_cents INTEGER, occurred_unix INTEGER, risk_priority TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO card_crypto_txn (card_ref, merchant_name, mcc_code, amount_cents, occurred_unix, risk_priority) VALUES (?, ?, ?, ?, ?, ?)", t.card_ref, t.merchant_name, t.mcc_code, t.amount_cents, t.occurred_unix, t.risk_priority) { Ok(n) => Ok(n), Err(err) => Err(DbError(err)) }
+    stop conn
+    return result
+}
+fn create_card_crypto_txn(t: CardCryptoTxn) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => create_card_crypto_txn_inner(conn, t), Err(err) => Err(DbError(err)) }
+}
+fn update_card_crypto_txn_inner(conn: db, t: CardCryptoTxn) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS card_crypto_txn (id INTEGER PRIMARY KEY AUTOINCREMENT, card_ref TEXT, merchant_name TEXT, mcc_code TEXT, amount_cents INTEGER, occurred_unix INTEGER, risk_priority TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE card_crypto_txn SET card_ref = ?, merchant_name = ?, mcc_code = ?, amount_cents = ?, occurred_unix = ?, risk_priority = ? WHERE id = ?", t.card_ref, t.merchant_name, t.mcc_code, t.amount_cents, t.occurred_unix, t.risk_priority, t.id) { Ok(n) => Ok(n), Err(err) => Err(DbError(err)) }
+    stop conn
+    return result
+}
+fn update_card_crypto_txn(t: CardCryptoTxn) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => update_card_crypto_txn_inner(conn, t), Err(err) => Err(DbError(err)) }
+}
+// Crypto Transaction Simulation Sandbox -- Track E4 preview action,
+// folded into the same screen rather than a dedicated tool screen
+// Nirdosha has no separate "sandbox" construct for.
+fn simulate_card_crypto_detection_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS card_crypto_txn (id INTEGER PRIMARY KEY AUTOINCREMENT, card_ref TEXT, merchant_name TEXT, mcc_code TEXT, amount_cents INTEGER, occurred_unix INTEGER, risk_priority TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(json, ErrorCode) = match db_query(conn, "SELECT merchant_name, mcc_code, (CASE WHEN mcc_code IN ('6051', '4829') THEN 'flag' ELSE 'pass' END) AS detection_result FROM card_crypto_txn WHERE id = ?", id) {
+        Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn simulate_card_crypto_detection(id: i64) -> Result(json, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => simulate_card_crypto_detection_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
+screen CardCryptoTxn {
+    title: "Fiat-Crypto Correlation"
+    action "Run Detection Simulation" -> simulate_card_crypto_detection {
+        style: "outlined"
+        show_result: true
+    }
+}
+
+fn list_merchant_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS merchant_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, merchant_name TEXT, entry_kind TEXT, keyword TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, merchant_name, entry_kind, keyword FROM merchant_entry ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_merchant_entry() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_merchant_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_merchant_entry_inner(conn: db, m: MerchantEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS merchant_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, merchant_name TEXT, entry_kind TEXT, keyword TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO merchant_entry (merchant_name, entry_kind, keyword) VALUES (?, ?, ?)", m.merchant_name, m.entry_kind, m.keyword) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_merchant_entry(m: MerchantEntry) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => create_merchant_entry_inner(conn, m), Err(e) => Err(DbError(e)) }
+}
+fn delete_merchant_entry_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "DELETE FROM merchant_entry WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn delete_merchant_entry(id: i64) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => delete_merchant_entry_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
+screen MerchantEntry {
+    title: "Merchant/Keyword Dictionary"
+}
+
+fn list_travel_rule_check_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS travel_rule_check (id INTEGER PRIMARY KEY AUTOINCREMENT, wallet_address TEXT, counterparty_info TEXT, validation_status TEXT, checked_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, wallet_address, counterparty_info, validation_status, checked_unix FROM travel_rule_check ORDER BY checked_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_travel_rule_check() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_travel_rule_check_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_travel_rule_check_inner(conn: db, t: TravelRuleCheck) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS travel_rule_check (id INTEGER PRIMARY KEY AUTOINCREMENT, wallet_address TEXT, counterparty_info TEXT, validation_status TEXT, checked_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO travel_rule_check (wallet_address, counterparty_info, validation_status, checked_unix) VALUES (?, ?, ?, ?)", t.wallet_address, t.counterparty_info, t.validation_status, t.checked_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_travel_rule_check(t: TravelRuleCheck) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => create_travel_rule_check_inner(conn, t), Err(e) => Err(DbError(e)) }
+}
+fn update_travel_rule_check_inner(conn: db, t: TravelRuleCheck) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS travel_rule_check (id INTEGER PRIMARY KEY AUTOINCREMENT, wallet_address TEXT, counterparty_info TEXT, validation_status TEXT, checked_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE travel_rule_check SET wallet_address = ?, counterparty_info = ?, validation_status = ?, checked_unix = ? WHERE id = ?", t.wallet_address, t.counterparty_info, t.validation_status, t.checked_unix, t.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_travel_rule_check(t: TravelRuleCheck) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => update_travel_rule_check_inner(conn, t), Err(e) => Err(DbError(e)) }
+}
+
+screen TravelRuleCheck {
+    title: "Travel Rule Compliance"
+}
+
+fn list_crypto_compliance_report_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS crypto_compliance_report (id INTEGER PRIMARY KEY AUTOINCREMENT, report_kind TEXT, schedule_rule TEXT, dispatch_history TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, report_kind, schedule_rule, dispatch_history FROM crypto_compliance_report ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_crypto_compliance_report() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_crypto_compliance_report_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_crypto_compliance_report_inner(conn: db, r: CryptoComplianceReport) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS crypto_compliance_report (id INTEGER PRIMARY KEY AUTOINCREMENT, report_kind TEXT, schedule_rule TEXT, dispatch_history TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO crypto_compliance_report (report_kind, schedule_rule, dispatch_history) VALUES (?, ?, ?)", r.report_kind, r.schedule_rule, r.dispatch_history) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_crypto_compliance_report(r: CryptoComplianceReport) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => create_crypto_compliance_report_inner(conn, r), Err(e) => Err(DbError(e)) }
+}
+
+screen CryptoComplianceReport {
+    title: "Crypto Compliance Report"
+}
+
+fn list_wallet_sanctions_hit_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet_sanctions_hit (id INTEGER PRIMARY KEY AUTOINCREMENT, wallet_address TEXT, list_source TEXT, match_confidence INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, wallet_address, list_source, match_confidence, status FROM wallet_sanctions_hit ORDER BY match_confidence DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_wallet_sanctions_hit() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_wallet_sanctions_hit_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_wallet_sanctions_hit_inner(conn: db, h: WalletSanctionsHit) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet_sanctions_hit (id INTEGER PRIMARY KEY AUTOINCREMENT, wallet_address TEXT, list_source TEXT, match_confidence INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO wallet_sanctions_hit (wallet_address, list_source, match_confidence, status) VALUES (?, ?, ?, ?)", h.wallet_address, h.list_source, h.match_confidence, h.status) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_wallet_sanctions_hit(h: WalletSanctionsHit) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => create_wallet_sanctions_hit_inner(conn, h), Err(e) => Err(DbError(e)) }
+}
+fn update_wallet_sanctions_hit_inner(conn: db, h: WalletSanctionsHit) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet_sanctions_hit (id INTEGER PRIMARY KEY AUTOINCREMENT, wallet_address TEXT, list_source TEXT, match_confidence INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE wallet_sanctions_hit SET wallet_address = ?, list_source = ?, match_confidence = ?, status = ? WHERE id = ?", h.wallet_address, h.list_source, h.match_confidence, h.status, h.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_wallet_sanctions_hit(h: WalletSanctionsHit) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => update_wallet_sanctions_hit_inner(conn, h), Err(e) => Err(DbError(e)) }
+}
+
+screen WalletSanctionsHit {
+    title: "Wallet Sanctions Screening Queue"
+}
+
+fn list_crypto_legal_hold_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS crypto_legal_hold (id INTEGER PRIMARY KEY AUTOINCREMENT, wallet_address TEXT, status TEXT, applied_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, wallet_address, status, applied_unix FROM crypto_legal_hold ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_crypto_legal_hold() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_crypto_legal_hold_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_crypto_legal_hold_inner(conn: db, h: CryptoLegalHold) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS crypto_legal_hold (id INTEGER PRIMARY KEY AUTOINCREMENT, wallet_address TEXT, status TEXT, applied_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO crypto_legal_hold (wallet_address, status, applied_unix) VALUES (?, ?, ?)", h.wallet_address, h.status, h.applied_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_crypto_legal_hold(h: CryptoLegalHold) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => create_crypto_legal_hold_inner(conn, h), Err(e) => Err(DbError(e)) }
+}
+
+screen CryptoLegalHold {
+    title: "Crypto Legal Hold"
+}
+
+fn stat_sanctioned_wallet_count_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet_sanctions_hit (id INTEGER PRIMARY KEY AUTOINCREMENT, wallet_address TEXT, list_source TEXT, match_confidence INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM wallet_sanctions_hit") {
+        Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn stat_sanctioned_wallet_count() -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => stat_sanctioned_wallet_count_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn chart_card_crypto_by_mcc_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS card_crypto_txn (id INTEGER PRIMARY KEY AUTOINCREMENT, card_ref TEXT, merchant_name TEXT, mcc_code TEXT, amount_cents INTEGER, occurred_unix INTEGER, risk_priority TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT mcc_code AS label, COUNT(*) AS value FROM card_crypto_txn GROUP BY mcc_code") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn chart_card_crypto_by_mcc() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => chart_card_crypto_by_mcc_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
 fn main() {}
