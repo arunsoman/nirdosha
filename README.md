@@ -65,6 +65,35 @@ wiki pages.
 
 ---
 
+## Current focus / how to help
+
+Solo-maintained research project — small, high-context contributions
+matter more than volume. Right now:
+
+- **Track B (full compilation)** — native codegen only covers the
+  numeric/control-flow subset; `db`/`json`/`http`/`mq`/identity/
+  `transact`/concurrency are interpreter-only. First gap to close:
+  `transact` → `db`/`json`.
+- **LLM eval harness** — [`bench/`](./bench) has a real pass@1 +
+  self-repair-rate scaffold but ships with mock models; wiring it to
+  DeepSeek/Kimi/GLM would make the LLM-writability claims independently
+  checkable.
+- **Windows / macOS verification** — the compiled `tcp`/`tcp_listener`
+  runtime has never run on a real Windows machine; macOS binaries link
+  system Z3 because `z3-src` doesn't build against current AppleClang.
+
+Full list with status tags: [`PUBLIC_ROADMAP.md`](./PUBLIC_ROADMAP.md).
+Issues are labeled `good first issue` / `help wanted` / `compiler` /
+`llm` / `infra` / `docs`. Pick one, comment before starting on anything
+non-trivial — see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+
+| If you care about | Try | 
+|---|---|
+| Ownership/concurrency, PL theory | A `Track B` codegen gap, or an SMT/typeck edge case |
+| Constrained decoding, agent repair loops | `bench/` harness + real models, `grammar_export/` corpus entries |
+| Real backends, CRUD, sandboxing | A new `examples/*.nir` service, or Track A production-readiness items |
+| Docs / DX | Error-message clarity, Getting Started walkthroughs, missing examples |
+
 ## Why this exists, in one paragraph
 
 Nirdosha targets one specific, currently-unsolved problem: **a backend
