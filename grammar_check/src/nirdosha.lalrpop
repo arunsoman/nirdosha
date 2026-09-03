@@ -14,6 +14,14 @@ match {
     "fn", "let", "return", "if", "else", "while", "box",
     "true", "false",
     "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "bool", "unit",
+    // Row 11/12/`WORKFLOW.md`/Track E1 declaration keywords -- real
+    // reserved keywords in `token.rs` (unlike `field`/`action`/
+    // `paginate`/`tile`/`chart`/`panel`/`data`/`on_entry`/`on_exit`/
+    // `on`/`terminal`/`link` below, which stay modeled as plain `IDENT`
+    // -- see the note above `ScreenItem` for why lalrpop can't
+    // faithfully reserve a *contextual* keyword the way `parser.rs`
+    // does).
+    "struct", "enum", "screen", "dashboard", "module", "workflow", "workspace", "state",
     "(", ")", "{", "}", ":", ",", "->", "=",
     "+", "-", "*", "/",
     "==", "!=", "<=", ">=", "<", ">",
@@ -21,6 +29,12 @@ match {
 } else {
     r"[0-9]+" => INT,
     r"[a-zA-Z_][a-zA-Z0-9_]*" => IDENT,
+    // A minimal string-literal lexeme -- no escape handling (`kv_entry`/
+    // `action`/`dashboard`/`module`'s STRING slots, GRAMMAR.md's
+    // `str_lit`). Semantic actions are all `()` (see the file header),
+    // so the *content* of a string never matters here, only that one
+    // token exists to occupy this slot in the grammar's shape.
+    r#""[^"]*""# => STR,
 } else {
     r"\s+" => { },
     r"//[^\n\r]*" => { },
@@ -28,7 +42,141 @@ match {
 
 pub Program: () = { Item* => () };
 
-Item: () = { FnDecl };
+// Every top-level declaration kind `GRAMMAR.md`'s own `item` production
+// lists. `struct_decl`/`enum_decl` were added alongside the Row 12/
+// `WORKFLOW.md`/Track E1 constructs below because `module_decl` and
+// `workflow_decl`'s own `data_block` directly embed them -- there was
+// no way to model those without also modeling these.
+Item: () = {
+    FnDecl => (),
+    StructDecl => (),
+    EnumDecl => (),
+    ScreenDecl => (),
+    DashboardDecl => (),
+    ModuleDecl => (),
+    WorkflowDecl => (),
+    WorkspaceDecl => (),
+};
+
+// ---- Row 11: struct/enum (product/sum types) --------------------------
+
+StructDecl: () = { "struct" IDENT TypeParamList? "{" FieldList ","? "}" => () };
+FieldList: () = { Field => (), FieldList "," Field => () };
+Field: () = { IDENT ":" Type => () };
+TypeParamList: () = { "(" IdentList ")" => () };
+IdentList: () = { IDENT => (), IdentList "," IDENT => () };
+
+EnumDecl: () = { "enum" IDENT TypeParamList? "{" VariantList ","? "}" => () };
+VariantList: () = { Variant => (), VariantList "," Variant => () };
+Variant: () = {
+    IDENT => (),
+    IDENT "(" TypeArgList ")" => (),
+};
+TypeArgList: () = { Type => (), TypeArgList "," Type => () };
+
+// ---- Row 12's UI DSL: `screen`/`dashboard` -----------------------------
+//
+// `field`/`action`/`paginate` (inside `ScreenItem`) and `tile`/`chart`
+// (inside `DashboardItem`) are deliberately modeled as plain `IDENT`,
+// not new reserved tokens -- `GRAMMAR.md`'s own note on `screen_decl`:
+// they're matched by identifier TEXT only in this one leading position
+// in the real parser, not globally reserved (`action` is a real struct
+// field name in `examples/trade-finance/trade_finance.nir`). lalrpop's
+// lexer dispatches purely on token KIND, with no way to say "this IDENT,
+// only when its text is exactly 'field'" -- so reserving these as their
+// own literal tokens here would misrepresent them as globally reserved,
+// the opposite of what's actually true. Using plain `IDENT` instead
+// keeps the model honest about that, at the cost of not being able to
+// tell lalrpop's conflict checker "these four `ScreenItem` alternatives
+// are text-disambiguated" -- they remain shape-disambiguated instead
+// (each has a different *second* token after the leading `IDENT`:
+// `"{"` / another `IDENT` / `STR` / `":"` -- see each alternative
+// below), which is sufficient for LALR(1) either way.
+ScreenDecl: () = { "screen" IDENT "{" ScreenItem* "}" => () };
+ScreenItem: () = {
+    PaginateBlock => (),
+    FieldOverride => (),
+    ActionDecl => (),
+    KvEntry => (),
+};
+// "paginate" "{" kv_entry* "}"
+PaginateBlock: () = { IDENT "{" KvEntry* "}" => () };
+// "field" IDENT "{" kv_entry* "}"
+FieldOverride: () = { IDENT IDENT "{" KvEntry* "}" => () };
+// "action" STRING "->" IDENT ("{" kv_entry* "}")?
+ActionDecl: () = {
+    IDENT STR "->" IDENT => (),
+    IDENT STR "->" IDENT "{" KvEntry* "}" => (),
+};
+KvEntry: () = { IDENT ":" Expr => () };
+
+DashboardDecl: () = { "dashboard" "{" DashboardItem* "}" => () };
+// ("tile" | "chart") STRING "->" IDENT -- both contextual, same shape.
+DashboardItem: () = { IDENT STR "->" IDENT => () };
+
+// ---- `module "Name" { ... }` -- nav grouping, not scoping --------------
+
+ModuleDecl: () = { "module" STR "{" ModuleItem* "}" => () };
+ModuleItem: () = {
+    FnDecl => (),
+    StructDecl => (),
+    EnumDecl => (),
+};
+
+// ---- `WORKFLOW.md`'s durable state machine -----------------------------
+//
+// `data`/`on_entry`/`on_exit`/`on`/`terminal`/`link` all stay plain
+// `IDENT` for the same reason `field`/`action`/`paginate` do above.
+// `EntryOrExitBlock` deliberately collapses `on_entry_block`/
+// `on_exit_block` into one production: both are `IDENT "{"
+// ActionCall* "}"`, structurally IDENTICAL once the leading keyword's
+// *text* is erased to plain `IDENT` -- lalrpop can't have two
+// alternatives of the same shape mean different things, so modeling
+// them as two separate (but shape-identical) alternatives would itself
+// be a real, spurious ambiguity this crate's own purpose is to catch,
+// not a faithful transliteration. One collapsed production is the
+// honest model; the real parser's actual text-based distinction between
+// "on_entry" and "on_exit" isn't (can't be) represented here.
+WorkflowDecl: () = { "workflow" IDENT "{" DataBlock? StateDecl+ "}" => () };
+// "data" "{" field ("," field)* ","? "}"
+DataBlock: () = { IDENT "{" FieldList ","? "}" => () };
+// "state" IDENT "terminal"? "{" state_item* "}"
+StateDecl: () = {
+    "state" IDENT "{" StateItem* "}" => (),
+    "state" IDENT IDENT "{" StateItem* "}" => (),
+};
+StateItem: () = {
+    EntryOrExitBlock => (),
+    Transition => (),
+    KvEntry => (),
+};
+EntryOrExitBlock: () = { IDENT "{" ActionCall* "}" => () };
+// action_call ::= ident "(" (expr ("," expr)*)? ")" -- same argument-list
+// shape a call already has (`Args`/`ArgList` above `Call`), reused as-is
+// (a separate, structurally-identical nonterminal was tried here and
+// made no difference to the conflict count below -- confirming this
+// isn't an `Args`-specific merging artifact, see the note above
+// `Item`'s own conflict-count discussion in the README).
+ActionCall: () = { IDENT "(" Args ")" => () };
+// "on" "link"? IDENT "->" IDENT
+Transition: () = {
+    IDENT IDENT "->" IDENT => (),
+    IDENT IDENT IDENT "->" IDENT => (),
+};
+
+// ---- Track E1: `workspace`/`panel` -- composite multi-panel screens ---
+
+WorkspaceDecl: () = { "workspace" IDENT "{" WorkspaceItem* "}" => () };
+WorkspaceItem: () = {
+    PanelDecl => (),
+    KvEntry => (),
+};
+// "panel" STRING "{" panel_item* "}"
+PanelDecl: () = { IDENT STR "{" PanelItem* "}" => () };
+PanelItem: () = {
+    ActionDecl => (),
+    KvEntry => (),
+};
 
 FnDecl: () = {
     "fn" IDENT "(" Params ")" RetType Block => (),
@@ -51,9 +199,21 @@ RetType: () = {
     "->" Type,
 };
 
+// `IDENT`/`IDENT "(" TypeArgList ")"` (added alongside `StructDecl`/
+// `EnumDecl` above, for `Field`'s own sake) is a declared struct/enum
+// name, optionally applied to concrete generic type arguments --
+// GRAMMAR.md's real `type` production's `ident ("(" type ...)? ")"`
+// alternative. Still deliberately narrower than GRAMMAR.md's full `type`
+// in one direction: `thread`/`chan`/`sandbox`/`Vector`/`Matrix`/`str`/
+// `tcp`/`tcp_listener`/`f64`/the `fn(...)->...` type-former are not
+// modeled here -- out of scope for what this pass set out to fix
+// (Row 12/`WORKFLOW.md`/Track E1's declaration-level constructs), a
+// real remaining gap, left disclosed rather than silently implied.
 Type: () = {
     "&" Type,
     "box" Type,
+    IDENT => (),
+    IDENT "(" TypeArgList ")" => (),
     "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "bool", "unit",
 };
 

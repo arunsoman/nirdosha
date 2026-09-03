@@ -63,4 +63,72 @@ mod tests {
     fn garbage_is_rejected() {
         assert!(!parses("fn ( ) { ="));
     }
+
+    // ---- Row 11/12/`WORKFLOW.md`/Track E1 declaration-level shapes ----
+    // Added alongside `nirdosha.lalrpop`'s own `StructDecl`/`EnumDecl`/
+    // `ScreenDecl`/`DashboardDecl`/`ModuleDecl`/`WorkflowDecl`/
+    // `WorkspaceDecl` productions -- same "would pass and confirm this
+    // specific shape is unambiguous *if* the crate built" caveat the
+    // rest of this file already carries (see the module doc comment and
+    // README's "What this crate still demonstrates" section).
+
+    #[test]
+    fn struct_and_enum_decls_parse() {
+        assert!(parses("struct Point(A) { x: A, y: A, } enum Status { Open, Closed(i64), }"));
+    }
+
+    #[test]
+    fn screen_and_dashboard_decls_parse() {
+        assert!(parses(
+            r#"struct Product { id: i64, name: i64, }
+               screen Product {
+                   title: 1
+                   paginate { page_size: 1 }
+                   field name { label: 1 }
+                   action "Restock" -> restock_product { style: 1 }
+               }
+               dashboard {
+                   tile "Count" -> stat_count
+                   chart "By Price" -> chart_price
+               }"#
+        ));
+    }
+
+    #[test]
+    fn module_decl_parses() {
+        assert!(parses(r#"module "Vendors" { struct Vendor { id: i64, } fn list_vendor() {} }"#));
+    }
+
+    #[test]
+    fn workflow_decl_parses() {
+        assert!(parses(
+            r#"workflow Approval {
+                   data { amount: i64, }
+                   state Draft {
+                       on_entry { notify(1) }
+                       on Submit -> Review
+                   }
+                   state Review terminal {
+                       on link Approve -> Draft
+                   }
+               }"#
+        ));
+    }
+
+    #[test]
+    fn workspace_and_panel_decl_parses() {
+        assert!(parses(
+            r#"workspace CaseInvestigation {
+                   title: 1
+                   subject: 1
+                   panel "Transactions" {
+                       source: 1
+                   }
+                   panel "Notes" {
+                       source: 1
+                       action "Add Note" -> add_case_note { style: 1 }
+                   }
+               }"#
+        ));
+    }
 }
