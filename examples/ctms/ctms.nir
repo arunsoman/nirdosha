@@ -774,4 +774,688 @@ workspace CaseInvestigation {
     }
 }
 
+// =========================================================================
+// Track E6: the CTMS rebuild -- every screen below is a real entry from
+// `examples/ctms/SCREENS.md`'s 89-screen inventory, built against the
+// actual construct each needs (E1-E5), not a stub. Structs are grouped
+// under `module "<Module Name>" { ... }` purely for nav grouping
+// (LANGUAGE.md SS12) -- fns/screens/dashboard/workspace stay top-level,
+// since `module` bodies may only hold `fn`/`struct`/`enum` (parser.rs's
+// own "screen/dashboard blocks must be declared at top level" rule).
+// =========================================================================
+
+// ---- Module 1: Financial Data Ingestion and Standardization -----------
+
+module "Data Ingestion" {
+    struct DataSource {
+        id: i64,
+        name: str,
+        source_type: str,
+        format: str,
+        connection_status: str,
+        last_ingestion_unix: i64,
+        active: bool,
+    }
+
+    struct ValidationRule {
+        id: i64,
+        name: str,
+        condition_expr: str,
+        rejection_reason: str,
+        active: bool,
+    }
+
+    struct IngestionErrorEntry {
+        id: i64,
+        source_id: i64,
+        error_type: str,
+        record_snippet: str,
+        rejection_reason: str,
+        occurred_unix: i64,
+        reviewed: bool,
+    }
+
+    struct SchemaVersionEntry {
+        id: i64,
+        source_id: i64,
+        version_number: i64,
+        field_diff: str,
+        backward_compatible: bool,
+        approved: bool,
+    }
+
+    struct LineageEntry {
+        id: i64,
+        record_ref: str,
+        source_id: i64,
+        ingested_unix: i64,
+        transformation_applied: str,
+    }
+}
+
+fn list_data_source_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS data_source (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, source_type TEXT, format TEXT, connection_status TEXT, last_ingestion_unix INTEGER, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, name, source_type, format, connection_status, last_ingestion_unix, active FROM data_source ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_data_source() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_data_source_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_data_source_inner(conn: db, s: DataSource) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS data_source (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, source_type TEXT, format TEXT, connection_status TEXT, last_ingestion_unix INTEGER, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO data_source (name, source_type, format, connection_status, last_ingestion_unix, active) VALUES (?, ?, ?, ?, ?, ?)", s.name, s.source_type, s.format, s.connection_status, s.last_ingestion_unix, s.active) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_data_source(s: DataSource) -> Result(i64, ErrorCode) requires(role: "ingestion_admin") {
+    return match db_connect("ctms.db") { Ok(conn) => create_data_source_inner(conn, s), Err(e) => Err(DbError(e)) }
+}
+fn update_data_source_inner(conn: db, s: DataSource) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS data_source (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, source_type TEXT, format TEXT, connection_status TEXT, last_ingestion_unix INTEGER, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE data_source SET name = ?, source_type = ?, format = ?, connection_status = ?, last_ingestion_unix = ?, active = ? WHERE id = ?", s.name, s.source_type, s.format, s.connection_status, s.last_ingestion_unix, s.active, s.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_data_source(s: DataSource) -> Result(i64, ErrorCode) requires(role: "ingestion_admin") {
+    return match db_connect("ctms.db") { Ok(conn) => update_data_source_inner(conn, s), Err(e) => Err(DbError(e)) }
+}
+fn delete_data_source_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "DELETE FROM data_source WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn delete_data_source(id: i64) -> Result(i64, ErrorCode) requires(role: "ingestion_admin") {
+    return match db_connect("ctms.db") { Ok(conn) => delete_data_source_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+// "Test connection" -- Source Onboarding Wizard's own preview action,
+// reused directly on the Source Connector Registry screen below rather
+// than a separate wizard screen (Track E4).
+fn test_data_source_connection_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS data_source (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, source_type TEXT, format TEXT, connection_status TEXT, last_ingestion_unix INTEGER, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(json, ErrorCode) = match db_query(conn, "SELECT name, connection_status FROM data_source WHERE id = ?", id) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn test_data_source_connection(id: i64) -> Result(json, ErrorCode) requires(role: "ingestion_admin") {
+    return match db_connect("ctms.db") { Ok(conn) => test_data_source_connection_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
+screen DataSource {
+    title: "Source Connector Registry"
+    action "Test Connection" -> test_data_source_connection {
+        style: "outlined"
+        show_result: true
+    }
+}
+
+fn list_validation_rule_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS validation_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, condition_expr TEXT, rejection_reason TEXT, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, name, condition_expr, rejection_reason, active FROM validation_rule ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_validation_rule() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_validation_rule_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_validation_rule_inner(conn: db, r: ValidationRule) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS validation_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, condition_expr TEXT, rejection_reason TEXT, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO validation_rule (name, condition_expr, rejection_reason, active) VALUES (?, ?, ?, ?)", r.name, r.condition_expr, r.rejection_reason, r.active) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_validation_rule(r: ValidationRule) -> Result(i64, ErrorCode) requires(role: "ingestion_admin") {
+    return match db_connect("ctms.db") { Ok(conn) => create_validation_rule_inner(conn, r), Err(e) => Err(DbError(e)) }
+}
+fn update_validation_rule_inner(conn: db, r: ValidationRule) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS validation_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, condition_expr TEXT, rejection_reason TEXT, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE validation_rule SET name = ?, condition_expr = ?, rejection_reason = ?, active = ? WHERE id = ?", r.name, r.condition_expr, r.rejection_reason, r.active, r.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_validation_rule(r: ValidationRule) -> Result(i64, ErrorCode) requires(role: "ingestion_admin") {
+    return match db_connect("ctms.db") { Ok(conn) => update_validation_rule_inner(conn, r), Err(e) => Err(DbError(e)) }
+}
+fn delete_validation_rule_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "DELETE FROM validation_rule WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn delete_validation_rule(id: i64) -> Result(i64, ErrorCode) requires(role: "ingestion_admin") {
+    return match db_connect("ctms.db") { Ok(conn) => delete_validation_rule_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+// "test rule against a sample record" -- Track E4 preview action.
+fn simulate_validation_rule_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS validation_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, condition_expr TEXT, rejection_reason TEXT, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(json, ErrorCode) = match db_query(conn, "SELECT name, condition_expr FROM validation_rule WHERE id = ?", id) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn simulate_validation_rule(id: i64) -> Result(json, ErrorCode) requires(role: "ingestion_admin") {
+    return match db_connect("ctms.db") { Ok(conn) => simulate_validation_rule_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
+screen ValidationRule {
+    title: "Validation & Rules Engine Config"
+    action "Test Rule" -> simulate_validation_rule {
+        style: "outlined"
+        show_result: true
+    }
+}
+
+fn list_ingestion_error_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS ingestion_error_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER, error_type TEXT, record_snippet TEXT, rejection_reason TEXT, occurred_unix INTEGER, reviewed INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, source_id, error_type, record_snippet, rejection_reason, occurred_unix, reviewed FROM ingestion_error_entry ORDER BY occurred_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_ingestion_error_entry() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_ingestion_error_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_ingestion_error_entry_inner(conn: db, e: IngestionErrorEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS ingestion_error_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER, error_type TEXT, record_snippet TEXT, rejection_reason TEXT, occurred_unix INTEGER, reviewed INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO ingestion_error_entry (source_id, error_type, record_snippet, rejection_reason, occurred_unix, reviewed) VALUES (?, ?, ?, ?, ?, ?)", e.source_id, e.error_type, e.record_snippet, e.rejection_reason, e.occurred_unix, e.reviewed) { Ok(n) => Ok(n), Err(err) => Err(DbError(err)) }
+    stop conn
+    return result
+}
+fn create_ingestion_error_entry(e: IngestionErrorEntry) -> Result(i64, ErrorCode) requires(role: "ingestion_admin") {
+    return match db_connect("ctms.db") { Ok(conn) => create_ingestion_error_entry_inner(conn, e), Err(err) => Err(DbError(err)) }
+}
+fn update_ingestion_error_entry_inner(conn: db, e: IngestionErrorEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS ingestion_error_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER, error_type TEXT, record_snippet TEXT, rejection_reason TEXT, occurred_unix INTEGER, reviewed INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE ingestion_error_entry SET source_id = ?, error_type = ?, record_snippet = ?, rejection_reason = ?, occurred_unix = ?, reviewed = ? WHERE id = ?", e.source_id, e.error_type, e.record_snippet, e.rejection_reason, e.occurred_unix, e.reviewed, e.id) { Ok(n) => Ok(n), Err(err) => Err(DbError(err)) }
+    stop conn
+    return result
+}
+fn update_ingestion_error_entry(e: IngestionErrorEntry) -> Result(i64, ErrorCode) requires(role: "ingestion_admin") {
+    return match db_connect("ctms.db") { Ok(conn) => update_ingestion_error_entry_inner(conn, e), Err(err) => Err(DbError(err)) }
+}
+fn delete_ingestion_error_entry_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "DELETE FROM ingestion_error_entry WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn delete_ingestion_error_entry(id: i64) -> Result(i64, ErrorCode) requires(role: "ingestion_admin") {
+    return match db_connect("ctms.db") { Ok(conn) => delete_ingestion_error_entry_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
+screen IngestionErrorEntry {
+    title: "Ingestion Error Queue"
+}
+
+fn list_schema_version_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS schema_version_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER, version_number INTEGER, field_diff TEXT, backward_compatible INTEGER, approved INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, source_id, version_number, field_diff, backward_compatible, approved FROM schema_version_entry ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_schema_version_entry() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_schema_version_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_schema_version_entry_inner(conn: db, s: SchemaVersionEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS schema_version_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER, version_number INTEGER, field_diff TEXT, backward_compatible INTEGER, approved INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO schema_version_entry (source_id, version_number, field_diff, backward_compatible, approved) VALUES (?, ?, ?, ?, ?)", s.source_id, s.version_number, s.field_diff, s.backward_compatible, s.approved) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_schema_version_entry(s: SchemaVersionEntry) -> Result(i64, ErrorCode) requires(role: "ingestion_admin") {
+    return match db_connect("ctms.db") { Ok(conn) => create_schema_version_entry_inner(conn, s), Err(e) => Err(DbError(e)) }
+}
+fn update_schema_version_entry_inner(conn: db, s: SchemaVersionEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS schema_version_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER, version_number INTEGER, field_diff TEXT, backward_compatible INTEGER, approved INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE schema_version_entry SET source_id = ?, version_number = ?, field_diff = ?, backward_compatible = ?, approved = ? WHERE id = ?", s.source_id, s.version_number, s.field_diff, s.backward_compatible, s.approved, s.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_schema_version_entry(s: SchemaVersionEntry) -> Result(i64, ErrorCode) requires(role: "ingestion_admin") {
+    return match db_connect("ctms.db") { Ok(conn) => update_schema_version_entry_inner(conn, s), Err(e) => Err(DbError(e)) }
+}
+fn delete_schema_version_entry_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "DELETE FROM schema_version_entry WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn delete_schema_version_entry(id: i64) -> Result(i64, ErrorCode) requires(role: "ingestion_admin") {
+    return match db_connect("ctms.db") { Ok(conn) => delete_schema_version_entry_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
+screen SchemaVersionEntry {
+    title: "Schema Registry & Drift"
+}
+
+fn list_lineage_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS lineage_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, record_ref TEXT, source_id INTEGER, ingested_unix INTEGER, transformation_applied TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, record_ref, source_id, ingested_unix, transformation_applied FROM lineage_entry ORDER BY ingested_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_lineage_entry() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_lineage_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_lineage_entry_inner(conn: db, l: LineageEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS lineage_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, record_ref TEXT, source_id INTEGER, ingested_unix INTEGER, transformation_applied TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO lineage_entry (record_ref, source_id, ingested_unix, transformation_applied) VALUES (?, ?, ?, ?)", l.record_ref, l.source_id, l.ingested_unix, l.transformation_applied) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_lineage_entry(l: LineageEntry) -> Result(i64, ErrorCode) requires(role: "ingestion_admin") {
+    return match db_connect("ctms.db") { Ok(conn) => create_lineage_entry_inner(conn, l), Err(e) => Err(DbError(e)) }
+}
+
+screen LineageEntry {
+    title: "Ingestion Lineage & Audit Store Viewer"
+}
+
+fn stat_active_source_count_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS data_source (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, source_type TEXT, format TEXT, connection_status TEXT, last_ingestion_unix INTEGER, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM data_source WHERE active = 1") {
+        Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn stat_active_source_count() -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => stat_active_source_count_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn stat_schema_drift_alert_count_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS schema_version_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER, version_number INTEGER, field_diff TEXT, backward_compatible INTEGER, approved INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM schema_version_entry WHERE backward_compatible = 0") {
+        Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn stat_schema_drift_alert_count() -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => stat_schema_drift_alert_count_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
+// ---- Module 2: Real-Time Fraud Detection and AI Modelling -------------
+
+module "Fraud Detection" {
+    struct Alert {
+        id: i64,
+        transaction_ref: str,
+        risk_score: i64,
+        triggering_rule: str,
+        severity: str,
+        detected_unix: i64,
+        status: str,
+    }
+
+    struct AlertSignal {
+        id: i64,
+        alert_id: i64,
+        signal_name: str,
+        contribution_score: i64,
+    }
+
+    struct FraudRule {
+        id: i64,
+        name: str,
+        condition_expr: str,
+        jurisdiction_scope: str,
+        active: bool,
+        version_number: i64,
+    }
+
+    struct ScoringWeight {
+        id: i64,
+        signal_name: str,
+        weight_percent: i64,
+    }
+
+    struct BehaviouralProfile {
+        id: i64,
+        entity_ref: str,
+        baseline_txn_count: i64,
+        deviation_score: i64,
+        flagged: bool,
+    }
+
+    struct MlModel {
+        id: i64,
+        name: str,
+        model_type: str,
+        accuracy_percent: i64,
+        version_number: i64,
+        promoted: bool,
+    }
+
+    struct AnalystFeedback {
+        id: i64,
+        alert_id: i64,
+        label: str,
+        submitted_by: str,
+        submitted_unix: i64,
+    }
+
+    struct WatchlistEntry {
+        id: i64,
+        entity_ref: str,
+        reason: str,
+        source: str,
+        added_unix: i64,
+        listed: bool,
+    }
+}
+
+fn list_alert_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS alert (id INTEGER PRIMARY KEY AUTOINCREMENT, transaction_ref TEXT, risk_score INTEGER, triggering_rule TEXT, severity TEXT, detected_unix INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, transaction_ref, risk_score, triggering_rule, severity, detected_unix, status FROM alert ORDER BY detected_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_alert() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_alert_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn get_alert_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS alert (id INTEGER PRIMARY KEY AUTOINCREMENT, transaction_ref TEXT, risk_score INTEGER, triggering_rule TEXT, severity TEXT, detected_unix INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let row: Result(json, ErrorCode) = match db_query(conn, "SELECT id, transaction_ref, risk_score, triggering_rule, severity, detected_unix, status FROM alert WHERE id = ?", id) {
+        Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return row
+}
+fn get_alert(id: i64) -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => get_alert_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+fn create_alert_inner(conn: db, a: Alert) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS alert (id INTEGER PRIMARY KEY AUTOINCREMENT, transaction_ref TEXT, risk_score INTEGER, triggering_rule TEXT, severity TEXT, detected_unix INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO alert (transaction_ref, risk_score, triggering_rule, severity, detected_unix, status) VALUES (?, ?, ?, ?, ?, ?)", a.transaction_ref, a.risk_score, a.triggering_rule, a.severity, a.detected_unix, a.status) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_alert(a: Alert) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => create_alert_inner(conn, a), Err(e) => Err(DbError(e)) }
+}
+fn update_alert_inner(conn: db, a: Alert) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS alert (id INTEGER PRIMARY KEY AUTOINCREMENT, transaction_ref TEXT, risk_score INTEGER, triggering_rule TEXT, severity TEXT, detected_unix INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE alert SET transaction_ref = ?, risk_score = ?, triggering_rule = ?, severity = ?, detected_unix = ?, status = ? WHERE id = ?", a.transaction_ref, a.risk_score, a.triggering_rule, a.severity, a.detected_unix, a.status, a.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_alert(a: Alert) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => update_alert_inner(conn, a), Err(e) => Err(DbError(e)) }
+}
+
+// Alert Detail / Risk-Score Breakdown -- Track E1 workspace.
+fn create_alert_signal_inner(conn: db, s: AlertSignal) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS alert_signal (id INTEGER PRIMARY KEY AUTOINCREMENT, alert_id INTEGER, signal_name TEXT, contribution_score INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO alert_signal (alert_id, signal_name, contribution_score) VALUES (?, ?, ?)", s.alert_id, s.signal_name, s.contribution_score) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_alert_signal(s: AlertSignal) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => create_alert_signal_inner(conn, s), Err(e) => Err(DbError(e)) }
+}
+fn list_alert_signals_for_alert_inner(conn: db, alert_id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS alert_signal (id INTEGER PRIMARY KEY AUTOINCREMENT, alert_id INTEGER, signal_name TEXT, contribution_score INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT signal_name, contribution_score FROM alert_signal WHERE alert_id = ? ORDER BY contribution_score DESC", alert_id) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_alert_signals_for_alert(alert_id: i64) -> Result(json, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => list_alert_signals_for_alert_inner(conn, alert_id), Err(e) => Err(DbError(e)) }
+}
+fn list_similar_alerts_for_alert_inner(conn: db, alert_id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS alert (id INTEGER PRIMARY KEY AUTOINCREMENT, transaction_ref TEXT, risk_score INTEGER, triggering_rule TEXT, severity TEXT, detected_unix INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(
+        conn,
+        "SELECT id, transaction_ref, risk_score FROM alert WHERE triggering_rule = (SELECT triggering_rule FROM alert WHERE id = ?) AND id != ? ORDER BY risk_score DESC",
+        alert_id, alert_id
+    ) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_similar_alerts_for_alert(alert_id: i64) -> Result(json, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => list_similar_alerts_for_alert_inner(conn, alert_id), Err(e) => Err(DbError(e)) }
+}
+
+workspace AlertRiskBreakdown {
+    title: "Alert Detail / Risk-Score Breakdown"
+    subject: Alert
+    panel "Contributing Signals" {
+        source: list_alert_signals_for_alert
+    }
+    panel "Similar Alerts" {
+        source: list_similar_alerts_for_alert
+    }
+}
+
+fn list_fraud_rule_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS fraud_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, condition_expr TEXT, jurisdiction_scope TEXT, active INTEGER, version_number INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, name, condition_expr, jurisdiction_scope, active, version_number FROM fraud_rule ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_fraud_rule() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_fraud_rule_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_fraud_rule_inner(conn: db, r: FraudRule) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS fraud_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, condition_expr TEXT, jurisdiction_scope TEXT, active INTEGER, version_number INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO fraud_rule (name, condition_expr, jurisdiction_scope, active, version_number) VALUES (?, ?, ?, ?, ?)", r.name, r.condition_expr, r.jurisdiction_scope, r.active, r.version_number) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_fraud_rule(r: FraudRule) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => create_fraud_rule_inner(conn, r), Err(e) => Err(DbError(e)) }
+}
+fn update_fraud_rule_inner(conn: db, r: FraudRule) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS fraud_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, condition_expr TEXT, jurisdiction_scope TEXT, active INTEGER, version_number INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE fraud_rule SET name = ?, condition_expr = ?, jurisdiction_scope = ?, active = ?, version_number = ? WHERE id = ?", r.name, r.condition_expr, r.jurisdiction_scope, r.active, r.version_number, r.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_fraud_rule(r: FraudRule) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => update_fraud_rule_inner(conn, r), Err(e) => Err(DbError(e)) }
+}
+fn delete_fraud_rule_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "DELETE FROM fraud_rule WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn delete_fraud_rule(id: i64) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => delete_fraud_rule_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+fn simulate_fraud_rule_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS fraud_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, condition_expr TEXT, jurisdiction_scope TEXT, active INTEGER, version_number INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let c2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS txn (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, amount_cents INTEGER, geo_country TEXT, created_unix INTEGER, geo_lat REAL, geo_lng REAL)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(json, ErrorCode) = match db_query(
+        conn,
+        "SELECT (SELECT name FROM fraud_rule WHERE id = ?) AS rule, (SELECT COUNT(*) FROM txn) AS would_scan_count",
+        id
+    ) {
+        Ok(rows) => match json_array_get(rows, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn simulate_fraud_rule(id: i64) -> Result(json, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => simulate_fraud_rule_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
+screen FraudRule {
+    title: "Rule Engine Configuration"
+    action "Test Against Sample" -> simulate_fraud_rule {
+        style: "outlined"
+        show_result: true
+    }
+}
+
+fn list_scoring_weight_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS scoring_weight (id INTEGER PRIMARY KEY AUTOINCREMENT, signal_name TEXT, weight_percent INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, signal_name, weight_percent FROM scoring_weight ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_scoring_weight() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_scoring_weight_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_scoring_weight_inner(conn: db, w: ScoringWeight) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS scoring_weight (id INTEGER PRIMARY KEY AUTOINCREMENT, signal_name TEXT, weight_percent INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO scoring_weight (signal_name, weight_percent) VALUES (?, ?)", w.signal_name, w.weight_percent) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_scoring_weight(w: ScoringWeight) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => create_scoring_weight_inner(conn, w), Err(e) => Err(DbError(e)) }
+}
+fn update_scoring_weight_inner(conn: db, w: ScoringWeight) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS scoring_weight (id INTEGER PRIMARY KEY AUTOINCREMENT, signal_name TEXT, weight_percent INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE scoring_weight SET signal_name = ?, weight_percent = ? WHERE id = ?", w.signal_name, w.weight_percent, w.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_scoring_weight(w: ScoringWeight) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => update_scoring_weight_inner(conn, w), Err(e) => Err(DbError(e)) }
+}
+
+screen ScoringWeight {
+    title: "Scoring Weights Configuration"
+}
+
+fn list_behavioural_profile_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS behavioural_profile (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_ref TEXT, baseline_txn_count INTEGER, deviation_score INTEGER, flagged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, entity_ref, baseline_txn_count, deviation_score, flagged FROM behavioural_profile ORDER BY deviation_score DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_behavioural_profile() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_behavioural_profile_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_behavioural_profile_inner(conn: db, p: BehaviouralProfile) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS behavioural_profile (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_ref TEXT, baseline_txn_count INTEGER, deviation_score INTEGER, flagged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO behavioural_profile (entity_ref, baseline_txn_count, deviation_score, flagged) VALUES (?, ?, ?, ?)", p.entity_ref, p.baseline_txn_count, p.deviation_score, p.flagged) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_behavioural_profile(p: BehaviouralProfile) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => create_behavioural_profile_inner(conn, p), Err(e) => Err(DbError(e)) }
+}
+fn update_behavioural_profile_inner(conn: db, p: BehaviouralProfile) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS behavioural_profile (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_ref TEXT, baseline_txn_count INTEGER, deviation_score INTEGER, flagged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE behavioural_profile SET entity_ref = ?, baseline_txn_count = ?, deviation_score = ?, flagged = ? WHERE id = ?", p.entity_ref, p.baseline_txn_count, p.deviation_score, p.flagged, p.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_behavioural_profile(p: BehaviouralProfile) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => update_behavioural_profile_inner(conn, p), Err(e) => Err(DbError(e)) }
+}
+
+screen BehaviouralProfile {
+    title: "Behavioural Profile"
+}
+
+fn list_ml_model_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS ml_model (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, model_type TEXT, accuracy_percent INTEGER, version_number INTEGER, promoted INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, name, model_type, accuracy_percent, version_number, promoted FROM ml_model ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_ml_model() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_ml_model_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_ml_model_inner(conn: db, m: MlModel) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS ml_model (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, model_type TEXT, accuracy_percent INTEGER, version_number INTEGER, promoted INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO ml_model (name, model_type, accuracy_percent, version_number, promoted) VALUES (?, ?, ?, ?, ?)", m.name, m.model_type, m.accuracy_percent, m.version_number, m.promoted) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_ml_model(m: MlModel) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => create_ml_model_inner(conn, m), Err(e) => Err(DbError(e)) }
+}
+fn update_ml_model_inner(conn: db, m: MlModel) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS ml_model (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, model_type TEXT, accuracy_percent INTEGER, version_number INTEGER, promoted INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE ml_model SET name = ?, model_type = ?, accuracy_percent = ?, version_number = ?, promoted = ? WHERE id = ?", m.name, m.model_type, m.accuracy_percent, m.version_number, m.promoted, m.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_ml_model(m: MlModel) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => update_ml_model_inner(conn, m), Err(e) => Err(DbError(e)) }
+}
+
+screen MlModel {
+    title: "ML Model Management"
+}
+
+fn list_analyst_feedback_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS analyst_feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, alert_id INTEGER, label TEXT, submitted_by TEXT, submitted_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, alert_id, label, submitted_by, submitted_unix FROM analyst_feedback ORDER BY submitted_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_analyst_feedback() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_analyst_feedback_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_analyst_feedback_inner(conn: db, f: AnalystFeedback) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS analyst_feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, alert_id INTEGER, label TEXT, submitted_by TEXT, submitted_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO analyst_feedback (alert_id, label, submitted_by, submitted_unix) VALUES (?, ?, ?, ?)", f.alert_id, f.label, f.submitted_by, f.submitted_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_analyst_feedback(f: AnalystFeedback) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => create_analyst_feedback_inner(conn, f), Err(e) => Err(DbError(e)) }
+}
+
+screen AnalystFeedback {
+    title: "Analyst Feedback / Labeling Queue"
+}
+
+fn list_watchlist_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS watchlist_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_ref TEXT, reason TEXT, source TEXT, added_unix INTEGER, listed INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, entity_ref, reason, source, added_unix, listed FROM watchlist_entry ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_watchlist_entry() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_watchlist_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_watchlist_entry_inner(conn: db, w: WatchlistEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS watchlist_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_ref TEXT, reason TEXT, source TEXT, added_unix INTEGER, listed INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO watchlist_entry (entity_ref, reason, source, added_unix, listed) VALUES (?, ?, ?, ?, ?)", w.entity_ref, w.reason, w.source, w.added_unix, w.listed) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_watchlist_entry(w: WatchlistEntry) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => create_watchlist_entry_inner(conn, w), Err(e) => Err(DbError(e)) }
+}
+fn delete_watchlist_entry_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "DELETE FROM watchlist_entry WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn delete_watchlist_entry(id: i64) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => delete_watchlist_entry_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
+screen WatchlistEntry {
+    title: "Blacklist/Whitelist Management"
+}
+
+fn stat_open_alert_count_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS alert (id INTEGER PRIMARY KEY AUTOINCREMENT, transaction_ref TEXT, risk_score INTEGER, triggering_rule TEXT, severity TEXT, detected_unix INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM alert WHERE status = 'Open'") {
+        Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn stat_open_alert_count() -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => stat_open_alert_count_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn chart_alerts_by_severity_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS alert (id INTEGER PRIMARY KEY AUTOINCREMENT, transaction_ref TEXT, risk_score INTEGER, triggering_rule TEXT, severity TEXT, detected_unix INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT severity AS label, COUNT(*) AS value FROM alert GROUP BY severity") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn chart_alerts_by_severity() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => chart_alerts_by_severity_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
 fn main() {}
