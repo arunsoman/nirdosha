@@ -2043,14 +2043,23 @@ E6 is the one item that waits on all five.*
     `parse_panel_decl` in `parser.rs`, mirroring `parse_screen_decl`
     production-for-production.
   - [x] Cross-verify against `grammar_check/`'s independent LALR(1)
-    generator — **found inapplicable, not silently skipped**: that
-    crate's `Item` production is still just `FnDecl` (pre-existing gap
-    predating this work — `struct`/`enum`/`screen`/`dashboard`/`module`/
-    `workflow` were never added there either, and the crate doesn't
-    build clean regardless, per its own README's disclosed statement-
-    boundary-ambiguity finding). Adding `workspace`/`panel` alone to a
-    crate that models none of the UI DSL would imply a cross-check that
-    doesn't exist — left undone, honestly, rather than faked.
+    generator — 2026-09-03 follow-up: `grammar_check/`'s own declared-
+    but-undelivered gap (its `Item` production was still just `FnDecl`,
+    "production-for-production" only in name) has been closed —
+    `struct_decl`/`enum_decl`/`screen_decl`/`dashboard_decl`/
+    `module_decl`/`workflow_decl`/`workspace_decl`/`panel_decl` are all
+    now modeled there (`grammar_check/README.md`'s 2026-09-03 section
+    has the full account). It still doesn't build clean — the
+    pre-existing statement-boundary ambiguity is unrelated and
+    unchanged, the same disclosed, deliberately-not-fixed finding as
+    before — but every one of the newly added declaration productions
+    was confirmed, by inspecting lalrpop's own conflict report directly,
+    to build conflict-free table states on its own; the conflict count's
+    rise (43 → 55) is that same pre-existing ambiguity being reported
+    against a larger `Item`-level FOLLOW set, not a new ambiguity class.
+    So: real, positive signal about `workspace`/`panel`'s own grammar
+    shape now exists, short of the "clean build" bar this crate has
+    never cleared for unrelated reasons.
   - [x] `compiler/nirdosha.gbnf` updated (hand-maintained, not test-
     verified — no `cargo test` target exercises it, confirmed by
     inspection before assuming otherwise).

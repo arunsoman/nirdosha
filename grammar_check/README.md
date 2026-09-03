@@ -130,3 +130,55 @@ cost — recorded as a real, open option, not silently dropped.
   is exactly the kind of result `/loop`-style "keep testing, don't just
   keep building" discipline is supposed to produce, and it's recorded
   here in full rather than quietly worked around.
+
+## 2026-09-03 update: the model was badly out of date, independent of the build failure above
+
+Before this update, `Item: () = { FnDecl };` was the *entire* declaration
+surface this crate modeled — no `struct`/`enum`, let alone `screen`/
+`dashboard`/`module`/`workflow`/Track E1's `workspace`. That's a second,
+separate gap from the shift/reduce conflicts above: even setting the
+statement-boundary ambiguity aside entirely, this crate hadn't tracked
+`GRAMMAR.md`'s own growth since roughly Phase 0, despite this file's own
+header claiming a "production-for-production" transliteration.
+
+`nirdosha.lalrpop` now also models `struct_decl`/`enum_decl` (Row 11),
+`screen_decl`/`dashboard_decl` (Row 12's UI DSL), `module_decl`,
+`workflow_decl` (`WORKFLOW.md`), and `workspace_decl`/`panel_decl`
+(`ROADMAP.md` Track E1) — every `item` alternative `GRAMMAR.md` currently
+lists. `src/lib.rs` gained matching shape tests (same "would pass if the
+crate built" caveat as the rest of this file). Two things worth stating
+plainly about this pass:
+
+- **The conflict count went up (43 → 55), and that's expected, not a
+  regression this change introduced.** Every new conflict traces back to
+  the *same* pre-existing statement-boundary/dangling-else ambiguity
+  family described above (`Args`' empty-vs-shift decision, the
+  `Additive`/`Comparison`/`IfExpr` chain) — confirmed by inspecting each
+  new conflict site directly, not assumed. None of `StructDecl`/
+  `EnumDecl`/`ScreenDecl`/`DashboardDecl`/`ModuleDecl`/`WorkflowDecl`/
+  `WorkspaceDecl`'s own productions appear as a conflict site themselves
+  — lalrpop built table states for all of them with zero conflicts of
+  their own. The count grew because `Item` now has 8 leading keywords
+  instead of 1, which enlarges the FOLLOW sets several existing
+  expressions/statements sit inside, multiplying how many lookahead
+  tokens the *same* underlying ambiguity gets reported against — not
+  because a new kind of ambiguity was introduced.
+- **`field`/`action`/`paginate`/`tile`/`chart`/`panel`/`data`/`on_entry`/
+  `on_exit`/`on`/`terminal`/`link` are modeled as plain `IDENT`, not new
+  reserved tokens** — matching their real, contextual (non-globally-
+  reserved) treatment in `token.rs`/`parser.rs`. lalrpop's lexer
+  dispatches on token *kind*, with no way to say "this `IDENT`, only
+  when its text is exactly `field`," so reserving them here would have
+  been a strictly *less* faithful model, not a more convenient one.
+  `on_entry_block`/`on_exit_block` are consequently collapsed into one
+  `EntryOrExitBlock` production — the two are structurally identical
+  once the leading keyword's text is erased to `IDENT`, and lalrpop
+  can't have two same-shape alternatives mean different things.
+- **Still deliberately not modeled**: generics' `type_param_list` is
+  present, but the `type` production stays narrower than `GRAMMAR.md`'s
+  full version — `thread`/`chan`/`sandbox`/`Vector`/`Matrix`/`str`/`tcp`/
+  `tcp_listener`/`f64`/the `fn(...)->...` type-former, `match`, field
+  access, `transact`, `audited`, `effect`/`requires`/`acquire`. Out of
+  scope for this pass (Row 12/`WORKFLOW.md`/Track E1's declaration-level
+  constructs specifically) — a real, remaining gap, disclosed rather
+  than silently implied to be covered.
