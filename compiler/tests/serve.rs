@@ -62,7 +62,7 @@ fn start_server(auth: Option<AuthConfig>) -> u16 {
     let transact_log = std::env::temp_dir().join(format!("nirdosha-test-transact-{port}.db"));
     let workflow_log = std::env::temp_dir().join(format!("nirdosha-test-workflow-{port}.db"));
     std::thread::spawn(move || {
-        nirdosha::serve::run(program, "127.0.0.1", port, auth, None, transact_log, workflow_log, None, None, None, None, None, None, false, None)
+        nirdosha::serve::run(program, "127.0.0.1", port, auth, None, transact_log, workflow_log, None, None, None, None, None, None)
             .expect("serve::run should not fail to bind");
     });
     for _ in 0..100 {
@@ -139,83 +139,6 @@ fn bearer_token_with_no_server_side_auth_config_is_a_clear_500_not_silently_acce
     let (status, body) = http_request(port, "POST", "/api/admin_only", r#"{"x":21}"#, Some("Bearer whatever"));
     assert_eq!(status, 500);
     assert!(body.contains("no --jwks-file"));
-}
-
-// ---- demo mode (self-declared identity, actually functional) ---------
-// `main.rs::cmd_serve` synthesizes `AuthConfig::demo()` and passes
-// `demo_mode: true` when no real `--jwks-file`/`--issuer`/`--audience`
-// is given -- unlike `start_server(None)` above (a bare `auth: None`,
-// `demo_mode: false`, exercising `resolve_identity`'s defensive-code
-// arm directly), this exercises the actual demo-mode path a real
-// `nirdosha serve` invocation takes.
-
-fn start_demo_server() -> u16 {
-    let port = free_port();
-    let program = Arc::new(build_program(SRC));
-    let transact_log = std::env::temp_dir().join(format!("nirdosha-test-demo-transact-{port}.db"));
-    let workflow_log = std::env::temp_dir().join(format!("nirdosha-test-demo-workflow-{port}.db"));
-    std::thread::spawn(move || {
-        nirdosha::serve::run(
-            program,
-            "127.0.0.1",
-            port,
-            Some(AuthConfig::demo()),
-            None,
-            transact_log,
-            workflow_log,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            true,
-            None,
-        )
-        .expect("serve::run should not fail to bind");
-    });
-    for _ in 0..100 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("demo server on port {port} never came up");
-}
-
-#[test]
-fn demo_login_mints_a_real_token_that_satisfies_a_role_gate() {
-    let port = start_demo_server();
-    let (login_status, login_body) =
-        http_request(port, "POST", "/api/_demo_login", r#"{"subject":"alice","roles":["admin"],"claims":{}}"#, None);
-    assert_eq!(login_status, 200, "demo login should succeed: {login_body}");
-    let token = login_body
-        .split("\"token\":\"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .unwrap_or_else(|| panic!("no token in demo login response: {login_body}"));
-    assert_eq!(token.matches('.').count(), 2, "a minted token should be a real 3-part JWT, got: {token}");
-
-    let (status, body) = http_request(port, "POST", "/api/admin_only", r#"{"x":21}"#, Some(&format!("Bearer {token}")));
-    assert_eq!(status, 200, "a self-picked admin role should actually satisfy requires(role: \"admin\"): {body}");
-    assert_eq!(body, "42");
-}
-
-#[test]
-fn demo_login_with_the_wrong_role_still_403s() {
-    let port = start_demo_server();
-    let (_, login_body) = http_request(port, "POST", "/api/_demo_login", r#"{"subject":"bob","roles":["nobody"],"claims":{}}"#, None);
-    let token = login_body.split("\"token\":\"").nth(1).and_then(|s| s.split('"').next()).expect("token");
-
-    let (status, body) = http_request(port, "POST", "/api/admin_only", r#"{"x":21}"#, Some(&format!("Bearer {token}")));
-    assert_eq!(status, 403, "a role the demo login never granted must not satisfy the gate: {body}");
-}
-
-#[test]
-fn demo_login_route_does_not_exist_on_a_real_auth_server() {
-    let port = start_server(Some(auth_config()));
-    let (status, body) = http_request(port, "POST", "/api/_demo_login", "{}", None);
-    assert_eq!(status, 404, "a production server must never expose the self-declared-identity demo route: {body}");
 }
 
 // ---- authenticated server (the real authz-gate path) ------------------
@@ -361,8 +284,6 @@ fn start_server_with_otel(otel_token: &str) -> (u16, u16) {
             None,
             Some(otel_port),
             Some(token),
-            false,
-            None,
         )
         .expect("serve::run should not fail to bind");
     });
@@ -497,8 +418,6 @@ fn readyz_reports_real_db_connectivity_when_db_is_configured() {
             None,
             None,
             None,
-            false,
-            None,
         )
         .expect("serve::run should not fail to bind");
     });
@@ -551,8 +470,6 @@ fn db_flag_pointed_at_postgres_is_rejected_with_a_clear_error_not_silently_misus
         None,
         None,
         None,
-        None,
-        false,
         None,
     );
     let err = result.expect_err("a postgres:// --db value must be rejected outright, not passed to rusqlite::Connection::open");

@@ -18,23 +18,7 @@
 //!   `{"ok":...}`/`{"err":...}` — exactly what `ui_gen_template.html`'s
 //!   `callFn` already expects, so the generated frontend needs no
 //!   changes to talk to this.
-//! - `POST /api/_demo_login` — demo mode only (no real `--jwks-file`/
-//!   `--issuer`/`--audience` configured): mints a real, ephemeral-
-//!   signed token for a self-declared `{subject, roles, claims}`, via
-//!   `AuthConfig::demo()`'s per-process secret and `mock_issue_token`.
-//!   Does not exist at all on a server started with real identity flags.
-//! - `GET /auth/login` / `GET /auth/callback` — production mode only
-//!   (the `--oidc-*` flags configured, which itself requires the real
-//!   identity trio): the real OIDC Authorization Code + PKCE redirect
-//!   flow, ending in the same `validate_oidc_token` verification every
-//!   other request already goes through.
-//! - `GET /api/_whoami` — always present, every mode: confirms a
-//!   bearer token is still valid against *this* running process (the
-//!   generated UI calls this once at page load to catch a
-//!   `localStorage`-cached identity from a previous, since-restarted
-//!   demo-mode process, whose ephemeral signing key no longer matches).
 //!
-
 //! ## Auth and the authz gate this module exists partly *because of*
 //!
 //! `Authorization: Bearer <token>` is validated via `validate_oidc_token`
@@ -72,7 +56,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use base64::Engine;
 use rust_decimal::Decimal;
 use serde_json::Value as JsonVal;
 
@@ -83,47 +66,6 @@ pub struct AuthConfig {
     pub jwks_json: String,
     pub issuer: String,
     pub audience: String,
-}
-
-impl AuthConfig {
-    /// Ephemeral, per-process demo identity: a random HMAC secret
-    /// generated once at server startup, never persisted or logged,
-    /// wrapped in a synthetic single-key JWKS (`kty:"oct"` — the only
-    /// key type `interpreter::mock_issue_token` can sign with). Used
-    /// exactly when `nirdosha serve` is given no real `--jwks-file`/
-    /// `--issuer`/`--audience` (`main.rs::cmd_serve`'s `(None,None,None)`
-    /// arm) — a self-declared demo identity is only ever "real" because
-    /// it's actually signed by this and actually re-verified through the
-    /// exact same `validate_oidc_token` a genuine IdP's token goes
-    /// through (`resolve_identity`, below), never trusted on its face.
-    pub fn demo() -> AuthConfig {
-        let mut buf = [0u8; 32];
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
-            .expect("OS entropy source for the ephemeral demo signing key");
-        let secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf);
-        let jwks_json = serde_json::json!({"keys": [{"kid": "demo", "kty": "oct", "k": secret}]}).to_string();
-        AuthConfig { jwks_json, issuer: "nirdosha-demo".to_string(), audience: "nirdosha-demo".to_string() }
-    }
-}
-
-/// `nirdosha serve --oidc-client-id ... --oidc-redirect-uri ...
-/// --oidc-authorize-endpoint ... --oidc-token-endpoint ...
-/// [--oidc-client-secret ...]` — production mode's real OIDC
-/// Authorization Code (+ PKCE) redirect flow. Only meaningful, and only
-/// ever constructed, alongside a real `AuthConfig` (the jwks/issuer/
-/// audience trio) — SSO is an additional layer on top of real-token
-/// validation, never a replacement for it. `client_secret` is optional:
-/// a public, PKCE-only client registration needs none at all (the
-/// `code_verifier` already proves possession), so the token-exchange
-/// request simply omits it when absent, supporting both public and
-/// confidential client registrations without a separate flag.
-pub struct OidcSsoConfig {
-    pub client_id: String,
-    pub client_secret: Option<String>,
-    pub redirect_uri: String,
-    pub authorize_endpoint: String,
-    pub token_endpoint: String,
 }
 
 fn cors_headers() -> Vec<tiny_http::Header> {
@@ -334,17 +276,6 @@ pub fn run(
     theme_path: Option<&str>,
     otel_port: Option<u16>,
     otel_token: Option<String>,
-    // Demo mode: true exactly when `auth` was synthesized by
-    // `AuthConfig::demo()` (`main.rs::cmd_serve`'s `(None,None,None)`
-    // arm) rather than built from real `--jwks-file`/`--issuer`/
-    // `--audience`. Gates whether `/api/_demo_login` exists at all and
-    // which login-screen branch `ui_gen::generate` renders.
-    demo_mode: bool,
-    // Production mode's SSO config: `Some` exactly when the `--oidc-*`
-    // flags were given (which itself requires the real identity trio,
-    // `main.rs::cmd_serve`'s validation) — gates whether `/auth/login`/
-    // `/auth/callback` exist at all.
-    sso: Option<OidcSsoConfig>,
 ) -> Result<(), String> {
     // `impl Into<LogTarget>` on the two params above so every existing
     // `PathBuf`-passing caller (every test in this repo included) keeps
@@ -380,8 +311,7 @@ pub fn run(
     let registry = crate::ast::TypeRegistry::build(&program);
     let effects = crate::effects::infer_effects(&program, &registry);
     let server_table_api = db_path.is_some();
-    let production_mode = sso.is_some();
-    let ui_html = crate::ui_gen::generate(&program, &effects, identity_base, server_table_api, demo_mode, production_mode, theme);
+    let ui_html = crate::ui_gen::generate(&program, &effects, identity_base, server_table_api, theme);
     // Live theme reload: `--theme <path>` is otherwise read exactly once,
     // at this startup — a redeployed `theme.json` would need a full
     // server restart to take effect. Same TTL-cache pattern
@@ -396,8 +326,6 @@ pub fn run(
     let theme_cache: Option<Arc<std::sync::Mutex<ThemeCache>>> =
         theme_path.map(|_| Arc::new(std::sync::Mutex::new(ThemeCache { html: ui_html.clone(), loaded_at: std::time::Instant::now() })));
     let auth = Arc::new(auth);
-    let sso = Arc::new(sso);
-    let pkce_store: Arc<PkceStore> = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let transact_log_path = Arc::new(transact_log_path);
     let workflow_log_path = Arc::new(workflow_log_path);
     // Layer 2a: built once, dormant, for the server's whole lifetime —
@@ -652,7 +580,7 @@ pub fn run(
         if method == tiny_http::Method::Get && url == "/" {
             let html = match (&theme_cache, theme_path) {
                 (Some(cache), Some(path)) => {
-                    refresh_theme_html_if_stale(cache, path, &program, &effects, identity_base, server_table_api, demo_mode, production_mode);
+                    refresh_theme_html_if_stale(cache, path, &program, &effects, identity_base, server_table_api);
                     cache.lock().unwrap().html.clone()
                 }
                 _ => ui_html.clone(),
@@ -665,94 +593,6 @@ pub fn run(
             let _ = request.respond(resp);
             metrics.record(200, request_started_at.elapsed());
             continue;
-        }
-
-        // `GET /api/_whoami` — always present, in every mode (demo,
-        // production, or no identity configured at all): lets the SPA
-        // confirm a `localStorage`-cached identity is still actually
-        // valid *against this specific running server process*, before
-        // trusting it to render nav/gated UI. This matters specifically
-        // because of how demo mode works: each `nirdosha serve` process
-        // mints its own fresh ephemeral signing key (`AuthConfig::
-        // demo()`), so a token minted by a *previous* process (an
-        // earlier run, before a restart) fails to verify here even
-        // though the browser's `localStorage` still remembers it —
-        // without this check, the page would otherwise render as
-        // "signed in" from stale client-side state alone, with every
-        // real gated action then failing with a confusing 401 the user
-        // never asked for. Same `resolve_identity` verification every
-        // other request already goes through, so this adds no new
-        // trust path — it's a read of the existing one.
-        if method == tiny_http::Method::Get && url == "/api/_whoami" {
-            let auth_header = request
-                .headers()
-                .iter()
-                .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("Authorization"))
-                .map(|h| h.value.as_str().to_string());
-            let (status, payload) = match resolve_identity(auth_header.as_deref(), auth.as_ref().as_ref(), &workflow_log_path) {
-                Ok(Some(identity)) => match &identity {
-                    Value::Struct(_, fields) => match (&fields[0], &fields[5]) {
-                        (Value::Str(subject), Value::Str(claims_json)) => {
-                            (200, format!("{{\"subject\":{},\"claims\":{}}}", serde_json::to_string(subject.as_ref()).unwrap(), claims_json))
-                        }
-                        _ => (500, json_err("malformed VerifiedIdentity")),
-                    },
-                    _ => (500, json_err("malformed VerifiedIdentity")),
-                },
-                Ok(None) => (401, json_err("not signed in")),
-                Err(status_body) => status_body,
-            };
-            let mut resp = tiny_http::Response::from_string(payload)
-                .with_status_code(status)
-                .with_header(header("Content-Type", "application/json"));
-            for h in cors_headers() {
-                resp.add_header(h);
-            }
-            let _ = request.respond(resp);
-            metrics.record(status, request_started_at.elapsed());
-            continue;
-        }
-
-        if let Some(cfg) = sso.as_ref().as_ref() {
-            if method == tiny_http::Method::Get && url == "/auth/login" {
-                sweep_expired_pkce_entries(&pkce_store);
-                let code_verifier = generate_pkce_code_verifier();
-                let code_challenge = pkce_code_challenge(&code_verifier);
-                let state = generate_pkce_code_verifier(); // same shape, different purpose
-                pkce_store.lock().unwrap().insert(state.clone(), PkceEntry { code_verifier, created_at: Instant::now() });
-                let redirect_url = format!(
-                    "{}?client_id={}&redirect_uri={}&response_type=code&scope=openid&state={}&code_challenge={}&code_challenge_method=S256",
-                    cfg.authorize_endpoint,
-                    url_encode_component(&cfg.client_id),
-                    url_encode_component(&cfg.redirect_uri),
-                    url_encode_component(&state),
-                    url_encode_component(&code_challenge),
-                );
-                let mut resp = tiny_http::Response::from_string("").with_status_code(302).with_header(header("Location", &redirect_url));
-                for h in cors_headers() {
-                    resp.add_header(h);
-                }
-                let _ = request.respond(resp);
-                metrics.record(302, request_started_at.elapsed());
-                continue;
-            }
-            if method == tiny_http::Method::Get && url.starts_with("/auth/callback") {
-                let query = url.splitn(2, '?').nth(1).unwrap_or("");
-                let params = parse_query_string(query);
-                let (status, body_or_redirect) = handle_oidc_callback(&params, cfg, &pkce_store, auth.as_ref().as_ref());
-                let mut resp = match body_or_redirect {
-                    OidcCallbackOutcome::Redirect(location) => tiny_http::Response::from_string("").with_status_code(status).with_header(header("Location", &location)),
-                    OidcCallbackOutcome::Error(msg) => tiny_http::Response::from_string(json_err(&msg))
-                        .with_status_code(status)
-                        .with_header(header("Content-Type", "application/json")),
-                };
-                for h in cors_headers() {
-                    resp.add_header(h);
-                }
-                let _ = request.respond(resp);
-                metrics.record(status, request_started_at.elapsed());
-                continue;
-            }
         }
 
         if method == tiny_http::Method::Post {
@@ -790,31 +630,6 @@ pub fn run(
                     },
                     None => (404, json_err("no --db was passed to `nirdosha serve`; the generic table-query route is disabled")),
                 };
-                let mut resp = tiny_http::Response::from_string(payload)
-                    .with_status_code(status)
-                    .with_header(header("Content-Type", "application/json"));
-                for h in cors_headers() {
-                    resp.add_header(h);
-                }
-                let _ = request.respond(resp);
-                metrics.record(status, request_started_at.elapsed());
-                continue;
-            }
-            if demo_mode && url == "/api/_demo_login" {
-                let body = match read_limited_body(&mut request) {
-                    Ok(b) => b,
-                    Err(status_body) => {
-                        let status = status_body.0;
-                        let mut resp = tiny_http::Response::from_string(status_body.1).with_status_code(status);
-                        for h in cors_headers() {
-                            resp.add_header(h);
-                        }
-                        let _ = request.respond(resp);
-                        metrics.record(status, request_started_at.elapsed());
-                        continue;
-                    }
-                };
-                let (status, payload) = handle_demo_login(&body, auth.as_ref().as_ref());
                 let mut resp = tiny_http::Response::from_string(payload)
                     .with_status_code(status)
                     .with_header(header("Content-Type", "application/json"));
@@ -1097,258 +912,6 @@ fn theme_ttl() -> std::time::Duration {
     std::time::Duration::from_secs(30)
 }
 
-/// Production mode's PKCE `state` → `code_verifier` correlation,
-/// generated and held entirely server-side (`GET /auth/login`,
-/// consumed once by `GET /auth/callback`) — the callback is a plain
-/// top-level `GET` from the IdP's own redirect, not an XHR the SPA
-/// controls, so the verifier can't be round-tripped through the
-/// browser the way a same-origin fetch could; keeping it server-side
-/// for its whole lifetime is also strictly more secure than a
-/// cookie-based round-trip (never touches the browser at all).
-struct PkceEntry {
-    code_verifier: String,
-    created_at: std::time::Instant,
-}
-
-/// Keyed by `state`. One-shot: `/auth/callback` removes an entry the
-/// moment it's looked up (`HashMap::remove`), so replaying the same
-/// `state` after first use always fails, same as it should for a
-/// value that's supposed to prove "this is the one browser session
-/// that started this exact login."
-type PkceStore = std::sync::Mutex<std::collections::HashMap<String, PkceEntry>>;
-
-/// 5 minutes — generous for an interactive login redirect round-trip,
-/// short enough that an abandoned login doesn't linger meaningfully.
-/// Overridable via `NIRDOSHA_TEST_PKCE_TTL_MS`, same env-var-seam
-/// pattern as `theme_ttl` above — a `#[cfg(test)]` item in this crate
-/// isn't visible to an integration-test crate at all, so expiry has to
-/// be testable from outside without waiting 5 real minutes.
-fn pkce_ttl() -> std::time::Duration {
-    if let Some(ms) = std::env::var("NIRDOSHA_TEST_PKCE_TTL_MS").ok().and_then(|s| s.parse::<u64>().ok()) {
-        return std::time::Duration::from_millis(ms);
-    }
-    std::time::Duration::from_secs(300)
-}
-
-/// Opportunistic cleanup, called from `GET /auth/login` (every new
-/// login attempt is a natural, cheap point to sweep) — no background
-/// timer, same "cheap, on-demand" posture `ThemeCache`/
-/// `RoleMappingCache` already take for their own staleness checks.
-fn sweep_expired_pkce_entries(store: &PkceStore) {
-    let mut guard = store.lock().unwrap();
-    guard.retain(|_, entry| entry.created_at.elapsed() < pkce_ttl());
-}
-
-/// A fresh, high-entropy, URL-safe random string — used both for PKCE's
-/// `code_verifier` (RFC 7636 wants 43-128 chars from the unreserved URL
-/// set; 32 random bytes base64url-encoded is 43 chars, comfortably
-/// inside that) and, reused unchanged, for the `state` value (same
-/// "random, unguessable, URL-safe" requirement, different purpose — no
-/// need for a second generator). Same `/dev/urandom` pattern as
-/// `AuthConfig::demo()`'s own ephemeral secret.
-fn generate_pkce_code_verifier() -> String {
-    let mut buf = [0u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
-        .expect("OS entropy source for a PKCE code_verifier/state value");
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
-}
-
-/// RFC 7636 §4.2: `code_challenge = BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))`.
-fn pkce_code_challenge(code_verifier: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(code_verifier.as_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-}
-
-/// Percent-encodes one query-string component (RFC 3986's unreserved
-/// set — `A-Za-z0-9-_.~` — passes through unchanged, everything else
-/// becomes `%XX`). No dependency needed for this — the alphabet is
-/// small and fixed.
-fn url_encode_component(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-/// The inverse of `url_encode_component`, applied to one query-string
-/// component — also decodes `+` as a space, the traditional
-/// `application/x-www-form-urlencoded` convention query strings also
-/// follow. A malformed `%` escape (not followed by two hex digits) is
-/// passed through literally rather than erroring — this is parsing an
-/// IdP's own redirect back to us, not something to hard-fail a whole
-/// login attempt over one stray `%`.
-fn url_decode_component(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16) {
-                Ok(byte) => {
-                    out.push(byte);
-                    i += 3;
-                }
-                Err(_) => {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            },
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// `?code=...&state=...` (or any other query string) → a plain
-/// key/value map, percent-decoded. No existing query-string parser in
-/// this file — every other route's params come from a JSON body, not a
-/// URL — this is new territory specifically for the IdP's redirect back.
-fn parse_query_string(qs: &str) -> std::collections::HashMap<String, String> {
-    qs.split('&')
-        .filter(|p| !p.is_empty())
-        .filter_map(|pair| {
-            let mut it = pair.splitn(2, '=');
-            let k = it.next()?;
-            let v = it.next().unwrap_or("");
-            Some((url_decode_component(k), url_decode_component(v)))
-        })
-        .collect()
-}
-
-/// `GET /auth/callback`'s two possible outcomes: redirect the browser
-/// back into the SPA with a token (success), or hand back a plain JSON
-/// error (the PKCE `state` was missing/expired/already used, or the
-/// token exchange/verification itself failed) — mirrors the "plain data
-/// in, `(status, body)` out" factoring every other route handler here
-/// already uses, just with two different response shapes depending on
-/// which happened.
-enum OidcCallbackOutcome {
-    Redirect(String),
-    Error(String),
-}
-
-/// The production-mode token exchange: consume the one-shot PKCE entry,
-/// POST the authorization code to the IdP's token endpoint, verify the
-/// resulting `id_token` through the exact same `validate_oidc_token`
-/// every other request already goes through (no second trust path), and
-/// hand it back to the SPA via a `#` fragment redirect (never sent to
-/// the server on the browser's own follow-up navigation, unlike a
-/// `?query` parameter — still visible in local browser history, a
-/// disclosed, minor residual exposure noted in the implementation plan;
-/// avoiding that entirely would need cookie/`postMessage`-based
-/// delivery, a bigger change than this feature's first landing).
-fn handle_oidc_callback(
-    params: &std::collections::HashMap<String, String>,
-    cfg: &OidcSsoConfig,
-    pkce_store: &PkceStore,
-    auth: Option<&AuthConfig>,
-) -> (u16, OidcCallbackOutcome) {
-    let Some(code) = params.get("code") else {
-        return (400, OidcCallbackOutcome::Error("missing `code` query parameter".to_string()));
-    };
-    let Some(state) = params.get("state") else {
-        return (400, OidcCallbackOutcome::Error("missing `state` query parameter".to_string()));
-    };
-    let code_verifier = {
-        let mut guard = pkce_store.lock().unwrap();
-        match guard.remove(state) {
-            Some(entry) if entry.created_at.elapsed() < pkce_ttl() => entry.code_verifier,
-            Some(_) => return (400, OidcCallbackOutcome::Error("login attempt expired — please sign in again".to_string())),
-            None => return (400, OidcCallbackOutcome::Error("unknown or already-used `state` — please sign in again".to_string())),
-        }
-    };
-    let Some(cfg_auth) = auth else {
-        return (500, OidcCallbackOutcome::Error("this server has no --jwks-file/--issuer/--audience configured".to_string()));
-    };
-
-    let mut form = format!(
-        "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
-        url_encode_component(code),
-        url_encode_component(&cfg.redirect_uri),
-        url_encode_component(&cfg.client_id),
-        url_encode_component(&code_verifier),
-    );
-    if let Some(secret) = &cfg.client_secret {
-        form.push_str(&format!("&client_secret={}", url_encode_component(secret)));
-    }
-
-    let Some((token_host, token_port, token_path, token_https)) = parse_endpoint_url(&cfg.token_endpoint) else {
-        return (500, OidcCallbackOutcome::Error(format!("--oidc-token-endpoint is not a valid http(s):// URL: {}", cfg.token_endpoint)));
-    };
-    // `https://` in any real deployment (this carries the client secret
-    // and authorization code) -- but not hard-enforced here, the same
-    // way `--identity-base`/`--oidc-authorize-endpoint` aren't either:
-    // an internal service behind a TLS-terminating proxy, or (this
-    // repo's own test suite) a loopback-only mock IdP double, are both
-    // normal `http://` shapes this shouldn't refuse to talk to. That
-    // judgment call belongs to whoever supplies `--oidc-token-endpoint`.
-    let exchange = if token_https {
-        interpreter::https_post_with_content_type(&token_host, token_port, &token_path, "application/x-www-form-urlencoded", &form)
-    } else {
-        interpreter::http_post_with_content_type(&token_host, token_port, &token_path, "application/x-www-form-urlencoded", &form)
-    };
-    let (status, body) = match exchange {
-        Ok(r) => r,
-        Err(e) => return (502, OidcCallbackOutcome::Error(format!("token exchange request failed: {e}"))),
-    };
-    if !(200..300).contains(&status) {
-        return (502, OidcCallbackOutcome::Error(format!("token endpoint returned {status}: {body}")));
-    }
-    let parsed: JsonVal = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(e) => return (502, OidcCallbackOutcome::Error(format!("token endpoint returned malformed JSON: {e}"))),
-    };
-    let Some(id_token) = parsed.get("id_token").and_then(JsonVal::as_str) else {
-        return (502, OidcCallbackOutcome::Error("token endpoint response has no `id_token`".to_string()));
-    };
-    if let Err(e) = interpreter::validate_oidc_token(id_token, &cfg_auth.issuer, &cfg_auth.audience, &cfg_auth.jwks_json) {
-        return (401, OidcCallbackOutcome::Error(format!("invalid id_token from identity provider: {e}")));
-    }
-    (302, OidcCallbackOutcome::Redirect(format!("/#/auth/callback?token={}", url_encode_component(id_token))))
-}
-
-/// `--oidc-authorize-endpoint`/`--oidc-token-endpoint` are given as full
-/// `http(s)://host[:port]/path` URLs (unlike `--identity-base`'s bare
-/// base URL, which `ui_gen_template.html` only ever appends a fixed
-/// `/api/login` suffix to) — this splits one apart into the pieces
-/// `interpreter::https_post_with_content_type` needs. No `url` crate
-/// dependency for this: the shape accepted is deliberately narrow
-/// (scheme, host, optional port, path), not general URL parsing.
-fn parse_endpoint_url(url: &str) -> Option<(String, i64, String, bool)> {
-    let (https, rest) = if let Some(r) = url.strip_prefix("https://") {
-        (true, r)
-    } else if let Some(r) = url.strip_prefix("http://") {
-        (false, r)
-    } else {
-        return None;
-    };
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse::<i64>().ok()?),
-        None => (authority.to_string(), if https { 443 } else { 80 }),
-    };
-    if host.is_empty() {
-        return None;
-    }
-    Some((host, port, path.to_string(), https))
-}
-
 /// Reloads `theme_path` from disk and regenerates `cache`'s HTML only if
 /// the TTL has elapsed — called on every `GET /` (cheap: just an
 /// `Instant::elapsed` check under the lock in the common case). A
@@ -1364,8 +927,6 @@ fn refresh_theme_html_if_stale(
     effects: &std::collections::HashMap<String, crate::effects::FnEffects>,
     identity_base: Option<&str>,
     server_table_api: bool,
-    demo_mode: bool,
-    production_mode: bool,
 ) {
     let mut guard = cache.lock().unwrap();
     if guard.loaded_at.elapsed() < theme_ttl() {
@@ -1386,7 +947,7 @@ fn refresh_theme_html_if_stale(
             return;
         }
     };
-    guard.html = crate::ui_gen::generate(program, effects, identity_base, server_table_api, demo_mode, production_mode, Some(&theme));
+    guard.html = crate::ui_gen::generate(program, effects, identity_base, server_table_api, Some(&theme));
 }
 
 fn build_table_catalog(program: &Program) -> std::collections::HashMap<String, Vec<String>> {
@@ -1611,14 +1172,6 @@ fn resolve_identity(
             },
             None => Err((401, json_err("Authorization header must be `Bearer <token>`"))),
         },
-        // Unreachable via `nirdosha serve` today: `main.rs::cmd_serve`
-        // always passes `Some(AuthConfig::demo())` when no real identity
-        // flags are given (demo mode), so `auth` is never `None` here
-        // for any CLI-started server -- a bearer-carrying request used
-        // to 500 unconditionally in that case, even for an ungated
-        // function, before demo mode existed. Left in place as harmless
-        // defensive code for any future non-CLI caller of `serve::run`
-        // that does pass `auth: None`.
         (Some(_), None) => {
             Err((500, json_err("this server has no --jwks-file/--issuer/--audience configured to validate a bearer token against")))
         }
@@ -1643,57 +1196,6 @@ fn upsert_identity_directory(identity: &Value, now: i64, workflow_log_path: &cra
             }
         }
         Err(e) => eprintln!("identity_directory: failed to open workflow log: {e}"),
-    }
-}
-
-/// `POST /api/_demo_login` — demo mode only (`nirdosha serve` with no
-/// real `--jwks-file`/`--issuer`/`--audience`, `main.rs::cmd_serve`'s
-/// `(None,None,None)` arm). Body: `{"subject": "...", "roles": [...],
-/// "claims": {...}}` (all optional — default subject `"demo"`, empty
-/// roles/claims). Mints a real token, signed by this process's own
-/// `AuthConfig::demo()` ephemeral secret, for exactly the self-declared
-/// identity — the frontend then attaches it as an ordinary `Authorization:
-/// Bearer <token>` on every later call, and it's re-verified through the
-/// exact same `resolve_identity`/`validate_oidc_token` path a real IdP's
-/// token goes through. This is what makes demo mode *functional*
-/// (a self-picked role can actually satisfy `requires(role: ...)`) rather
-/// than the old client-only stub that never sent anything to the server
-/// at all. `auth` is `None` here only if `demo_mode` was somehow true
-/// without `AuthConfig::demo()` having been constructed — not reachable
-/// via `main.rs`, but handled cleanly rather than assumed away.
-fn handle_demo_login(body: &str, auth: Option<&AuthConfig>) -> (u16, String) {
-    let Some(cfg) = auth else { return (500, json_err("demo login is not available on this server")) };
-    let req: JsonVal = if body.trim().is_empty() { JsonVal::Object(Default::default()) } else {
-        match serde_json::from_str(body) {
-            Ok(v) => v,
-            Err(e) => return (400, json_err(&format!("invalid JSON body: {e}"))),
-        }
-    };
-    let subject = req.get("subject").and_then(JsonVal::as_str).unwrap_or("demo").to_string();
-    let roles: Vec<String> =
-        req.get("roles").and_then(JsonVal::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
-    let claim_pairs: Vec<(String, String)> = req
-        .get("claims")
-        .and_then(JsonVal::as_object)
-        .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
-        .unwrap_or_default();
-
-    // `identity_has_role`/`identity_claim` (interpreter.rs) read a
-    // top-level `"roles"` array and flat top-level claim keys out of
-    // `VerifiedIdentity.claims_json` -- build exactly that shape, since
-    // `mock_issue_token` merges this object straight into the token's
-    // payload unchanged.
-    let mut claims_obj = serde_json::Map::new();
-    claims_obj.insert("roles".to_string(), serde_json::json!(roles));
-    for (k, v) in &claim_pairs {
-        claims_obj.insert(k.clone(), serde_json::json!(v));
-    }
-    let claims_json = serde_json::to_string(&JsonVal::Object(claims_obj)).expect("built from plain strings, always serializes");
-
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    match interpreter::mock_issue_token(&subject, &cfg.issuer, &cfg.audience, now, 3600, &claims_json, &cfg.jwks_json) {
-        Ok(token) => (200, serde_json::json!({"token": token}).to_string()),
-        Err(e) => (500, json_err(&format!("failed to mint demo token: {e}"))),
     }
 }
 
