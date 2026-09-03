@@ -1,0 +1,261 @@
+// CTMS -- Track E1 proof-of-concept for `workspace`/`panel`
+// (`ROADMAP.md` Track E1, `examples/ctms/UI_CONSTRUCTS.md` SS1). This is
+// deliberately NOT the full CTMS rebuild -- that's Track E6, blocked on
+// E1-E5 all landing. This file exists to prove the Investigation
+// Workspace worked example for real: a `Matter` (an investigative case
+// -- named `Matter`, not `Case`, since `CASE` is a reserved SQL keyword
+// and this file's own `list_matter`/etc. hand-write real SQL against it)
+// with two composed panels (a transaction list, a notes list with an
+// "Add Note" action), backed by real SQLite tables, typechecked and
+// served by the real compiler -- not a mockup.
+//
+// Serve it:
+//   nirdosha serve examples/identity_mock.nir --port 9090 &
+//   nirdosha serve examples/ctms/ctms.nir --port 8080 \
+//     --jwks-file examples/store_jwks.json --issuer https://mock-idp.local \
+//     --audience store-app --identity-base http://localhost:9090 \
+//     --db ctms.db
+// Then: create a Matter on its own screen, click "Open Workspace" on its
+// row (or use the "Investigation Workspace" nav entry), sign in as a
+// role with "investigator" to use the "Add Note" panel action.
+
+enum ErrorCode {
+    DbError(str),
+}
+
+struct Text {
+    value: str,
+}
+
+struct Matter {
+    id: i64,
+    subject_name: str,
+    status: str,
+    risk_score: i64,
+}
+
+struct Transaction {
+    id: i64,
+    matter_id: i64,
+    amount_cents: i64,
+    geo_country: str,
+}
+
+// ---- Matter: CRUD, SQLite-backed ---------------------------------------
+
+fn list_matter_inner(conn: db) -> Result(json, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, subject_name, status, risk_score FROM matter ORDER BY id") {
+        Ok(r) => Ok(r),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return rows
+}
+
+fn list_matter() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") {
+        Ok(conn) => list_matter_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn get_matter_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let row: Result(json, ErrorCode) = match db_query(conn, "SELECT id, subject_name, status, risk_score FROM matter WHERE id = ?", id) {
+        Ok(r) => match json_array_get(r, 0) {
+            Ok(one) => Ok(one),
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return row
+}
+
+fn get_matter(id: i64) -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") {
+        Ok(conn) => get_matter_inner(conn, id),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn create_matter_inner(conn: db, m: Matter) -> Result(i64, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO matter (subject_name, status, risk_score) VALUES (?, ?, ?)", m.subject_name, m.status, m.risk_score) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn create_matter(m: Matter) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => create_matter_inner(conn, m),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn update_matter_inner(conn: db, m: Matter) -> Result(i64, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE matter SET subject_name = ?, status = ?, risk_score = ? WHERE id = ?", m.subject_name, m.status, m.risk_score, m.id) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn update_matter(m: Matter) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => update_matter_inner(conn, m),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn delete_matter_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "DELETE FROM matter WHERE id = ?", id) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn delete_matter(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => delete_matter_inner(conn, id),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+// ---- Transaction: seed/query only -- no screen of its own, it's only
+// ever browsed through a Matter's own workspace panel below. ------------
+
+fn create_transaction_inner(conn: db, t: Transaction) -> Result(i64, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS txn (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, amount_cents INTEGER, geo_country TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO txn (matter_id, amount_cents, geo_country) VALUES (?, ?, ?)", t.matter_id, t.amount_cents, t.geo_country) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn create_transaction(t: Transaction) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => create_transaction_inner(conn, t),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+// The Investigation Workspace's first panel source: exactly one `i64`
+// param, `Result(json, _)` return -- `typeck.rs::check_workspace`'s
+// required shape (LANGUAGE.md SS15).
+fn list_transaction_for_matter_inner(conn: db, matter_id: i64) -> Result(json, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS txn (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, amount_cents INTEGER, geo_country TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, amount_cents, geo_country FROM txn WHERE matter_id = ? ORDER BY id", matter_id) {
+        Ok(r) => Ok(r),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return rows
+}
+
+fn list_transaction_for_matter(matter_id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => list_transaction_for_matter_inner(conn, matter_id),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+// ---- MatterNote: created only through the workspace's "Notes" panel ---
+
+fn list_matter_note_inner(conn: db, matter_id: i64) -> Result(json, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter_note (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, author TEXT, body TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, author, body FROM matter_note WHERE matter_id = ? ORDER BY id", matter_id) {
+        Ok(r) => Ok(r),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return rows
+}
+
+fn list_matter_note(matter_id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => list_matter_note_inner(conn, matter_id),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+// `author`/`body` both stay `Text`, never a bare `str` -- the
+// enum-favoring-`str`-ban applies at *every* user fn's call boundary,
+// including a private `_inner` helper (LANGUAGE.md SS6b) -- only
+// builtins (`db_execute` etc.) are exempt.
+fn add_matter_note_inner(conn: db, matter_id: i64, author: Text, body: Text) -> Result(i64, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter_note (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, author TEXT, body TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO matter_note (matter_id, author, body) VALUES (?, ?, ?)", matter_id, author.value, body.value) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+// `author` is hardcoded here since real subject identity plumbing into
+// a panel action's own params is future work, same as `WORKFLOW.md`'s
+// disclosed "comment not yet threaded into on_entry/on_exit" gap.
+fn add_matter_note(matter_id: i64, body: Text) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") {
+        Ok(conn) => add_matter_note_inner(conn, matter_id, Text("investigator"), body),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+// ---- The Investigation Workspace itself --------------------------------
+// `Matter` already gets a real screen from the CRUD naming convention
+// above (`list_matter`/`create_matter`/`update_matter`/`delete_matter`/
+// `get_matter` -- zero extra syntax needed for that half) -- this
+// `workspace` block is the only new construct this file exercises.
+
+workspace CaseInvestigation {
+    title: "Investigation Workspace"
+    subject: Matter
+
+    panel "Transactions" {
+        source: list_transaction_for_matter
+    }
+    panel "Notes" {
+        source: list_matter_note
+        action "Add Note" -> add_matter_note {
+            style: "filled"
+        }
+    }
+}
+
+fn main() {}

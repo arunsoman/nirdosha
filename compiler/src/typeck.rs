@@ -386,6 +386,30 @@ pub enum TypeErrorKind {
     /// A `dashboard` `tile`/`chart` target that doesn't resolve to a real
     /// user-defined function.
     UnknownDashboardFn { metric_kind: String, fn_name: String },
+
+    // ---- Track E1's `workspace`/`panel` DSL ---------------------------
+    /// `workspace <Name>` with no `subject: <Struct>` entry at all.
+    WorkspaceMissingSubject(String),
+    /// `subject: <expr>` where `<expr>` isn't a bare struct name
+    /// (`Expr::Ident`) — the same "must name a function/type directly"
+    /// shape `ScreenFnNotAnIdent` already enforces for `screen`'s own
+    /// `list`/`create`/etc.
+    WorkspaceSubjectNotAnIdent(String),
+    /// `subject: <Name>` where `<Name>` isn't a declared struct.
+    UnknownWorkspaceSubject { workspace: String, struct_name: String },
+    /// `subject: <Struct>` where `<Struct>` has no `id: i64` field — the
+    /// primary-key convention every `get_<S>`/`update_<S>`/`delete_<S>`
+    /// (and, here, every panel's `source` fn) already assumes.
+    WorkspaceSubjectMissingId { workspace: String, struct_name: String },
+    /// `panel "<label>" { ... }` with no `source: <fn>` entry at all.
+    PanelMissingSource { workspace: String, panel: String },
+    /// `source: <expr>` where `<expr>` isn't a bare function name.
+    PanelSourceNotAnIdent { workspace: String, panel: String },
+    /// `source: <fn>` where `<fn>` doesn't take exactly one `i64`
+    /// parameter and return `Result(json, _)` — the one shape
+    /// `ui_gen_template.html`'s `renderWorkspace` (`callFn(source,
+    /// {id})`, expecting a JSON array/object back) actually calls.
+    PanelSourceWrongShape { workspace: String, panel: String, fn_name: String },
     /// A user `fn`'s parameter or return type is (or contains) `str` —
     /// the "enum favoring" rule: `str` may not cross a user function's
     /// call boundary, so categorical string data belongs in a real
@@ -765,6 +789,36 @@ impl std::fmt::Display for TypeError {
             TypeErrorKind::UnknownDashboardFn { metric_kind, fn_name } => write!(
                 f,
                 "{line}:{col}: `{metric_kind} ... -> {fn_name}` — no function named `{fn_name}` is declared"
+            ),
+            TypeErrorKind::WorkspaceMissingSubject(name) => write!(
+                f,
+                "{line}:{col}: `workspace {name}` has no `subject: <Struct>` entry — every workspace must name the struct it's scoped per-instance-of"
+            ),
+            TypeErrorKind::WorkspaceSubjectNotAnIdent(name) => write!(
+                f,
+                "{line}:{col}: `workspace {name}` — `subject` must name a struct directly (e.g. `subject: Case`)"
+            ),
+            TypeErrorKind::UnknownWorkspaceSubject { workspace, struct_name } => write!(
+                f,
+                "{line}:{col}: `workspace {workspace} {{ subject: {struct_name} }}` — no struct named `{struct_name}` is declared"
+            ),
+            TypeErrorKind::WorkspaceSubjectMissingId { workspace, struct_name } => write!(
+                f,
+                "{line}:{col}: `workspace {workspace} {{ subject: {struct_name} }}` — `{struct_name}` has no `id: i64` field, \
+                 which every workspace's per-instance URL (`#/ws/{workspace}/<id>`) and every panel's `source` fn assume"
+            ),
+            TypeErrorKind::PanelMissingSource { workspace, panel } => write!(
+                f,
+                "{line}:{col}: `panel \"{panel}\"` in `workspace {workspace}` has no `source: <fn>` entry"
+            ),
+            TypeErrorKind::PanelSourceNotAnIdent { workspace, panel } => write!(
+                f,
+                "{line}:{col}: `panel \"{panel}\"` in `workspace {workspace}` — `source` must name a function directly"
+            ),
+            TypeErrorKind::PanelSourceWrongShape { workspace, panel, fn_name } => write!(
+                f,
+                "{line}:{col}: `panel \"{panel}\"` in `workspace {workspace}` — `source: {fn_name}` must take exactly one \
+                 `i64` parameter and return `Result(json, _)`"
             ),
             TypeErrorKind::StrInFnSignature { fn_name, param_name: Some(param_name) } => write!(
                 f,
@@ -1226,6 +1280,9 @@ fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeE
     if let Some(dash) = &program.dashboard {
         c.check_dashboard(dash);
     }
+    for ws in &program.workspaces {
+        c.check_workspace(ws);
+    }
 
     for f in &program.fns {
         c.check_fn(f);
@@ -1465,6 +1522,79 @@ impl<'a> Checker<'a> {
         }
         for c in &dash.charts {
             self.check_metric_ref("chart", c);
+        }
+    }
+
+    /// `workspace <Name> { subject: <Struct> panel "..." { source: <fn>
+    /// action ... } }` — mirrors `check_screen`, plus the one extra shape
+    /// check `screen` doesn't need: a panel's `source` isn't just "any
+    /// function," it's specifically a one-`id`-in/`Result(json, _)`-out
+    /// function, since that's the exact call `ui_gen_template.html`'s
+    /// `renderWorkspace` makes (`ROADMAP.md` Track E1).
+    fn check_workspace(&mut self, ws: &WorkspaceDecl) {
+        match ws.entries.iter().find(|(k, _)| k == "subject") {
+            None => self.error(TypeErrorKind::WorkspaceMissingSubject(ws.name.clone()), ws.span),
+            Some((_, Expr::Ident(struct_name, span))) => match self.registry.struct_fields(struct_name) {
+                None => self.error(
+                    TypeErrorKind::UnknownWorkspaceSubject { workspace: ws.name.clone(), struct_name: struct_name.clone() },
+                    *span,
+                ),
+                Some(fields) => {
+                    if !fields.iter().any(|f| f.name == "id" && f.ty == Ty::I64) {
+                        self.error(
+                            TypeErrorKind::WorkspaceSubjectMissingId {
+                                workspace: ws.name.clone(),
+                                struct_name: struct_name.clone(),
+                            },
+                            *span,
+                        );
+                    }
+                }
+            },
+            Some((_, other)) => self.error(TypeErrorKind::WorkspaceSubjectNotAnIdent(ws.name.clone()), other.span()),
+        }
+
+        for panel in &ws.panels {
+            match panel.entries.iter().find(|(k, _)| k == "source") {
+                None => self.error(
+                    TypeErrorKind::PanelMissingSource { workspace: ws.name.clone(), panel: panel.title.clone() },
+                    panel.span,
+                ),
+                Some((_, Expr::Ident(fn_name, span))) => {
+                    // Borrow `self.sigs` only long enough to compute a
+                    // plain `bool`, so the immutable borrow is released
+                    // before `self.error(...)`'s mutable one below — the
+                    // same "compute, then error" split `check_min_max_expr`
+                    // and friends already use for the same reason.
+                    let shape = self.sigs.get(fn_name).map(|sig| {
+                        sig.params.len() == 1
+                            && sig.params[0] == Ty::I64
+                            && matches!(&sig.ret, Ty::Named(n, args) if n == "Result" && args.first() == Some(&Ty::Json))
+                    });
+                    match shape {
+                        None => self.error(
+                            TypeErrorKind::ScreenFnNotFound { key: "source".to_string(), fn_name: fn_name.clone() },
+                            *span,
+                        ),
+                        Some(false) => self.error(
+                            TypeErrorKind::PanelSourceWrongShape {
+                                workspace: ws.name.clone(),
+                                panel: panel.title.clone(),
+                                fn_name: fn_name.clone(),
+                            },
+                            *span,
+                        ),
+                        Some(true) => {}
+                    }
+                }
+                Some((_, other)) => self.error(
+                    TypeErrorKind::PanelSourceNotAnIdent { workspace: ws.name.clone(), panel: panel.title.clone() },
+                    other.span(),
+                ),
+            }
+            for action in &panel.actions {
+                self.check_fn_ref("action", &Expr::Ident(action.target_fn.clone(), action.span));
+            }
         }
     }
 

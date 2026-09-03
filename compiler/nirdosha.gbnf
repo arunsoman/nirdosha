@@ -56,7 +56,7 @@ root        ::= ws program ws
 
 program     ::= (item ws)*
 
-item        ::= fn-decl | struct-decl | enum-decl | screen-decl | dashboard-decl | module-decl | workflow-decl
+item        ::= fn-decl | struct-decl | enum-decl | screen-decl | dashboard-decl | module-decl | workflow-decl | workspace-decl
 
 fn-decl     ::= "fn" ws ident ws "(" ws params? ws ")" ws ret-type? (ws effect-annotation)? (ws requires-annotation)? ws block
 
@@ -85,6 +85,14 @@ kv-entry       ::= ident ws ":" ws expr
 
 dashboard-decl ::= "dashboard" ws "{" ws (dashboard-item ws)* "}"
 dashboard-item ::= ("tile" | "chart") ws str-lit ws "->" ws ident
+
+# `workspace Name { subject: Struct panel "..." { ... } }` -- Track E1's
+# composite multi-panel screen. `action-decl` inside `panel-item` is
+# `screen-item`'s own production, reused unchanged.
+workspace-decl ::= "workspace" ws ident ws "{" ws (workspace-item ws)* "}"
+workspace-item ::= panel-decl | kv-entry
+panel-decl     ::= "panel" ws str-lit ws "{" ws (panel-item ws)* "}"
+panel-item     ::= action-decl | kv-entry
 
 module-decl ::= "module" ws str-lit ws "{" ws ((fn-decl | struct-decl | enum-decl) ws)* "}"
 

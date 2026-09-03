@@ -513,3 +513,77 @@ fn the_embedded_favicon_data_uri_decodes_to_a_real_png() {
     // that merely survived the placeholder substitution.
     assert_eq!(&bytes[0..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
 }
+
+// ── `workspace`/`panel` (`ROADMAP.md` Track E1) ─────────────────────────
+
+#[test]
+fn workspace_and_panel_render_into_the_manifest() {
+    let src = r#"
+        struct Text {
+            value: str,
+        }
+
+        struct Case {
+            id: i64,
+            status: str,
+        }
+
+        fn get_case(id: i64) -> Case { return Case(id, "open") }
+
+        fn list_transaction_for_case(case_id: i64) -> Result(json, Text) {
+            return match json_parse("[]") {
+                Ok(v) => Ok(v),
+                Err(e) => Err(Text(e)),
+            }
+        }
+        fn add_case_note(case_id: i64, body: Text) -> Result(json, Text) requires(role: "investigator") {
+            return match json_parse("{}") {
+                Ok(v) => Ok(v),
+                Err(e) => Err(Text(e)),
+            }
+        }
+
+        workspace CaseInvestigation {
+            title: "Investigation Workspace"
+            subject: Case
+
+            panel "Transactions" {
+                source: list_transaction_for_case
+            }
+            panel "Notes" {
+                source: list_transaction_for_case
+                action "Add Note" -> add_case_note {
+                    style: "filled"
+                }
+            }
+        }
+
+        fn main() {}
+    "#;
+    let html = emit_ui(src);
+
+    assert!(!html.contains("__NIRDOSHA_WORKSPACES__"), "the placeholder must always be substituted, never leak into real output");
+    assert!(html.contains(r#""name":"CaseInvestigation""#));
+    assert!(html.contains(r#""snake":"case_investigation""#));
+    assert!(html.contains(r#""title":"Investigation Workspace""#));
+    assert!(html.contains(r#""subject":"Case""#));
+    assert!(html.contains(r#""subjectSnake":"case""#));
+    assert!(html.contains(r#""subjectGetFn":"get_case""#));
+    assert!(html.contains(r#""title":"Transactions""#));
+    assert!(html.contains(r#""title":"Notes""#));
+    assert!(html.contains(r#""sourceFn":"list_transaction_for_case""#));
+    assert!(html.contains(r#""sourceParam":"case_id""#));
+    assert!(html.contains(r#""fn":"add_case_note""#));
+    assert!(html.contains(r#""requiredRole":"investigator""#), "the panel action's own requires(role: ...) gate should carry through");
+
+    // Client-side wiring: nav entry + route dispatch + renderer exist.
+    assert!(html.contains(r#"navButton("ws/" + ws.snake, ws.title)"#));
+    assert!(html.contains(r#"hash.startsWith("ws/")"#));
+    assert!(html.contains("async function renderWorkspace(ws, id)"));
+}
+
+#[test]
+fn a_program_with_no_workspace_block_renders_an_empty_workspaces_array() {
+    let html = emit_ui(include_str!("../../examples/ui_todo.nir"));
+    assert!(html.contains("const WORKSPACES = [];"), "no workspace block should mean a literally empty array, same as WORKFLOWS already does");
+}

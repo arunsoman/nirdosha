@@ -417,6 +417,13 @@ const CHARTS = __NIRDOSHA_CHARTS__;
 // row gets is decided per-row, at fetch time, by `pendingFn`'s own
 // response -- see `renderWorkflowQueue`.
 const WORKFLOWS = __NIRDOSHA_WORKFLOWS__;
+// One entry per declared `workspace` (`ROADMAP.md` Track E1,
+// `examples/ctms/UI_CONSTRUCTS.md` §1) -- `{name, snake, title, subject,
+// subjectSnake, subjectGetFn, subjectGetParam, subjectFields, panels:
+// [{title, sourceFn, sourceParam, sourceRequires*, actions}]}`. A
+// composite, multi-panel screen scoped to one instance of `subject` --
+// see `renderWorkspace` below.
+const WORKSPACES = __NIRDOSHA_WORKSPACES__;
 const API_BASE = window.NIRDOSHA_API_BASE || "/api";
 const IDENTITY_BASE = __NIRDOSHA_IDENTITY_BASE__;
 const IDENTITY_KEY = "nirdosha_identity";
@@ -785,7 +792,15 @@ function cellText(f, row) {
   return v !== null && v !== undefined ? String(v) : "";
 }
 
-async function renderListScreen(screen, root) {
+// `openWorkspace`, when given (`renderScreen` passes the `WORKSPACES`
+// entry whose `subjectSnake` matches this screen, if any), adds one more
+// per-row button navigating to that instance's composite workspace
+// (`#/ws/<openWorkspace.snake>/<row.id>`, `renderWorkspace`) -- additive
+// only, every other row action (`Edit`/`Delete`/custom) is unaffected,
+// and a screen with no matching workspace renders exactly as it always
+// has (`undefined` here, same as calling this fn the original two-arg
+// way every existing call site still does).
+async function renderListScreen(screen, root, openWorkspace) {
   const listAction = screen.actions.find((a) => a.kind === "list");
   const createAction = screen.actions.find((a) => a.kind === "create");
   const updateAction = screen.actions.find((a) => a.kind === "update");
@@ -885,6 +900,7 @@ async function renderListScreen(screen, root) {
     if (updateAction) thead.appendChild(el("th", { text: "" }));
     if (deleteAction) thead.appendChild(el("th", { text: "" }));
     for (const _ of customActions) thead.appendChild(el("th", { text: "" }));
+    if (openWorkspace) thead.appendChild(el("th", { text: "" }));
     const theadRows = [thead];
 
     // A filter row under the header, one `<select>` per enum-backed
@@ -925,7 +941,7 @@ async function renderListScreen(screen, root) {
     let rowIndex = 0;
     for (const row of list) {
       const tds = visibleFields.map((f) => el("td", { text: cellText(f, row) }));
-      const colspan = visibleFields.length + (updateAction ? 1 : 0) + (deleteAction ? 1 : 0) + customActions.length;
+      const colspan = visibleFields.length + (updateAction ? 1 : 0) + (deleteAction ? 1 : 0) + customActions.length + (openWorkspace ? 1 : 0);
       let tr, editRow = null;
       if (updateAction) {
         const btn = el("button", { class: "btn btn-outlined", text: "Edit" }, []);
@@ -963,6 +979,11 @@ async function renderListScreen(screen, root) {
           const r = await callFn(action.fn, payload);
           if (r !== null) { showSnackbar(`${action.label || action.fn} done.`); load(); }
         });
+        tds.push(el("td", {}, [btn]));
+      }
+      if (openWorkspace) {
+        const btn = el("button", { class: "btn btn-outlined", text: "Open Workspace" }, []);
+        btn.addEventListener("click", () => { location.hash = "#/ws/" + openWorkspace.snake + "/" + row.id; });
         tds.push(el("td", {}, [btn]));
       }
       tr = el("tr", { class: "row-enter", style: `animation-delay: calc(var(--stagger-ms) * ${rowIndex} * 1ms)` }, tds);
@@ -1249,7 +1270,7 @@ function renderScreen(screen) {
       text: "Sign-in on this page is a generated stub (localStorage identity), not real token verification -- wire it to your own auth once a backend exists." }));
   }
   if (screen.singular) renderSingularScreen(screen, content);
-  else renderListScreen(screen, content);
+  else renderListScreen(screen, content, WORKSPACES.find((w) => w.subjectSnake === screen.snake));
 }
 
 // `WORKFLOW.md`'s "state ownership + a generated queue UI" section --
@@ -1269,6 +1290,141 @@ function renderWorkflowScreen(wf) {
       text: "Sign-in on this page is a generated stub (localStorage identity), not real token verification -- wire it to your own auth once a backend exists." }));
   }
   renderWorkflowQueue(wf, content);
+}
+
+// `#/ws/<snake>` -- the picker: which instance of `ws.subject` do you
+// want to open? Reuses the subject's own already-derived `MANIFEST`
+// screen and `renderListScreen` completely unchanged (including its
+// pagination/sort/search when `SERVER_TABLE_API` is on), passing `ws`
+// itself as `openWorkspace` so every row gets an "Open Workspace" button
+// -- the exact same table a visitor browsing the subject's own screen
+// already sees, just reached via the "Workspaces" nav entry instead.
+function renderWorkspaceList(ws) {
+  const content = document.getElementById("content");
+  content.textContent = "";
+  replayAnimation(content, "screen-enter");
+  content.appendChild(el("h1", { class: "screen-title", text: ws.title }));
+  const subjectScreen = MANIFEST.find((s) => s.snake === ws.subjectSnake);
+  content.appendChild(el("p", { class: "screen-sub", text: "Pick a " + (subjectScreen ? subjectScreen.title : ws.subject) + " to open." }));
+  if (!subjectScreen) {
+    content.appendChild(el("div", { class: "empty-state",
+      text: `No screen derived for ${ws.subject} -- add list_/create_/update_/delete_/get_ functions for it.` }));
+    return;
+  }
+  renderListScreen(subjectScreen, content, ws);
+}
+
+// `#/ws/<snake>/<id>` -- the composed workspace itself
+// (`examples/ctms/UI_CONSTRUCTS.md` §1, `ROADMAP.md` Track E1): a
+// read-only header built from `ws.subjectGetFn(id)` (via the exact same
+// `buildFieldControl` field->control mapping every other screen uses,
+// inputs disabled post-hoc since this call passes `isEdit: false`, not a
+// dedicated read-only mode) plus one `.card` per panel, each fetched and
+// rendered independently by `renderPanel` below.
+async function renderWorkspace(ws, id) {
+  const content = document.getElementById("content");
+  content.textContent = "";
+  replayAnimation(content, "screen-enter");
+  content.appendChild(el("h1", { class: "screen-title", text: ws.title }));
+  content.appendChild(el("p", { class: "screen-sub", text: `${ws.subject} #${id}` }));
+
+  let subjectRow = null;
+  if (ws.subjectGetFn) {
+    subjectRow = await callFn(ws.subjectGetFn, { [ws.subjectGetParam]: Number(id) });
+    if (subjectRow) {
+      const headerFields = ws.subjectFields.filter(canViewField);
+      const header = el("div", { class: "card" }, headerFields.map((f) => {
+        const c = buildFieldControl(f, subjectRow[f.name], false, true);
+        c.el.querySelectorAll("input,select,textarea").forEach((i) => i.setAttribute("disabled", ""));
+        return c.el;
+      }));
+      content.appendChild(header);
+    }
+  }
+
+  for (const panel of ws.panels) {
+    const card = el("section", { class: "card" }, []);
+    card.appendChild(el("h2", { class: "screen-sub", text: panel.title }));
+    content.appendChild(card);
+    renderPanel(panel, card, id);
+  }
+}
+
+// One panel's own composed section: fetches `panel.sourceFn` with the
+// workspace subject's `id` as its one argument, renders whatever comes
+// back as a plain table (columns inferred from the first row's own
+// keys -- a panel's `source` fn shapes its own output, there's no
+// declared `FieldSpec` list to render from the way a screen's own
+// fields are), then each declared panel `action` as a button below.
+//
+// Convention (undesigned in depth -- `examples/ctms/UI_CONSTRUCTS.md`
+// §1's "Panel refresh" open question): a panel action's *first*
+// parameter is always treated as "this workspace instance's own id" --
+// pre-filled from `id` and never rendered as an input, the same
+// "sole id param, hidden" treatment a screen's own delete/custom row
+// actions already give their id param (`renderListScreen`'s
+// `deleteAction`/`customActions` handling above) -- every remaining
+// parameter renders as an ordinary form field. A successful action
+// reloads just this panel, not the whole workspace.
+async function renderPanel(panel, container, id) {
+  const body = el("div", { class: "table-scroll" }, [el("div", { class: "empty-state", text: "Loading…" })]);
+  container.appendChild(body);
+
+  async function reload() {
+    body.textContent = "";
+    if (panel.sourceRequiresLogin && !getIdentity()) {
+      body.appendChild(el("div", { class: "empty-state", text: "Sign in to view this." }));
+      return;
+    }
+    const result = await callFn(panel.sourceFn, { [panel.sourceParam]: Number(id) });
+    const list = Array.isArray(result) ? result : (result && typeof result === "object" ? [result] : []);
+    if (list.length === 0) {
+      body.appendChild(el("div", { class: "empty-state", text: "Nothing here yet." }));
+      return;
+    }
+    const cols = Object.keys(list[0]);
+    const table = el("table", {}, [el("thead", {}, [el("tr", {}, cols.map((c) => el("th", { text: c })))])]);
+    const tbody = el("tbody", {}, []);
+    let rowIndex = 0;
+    for (const row of list) {
+      tbody.appendChild(el(
+        "tr",
+        { class: "row-enter", style: `animation-delay: calc(var(--stagger-ms) * ${rowIndex} * 1ms)` },
+        cols.map((c) => el("td", { text: row[c] !== null && row[c] !== undefined ? String(row[c]) : "" })),
+      ));
+      rowIndex++;
+    }
+    table.appendChild(tbody);
+    body.appendChild(el("div", { class: "table-scroll" }, [table]));
+  }
+  await reload();
+
+  for (const action of panel.actions) {
+    const btn = el("button", { class: action.style === "filled" ? "btn btn-filled" : "btn btn-outlined", text: action.label || action.fn }, []);
+    if (!canRun(action)) btn.setAttribute("disabled", "");
+    let formEl = null;
+    btn.addEventListener("click", () => {
+      if (formEl) { formEl.remove(); formEl = null; return; }
+      const idParam = action.params[0];
+      const idValues = idParam ? { [idParam.name]: Number(id) } : {};
+      const restParams = idParam ? action.params.slice(1) : action.params;
+      formEl = buildForm(
+        restParams, null,
+        async (vals) => {
+          if (action.confirm && !window.confirm(action.confirm)) return;
+          const r = await callFn(action.fn, { ...idValues, ...vals });
+          if (r !== null) {
+            showSnackbar(`${action.label || action.fn} done.`);
+            formEl.remove(); formEl = null;
+            await reload();
+          }
+        },
+        action.label || "Submit", !canRun(action), gateReason(action),
+      );
+      container.appendChild(formEl);
+    });
+    container.appendChild(btn);
+  }
 }
 
 // ---- login (stub) screen ----
@@ -1524,6 +1680,15 @@ function renderNav() {
     // -- `canRun`-style nav-visibility gating doesn't apply here, there's
     // no single static role to check).
     for (const wf of WORKFLOWS) nav.appendChild(navButton("wf/" + wf.snake, wf.title));
+    // "Workspaces" -- one nav entry per declared `workspace`, same
+    // always-shown-to-any-signed-in-identity treatment as `WORKFLOWS`
+    // above (a workspace's own panels are each independently gated
+    // server-side; there's no single static role to nav-gate on here
+    // either). Points at the picker (`renderWorkspaceList`,
+    // `#/ws/<snake>`), not a specific instance -- an instance is only
+    // reachable from there, or from the subject screen's own "Open
+    // Workspace" row button (`renderListScreen`).
+    for (const ws of WORKSPACES) nav.appendChild(navButton("ws/" + ws.snake, ws.title));
 
     const currentHash = (location.hash || "").replace(/^#\//, "");
     const groups = [];
@@ -1588,6 +1753,17 @@ function route() {
   if (hash.startsWith("wf/")) {
     const wf = WORKFLOWS.find((w) => w.snake === hash.slice(3));
     if (wf) { renderWorkflowScreen(wf); return; }
+  }
+  if (hash.startsWith("ws/")) {
+    const rest = hash.slice(3);
+    const slash = rest.indexOf("/");
+    const wsSnake = slash >= 0 ? rest.slice(0, slash) : rest;
+    const ws = WORKSPACES.find((w) => w.snake === wsSnake);
+    if (ws) {
+      if (slash >= 0) renderWorkspace(ws, rest.slice(slash + 1));
+      else renderWorkspaceList(ws);
+      return;
+    }
   }
   const screen = MANIFEST.find((s) => s.snake === hash) || MANIFEST[0];
   if (!hash && HAS_DASHBOARD) { location.hash = "#/dashboard"; return; }

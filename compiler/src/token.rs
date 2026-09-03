@@ -124,6 +124,18 @@ pub enum Tok {
     /// identifier anywhere in the existing examples, matching `Screen`'s
     /// own reserved-vs-contextual reasoning.
     State,
+    /// `workspace Name { subject: Struct panel "..." { ... } }` — a
+    /// composite multi-panel screen (`ROADMAP.md` Track E1,
+    /// `examples/ctms/UI_CONSTRUCTS.md` §1). A real reserved keyword,
+    /// same reasoning as `Screen`/`Dashboard`/`Module`/`Workflow` above;
+    /// its body's `panel` is contextual-only (matched by identifier text
+    /// only inside `parser.rs::parse_workspace_decl`), the same
+    /// "keyword only within one specific syntactic slot" treatment
+    /// `screen`'s own `field`/`action`/`paginate` already get — disam-
+    /// biguated from an ordinary `kv_entry` by its second token always
+    /// being a `string`, never a `:`, so LL(1) holds with no
+    /// second-token lookahead beyond that same one-token check.
+    Workspace,
     /// `Vector`/`Matrix` in *type* position (`Vector(f64, 3)`) — deliberately
     /// capitalized, distinct from the lowercase `TypeName` scalars, matching
     /// the surface syntax the unified plan's architecture table already
@@ -389,6 +401,7 @@ impl<'a> Lexer<'a> {
                     "module" => Tok::Module,
                     "workflow" => Tok::Workflow,
                     "state" => Tok::State,
+                    "workspace" => Tok::Workspace,
                     "Vector" => Tok::VectorKw,
                     "Matrix" => Tok::MatrixKw,
                     "true" => Tok::True,

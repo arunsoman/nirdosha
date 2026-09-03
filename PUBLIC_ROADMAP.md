@@ -105,10 +105,11 @@ independent of Tracks A–D — see
 - [DONE] Screen inventory + construct design — an 89-screen inventory
   and a 5-construct design proposal, worked against a real
   Counter-Terrorism Financing & Transaction Monitoring System spec
-- [OPEN] `workspace`/`panel` (composite multi-pane screens) plus four
-  smaller DSL extensions (graph/heatmap/timeline views, live-status
-  fields, preview actions, a workflow stepper) — see `ROADMAP.md`
-  Track E
+- [DONE] `workspace`/`panel` — composite multi-pane screens composing
+  fields/lists from several structs onto one page (`LANGUAGE.md` §15)
+- [OPEN] Four smaller DSL extensions on top of it (graph/heatmap/
+  timeline views, live-status fields, preview actions, a workflow
+  stepper) — see `ROADMAP.md` Track E
 
 ---
 

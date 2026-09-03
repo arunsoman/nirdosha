@@ -1204,3 +1204,74 @@ Interpreter-only, the same way `transact`/`db`/`mq` already are (§10):
 `PHASE4_BUILTINS`/`PHASE5_BUILTINS`/... allowlists, so `nirdosha build`/
 `emit-llvm` cleanly rejects a program using `workflow`, naming the
 specific unsupported builtin — never a silent mis-compile.
+
+## 15. `workspace`/`panel` — composite multi-panel screens (Row 12, `emit-ui`/`serve` only)
+
+Full design in `examples/ctms/UI_CONSTRUCTS.md` §1 (`ROADMAP.md` Track
+E1) — this section is the short version.
+
+`screen <Struct> { ... }` (§11) is fundamentally one-struct-shaped: its
+fields come from that one struct, its actions are that struct's own CRUD
+functions. Some real screens genuinely need fields and lists from
+*several* structs composed onto one page, all scoped to one instance —
+an investigation view showing a case's own fields alongside its
+transactions, its alerts, and its notes, say. `workspace` is that:
+
+```nirdosha
+workspace CaseInvestigation {
+    title: "Investigation Workspace"     // optional; defaults to a
+                                          // display-cased `CaseInvestigation`
+    subject: Case                        // must have an `id: i64` field
+
+    panel "Transactions" {
+        source: list_transaction_for_case   // fn(i64) -> Result(json, _)
+    }
+    panel "Notes" {
+        source: list_case_note
+        action "Add Note" -> add_case_note {
+            style: "filled"
+        }
+    }
+}
+```
+
+`subject: <Struct>` names the struct this workspace is opened per
+instance of — every panel's `source` is called with that instance's
+`id`. Reachable at `#/ws/case_investigation/<id>` once signed in; a
+"Workspaces" nav entry (`#/ws/case_investigation`, no id) shows a picker
+— literally `subject`'s own already-derived screen and table, so it gets
+that screen's real pagination/sort/search for free when
+`--db`/`SERVER_TABLE_API` is on — and every row on `subject`'s own
+ordinary screen also gets an "Open Workspace" button straight to its
+instance.
+
+**`source`'s required shape**: exactly one `i64` parameter, returning
+`Result(json, _)` — the same shape check `typeck.rs::check_workspace`
+enforces before `ui_gen` ever runs. Whatever that fn returns (an array
+of objects, typically — a plain `db_query` result works unmodified) is
+rendered as a plain table, columns inferred from the first row's own
+keys; there's no declared field list for a panel the way a screen's own
+`FieldSpec`s exist, since a panel's shape is whatever its own query
+returns, not a struct's declared fields.
+
+A panel's `action "<label>" -> <fn> { ... }` is `screen`'s own
+`action_decl` reused completely unchanged. **Convention**: a panel
+action's first parameter is always treated as this workspace instance's
+own id — pre-filled, never rendered as an input, the same "sole id
+param, hidden" treatment a screen's own delete/custom row actions
+already give theirs; every other parameter renders as an ordinary form
+field. A successful action reloads just that one panel.
+
+**What this does not add**: no new `serve.rs` route, no new server-side
+trust boundary — every panel's `source` and every panel action are
+ordinary already-`requires(...)`-gated `.nir` functions already exposed
+at `POST /api/<fn>`, exactly as any other screen's actions are. A
+workspace is a client-side *composition* of calls that already exist and
+are already secured. `render:` on a panel item (a richer visualization
+than a plain table — a timeline, a graph, a heatmap) is Track E2, not
+yet built — a `render` key is parsed today (an ordinary `kv_entry`, the
+same forward-compatible fallback every other DSL block here already
+has) but has no effect yet.
+
+Like `module`/`workflow`, a program that declares no `workspace` is
+byte-for-byte unaffected.

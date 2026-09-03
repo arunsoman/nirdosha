@@ -272,12 +272,14 @@ impl Parser {
         let mut screens = Vec::new();
         let mut dashboard = None;
         let mut workflows = Vec::new();
+        let mut workspaces = Vec::new();
         while self.peek().tok != Tok::Eof {
             match self.peek().tok {
                 Tok::Struct => structs.push(self.parse_struct_decl()?),
                 Tok::Enum => enums.push(self.parse_enum_decl()?),
                 Tok::Screen => screens.push(self.parse_screen_decl()?),
                 Tok::Workflow => workflows.push(self.parse_workflow_decl()?),
+                Tok::Workspace => workspaces.push(self.parse_workspace_decl()?),
                 Tok::Dashboard => {
                     let d = self.parse_dashboard_decl()?;
                     if dashboard.is_some() {
@@ -297,7 +299,7 @@ impl Parser {
                 _ => fns.push(self.parse_fn_decl()?),
             }
         }
-        let mut program = Program { fns, structs, enums, screens, dashboard, workflows };
+        let mut program = Program { fns, structs, enums, screens, dashboard, workflows, workspaces };
         crate::workflow_lower::lower(&mut program)?;
         Ok(program)
     }
@@ -493,6 +495,60 @@ impl Parser {
         }
         self.expect(&Tok::RBrace, "`}`")?;
         Ok(DashboardDecl { tiles, charts, span })
+    }
+
+    /// `workspace_decl ::= "workspace" IDENT "{" workspace_item* "}"`
+    /// `workspace_item ::= panel_decl | kv_entry`
+    /// (`GRAMMAR.md`, `ROADMAP.md` Track E1) — same first-token-text
+    /// dispatch as `screen_decl`'s own body: `"panel"` vs. anything else
+    /// is a plain `kv_entry` (`subject: Case`, `title: "..."`), so this
+    /// stays LL(1) with no second-token lookahead, mirroring
+    /// `parse_screen_decl` production-for-production.
+    fn parse_workspace_decl(&mut self) -> PResult<WorkspaceDecl> {
+        let span = self.span();
+        self.expect(&Tok::Workspace, "`workspace`")?;
+        let name = self.expect_ident()?;
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut entries = Vec::new();
+        let mut panels = Vec::new();
+        while self.peek().tok != Tok::RBrace {
+            let is_panel = matches!(&self.peek().tok, Tok::Ident(s) if s == "panel");
+            if is_panel {
+                self.expect_ident()?; // consume "panel"
+                panels.push(self.parse_panel_decl()?);
+            } else {
+                entries.push(self.parse_kv_entry()?);
+            }
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(WorkspaceDecl { name, entries, panels, span })
+    }
+
+    /// `panel_decl ::= "panel" STRING "{" panel_item* "}"`
+    /// `panel_item ::= action_decl | kv_entry`
+    /// Called with the leading `"panel"` token already consumed by
+    /// `parse_workspace_decl` (the same "caller consumes the dispatch
+    /// keyword" shape `parse_dashboard_decl`'s `tile`/`chart` arm uses).
+    /// `action_decl` inside a panel is `parse_action_decl` reused
+    /// completely unchanged — zero new syntax for panel actions beyond
+    /// what a screen's own actions already have.
+    fn parse_panel_decl(&mut self) -> PResult<PanelDecl> {
+        let span = self.span();
+        let title = self.expect_str_lit("a panel title")?;
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut entries = Vec::new();
+        let mut actions = Vec::new();
+        while self.peek().tok != Tok::RBrace {
+            let is_action = matches!(&self.peek().tok, Tok::Ident(s) if s == "action");
+            if is_action {
+                self.expect_ident()?; // consume "action"
+                actions.push(self.parse_action_decl()?);
+            } else {
+                entries.push(self.parse_kv_entry()?);
+            }
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(PanelDecl { title, entries, actions, span })
     }
 
     /// `workflow_decl ::= "workflow" IDENT "{" data_block? state_decl+ "}"`

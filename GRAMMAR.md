@@ -102,7 +102,7 @@ parses as `return (x - y)` — one statement, a subtraction — never as
 ```ebnf
 program     ::= item*
 
-item        ::= fn_decl | struct_decl | enum_decl | screen_decl | dashboard_decl | module_decl | workflow_decl
+item        ::= fn_decl | struct_decl | enum_decl | screen_decl | dashboard_decl | module_decl | workflow_decl | workspace_decl
 
 fn_decl     ::= "fn" ident "(" params? ")" ("->" type)? effect_annotation? requires_annotation? block
 
@@ -187,6 +187,25 @@ kv_entry       ::= ident ":" expr
 
 dashboard_decl ::= "dashboard" "{" dashboard_item* "}"
 dashboard_item ::= ("tile" | "chart") string "->" ident
+
+// `workspace Name { subject: Struct panel "..." { ... } }`
+// (`ROADMAP.md` Track E1, `examples/ctms/UI_CONSTRUCTS.md` §1) -- a
+// composite, multi-panel screen scoped to one instance of `subject`,
+// additive over `screen_decl`/`dashboard_decl` the same way those are
+// additive over pure naming-convention inference. `workspace` is a real
+// reserved keyword (like `screen`/`dashboard`/`module`/`workflow`
+// above); `panel` is contextual-only, the same "keyword only within
+// this one leading position" treatment `field`/`action`/`paginate`
+// already get inside `screen_item` -- disambiguated from an ordinary
+// `kv_entry` the same way: `panel_decl`'s second token is always a
+// `string`, a `kv_entry`'s second token is always `:`, so LL(1) holds
+// with no second-token lookahead beyond that same one-token check.
+// `action_decl` inside `panel_item` is `screen_item`'s own production,
+// reused completely unchanged -- zero new syntax for a panel's actions.
+workspace_decl ::= "workspace" ident "{" workspace_item* "}"
+workspace_item ::= panel_decl | kv_entry
+panel_decl     ::= "panel" string "{" panel_item* "}"
+panel_item     ::= action_decl | kv_entry
 
 // Pure nav-grouping sugar for `ui_gen.rs`, not a scoping/namespace
 // construct: every `fn`/`struct`/`enum` inside still registers into the
