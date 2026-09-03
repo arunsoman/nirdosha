@@ -47,6 +47,24 @@ Status tags: `[DONE]` (verified — tests pass or run end-to-end),
   not just hidden in the client
 - [DONE] Design-token theming (`--theme`) with live reload — color
   ramps, motion, dark-mode strategy, layout shell, all optional
+- [DONE] `workspace`/`panel` — composite multi-pane screens composing
+  fields/lists from several structs onto one page (`LANGUAGE.md` §15)
+- [DONE] `visual`/`render` — graph, heatmap, and timeline views on a
+  dashboard or inside a panel, on top of the existing bar-chart-only
+  `chart` (`LANGUAGE.md` §11c)
+- [DONE] `field { render: "countdown" }` — a live SLA countdown chip on
+  a table field, ticking client-side with zero added network traffic
+  (`LANGUAGE.md` §11)
+- [DONE] `action { show_result: true }` — a "Simulate"/"Preview" action
+  shows its own JSON return value in a modal instead of just refreshing
+  the row (`LANGUAGE.md` §11)
+- [DONE] A workflow stage stepper — a real `●━●━○━○` progress stepper
+  on a workflow queue row instead of a bare state-name badge, no syntax
+  change (`LANGUAGE.md` §14)
+- [DONE] `examples/ctms/ctms.nir` — all of the above proven together
+  against a real 89-screen enterprise app spec (a Counter-Terrorism
+  Financing & Transaction Monitoring System), not just in isolation —
+  see `ROADMAP.md` Track E6
 
 **LLM integration**
 - [DONE] LL(1) grammar exported to GBNF for constrained decoding
@@ -97,31 +115,6 @@ underlying capability already ships; the `/v1/*` server itself is 0% built)
 UI manifest, independent of Tracks A–C — see [`MOBILE.md`](./MOBILE.md))
 - [OPEN] `emit-mobile` codegen scaffold — native iOS/Android from the
   same `struct`/`screen` declarations that drive the web UI today
-
-**Track E — Enterprise UI constructs** (extends the same UI manifest/
-DSL with what a dense enterprise app needs beyond CRUD+dashboard,
-independent of Tracks A–D — see
-[`examples/ctms/UI_CONSTRUCTS.md`](./examples/ctms/UI_CONSTRUCTS.md))
-- [DONE] Screen inventory + construct design — an 89-screen inventory
-  and a 5-construct design proposal, worked against a real
-  Counter-Terrorism Financing & Transaction Monitoring System spec
-- [DONE] `workspace`/`panel` — composite multi-pane screens composing
-  fields/lists from several structs onto one page (`LANGUAGE.md` §15)
-- [DONE] `visual`/`render` — graph, heatmap, and timeline views on a
-  dashboard or inside a panel, on top of the existing bar-chart-only
-  `chart` (`LANGUAGE.md` §11c)
-- [DONE] `field { render: "countdown" }` — a live SLA countdown chip on
-  a table field, ticking client-side with zero added network traffic
-  (`LANGUAGE.md` §11)
-- [DONE] `action { show_result: true }` — a "Simulate"/"Preview" action
-  shows its own JSON return value in a modal instead of just refreshing
-  the row (`LANGUAGE.md` §11)
-- [DONE] A workflow stage stepper — a real `●━●━○━○` progress stepper
-  on a workflow queue row instead of a bare state-name badge, no syntax
-  change (`LANGUAGE.md` §14)
-- [OPEN] Rebuild `examples/ctms/ctms.nir` end-to-end against the full
-  89-screen inventory — every construct it needs now exists — see
-  `ROADMAP.md` Track E
 
 ---
 
