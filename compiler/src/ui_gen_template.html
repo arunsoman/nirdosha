@@ -1102,6 +1102,38 @@ async function renderListScreen(screen, root, openWorkspace) {
 // (`WORKFLOW.md`'s "audit trail" section, `historyFn`) that expands an
 // inline transition log below the row, the same toggle-a-row-below-it
 // shape `renderListScreen`'s own inline edit form already uses.
+// ---- Track E5: workflow stage stepper ----------------------------------
+// `allStates` is `workflow Name { state A {} state B {} ... }`'s own
+// declared `state` list, in order (`ui_gen.rs::WorkflowQueue::
+// all_states`) -- everything this needs was already parsed before this
+// existed; this is purely a rendering upgrade over the bare
+// `state_label` badge every row used to show. Falls back to that plain
+// badge if `current` isn't found in `allStates` at all (display code,
+// not a place to throw on an otherwise-well-formed program).
+function buildStepper(allStates, current, label) {
+  const idx = allStates.indexOf(current);
+  if (idx === -1) {
+    return el("span", { class: "badge", text: label || current, style: "margin-left:0;" });
+  }
+  const dots = allStates.map((name, i) => {
+    const dot = el("span", {
+      text: "●",
+      title: name,
+      style: `font-size:10px;color:${i <= idx ? "var(--md-primary)" : "var(--md-on-surface-variant)"};`,
+    });
+    if (i === allStates.length - 1) return el("span", {}, [dot]);
+    const line = el("span", {
+      style: `display:inline-block;width:16px;height:2px;vertical-align:middle;background:${i < idx ? "var(--md-primary)" : "var(--md-on-surface-variant)"};`,
+    });
+    return el("span", {}, [dot, line]);
+  });
+  return el(
+    "span",
+    { title: `${label || current} (step ${idx + 1} of ${allStates.length})`, style: "display:inline-flex;align-items:center;gap:2px;" },
+    dots,
+  );
+}
+
 async function renderWorkflowQueue(wf, root) {
   root.appendChild(el("h2", { text: wf.title, style: "font-size:16px;font-weight:500;" }));
 
@@ -1169,7 +1201,7 @@ async function renderWorkflowQueue(wf, root) {
     let rowIndex = 0;
     for (const row of rows) {
       const tds = wf.dataFields.map((f) => el("td", { text: cellText(f, row.data) }));
-      tds.push(el("td", {}, [el("span", { class: "badge", text: row.state_label || row.state, style: "margin-left:0;" })]));
+      tds.push(el("td", {}, [buildStepper(wf.allStates, row.state, row.state_label)]));
       const btnCell = el("td", { class: "row-actions" }, []);
       let tr, historyRow = null;
       if (mode === "pending") {

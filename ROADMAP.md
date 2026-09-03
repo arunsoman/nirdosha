@@ -2286,47 +2286,60 @@ E6 is the one item that waits on all five.*
   - [x] Full `cargo test` (whole suite) green — verified above.
   - [ ] Full `cargo test` green before `[DONE]`.
 
-- `[OPEN]` **E5. Workflow stage stepper.** Unblocks Case Workflow/Stage
+- `[DONE]` **E5. Workflow stage stepper.** Unblocks Case Workflow/Stage
   Tracker (Module 3) — rendering the doc's own 4-stage model as a real
   progress stepper instead of a bare state-name label. **No grammar or
   DSL change at all** — everything the render needs (`workflow`'s
   declared `state` list, in order) is already parsed; this is purely a
   `ui_gen.rs`/`ui_gen_template.html` manifest-enrichment + rendering
-  upgrade. Full design: `UI_CONSTRUCTS.md` §5.
-  - [ ] `ui_gen.rs`: `WorkflowQueue` gains `all_states: Vec<String>` —
+  upgrade. Full design: `UI_CONSTRUCTS.md` §5. — 2026-09-03, verified:
+  full `cargo test` green (same pre-existing `mq.rs` Redis gap,
+  unrelated), plus a real `nirdosha serve --db` smoke test (started a
+  real `CaseLifecycle` instance, advanced it `Investigation ->
+  ComplianceEscalation` via a real `Escalate` event, confirmed the
+  manifest's `allStates` carries the full declared order and the
+  instance's own `state`/`state_label` updated correctly) and a
+  `node --check` pass on the extracted client `<script>`.
+  - [x] `ui_gen.rs`: `WorkflowQueue` gained `all_states: Vec<String>` —
     the declared `workflow`'s own `state` list in declaration order,
-    read straight off `ast::WorkflowDecl`.
-  - [ ] `ui_gen_template.html`: `renderWorkflowScreen`/
-    `renderWorkflowQueue` render a horizontal stepper (`wf.allStates`,
-    current index = the row's own `state` position in that list) using
-    the existing MD3 primary/on-surface-variant color tokens — no new
-    theme tokens.
-  - [ ] `LANGUAGE.md`: a short note in §14 (`workflow`) describing the
-    generated stepper, since the underlying grammar is unchanged.
-  - [ ] New/extended test coverage in `tests/workflow.rs` or
-    `tests/emit_ui.rs` confirming `all_states`/current-index appear
-    correctly in the manifest for a multi-state workflow.
-  - [ ] Apply to `examples/ctms/ctms.nir`: the `CaseLifecycle` workflow
-    (Investigation → ComplianceEscalation → Resolution →
+    read straight off `ast::WorkflowDecl::states`.
+  - [x] `ui_gen_template.html`: a new `buildStepper(allStates, current,
+    label)` (a `●━●━○━○` horizontal stepper, current index = the row's
+    own `state` position in `allStates`, falling back to the original
+    plain badge if `current` isn't found in it at all) replaces the bare
+    `state_label` badge in `renderWorkflowQueue`'s row rendering — same
+    MD3 `var(--md-primary)`/`var(--md-on-surface-variant)` tokens, no
+    new theme tokens.
+  - [x] `LANGUAGE.md` §14 documents the generated stepper.
+  - [x] Test coverage: 2 new real end-to-end `tests/emit_ui.rs` cases
+    (`allStates` in declaration order in the manifest, plus confirming
+    the stepper builder is actually wired into the row renderer; and the
+    "no workflow" empty-array regression guard).
+  - [x] Applied to `examples/ctms/ctms.nir`: the `CaseLifecycle`
+    workflow (Investigation → ComplianceEscalation → Resolution →
     RegulatoryFiling, Module 3), per `UI_CONSTRUCTS.md` §5's worked
-    example.
-  - [ ] Full `cargo test` green before `[DONE]`.
+    example, with real `owner`/`label` per state (`WORKFLOW.md`'s
+    "state ownership + a generated queue UI" section) rather than a
+    bare skeleton.
+  - [x] Full `cargo test` (whole suite) green — verified above.
 
-- `[BLOCKED: E5]` **E6. Rebuild `examples/ctms/ctms.nir` end-to-end.**
-  E1+E2+E3+E4 grew the file into a real, verified `Matter`/`Transaction`/
-  `MatterNote`/`Wallet`/`WalletLink`/`CompliancePolicy` proof-of-concept
-  (one `workspace`, two panels — one now a live timeline —, a dashboard
+- `[OPEN]` **E6. Rebuild `examples/ctms/ctms.nir` end-to-end.** E1–E5
+  are now all `[DONE]` — every construct this rebuild needs exists and
+  is verified. E1–E5 each grew the file into a real, verified
+  `Matter`/`Transaction`/`MatterNote`/`Wallet`/`WalletLink`/
+  `CompliancePolicy` proof-of-concept plus a `CaseLifecycle` workflow
+  (one `workspace`, two panels — one a live timeline —, a dashboard
   with three tiles (one live-SLA-aware) and a graph/heatmap visual each,
-  a live SLA countdown on the Matter Queue, and a simulate-before-apply
-  action on the Policy Management Engine) — still nowhere near the
-  8-struct plain-CRUD-only version `SCREENS.md`'s own intro names as
-  this whole initiative's starting point, let alone the full 89-screen
-  inventory. Once E5 also lands: rebuild it for real
-  against the actual CTMS screen inventory (`SCREENS.md`), not just the
-  handful of worked-example screens E1–E5 individually touch — then
-  verify it actually renders (`nirdosha emit-ui`) and serves (`nirdosha
-  serve --db`) end to end, the same "verified, not just written" bar
-  this file holds every other `[DONE]` item to.
+  a live SLA countdown on the Matter Queue, a simulate-before-apply
+  action on the Policy Management Engine, and a real 4-stage workflow
+  stepper) — still nowhere near the 8-struct plain-CRUD-only version
+  `SCREENS.md`'s own intro names as this whole initiative's starting
+  point, let alone the full 89-screen inventory. Now unblocked: rebuild
+  it for real against the actual CTMS screen inventory (`SCREENS.md`),
+  not just the handful of worked-example screens E1–E5 individually
+  touch — then verify it actually renders (`nirdosha emit-ui`) and
+  serves (`nirdosha serve --db`) end to end, the same "verified, not
+  just written" bar this file holds every other `[DONE]` item to.
 - `[DONE]` **E7. `PUBLIC_ROADMAP.md` — add a Track E entry.** Brief,
   external-facing mirror of Track D's own entry there — done as part of
   this same session, since it's small. — 2026-09-03.

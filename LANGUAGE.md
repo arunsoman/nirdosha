@@ -1272,6 +1272,16 @@ Interpreter-only, the same way `transact`/`db`/`mq` already are (§10):
 `emit-llvm` cleanly rejects a program using `workflow`, naming the
 specific unsupported builtin — never a silent mis-compile.
 
+**Generated UI: a real stage stepper, not a bare state-name badge**
+(Track E5, `ROADMAP.md`) — `nirdosha serve`'s workflow queue screen
+(the same `list_<workflow>_pending_for_me`/`list_<workflow>_
+submitted_by_me` queue described above) renders each row's own `state`
+as a `●━●━○━○`-style horizontal stepper against the workflow's full
+declared `state` list, not just that one row's current name. No syntax
+change — the declared `state` order was already parsed; this is purely
+`ui_gen.rs` carrying that ordered list into the manifest for
+`ui_gen_template.html` to draw against.
+
 ## 15. `workspace`/`panel` — composite multi-panel screens (Row 12, `emit-ui`/`serve` only)
 
 Full design in `examples/ctms/UI_CONSTRUCTS.md` §1 (`ROADMAP.md` Track

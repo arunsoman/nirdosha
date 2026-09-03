@@ -721,6 +721,37 @@ dashboard {
     }
 }
 
+// ---- Track E5: the Case Workflow/Stage Tracker (Module 3) -------------
+// `UI_CONSTRUCTS.md` SS5's own worked example, built for real: no syntax
+// beyond what `WORKFLOW.md` already supports -- the stepper is purely a
+// rendering upgrade on top of this declared `state` order.
+workflow CaseLifecycle {
+    data {
+        matter_id: i64,
+    }
+
+    state Investigation {
+        owner: role("investigator")
+        label: "Investigation & Enrichment"
+        on Escalate -> ComplianceEscalation
+        on Resolve -> Resolution
+    }
+    state ComplianceEscalation {
+        owner: role("compliance_officer")
+        label: "Compliance Escalation / Legal Hold"
+        on Resolve -> Resolution
+    }
+    state Resolution {
+        owner: role("investigator")
+        label: "Resolution"
+        on FileReport -> RegulatoryFiling
+    }
+    state RegulatoryFiling terminal {
+        owner: role("compliance_officer")
+        label: "Regulatory Filing"
+    }
+}
+
 // ---- The Investigation Workspace itself --------------------------------
 // `Matter` already gets a real screen from the CRUD naming convention
 // above (`list_matter`/`create_matter`/`update_matter`/`delete_matter`/
