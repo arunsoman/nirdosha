@@ -98,6 +98,18 @@ UI manifest, independent of Tracks A–C — see [`MOBILE.md`](./MOBILE.md))
 - [OPEN] `emit-mobile` codegen scaffold — native iOS/Android from the
   same `struct`/`screen` declarations that drive the web UI today
 
+**Track E — Enterprise UI constructs** (extends the same UI manifest/
+DSL with what a dense enterprise app needs beyond CRUD+dashboard,
+independent of Tracks A–D — see
+[`examples/ctms/UI_CONSTRUCTS.md`](./examples/ctms/UI_CONSTRUCTS.md))
+- [DONE] Screen inventory + construct design — an 89-screen inventory
+  and a 5-construct design proposal, worked against a real
+  Counter-Terrorism Financing & Transaction Monitoring System spec
+- [OPEN] `workspace`/`panel` (composite multi-pane screens) plus four
+  smaller DSL extensions (graph/heatmap/timeline views, live-status
+  fields, preview actions, a workflow stepper) — see `ROADMAP.md`
+  Track E
+
 ---
 
 ## How to help

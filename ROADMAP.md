@@ -1984,6 +1984,239 @@ capability, per `MOBILE.md`'s own archetype ranking.*
 
 ---
 
+## Track E — Enterprise UI constructs (`examples/ctms/SCREENS.md`, `examples/ctms/UI_CONSTRUCTS.md`)
+
+*Priority: independent of Tracks A–D — this grows `ui_gen.rs`'s existing
+manifest/renderer (the same `Screen`/`FieldSpec`/`Action`/`Metric` IR
+`MOBILE.md`'s Track D already reuses unchanged), not the
+interpreter/compiler/agent-API/mobile work above. Grounded in a real,
+dense enterprise spec (CTMS — Counter-Terrorism Financing & Transaction
+Monitoring System) worked all the way from a raw doc through a full
+89-screen inventory to five concrete, grammar-shaped construct
+proposals, exactly the way `MOBILE.md` was written before `mobile_gen.rs`
+existed. E1–E5 each stand alone (no ordering constraint between them,
+per `UI_CONSTRUCTS.md`'s own leverage ordering) and can be picked up in
+priority order or in whatever order actually matches what's being built;
+E6 is the one item that waits on all five.*
+
+- `[DONE]` **E0. Screen inventory.** `examples/ctms/SCREENS.md` —
+  89 screens across CTMS's 10 modules plus cross-cutting, each with
+  actor(s)/purpose/key data/actions/screen-shape, grounded in the CTMS
+  doc's own component/actor/event names, not generalized boilerplate.
+  — 2026-09-03.
+- `[DONE]` **E0b. Construct design.** `examples/ctms/UI_CONSTRUCTS.md` —
+  gap analysis of all 89 `SCREENS.md` screens against today's `screen`/
+  `dashboard`/`module` DSL, five proposed constructs in priority order
+  (`workspace`/`panel`; `visual` dashboard/panel item + `render:
+  "graph"|"heatmap"|"timeline"`; `field { render: "countdown" }`;
+  `action { show_result: true }`; a workflow stage stepper), each with a
+  grammar-shaped syntax sketch, what it lowers to in `ui_gen.rs`/
+  `ui_gen_template.html`/`serve.rs`, a worked CTMS example, and an
+  explicit "not included" scope note — same level of detail `MOBILE.md`
+  uses for its own not-yet-built constructs. Also shows, with two worked
+  examples, that most of the 89 screens (report generation/scheduling,
+  most config-as-data policy screens, plain CRUD) need **no** new
+  construct at all — existing minimalism preserved, not inflated. —
+  2026-09-03.
+
+- `[OPEN]` **E1. `workspace` / `panel` — composite multi-pane screens.**
+  Highest-leverage item: ~18 of the 89 screens directly (Investigation
+  Workspace, Alert Detail/Risk-Score Breakdown, Behavioural Profile, ML
+  Model Management, Case Collaboration, Evidence Management, Decision
+  Panel, Escalation & Regulatory Referral, Case Export/Audit Dossier,
+  Fiat–Crypto Correlation, Entity 360, Exchange/Partner FI Portal, RTFDS
+  Real-Time Action Console, plus the child-row half of several
+  config-as-data screens). New top-level construct — composes fields/
+  lists from multiple structs, scoped to one subject-struct instance,
+  onto a single screen; today's `screen <Struct> { ... }` is
+  fundamentally one-struct-shaped and can't express this. Full design:
+  `UI_CONSTRUCTS.md` §1.
+  - [ ] Grammar: new `workspace_decl ::= "workspace" ident "{"
+    workspace_item* "}"`, `workspace_item ::= panel_decl | kv_entry`,
+    `panel_decl ::= "panel" string "{" panel_item* "}"`, `panel_item ::=
+    action_decl | kv_entry` (`GRAMMAR.md`, `item` production gains
+    `workspace_decl` alongside `screen_decl`/`dashboard_decl`); new
+    `parse_workspace_decl`/`parse_panel_decl` in `parser.rs`, mirroring
+    `parse_screen_decl`/`parse_field_override`.
+  - [ ] Cross-verify the grammar delta against `grammar_check/`'s
+    independent LALR(1) generator.
+  - [ ] Update `compiler/nirdosha.gbnf` to stay in sync with the new
+    productions.
+  - [ ] AST: `ast::WorkspaceDecl`/`PanelDecl`; `typeck.rs::check_workspace`
+    (mirroring `check_screen`) — `subject` resolves to a real struct with
+    an `id: i64` field, every panel's `source` resolves to a real fn
+    taking one `i64` param and returning `Result(json, E)`, every panel
+    `action`'s `->` target resolves, same shape checks `check_screen`'s
+    `action_decl` already gets.
+  - [ ] `ui_gen.rs`: new `struct Workspace`/`struct Panel`, a
+    `build_workspaces` pass alongside `build_screens`, a new `WORKSPACES`
+    top-level array in `manifest_json`.
+  - [ ] `ui_gen_template.html`: new `#/ws/<snake>/<id>` route,
+    `renderWorkspace` (subject header via existing singular-form
+    rendering, reused; each panel a `.card` fetched via the existing
+    `callFn`), panel actions reusing the existing action-button/confirm/
+    gating code path verbatim — same `.card`/`row-enter`/`--stagger-ms`
+    motion-token styling every other screen already uses, no new CSS or
+    animation vocabulary.
+  - [ ] `serve.rs`: confirm (this is the point of the design — expected
+    to be a no-op) that no new route is needed, since every panel
+    `source`/action is an ordinary already-secured `POST /api/<fn>` call.
+  - [ ] `LANGUAGE.md`: new `§15. workspace/panel` section, same register
+    as §11/§12/§14.
+  - [ ] New `compiler/tests/workspace_dsl.rs` (parse/typeck shape) plus
+    at least one real end-to-end case in `tests/emit_ui.rs`/a `serve`
+    integration test.
+  - [ ] Apply to `examples/ctms/ctms.nir`: build the Investigation
+    Workspace screen (Module 3) for real, per `UI_CONSTRUCTS.md` §1's
+    worked example.
+  - [ ] Full `cargo test` (whole suite) green before this item is
+    `[DONE]`.
+
+- `[OPEN]` **E2. `visual` dashboard/panel item + `render: "graph"|
+  "heatmap"|"timeline"`.** Unblocks Case Linking/Entity Graph, Wallet
+  Cluster Graph, Graph Network Explorer, Session/Device Linkage View,
+  Geo Heatmap directly (~6 screens), plus upgrades an E1 panel from a
+  flat table to a timeline. Small grammar extension — one new
+  `dashboard_item` keyword plus a closed-vocabulary `render:` key reused
+  inside `panel` (no separate mini-language per chart kind). Full
+  design: `UI_CONSTRUCTS.md` §2.
+  - [ ] Grammar: `dashboard_item ::= ("tile" | "chart") string "->" ident
+    | "visual" string "->" ident ("{" kv_entry* "}")?` (`GRAMMAR.md`);
+    `parser.rs::parse_dashboard_decl` grows the `visual` arm.
+  - [ ] Cross-verify against `grammar_check/`'s independent LALR(1)
+    parser.
+  - [ ] Update `compiler/nirdosha.gbnf`.
+  - [ ] AST/typeck: `render` restricted to the closed set (`"graph"` |
+    `"heatmap"` | `"timeline"`, plus `"bar_chart"`'s existing implicit
+    default) — new `TypeErrorKind` variant for an unrecognized value,
+    `typeck.rs::check_dashboard`'s sibling check next to
+    `check_pattern_expr`/`check_format_expr`.
+  - [ ] `ui_gen.rs`: `Metric` gains `render: MetricRender` (default
+    `BarChart` — every existing `dashboard { chart ... }` unaffected);
+    `build_visuals` alongside `build_charts`.
+  - [ ] `ui_gen_template.html`: `renderDashboard`'s per-chart loop
+    branches on `chart.render`; three new pure render functions
+    (`renderForceGraph` — static circular/concentric layout, no physics;
+    `renderHeatGrid` — binned density grid, not a real basemap;
+    `renderTimelineList` — reuses the existing `row-enter`/
+    `--stagger-ms` per-row entrance), same inline-SVG/zero-dependency,
+    `var(--md-primary)`-token approach `renderBarChart` already uses.
+  - [ ] `LANGUAGE.md`: extend §11's dashboard section (or a new §15b)
+    documenting `visual`/`render` and each shape's expected JSON
+    contract.
+  - [ ] New test coverage: `tests/screen_dsl.rs` (or a new file) for the
+    grammar/typeck shape, plus a real end-to-end `emit-ui`/`serve` case
+    exercising at least the `"graph"` render kind.
+  - [ ] Apply to `examples/ctms/ctms.nir`: Wallet Cluster Graph (Module
+    7, `render: "graph"`) and Geo Heatmap (Module 5, `render:
+    "heatmap"`), per `UI_CONSTRUCTS.md` §2's worked example.
+  - [ ] Full `cargo test` green before `[DONE]`.
+
+- `[OPEN]` **E3. `field { render: "countdown" }` — live-SLA/live-status
+  fields.** Unblocks Case Queue, Alert Queue, Compliance Flag Queue,
+  RTFDS Session/Fraud Alert Queue, Wallet Sanctions Screening Queue,
+  Regulatory Filing Calendar, and the "SLA countdown per case" widgets
+  on the Investigator/Supervisor Home dashboards (~9 screens). **No
+  grammar change** — `field_override`'s body is already generic
+  `kv_entry*`; this is one new closed-vocabulary value, same precedent
+  `field { format: "email" }` already set. Full design:
+  `UI_CONSTRUCTS.md` §3.
+  - [ ] AST/typeck: `typeck.rs::check_screen` gains a
+    `check_render_expr` sibling next to `check_pattern_expr`/
+    `check_format_expr`/`check_min_max_expr` — `render` must be a string
+    literal from the fixed set (`"countdown"` for v1), and only on an
+    integer-typed field.
+  - [ ] `ui_gen.rs`: `FieldSpec` gains `render: Option<&'static str>`,
+    populated by `apply_field_overrides` alongside `pattern`/`min`/`max`.
+  - [ ] `ui_gen_template.html`: table-cell renderer branches on
+    `f.render === "countdown"` — client-side `Date.now()`-based
+    remaining-time text, one shared `setInterval` for every `.countdown`
+    node on the page (not one timer per row); an overdue row gets the
+    existing semantic error/warning color token, no new theme tokens.
+  - [ ] `LANGUAGE.md`: document `render` as a new `field { ... }` key
+    (§11 or its own subsection), alongside `pattern`/`format`/`min`/
+    `max`.
+  - [ ] New test coverage: a `tests/screen_dsl.rs` typeck case (wrong
+    field type/value rejected) plus a real end-to-end render check
+    (`tests/emit_ui.rs` or a browser-level check that the countdown
+    markup/interval is actually emitted).
+  - [ ] Apply to `examples/ctms/ctms.nir`: `screen Case { field
+    sla_deadline_unix { render: "countdown" } }` on the Case Queue
+    screen (Module 3), per `UI_CONSTRUCTS.md` §3's worked example.
+  - [ ] Full `cargo test` green before `[DONE]`.
+
+- `[OPEN]` **E4. `action { show_result: true }` — preview/simulate
+  actions.** Unblocks the "simulate before apply" half of Rule Engine
+  Configuration, Scoring Weights Configuration, Policy Management
+  Engine, RBAC/ABAC Policy Editor, Integrity/Tamper-Check, Audit Search
+  & Export (~6 screens' worth of preview actions, not new screens on
+  their own). **No grammar change** — one new boolean key inside the
+  existing `action_decl` body. Full design: `UI_CONSTRUCTS.md` §4.
+  - [ ] AST/typeck: `typeck.rs::check_screen`'s `action_decl` check
+    requires the target fn's return type be `Result(json, E)` whenever
+    `show_result: true` is present.
+  - [ ] `ui_gen.rs`: `Action` gains `show_result: bool` (default
+    `false`), threaded through `build_custom_action`.
+  - [ ] `ui_gen_template.html`: the existing action-button click handler
+    opens the existing modal/dialog primitive with the JSON response
+    pretty-printed, when `action.showResult` and the call succeeded — no
+    new CSS, no new animation.
+  - [ ] `LANGUAGE.md`: document `show_result` alongside `style`/
+    `confirm` in the `action` `kv_entry` list (§11).
+  - [ ] New test coverage: a typeck case (non-`Result(json, E)` target
+    rejected), plus a real end-to-end `serve` case confirming the
+    response is actually returned to the client for display.
+  - [ ] Apply to `examples/ctms/ctms.nir`: `"Simulate" -> 
+    simulate_policy_threshold { show_result: true }` on the Policy
+    Management Engine screen (Module 6), per `UI_CONSTRUCTS.md` §4's
+    worked example.
+  - [ ] Full `cargo test` green before `[DONE]`.
+
+- `[OPEN]` **E5. Workflow stage stepper.** Unblocks Case Workflow/Stage
+  Tracker (Module 3) — rendering the doc's own 4-stage model as a real
+  progress stepper instead of a bare state-name label. **No grammar or
+  DSL change at all** — everything the render needs (`workflow`'s
+  declared `state` list, in order) is already parsed; this is purely a
+  `ui_gen.rs`/`ui_gen_template.html` manifest-enrichment + rendering
+  upgrade. Full design: `UI_CONSTRUCTS.md` §5.
+  - [ ] `ui_gen.rs`: `WorkflowQueue` gains `all_states: Vec<String>` —
+    the declared `workflow`'s own `state` list in declaration order,
+    read straight off `ast::WorkflowDecl`.
+  - [ ] `ui_gen_template.html`: `renderWorkflowScreen`/
+    `renderWorkflowQueue` render a horizontal stepper (`wf.allStates`,
+    current index = the row's own `state` position in that list) using
+    the existing MD3 primary/on-surface-variant color tokens — no new
+    theme tokens.
+  - [ ] `LANGUAGE.md`: a short note in §14 (`workflow`) describing the
+    generated stepper, since the underlying grammar is unchanged.
+  - [ ] New/extended test coverage in `tests/workflow.rs` or
+    `tests/emit_ui.rs` confirming `all_states`/current-index appear
+    correctly in the manifest for a multi-state workflow.
+  - [ ] Apply to `examples/ctms/ctms.nir`: the `CaseLifecycle` workflow
+    (Investigation → ComplianceEscalation → Resolution →
+    RegulatoryFiling, Module 3), per `UI_CONSTRUCTS.md` §5's worked
+    example.
+  - [ ] Full `cargo test` green before `[DONE]`.
+
+- `[BLOCKED: E1–E5]` **E6. Rebuild `examples/ctms/ctms.nir` end-to-end.**
+  The file doesn't exist in the working tree today — only in git history
+  (`git show c6d6e3e:examples/ctms/ctms.nir`), where it's the
+  8-struct/plain-CRUD-only version `SCREENS.md`'s own intro names as the
+  thing this whole initiative found falling short (no Investigation
+  Workspace, no graph views, no geo heatmap, no live-SLA queues, no
+  simulate actions, no workflow stepper). Once E1–E5 land: rebuild it
+  for real using all five constructs against the actual CTMS screen
+  inventory (`SCREENS.md`), not just the five worked-example screens
+  E1–E5 individually touch — then verify it actually renders
+  (`nirdosha emit-ui`) and serves (`nirdosha serve --db`) end to end,
+  the same "verified, not just written" bar this file holds every other
+  `[DONE]` item to.
+- `[DONE]` **E7. `PUBLIC_ROADMAP.md` — add a Track E entry.** Brief,
+  external-facing mirror of Track D's own entry there — done as part of
+  this same session, since it's small. — 2026-09-03.
+
+---
+
 ## Suggested near-term order
 
 Given "critical apps soon": the security review, the systematic
@@ -1995,4 +2228,8 @@ and C1 can run in parallel with each other and with the start of B1.
 B1–B9 is the long track — pick up items as they become relevant to what's
 actually being built, not in lockstep. Track D runs independently of all
 of the above — D1 can start whenever native app delivery actually becomes
-a priority, without waiting on A/B/C.
+a priority, without waiting on A/B/C. Track E runs independently of
+Tracks A–D too — E1 (`workspace`/`panel`, the highest-leverage item) can
+start any time, without waiting on Track D's mobile work or anything in
+A/B/C; only E6 (rebuilding `examples/ctms/ctms.nir`) waits on E1–E5
+actually landing first.
