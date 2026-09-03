@@ -1022,6 +1022,88 @@ pub fn workflow_owner_warnings(program: &Program) -> Vec<TypeWarning> {
         .collect()
 }
 
+/// Every `role(...)`/`claim(k, v)` string this program declares anywhere,
+/// deduped and sorted — the demo-mode login screen's "what can I try"
+/// catalog (`nirdosha serve` with no `--jwks-file`/`--issuer`/
+/// `--audience`). Same "standalone `pub fn(program: &Program) -> ...`,
+/// no `Checker` involved" shape as `ungated_fn_warnings`/
+/// `workflow_owner_warnings` above.
+///
+/// Three sources, since role/claim strings appear in three unrelated
+/// places in the grammar: a `fn`'s own `requires(...)` (`FnDecl::
+/// requires`, typed as `Requirement`); a `screen <Struct> { field <name>
+/// { view: role(...)/claim(...), edit: ... } }` field override
+/// (`ScreenDecl.fields[].entries`, raw `Expr::Call` inside a `KvEntry` —
+/// `ui_gen.rs::kv_gate` is the existing parser for this shape, but it's
+/// private to that module; the ~10-line match is duplicated here rather
+/// than exposing it, to avoid `typeck` taking a dependency on `ui_gen`,
+/// the outer layer, for one small helper); and a `workflow`'s `state
+/// Name { owner: role(...)/claim(...) }` (`WorkflowDecl.states[].
+/// entries`, same shape again).
+///
+/// `role(...)` is any-of and can name more than one role in a single
+/// call (`kv_gate`'s own doc comment) — every name is collected, not
+/// just the first. Claims are collected as the exact `(key, value)`
+/// pair a `requires(claim: ...)`/`claim(...)` demands, not just the
+/// key, since that's the actually-actionable unit for someone trying to
+/// self-assign a matching identity in the demo picker.
+pub fn collect_role_claim_strings(program: &Program) -> (Vec<String>, Vec<(String, String)>) {
+    let mut roles: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut claims: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+
+    // Local mirror of `ui_gen.rs::kv_gate` -- see this fn's own doc
+    // comment for why it's duplicated rather than shared.
+    fn role_claim_from_expr(v: &Expr, roles: &mut std::collections::BTreeSet<String>, claims: &mut std::collections::BTreeSet<(String, String)>) {
+        match v {
+            Expr::Call(name, args, _) if name == "role" => {
+                for a in args {
+                    if let Expr::Str(s, _) = a {
+                        roles.insert(s.clone());
+                    }
+                }
+            }
+            Expr::Call(name, args, _) if name == "claim" && args.len() == 2 => {
+                if let (Expr::Str(k, _), Expr::Str(val, _)) = (&args[0], &args[1]) {
+                    claims.insert((k.clone(), val.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for f in &program.fns {
+        match &f.requires {
+            Some(Requirement::Role(r)) => {
+                roles.insert(r.clone());
+            }
+            Some(Requirement::Claim(k, v)) => {
+                claims.insert((k.clone(), v.clone()));
+            }
+            None => {}
+        }
+    }
+    for screen in &program.screens {
+        for field in &screen.fields {
+            for (key, v) in &field.entries {
+                if key == "view" || key == "edit" {
+                    role_claim_from_expr(v, &mut roles, &mut claims);
+                }
+            }
+        }
+    }
+    for workflow in &program.workflows {
+        for state in &workflow.states {
+            for (key, v) in &state.entries {
+                if key == "owner" {
+                    role_claim_from_expr(v, &mut roles, &mut claims);
+                }
+            }
+        }
+    }
+
+    (roles.into_iter().collect(), claims.into_iter().collect())
+}
+
 fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeError>> {
     let registry = TypeRegistry::build(program);
     let mut c = Checker { sigs: HashMap::new(), errors: Vec::new(), registry, silent: false };

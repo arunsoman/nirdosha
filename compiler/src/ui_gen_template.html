@@ -34,10 +34,23 @@ __NIRDOSHA_THEME_SCRIPT__
     --md-on-surface: #17142e;
     --md-surface-variant: #efedf7;
     --md-on-surface-variant: #5c5a78;
-    --md-outline: #918eb0;
+    /* 2026-09-03, contrast pass: darkened from #918eb0 (3.13:1 vs
+       --md-surface -- right at WCAG 1.4.11's 3:1 floor for a UI-
+       component border, with essentially zero margin) to a real 3.86:1. */
+    --md-outline: #827ea0;
     --md-error: #c4433a;
     --md-on-error: #ffffff;
     --md-error-container: #fbe4e1;
+    /* Same 2026-09-03 pass: `.snackbar.error` was pairing `--md-on-error`
+       (white -- meant for a *solid* `--md-error` fill, e.g. `.btn-danger`)
+       against this pale container instead, measuring 1.21:1 -- an error
+       toast that was functionally invisible exactly when a user most
+       needed to read it. This dedicated on-container tone mirrors the
+       `--md-on-primary-container` pattern already established above:
+       11.13:1 against `--md-error-container`. (Reuses dark mode's own
+       `--md-on-error` value below -- already a color this palette uses,
+       not a new one invented for this alone.) */
+    --md-on-error-container: #5c130c;
     --md-background: #fbfaff;
     --md-elevation-1: 0 1px 2px rgba(31,26,82,.12), 0 1px 3px 1px rgba(31,26,82,.08);
     --md-elevation-2: 0 1px 2px rgba(31,26,82,.16), 0 2px 6px 2px rgba(31,26,82,.10);
@@ -45,20 +58,34 @@ __NIRDOSHA_THEME_SCRIPT__
     --md-radius-md: 8px;
     --md-radius-lg: 8px;
     --md-font: "IBM Plex Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
-    /* The one brand accent that stays byte-identical in light and dark
-       (`assets/brand/nirdosha-icon.png`'s amber stripe, #f89a1c) --
-       reserved for interactive/focus signaling specifically (nav's
-       active-item marker, every `:focus-visible` ring), deliberately
-       *not* a fill color anywhere -- restraint is the point: one accent,
-       spent in one consistent role, not sprinkled decoratively. See
-       `.nav-item.active`'s doc comment for the motif it's drawn from.
-       `--brand-mono` is the second half of the two-role type system
-       (`--font-sans` above is the first): IBM Plex Mono, used only where
-       a value is literally code/data-shaped (the app-bar wordmark, a
-       `dec128`-typed table column) -- a programming-language brand
-       reaching for its own monospace family instead of Material's
-       generic "everything is the same grotesque" stance. */
-    --brand-accent: #f89a1c;
+    /* The brand accent (`assets/brand/nirdosha-icon.png`'s amber
+       stripe) -- reserved for interactive/focus signaling specifically
+       (nav's active-item marker, every `:focus-visible` ring),
+       deliberately *not* a fill color anywhere -- restraint is the
+       point: one accent, spent in one consistent role, not sprinkled
+       decoratively. See `.nav-item.active`'s doc comment for the motif
+       it's drawn from. `--brand-mono` is the second half of the two-
+       role type system (`--font-sans` above is the first): IBM Plex
+       Mono, used only where a value is literally code/data-shaped (the
+       app-bar wordmark, a `dec128`-typed table column) -- a
+       programming-language brand reaching for its own monospace family
+       instead of Material's generic "everything is the same grotesque"
+       stance.
+
+       2026-09-03, contrast pass: this token is no longer byte-identical
+       across modes. The pure logo amber (`#f89a1c`) measured only
+       2.18:1 against `--md-surface` and 1.69:1 against
+       `--md-primary-container` (the nav-active border's own background)
+       in light mode -- both fail WCAG 1.4.11's 3:1 floor for a UI-
+       component boundary, on the app's *entire* interactive-signal
+       color (every focus ring, the active-nav marker). Darkened along
+       the same ~34° hue -- still unmistakably "the logo's amber," not a
+       hue shift -- to `#b85f00`: 4.49:1 / 3.48:1. Dark mode's own
+       backgrounds already gave the original value 8.58:1/5.30:1/6.46:1,
+       so it keeps `#f89a1c` there, now as an explicit override (below)
+       rather than implicit inheritance, since the two modes genuinely
+       differ now. */
+    --brand-accent: #b85f00;
     --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
     /* Design-token defaults below match `DesignSpec`'s own defaults
        (radius=rounded, shadow=subtle, density=comfortable,
@@ -99,7 +126,15 @@ __NIRDOSHA_THEME_SCRIPT__
       --md-error: #ffb4a8;
       --md-on-error: #5c130c;
       --md-error-container: #7a251b;
+      /* Same snackbar-error fix as light mode -- old pairing
+         (--md-on-error #5c130c vs --md-error-container #7a251b) was
+         1.36:1, equally broken here. New pairing: 7.70:1. */
+      --md-on-error-container: #ffdad4;
       --md-background: #0d0b1c;
+      /* Explicit now, not inherited -- see --brand-accent's own comment
+         above for why the two modes no longer share one literal value.
+         Already fine here (8.58:1 vs surface), unchanged. */
+      --brand-accent: #f89a1c;
     }
   }
   __NIRDOSHA_THEME_OVERRIDE__
@@ -204,6 +239,12 @@ __NIRDOSHA_THEME_SCRIPT__
      digit widths make a column of amounts/quantities actually line up,
      the same reasoning a spreadsheet or a terminal already applies. */
   .field input[type=number] { font-family: var(--font-mono); }
+  /* 2026-09-03: hint/placeholder text had no explicit styling anywhere
+     in this file, so it fell back to whatever gray each browser's UA
+     stylesheet happens to pick -- unverifiable, inconsistent across
+     browsers. Pinned to an already-verified pairing (6.59:1 light /
+     7.77:1 dark against --md-surface). */
+  .field input::placeholder, .search-box::placeholder { color: var(--md-on-surface-variant); opacity: 1; }
   .field input:hover, .field select:hover { border-color: var(--md-on-surface-variant); }
   .field input:focus-visible, .field select:focus-visible {
     outline: 2px solid var(--brand-accent); outline-offset: -1px; border-color: var(--brand-accent);
@@ -286,18 +327,68 @@ __NIRDOSHA_THEME_SCRIPT__
     display: inline-block; font-size: 11px; font-weight: 500; padding: 2px 8px; border-radius: 8px;
     background: var(--md-surface-variant); color: var(--md-on-surface-variant); margin-left: 6px;
   }
+  /* Which identity mode this server is running in -- always visible,
+     server-rendered (`ui_gen.rs::mode_badge_html`), not a JS decision,
+     specifically so it's never ambiguous whether self-service sign-in
+     is real production identity or a demo-only ephemeral one. Amber
+     (the one brand accent, `--brand-accent`) for demo -- a deliberate,
+     visible "this isn't production" signal, not decorative; production
+     gets a calmer, unremarkable treatment since it's the expected state. */
+  .mode-badge {
+    display: inline-flex; align-items: center; font-size: 11px; font-weight: 600;
+    padding: 3px 10px; border-radius: 999px; letter-spacing: .02em; white-space: nowrap;
+    text-transform: uppercase; cursor: help;
+  }
+  .mode-badge-demo { background: color-mix(in srgb, var(--brand-accent) 20%, transparent); color: var(--brand-accent); border: 1px solid color-mix(in srgb, var(--brand-accent) 45%, transparent); }
+  .mode-badge-production { background: var(--md-surface-variant); color: var(--md-on-surface-variant); border: 1px solid var(--md-outline); }
   .gate-note { font-size: 12px; color: var(--md-error); margin-top: 4px; }
   .row-actions { display: flex; gap: 6px; }
   .stub-note {
     font-size: 12px; color: var(--md-on-surface-variant); background: var(--md-surface-variant);
     padding: 8px 12px; border-radius: var(--md-radius-sm); margin-bottom: 16px;
   }
+  /* Demo mode's "pick a persona" login (`renderLogin`) -- one card per
+     role/claim `IDENTITY_CATALOG` found, same hover-lift/press language
+     `.btn`/`.card`/`tbody tr` already establish, so this reads as
+     "part of the same app," not a bolted-on widget. */
+  .demo-avatar-grid { display: flex; flex-wrap: wrap; gap: var(--density-gap); margin-bottom: var(--density-gap); }
+  .demo-avatar-card {
+    display: flex; flex-direction: column; align-items: center; gap: 8px; width: 104px;
+    background: var(--md-surface); border: 1px solid var(--md-surface-variant); border-radius: var(--radius-card);
+    padding: 16px 8px; cursor: pointer; font-family: inherit;
+    transition: box-shadow var(--motion-interaction-ms) var(--motion-easing),
+                transform var(--motion-interaction-ms) var(--motion-easing),
+                border-color var(--motion-interaction-ms) var(--motion-easing);
+  }
+  .demo-avatar-card:hover { transform: translateY(calc(-1 * var(--hover-lift-px))); box-shadow: var(--md-elevation-1); border-color: var(--md-outline); }
+  .demo-avatar-card:active { transform: scale(var(--press-scale)); }
+  .demo-avatar-card:focus-visible { outline: 2px solid var(--brand-accent); outline-offset: 2px; }
+  .demo-avatar {
+    width: 48px; height: 48px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    color: #fff; font-weight: 600; font-size: 16px; font-family: var(--font-sans); flex-shrink: 0;
+  }
+  .demo-avatar-label { font-size: 13px; font-weight: 500; text-align: center; word-break: break-word; }
+  .demo-avatar-sublabel { font-size: 11px; color: var(--md-on-surface-variant); }
+  .demo-advanced { font-size: 13px; color: var(--md-on-surface-variant); }
+  .demo-advanced summary { cursor: pointer; padding: 4px 0; }
+  .demo-advanced[open] summary { margin-bottom: 8px; }
   .snackbar {
-    position: fixed; left: 24px; bottom: 24px; background: #2f3033; color: #f1f0f4;
+    /* 2026-09-03: was a generic Material neutral gray (#2f3033/#f1f0f4)
+       with zero relationship to the brand -- retinted to the brand's
+       own navy (the exact `--md-on-surface` light-mode value, reused
+       rather than inventing a new color) so the one chrome element
+       that's intentionally dark in either palette reads as "this
+       app," not a stock default. 14.28:1, was 11.63:1 -- both were
+       already fine, this is a brand fix, not a contrast one. */
+    position: fixed; left: 24px; bottom: 24px; background: #17142e; color: #f1f0f4;
     padding: 14px 20px; border-radius: var(--md-radius-sm); box-shadow: var(--md-elevation-2);
     font-size: 14px; max-width: 400px; z-index: 100;
   }
-  .snackbar.error { background: var(--md-error-container); color: var(--md-on-error); }
+  /* 2026-09-03: was `color: var(--md-on-error)` (white -- the correct
+     on-color for a *solid* --md-error fill like .btn-danger, wrong one
+     here) against this pale container -- 1.21:1 light / 1.36:1 dark,
+     functionally invisible. Now uses the dedicated on-container tone. */
+  .snackbar.error { background: var(--md-error-container); color: var(--md-on-error-container); }
   .snackbar[hidden] { display: none; }
 </style>
 </head>
@@ -305,6 +396,7 @@ __NIRDOSHA_THEME_SCRIPT__
 <div class="app-bar">
   <img class="app-bar-mark" src="__NIRDOSHA_LOGO__" alt="" width="32" height="32">
   <h1 id="app-title">Nirdosha App</h1>
+  __NIRDOSHA_MODE_BADGE__
   <div id="identity-slot"></div>
 </div>
 <div class="layout">
@@ -336,6 +428,22 @@ const IDENTITY_KEY = "nirdosha_identity";
 // all -- see `ui_gen.rs::generate`'s own doc comment for why this is a
 // deliberate degradation, not a missing feature.
 const SERVER_TABLE_API = __NIRDOSHA_SERVER_TABLE_API__;
+// Every role/claim string `typeck::collect_role_claim_strings` found
+// anywhere in this program -- `{roles: [...], claims: [{key,value}, ...]}`.
+// Demo mode's login screen uses this to show what's actually gated
+// instead of asking a visitor to guess a string. Always present (even
+// with zero of either), never `null`.
+const IDENTITY_CATALOG = __NIRDOSHA_IDENTITY_CATALOG__;
+// True exactly when `nirdosha serve` has no real `--jwks-file`/
+// `--issuer`/`--audience` configured -- the self-service demo login
+// (`renderLogin`) is functional in this mode (it mints a real,
+// server-verified token via `/api/_demo_login`), not just a nav-only
+// preview.
+const DEMO_MODE = __NIRDOSHA_DEMO_MODE__;
+// True exactly when `nirdosha serve`'s `--oidc-*` flags are configured
+// -- the login screen becomes a real redirect to the identity
+// provider's own hosted login (`/auth/login`), not a form of any kind.
+const PRODUCTION_MODE = __NIRDOSHA_PRODUCTION_MODE__;
 
 // ---- identity ----
 // With no IDENTITY_BASE (the default), this is a pure client-side STUB:
@@ -1130,7 +1238,13 @@ function renderScreen(screen) {
   const uniqueBadges = [...new Set(screen.actions.flatMap((a) => a.badges || []))];
   for (const b of uniqueBadges) sub.appendChild(el("span", { class: "badge", text: b }));
   content.appendChild(sub);
-  if (!IDENTITY_BASE && screen.actions.some((a) => a.requiresLogin)) {
+  // Only the true static-file stub (`nirdosha emit-ui`, no server behind
+  // any of `IDENTITY_BASE`/`DEMO_MODE`/`PRODUCTION_MODE`) ever skips real
+  // token verification -- both `DEMO_MODE` (a real, server-verified
+  // ephemeral token) and `PRODUCTION_MODE` (a real IdP token) already
+  // mint/validate for real, so this warning would be actively wrong
+  // there, not just redundant.
+  if (!IDENTITY_BASE && !DEMO_MODE && !PRODUCTION_MODE && screen.actions.some((a) => a.requiresLogin)) {
     content.appendChild(el("div", { class: "stub-note",
       text: "Sign-in on this page is a generated stub (localStorage identity), not real token verification -- wire it to your own auth once a backend exists." }));
   }
@@ -1150,7 +1264,7 @@ function renderWorkflowScreen(wf) {
   replayAnimation(content, "screen-enter");
   content.appendChild(el("h1", { class: "screen-title", text: wf.title }));
   content.appendChild(el("p", { class: "screen-sub", text: "Workflow queue" }));
-  if (!IDENTITY_BASE) {
+  if (!IDENTITY_BASE && !DEMO_MODE && !PRODUCTION_MODE) {
     content.appendChild(el("div", { class: "stub-note",
       text: "Sign-in on this page is a generated stub (localStorage identity), not real token verification -- wire it to your own auth once a backend exists." }));
   }
@@ -1179,6 +1293,40 @@ function postLoginRedirect() {
     if (first) location.hash = "#/" + first.snake;
   }
   route();
+}
+
+// ---- demo mode's "pick a persona" avatars ----
+// A small fixed palette, indexed by a cheap hash of the name -- same
+// avatar every time for the same role/claim, no images/assets needed.
+// 2026-09-03: replaced the generic Material-You default swatch (no
+// relationship to this brand) with one built from the logo's own
+// family -- the first two are the navy itself and one step up its tint
+// ramp (`--md-primary`/`--md-primary-container`'s neighborhood), the
+// next two are deep ochre/rust variants on the *same* ~34° hue as
+// `--brand-accent` darkened for a fill role instead of a thin-accent
+// one, and the remaining four are jewel-tone siblings at matching
+// depth/saturation that bridge the warm amber and cool navy so an
+// 8-color set doesn't collapse into "navy and orange, repeated." Every
+// entry clears 4.5:1 against the avatar's own white initials text.
+const DEMO_AVATAR_COLORS = ["#1f1a52", "#382f7a", "#8b5104", "#a0430c", "#1f6f64", "#6b2158", "#386a20", "#31628d"];
+function demoAvatarColorFor(name) {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
+  return DEMO_AVATAR_COLORS[hash % DEMO_AVATAR_COLORS.length];
+}
+function demoAvatarInitials(name) {
+  const parts = name.replace(/[_-]/g, " ").trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "?";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[1][0]).toUpperCase();
+}
+function demoAvatarCard(label, sublabel, onClick) {
+  const avatar = el("div", { class: "demo-avatar", style: `background:${demoAvatarColorFor(label)}`, text: demoAvatarInitials(label) });
+  return el("button", { type: "button", class: "demo-avatar-card", onclick: onClick }, [
+    avatar,
+    el("div", { class: "demo-avatar-label", text: label }),
+    sublabel ? el("div", { class: "demo-avatar-sublabel", text: sublabel }) : null,
+  ]);
 }
 
 function renderLogin() {
@@ -1222,6 +1370,86 @@ function renderLogin() {
     return;
   }
 
+  // Production mode: `--oidc-*` flags are configured (which itself
+  // requires the real `--jwks-file`/`--issuer`/`--audience` trio) --
+  // hand off entirely to the identity provider's own hosted login, a
+  // real OIDC Authorization Code + PKCE redirect (`serve.rs`'s `GET
+  // /auth/login`/`GET /auth/callback`). No form, no fetch here -- just
+  // a full-page navigation; the round trip lands back on `#/auth/callback`
+  // (see the bootstrap snippet near `route()`, below).
+  if (PRODUCTION_MODE) {
+    content.appendChild(el("div", { class: "stub-note", text: "Sign in with your organization's identity provider." }));
+    content.appendChild(el("button", { type: "button", class: "btn btn-filled", text: "Sign in with SSO", onclick: () => { location.href = "/auth/login"; } }));
+    return;
+  }
+
+  // Demo mode: no real `--jwks-file`/`--issuer`/`--audience` configured
+  // -- one avatar per role/claim `IDENTITY_CATALOG` found anywhere in
+  // this program, each a one-click sign-in as that persona. Unlike the
+  // old free-text stub below, this actually POSTs to `/api/_demo_login`
+  // and gets back a real, server-verified token (`serve.rs::
+  // AuthConfig::demo()`'s ephemeral per-process secret), so a
+  // `requires(role: ...)`-gated action genuinely runs, not just previews.
+  if (DEMO_MODE) {
+    content.appendChild(el("div", { class: "stub-note",
+      text: "Demo mode: pick a role below to sign in as it. This mints a real, server-verified token (ephemeral to this running server, never a stand-in for a real identity provider) -- run with real --jwks-file/--issuer/--audience for production sign-in." }));
+
+    async function signInAs(subjectValue, roleList, claimPairs) {
+      try {
+        const res = await fetch(`${API_BASE}/_demo_login`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ subject: subjectValue, roles: roleList, claims: claimPairs }),
+        });
+        const body = await res.json();
+        if (body && body.err) { showSnackbar(String(body.err), true); return; }
+        const token = body.token;
+        const claims = decodeJwtPayload(token);
+        setIdentity({ subject: subjectValue, roles: roleList, claims, token });
+        showSnackbar("Signed in.");
+        postLoginRedirect();
+      } catch (err) { showSnackbar(`login: ${err.message}`, true); }
+    }
+
+    const grid = el("div", { class: "demo-avatar-grid" }, []);
+    for (const role of IDENTITY_CATALOG.roles) {
+      grid.appendChild(demoAvatarCard(role, "role", () => signInAs(role, [role], {})));
+    }
+    for (const c of IDENTITY_CATALOG.claims) {
+      grid.appendChild(demoAvatarCard(`${c.key}=${c.value}`, "claim", () => signInAs(c.key, [], { [c.key]: c.value })));
+    }
+    if (IDENTITY_CATALOG.roles.length === 0 && IDENTITY_CATALOG.claims.length === 0) {
+      grid.appendChild(demoAvatarCard("guest", "no roles/claims declared", () => signInAs("guest", [], {})));
+    }
+    content.appendChild(grid);
+
+    // Advanced: a custom subject, or more than one role/claim at once --
+    // anything the one-click persona grid above doesn't cover.
+    const claims = el("input", { type: "text", value: "" });
+    const details = el("details", { class: "demo-advanced" }, [
+      el("summary", { text: "Advanced: custom subject/roles/claims" }),
+      el("form", { class: "card", onsubmit: (e) => {
+        e.preventDefault();
+        const claimPairs = {};
+        for (const part of claims.value.split(",")) {
+          const [k, v] = part.split("=").map((s) => (s || "").trim());
+          if (k) claimPairs[k] = v || "";
+        }
+        signInAs(subject.value || "demo", roles.value.split(",").map((s) => s.trim()).filter(Boolean), claimPairs);
+      }}, [
+        el("div", { class: "field" }, [el("label", { text: "subject" }), subject]),
+        el("div", { class: "field" }, [el("label", { text: "roles (comma-separated) — known: " + (IDENTITY_CATALOG.roles.join(", ") || "none") }), roles]),
+        el("div", { class: "field" }, [el("label", { text: "claims (key=value, comma-separated) — known: " + (IDENTITY_CATALOG.claims.map((c) => `${c.key}=${c.value}`).join(", ") || "none") }), claims]),
+        el("button", { type: "submit", class: "btn btn-filled", text: "Sign in" }),
+      ]),
+    ]);
+    content.appendChild(details);
+    return;
+  }
+
+  // Neither mode -- `nirdosha emit-ui`'s static-file output, no server
+  // behind either `/api/_demo_login` or `/auth/login`. Original pure
+  // client-side stub, unchanged: stores a mock identity in this browser
+  // only, no token sent anywhere.
   content.appendChild(el("div", { class: "stub-note",
     text: "Generated stub: stores a mock identity in this browser only, no token sent anywhere -- a requires(role: ...)-gated action cannot actually pass the server's check this way. Run with `nirdosha serve --identity-base <url>` for a real (mock) sign-in." }));
   const claims = el("input", { type: "text", value: "" });
@@ -1336,6 +1564,23 @@ function renderNav() {
 
 function route() {
   const hash = (location.hash || "").replace(/^#\//, "");
+  // Production mode's OIDC redirect lands back here from `serve.rs`'s
+  // `GET /auth/callback` (`/#/auth/callback?token=...`) -- this is the
+  // one piece of hash-query parsing this template does anywhere, and it
+  // has to run before the `!getIdentity()` guard below, or an
+  // unauthenticated visitor mid-redirect would get bounced to `#/login`
+  // before ever storing the token that redirect carries.
+  if (hash.startsWith("auth/callback")) {
+    const qIndex = hash.indexOf("?");
+    const params = new URLSearchParams(qIndex >= 0 ? hash.slice(qIndex + 1) : "");
+    const token = params.get("token");
+    if (token) {
+      const claims = decodeJwtPayload(token);
+      setIdentity({ subject: claims.sub, roles: claims.roles || [], claims, token });
+    }
+    location.hash = "#/dashboard";
+    return;
+  }
   document.querySelectorAll(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.route === hash));
   if (!getIdentity() && hash !== "login") { location.hash = "#/login"; return; }
   if (hash === "login") { renderLogin(); return; }
@@ -1363,8 +1608,32 @@ function route() {
 // so it needs to re-run on every hash change too, not just at login/
 // logout/initial load.
 window.addEventListener("hashchange", () => { renderNav(); route(); });
-renderNav();
-route();
+
+// A `localStorage`-cached identity from a *previous* run of this server
+// can look signed-in while actually being dead: demo mode mints a
+// fresh ephemeral signing key every process start (`AuthConfig::
+// demo()`), so a token from before a restart no longer verifies here,
+// even though the browser never forgot it. Confirm the cached identity
+// (if any) is still valid against THIS process, via the same
+// `resolve_identity` verification every other request goes through,
+// before rendering anything as signed-in -- otherwise the nav/screens
+// would render from stale client-side role/claim data that the server
+// will then reject on the very first real action, a confusing dead end
+// with no obvious cause. A network hiccup here doesn't sign the user
+// out -- only an explicit rejection from the server does; the next real
+// API call still enforces this for real either way.
+async function validateStoredIdentityThenStart() {
+  const id = getIdentity();
+  if (id && id.token) {
+    try {
+      const res = await fetch(`${API_BASE}/_whoami`, { headers: { Authorization: `Bearer ${id.token}` } });
+      if (!res.ok) clearIdentity();
+    } catch (e) { /* transient failure -- leave the cached identity alone */ }
+  }
+  renderNav();
+  route();
+}
+validateStoredIdentityThenStart();
 </script>
 </body>
 </html>
