@@ -412,17 +412,20 @@ pub enum TypeErrorKind {
     PanelSourceWrongShape { workspace: String, panel: String, fn_name: String },
 
     // ---- Track E2's `render:` DSL (on `visual` and, reused, `panel`) ---
-    /// `visual "..." -> fn { render: "..." }` or `panel "..." { render:
-    /// "..." }` whose `render` value is a string literal, but not one of
-    /// the closed set (`"graph"`/`"heatmap"`/`"timeline"`)
-    /// `ui_gen_template.html`'s `renderDashboard`/`renderPanel` actually
-    /// know how to draw. `context` is a pre-formatted description of
-    /// where this fired (`"visual \"...\""` or `"panel \"...\" in
-    /// workspace ..."`), since the same check serves both. A
-    /// non-string-literal `render` value is caught by the existing, more
-    /// general `InvalidFieldValidationExpr { key: "render" }` instead —
-    /// this variant only ever fires once that shape check already passed.
-    UnknownRenderValue { context: String, render: String },
+    /// `visual "..." -> fn { render: "..." }`, `panel "..." { render:
+    /// "..." }`, or `field <name> { render: "..." }` (Track E2/E3) whose
+    /// `render` value is a string literal, but not one of that
+    /// particular context's own closed set. `context` is a pre-formatted
+    /// description of where this fired (`"visual \"...\""`, `"panel
+    /// \"...\" in workspace ..."`, `"field <name>\" on <struct>"`), and
+    /// `allowed` a pre-formatted, already-quoted list of what would have
+    /// been accepted (`"\"graph\", \"heatmap\", \"timeline\""` or just
+    /// `"\"countdown\""`) — one shared variant/check across all three
+    /// contexts rather than three near-identical ones. A non-string-
+    /// literal `render` value is caught by the existing, more general
+    /// `InvalidFieldValidationExpr { key: "render" }` instead — this
+    /// variant only ever fires once that shape check already passed.
+    UnknownRenderValue { context: String, render: String, allowed: String },
     /// A user `fn`'s parameter or return type is (or contains) `str` —
     /// the "enum favoring" rule: `str` may not cross a user function's
     /// call boundary, so categorical string data belongs in a real
@@ -782,6 +785,11 @@ impl std::fmt::Display for TypeError {
                 "{line}:{col}: `field {field_name} {{ pattern: ... }}` on `{struct_name}` — \
                  `{field_name}` is `{field_ty}`, not `str`; `pattern` only applies to `str` fields"
             ),
+            TypeErrorKind::FieldValidationTypeMismatch { struct_name, field_name, key, field_ty } if key == "render" => write!(
+                f,
+                "{line}:{col}: `field {field_name} {{ render: \"countdown\" }}` on `{struct_name}` — \
+                 `{field_name}` is `{field_ty}`, not an integer; `render: \"countdown\"` only applies to an integer field"
+            ),
             TypeErrorKind::FieldValidationTypeMismatch { struct_name, field_name, key, field_ty } => write!(
                 f,
                 "{line}:{col}: `field {field_name} {{ {key}: ... }}` on `{struct_name}` — \
@@ -836,10 +844,9 @@ impl std::fmt::Display for TypeError {
                 "{line}:{col}: `panel \"{panel}\"` in `workspace {workspace}` — `source: {fn_name}` must take exactly one \
                  `i64` parameter and return `Result(json, _)`"
             ),
-            TypeErrorKind::UnknownRenderValue { context, render } => write!(
+            TypeErrorKind::UnknownRenderValue { context, render, allowed } => write!(
                 f,
-                "{line}:{col}: {context} {{ render: \"{render}\" }} — not a recognized render kind; \
-                 use one of \"graph\", \"heatmap\", \"timeline\""
+                "{line}:{col}: {context} {{ render: \"{render}\" }} — not a recognized render kind; use one of {allowed}"
             ),
             TypeErrorKind::StrInFnSignature { fn_name, param_name: Some(param_name) } => write!(
                 f,
@@ -1481,6 +1488,38 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `field <name> { render: "..." }` (`ROADMAP.md` Track E3) — value
+    /// must be a string literal from the fixed set (`"countdown"` for
+    /// v1 — `LANGUAGE.md`'s own "candidate siblings, not designed yet"
+    /// note names `"badge"`/`"progress"` as future extensions of this
+    /// same key, not a one-off hack), reusing `check_render_expr`'s
+    /// shape check; `"countdown"` specifically only applies to an
+    /// integer-typed field (a unix-seconds deadline) — the one thing
+    /// `visual`/`panel`'s own `render` never needed, since neither is
+    /// attached to any one struct's field to cross-check a type against.
+    fn check_field_render_expr(&mut self, struct_name: &str, field_name: &str, field_ty: Option<&Ty>, value: &Expr) {
+        self.check_render_expr(format!("`field {field_name}` on `{struct_name}`"), value, |s| s == "countdown", "\"countdown\"");
+        let Some(ty) = field_ty else { return };
+        // Already reported (wrong literal shape, or not "countdown") by
+        // `check_render_expr` above — don't pile a second, confusing
+        // type-mismatch error on top of a value that was never going to
+        // be valid regardless of the field's type.
+        if !matches!(value, Expr::Str(s, _) if s == "countdown") {
+            return;
+        }
+        if !ty.is_integer() {
+            self.error(
+                TypeErrorKind::FieldValidationTypeMismatch {
+                    struct_name: struct_name.to_string(),
+                    field_name: field_name.to_string(),
+                    key: "render".to_string(),
+                    field_ty: format!("{ty:?}"),
+                },
+                value.span(),
+            );
+        }
+    }
+
     /// `screen <Struct> { ... }` — existence/shape checks only; see the
     /// module-level note above `typecheck`'s `screens`/`dashboard` pass.
     fn check_screen(&mut self, screen: &ScreenDecl) {
@@ -1526,6 +1565,7 @@ impl<'a> Checker<'a> {
                     "pattern" => self.check_pattern_expr(&screen.struct_name, &fo.field_name, field_ty, value),
                     "format" => self.check_format_expr(&screen.struct_name, &fo.field_name, field_ty, value),
                     "min" | "max" => self.check_min_max_expr(&screen.struct_name, &fo.field_name, key, field_ty, value),
+                    "render" => self.check_field_render_expr(&screen.struct_name, &fo.field_name, field_ty, value),
                     _ => {}
                 }
             }
@@ -1548,29 +1588,39 @@ impl<'a> Checker<'a> {
             self.check_metric_ref("visual", v);
             for (key, value) in &v.entries {
                 if key == "render" {
-                    self.check_render_expr(format!("`visual \"{}\"`", v.label), value);
+                    self.check_render_expr(
+                        format!("`visual \"{}\"`", v.label),
+                        value,
+                        |s| matches!(s, "graph" | "heatmap" | "timeline"),
+                        "\"graph\", \"heatmap\", \"timeline\"",
+                    );
                 }
             }
         }
     }
 
     /// `visual "..." -> fn { render: "..." }` or `panel "..." { render:
-    /// "..." }` (`ROADMAP.md` Track E2) — value must be a string literal
-    /// from the closed vocabulary `ui_gen_template.html`'s
-    /// `renderDashboard`/`renderPanel` actually know how to draw. Unlike
-    /// `check_format_expr`, there's no backing struct field to
-    /// cross-check a type against — neither a visual nor a panel is
-    /// attached to any one struct's field. `context` is a pre-formatted,
-    /// already-backtick-quoted description for the error message, since
-    /// this one check serves two different callers with different
-    /// surrounding syntax.
-    fn check_render_expr(&mut self, context: String, value: &Expr) {
+    /// "..." }`, or a `field <name> { render: "..." }` (`ROADMAP.md`
+    /// Track E2/E3) — value must be a string literal from `allowed`
+    /// (checked as a `matches!` set the caller also names in `allowed`'s
+    /// own display text, kept in sync by hand since a `&[&str]` can't
+    /// itself produce a `matches!` pattern). Unlike `check_format_expr`,
+    /// there's no backing struct field to cross-check a type against for
+    /// `visual`/`panel` — a field-level `render` value's own field-type
+    /// check is `check_field_render_expr`'s job instead, layered on top
+    /// of this one. `context` is a pre-formatted, already-backtick-
+    /// quoted description for the error message, since this one check
+    /// serves three different callers with different surrounding syntax.
+    fn check_render_expr(&mut self, context: String, value: &Expr, valid: fn(&str) -> bool, allowed: &str) {
         let Expr::Str(render, _) = value else {
             self.error(TypeErrorKind::InvalidFieldValidationExpr { key: "render".to_string() }, value.span());
             return;
         };
-        if !matches!(render.as_str(), "graph" | "heatmap" | "timeline") {
-            self.error(TypeErrorKind::UnknownRenderValue { context, render: render.clone() }, value.span());
+        if !valid(render) {
+            self.error(
+                TypeErrorKind::UnknownRenderValue { context, render: render.clone(), allowed: allowed.to_string() },
+                value.span(),
+            );
         }
     }
 
@@ -1649,7 +1699,12 @@ impl<'a> Checker<'a> {
             // `check_render_expr` rather than a second check.
             for (key, value) in &panel.entries {
                 if key == "render" {
-                    self.check_render_expr(format!("`panel \"{}\"` in `workspace {}`", panel.title, ws.name), value);
+                    self.check_render_expr(
+                        format!("`panel \"{}\"` in `workspace {}`", panel.title, ws.name),
+                        value,
+                        |s| matches!(s, "graph" | "heatmap" | "timeline"),
+                        "\"graph\", \"heatmap\", \"timeline\"",
+                    );
                 }
             }
         }

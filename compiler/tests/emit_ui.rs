@@ -109,7 +109,7 @@ fn option_field_is_optional_but_keeps_its_inner_control() {
     "#;
     let html = emit_ui(src);
     assert!(html.contains(
-        r#""control":"number","displayLabel":null,"label":"i64","max":null,"min":null,"name":"reminder","nested":[],"options":[],"pattern":null,"required":false"#
+        r#""control":"number","displayLabel":null,"label":"i64","max":null,"min":null,"name":"reminder","nested":[],"options":[],"pattern":null,"render":null,"required":false"#
     ));
 }
 
@@ -691,4 +691,42 @@ fn a_declared_tile_label_now_overrides_the_inferred_one() {
     let html = emit_ui(src);
     assert!(html.contains(r#""label":"Custom Widget Label""#));
     assert!(!html.contains(r#""label":"Widgets""#));
+}
+
+// ── Track E3: `field { render: "countdown" }` ───────────────────────────
+
+#[test]
+fn field_render_countdown_reaches_the_manifest_and_client_wiring() {
+    let src = r#"
+        struct Case {
+            id: i64,
+            status: str,
+            sla_deadline_unix: i64,
+        }
+        fn list_case() -> i64 { return 0 }
+
+        screen Case {
+            field sla_deadline_unix {
+                label: "SLA"
+                render: "countdown"
+            }
+        }
+
+        fn main() {}
+    "#;
+    let html = emit_ui(src);
+
+    assert!(html.contains(r#""displayLabel":"SLA""#));
+    assert!(html.contains(r#""name":"sla_deadline_unix""#));
+    assert!(html.contains(r#""render":"countdown""#));
+    // A field with no declared `render` still serializes the key,
+    // explicitly `null` rather than omitted (same convention `pattern`/
+    // `min`/`max` already have).
+    assert!(html.contains(r#""name":"status""#));
+
+    // Client-side wiring: the shared-timer countdown machinery exists.
+    assert!(html.contains("function formatCountdown(deadlineUnix)"));
+    assert!(html.contains("function updateCountdownEl(node)"));
+    assert!(html.contains(r#"f.render === "countdown""#));
+    assert!(html.contains("countdown-overdue"));
 }

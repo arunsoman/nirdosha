@@ -136,6 +136,16 @@ struct FieldSpec {
     /// unbounded on that side.
     min: Option<f64>,
     max: Option<f64>,
+    /// `screen <Struct> { field <name> { render: "..." } }` (`ROADMAP.md`
+    /// Track E3) — a display-only client hint, already proven by
+    /// `typeck.rs::check_field_render_expr` to be one of a fixed set
+    /// (`"countdown"` for v1) and, for `"countdown"` specifically, only
+    /// on an integer field. Unlike `pattern`/`min`/`max`, this never
+    /// becomes a validation rule — `serve.rs` has nothing to enforce
+    /// here at all, the value passes straight through unchanged; only
+    /// how the client *displays* it changes. `None` means the ordinary
+    /// per-control rendering every other field already has.
+    render: Option<&'static str>,
 }
 
 /// One CRUD-convention function backing a screen, plus what it costs to
@@ -501,6 +511,7 @@ fn build_field(program: &Program, name: &str, ty: &Ty, visiting: &mut Vec<String
         pattern: None,
         min: None,
         max: None,
+        render: None,
     };
     match ty {
         // `date`/`time`-named str fields get a calendar picker instead of
@@ -564,6 +575,7 @@ fn build_field(program: &Program, name: &str, ty: &Ty, visiting: &mut Vec<String
                         pattern: None,
                         min: None,
                         max: None,
+                        render: None,
                     };
                 }
                 return base("readonly", false);
@@ -607,6 +619,7 @@ fn build_field(program: &Program, name: &str, ty: &Ty, visiting: &mut Vec<String
                     pattern: None,
                     min: None,
                     max: None,
+                    render: None,
                 };
             }
             base("readonly", false)
@@ -1081,6 +1094,15 @@ fn apply_field_overrides(decl: Option<&ScreenDecl>, fields: &mut [FieldSpec], ow
         spec.pattern = resolve_pattern(&fo.entries);
         spec.min = kv_num(&fo.entries, "min");
         spec.max = kv_num(&fo.entries, "max");
+        // Already proven by `typeck.rs::check_field_render_expr` to be
+        // one of a fixed set — `"countdown"` is the only one with
+        // meaning yet (Track E3); matched explicitly rather than
+        // passing any string through, so a future closed-vocabulary
+        // addition here is a deliberate one-line change, not implicit.
+        spec.render = match kv_str(&fo.entries, "render") {
+            Some("countdown") => Some("countdown"),
+            _ => None,
+        };
     }
 }
 
@@ -1300,7 +1322,7 @@ fn field_json(f: &FieldSpec) -> serde_json::Value {
         "options": f.options,
         "requiredViewRoles": f.view_roles, "requiredViewClaim": f.view_claim,
         "requiredEditRoles": f.edit_roles, "requiredEditClaim": f.edit_claim,
-        "pattern": f.pattern, "min": f.min, "max": f.max,
+        "pattern": f.pattern, "min": f.min, "max": f.max, "render": f.render,
     })
 }
 

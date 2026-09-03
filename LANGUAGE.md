@@ -913,8 +913,10 @@ accepts); `pattern` must be a string literal that compiles as a valid
 regex, and only on a `str` field; `format` must be one of a fixed set
 of named shapes (below), and only on a `str` field; `min`/`max` must be
 an int/float literal, and only on a numeric field; `pattern` and
-`format` may not both be declared on the same field; `dashboard`'s
-`tile`/`chart` targets must resolve to real functions.
+`format` may not both be declared on the same field; `render` (Track E3)
+must be `"countdown"` (the only value with meaning so far), and only on
+an integer field; `dashboard`'s `tile`/`chart`/`visual` targets must
+resolve to real functions.
 
 **What `screen`/`dashboard` currently change in the generated UI**:
 `title` overrides the nav label/heading/toast text (default: the struct
@@ -939,6 +941,22 @@ fixed, closed vocabulary — `"email"`, `"phone"`, `"date"`, `"url"`,
 `"uuid"` — expanding to the matching regex at typeck/`ui_gen` time
 (`ast::well_known_format_pattern`); anything else needs a hand-written
 `pattern`.
+
+`field { render: "countdown" }` (Track E3) is display-only, never a
+validation rule the way `pattern`/`format`/`min`/`max` are — an integer
+field (a unix-seconds deadline) renders as a live "23m left"/"2h 14m
+left"/"OVERDUE" chip in a table cell instead of the raw number, ticking
+down client-side off `Date.now()` on one shared page-wide timer (not one
+per row), ~9 screens' worth of "SLA countdown"/"nearing SLA breach"
+widgets across `SCREENS.md` this unblocks directly. Static-field
+ticking, deliberately not a poll or a push mechanism — the deadline
+value itself already comes down with the row exactly as it does today;
+only that one field's *display* changes, entirely in the browser, no
+new `serve.rs` route or network traffic at all. Named as a candidate for
+future closed-vocabulary siblings, not designed here: `"badge"` (color a
+zero-payload-enum field by variant) and `"progress"` (a 0–100 field as a
+bar) — confirming `render` as a key is the right shape to extend later,
+not a one-off hack for countdowns specifically.
 
 **Field-level `view`/`edit` RBAC is real, both sides**: `ui_gen.rs`
 computes `view_roles`/`view_claim`/`edit_roles`/`edit_claim` per field

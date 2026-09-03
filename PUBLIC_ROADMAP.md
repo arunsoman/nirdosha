@@ -110,8 +110,11 @@ independent of Tracks A–D — see
 - [DONE] `visual`/`render` — graph, heatmap, and timeline views on a
   dashboard or inside a panel, on top of the existing bar-chart-only
   `chart` (`LANGUAGE.md` §11c)
-- [OPEN] Three smaller DSL extensions on top of it (live-status fields,
-  preview actions, a workflow stepper) — see `ROADMAP.md` Track E
+- [DONE] `field { render: "countdown" }` — a live SLA countdown chip on
+  a table field, ticking client-side with zero added network traffic
+  (`LANGUAGE.md` §11)
+- [OPEN] Two smaller DSL extensions on top of it (preview actions, a
+  workflow stepper) — see `ROADMAP.md` Track E
 
 ---
 
