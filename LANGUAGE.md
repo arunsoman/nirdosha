@@ -955,16 +955,56 @@ UI**: `paginate { page_size, total }`, `field { searchable, sortable }`,
 form insert-vs-update auto-hide-primary-key behavior. Tracked, with the
 reason each is still open, in `compiler/UI_DSL_TODO.md`.
 
-**Deliberate non-goals, closed by design**: exactly one chart type (an
-inline-SVG bar chart — no line/scatter/heatmap/treemap/geo/3D, no
-Recharts/D3/Victory-style dependency); exactly four built-in animations,
-fixed (§11b's `fade-in`/`slide-up`/`scale-in`/`pop` — no custom
-`@keyframes`, no gesture/physics-based motion, nothing like Framer
-Motion); and a fixed seven-kind form-control set (`text`/`number`/
-`checkbox`/`select`/`struct`/`readonly`/`date` — no rich text editor,
-color picker, drag-drop upload with preview, autocomplete/typeahead,
-calendar/scheduler, or signature pad). Full rationale in
-`compiler/UI_DSL_TODO.md`'s "Deliberate non-goals" section.
+**Deliberate non-goals, closed by design**: `dashboard { chart ... }`
+(naming-convention `chart_<name>` too) is still exactly one chart type,
+an inline-SVG bar chart, forever — `dashboard { visual ... }` (Track E2,
+below) is the escape hatch for graph/heatmap/timeline, not a change to
+what `chart` itself does. No Recharts/D3/Victory-style external charting
+dependency regardless. Still true independent of that: exactly four
+built-in animations, fixed (§11b's `fade-in`/`slide-up`/`scale-in`/
+`pop` — no custom `@keyframes`, no gesture/physics-based motion, nothing
+like Framer Motion); and a fixed seven-kind form-control set
+(`text`/`number`/`checkbox`/`select`/`struct`/`readonly`/`date` — no
+rich text editor, color picker, drag-drop upload with preview,
+autocomplete/typeahead, calendar/scheduler, or signature pad). Full
+rationale in `compiler/UI_DSL_TODO.md`'s "Deliberate non-goals" section.
+
+### 11c. `dashboard { visual ... }` — graph, heatmap, timeline (Track E2)
+
+`chart`'s one-inline-SVG-bar-chart limit (above) stays exactly as
+closed as it always was. `visual "<label>" -> <fn> { render: "graph" |
+"heatmap" | "timeline" }` is a second, separate `dashboard_item` kind
+with no naming-convention equivalent — always explicitly declared,
+since a render *kind* can't be inferred from a function name the way
+`stat_`/`chart_` infer their kind. Reuses the ordinary `kv_entry`
+grammar `screen`'s own body already has — no separate mini-language per
+chart type.
+
+`render`'s value is a closed, typechecked vocabulary
+(`typeck.rs::check_render_expr`); each kind fixes its backing fn's
+expected `json` shape, the same "the fn returns exactly this shape,
+usually one `db_query` with the right column aliases" contract
+`chart_<name>`'s `{label, value}[]` already establishes:
+
+| `render` | Expected JSON shape |
+|---|---|
+| `"graph"` | `{"nodes": [{"id", "label", "risk"?}], "edges": [{"source", "target", "weight"?}]}` |
+| `"heatmap"` | `[{"lat", "lng", "weight", "label"?}]` |
+| `"timeline"` | `[{"ts", "label", "detail"?}]`, any order (client sorts by `ts`) |
+
+Same `render` key, same closed vocabulary, also works inside a
+`workspace`'s own `panel { ... }` (§15) — `panel "..." { render:
+"timeline" }` renders that panel's rows as a timeline instead of a
+plain table, reusing the exact same client-side render functions.
+
+**Honest limits, not yet built, disclosed rather than silently
+implied**: `"graph"`'s layout is a static circle (or concentric risk
+rings, when every node carries a numeric `risk`) — no drag, no zoom, no
+force-directed physics. `"heatmap"` is a binned density grid
+(equirectangular bucketing into a fixed 12×8 grid) — no real basemap,
+no map tiles, no borders. Neither has a node/edge or point count ceiling
+enforced anywhere — a screen with a few dozen nodes/points is the
+informal ceiling before either becomes visually unreadable.
 
 ### 11a. Identity role-mapping cache (`ROADMAP.md` Track A item A6)
 
@@ -1267,11 +1307,11 @@ trust boundary — every panel's `source` and every panel action are
 ordinary already-`requires(...)`-gated `.nir` functions already exposed
 at `POST /api/<fn>`, exactly as any other screen's actions are. A
 workspace is a client-side *composition* of calls that already exist and
-are already secured. `render:` on a panel item (a richer visualization
-than a plain table — a timeline, a graph, a heatmap) is Track E2, not
-yet built — a `render` key is parsed today (an ordinary `kv_entry`, the
-same forward-compatible fallback every other DSL block here already
-has) but has no effect yet.
+are already secured. `panel "..." { render: "graph" | "heatmap" |
+"timeline" }` (Track E2, §11c) upgrades a panel from its default plain
+table to one of those three richer visualizations, same closed
+vocabulary and same honest limits (static graph layout, binned
+heatmap grid, no basemap) §11c discloses for `dashboard { visual ... }`.
 
 Like `module`/`workflow`, a program that declares no `workspace` is
 byte-for-byte unaffected.

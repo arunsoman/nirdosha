@@ -1527,21 +1527,30 @@ pub struct ScreenDecl {
 
 /// `tile "<label>" -> <fn>` or `chart "<label>" -> <fn>` inside a
 /// `dashboard` block — same shape for both, distinguished by which
-/// `Vec` in `DashboardDecl` it lands in.
+/// `Vec` in `DashboardDecl` it lands in. `entries` is always empty for
+/// `tile`/`chart` (neither has a body) — populated only for a `visual`
+/// item's own `{ render: "..." }` (Track E2, `ROADMAP.md`), which
+/// reuses this same struct rather than a fourth near-identical one.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MetricRef {
     pub label: String,
     pub target_fn: String,
+    pub entries: Vec<KvEntry>,
     pub span: Span,
 }
 
-/// `dashboard { tile "..." -> stat_fn  chart "..." -> chart_fn }` — a
-/// single top-level block supplementing `stat_`/`chart_` naming-
-/// convention inference in `ui_gen.rs`.
+/// `dashboard { tile "..." -> stat_fn  chart "..." -> chart_fn  visual
+/// "..." -> graph_fn { render: "graph" } }` — a single top-level block
+/// supplementing `stat_`/`chart_` naming-convention inference in
+/// `ui_gen.rs`. `visuals` (Track E2) has no naming-convention
+/// equivalent at all — a `render` kind can't be inferred from a fn name
+/// the way `stat_`/`chart_` infer their kind, so every `visual` is
+/// declared here, never picked up automatically.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DashboardDecl {
     pub tiles: Vec<MetricRef>,
     pub charts: Vec<MetricRef>,
+    pub visuals: Vec<MetricRef>,
     pub span: Span,
 }
 

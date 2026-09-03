@@ -107,9 +107,11 @@ independent of Tracks A–D — see
   Counter-Terrorism Financing & Transaction Monitoring System spec
 - [DONE] `workspace`/`panel` — composite multi-pane screens composing
   fields/lists from several structs onto one page (`LANGUAGE.md` §15)
-- [OPEN] Four smaller DSL extensions on top of it (graph/heatmap/
-  timeline views, live-status fields, preview actions, a workflow
-  stepper) — see `ROADMAP.md` Track E
+- [DONE] `visual`/`render` — graph, heatmap, and timeline views on a
+  dashboard or inside a panel, on top of the existing bar-chart-only
+  `chart` (`LANGUAGE.md` §11c)
+- [OPEN] Three smaller DSL extensions on top of it (live-status fields,
+  preview actions, a workflow stepper) — see `ROADMAP.md` Track E
 
 ---
 

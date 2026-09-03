@@ -2109,45 +2109,80 @@ E6 is the one item that waits on all five.*
     still E6, blocked on E2–E5.
   - [x] Full `cargo test` (whole suite) green — verified above.
 
-- `[OPEN]` **E2. `visual` dashboard/panel item + `render: "graph"|
+- `[DONE]` **E2. `visual` dashboard/panel item + `render: "graph"|
   "heatmap"|"timeline"`.** Unblocks Case Linking/Entity Graph, Wallet
   Cluster Graph, Graph Network Explorer, Session/Device Linkage View,
   Geo Heatmap directly (~6 screens), plus upgrades an E1 panel from a
   flat table to a timeline. Small grammar extension — one new
   `dashboard_item` keyword plus a closed-vocabulary `render:` key reused
   inside `panel` (no separate mini-language per chart kind). Full
-  design: `UI_CONSTRUCTS.md` §2.
-  - [ ] Grammar: `dashboard_item ::= ("tile" | "chart") string "->" ident
-    | "visual" string "->" ident ("{" kv_entry* "}")?` (`GRAMMAR.md`);
-    `parser.rs::parse_dashboard_decl` grows the `visual` arm.
-  - [ ] Cross-verify against `grammar_check/`'s independent LALR(1)
-    parser.
-  - [ ] Update `compiler/nirdosha.gbnf`.
-  - [ ] AST/typeck: `render` restricted to the closed set (`"graph"` |
-    `"heatmap"` | `"timeline"`, plus `"bar_chart"`'s existing implicit
-    default) — new `TypeErrorKind` variant for an unrecognized value,
-    `typeck.rs::check_dashboard`'s sibling check next to
-    `check_pattern_expr`/`check_format_expr`.
-  - [ ] `ui_gen.rs`: `Metric` gains `render: MetricRender` (default
-    `BarChart` — every existing `dashboard { chart ... }` unaffected);
-    `build_visuals` alongside `build_charts`.
-  - [ ] `ui_gen_template.html`: `renderDashboard`'s per-chart loop
-    branches on `chart.render`; three new pure render functions
-    (`renderForceGraph` — static circular/concentric layout, no physics;
-    `renderHeatGrid` — binned density grid, not a real basemap;
-    `renderTimelineList` — reuses the existing `row-enter`/
-    `--stagger-ms` per-row entrance), same inline-SVG/zero-dependency,
-    `var(--md-primary)`-token approach `renderBarChart` already uses.
-  - [ ] `LANGUAGE.md`: extend §11's dashboard section (or a new §15b)
-    documenting `visual`/`render` and each shape's expected JSON
-    contract.
-  - [ ] New test coverage: `tests/screen_dsl.rs` (or a new file) for the
-    grammar/typeck shape, plus a real end-to-end `emit-ui`/`serve` case
-    exercising at least the `"graph"` render kind.
-  - [ ] Apply to `examples/ctms/ctms.nir`: Wallet Cluster Graph (Module
-    7, `render: "graph"`) and Geo Heatmap (Module 5, `render:
-    "heatmap"`), per `UI_CONSTRUCTS.md` §2's worked example.
-  - [ ] Full `cargo test` green before `[DONE]`.
+  design: `UI_CONSTRUCTS.md` §2. — 2026-09-03, verified: full `cargo
+  test` green (same pre-existing `mq.rs` Redis gap, unrelated), plus a
+  real `nirdosha serve --db` smoke test (graph via `graph_wallet_clusters`
+  — real nodes/edges JSON built by SQLite's own `json_object`/
+  `json_group_array` functions through `db_query`, confirmed empirically,
+  not assumed; heatmap via `heatmap_transaction_geo`; the Investigation
+  Workspace's own Transactions panel reshaped to `render: "timeline"`)
+  and a `node --check` pass on the extracted client `<script>`.
+  - [x] Grammar: `dashboard_item`'s `visual` alternative added to
+    `GRAMMAR.md` and `compiler/nirdosha.gbnf`; `MetricRef` gained an
+    `entries: Vec<KvEntry>` field (empty for `tile`/`chart`) rather than
+    a fourth near-identical AST node; `parse_dashboard_decl` grows the
+    `visual` arm, contextual like `tile`/`chart` (not a reserved token).
+  - [x] Cross-verified against `grammar_check/`'s independent LALR(1)
+    generator (now that E1's follow-up made it actually model
+    `dashboard_decl` at all) — `DashboardItem`'s two alternatives
+    (`visual`'s optional trailing body) build zero conflicts of their
+    own; the crate's build still fails for the same pre-existing,
+    unrelated, disclosed reason as before.
+  - [x] `compiler/nirdosha.gbnf` updated.
+  - [x] AST/typeck: `render` restricted to the closed set — but the
+    check (`typeck.rs::check_render_expr`, generalized past its original
+    `check_visual_render_expr` name) deliberately serves *both*
+    `visual`'s and `panel`'s own `render:` key from one implementation,
+    since the design doc's own text called for `panel` to reuse this
+    same vocabulary (§1's worked example already used `render:
+    "timeline"` on a panel) — one `TypeErrorKind::UnknownRenderValue`
+    variant, not two.
+  - [x] `ui_gen.rs`: `Metric` gained `render: MetricRender` (default
+    `BarChart`); **a real, previously-undisclosed pre-existing gap found
+    and fixed as a precondition** — `ui_gen.rs` never read
+    `program.dashboard` at all before this (confirmed empirically: a
+    declared `dashboard { tile "Custom Label" -> stat_fn }` entry's own
+    label was silently discarded in favor of naming-convention
+    inference, with no error). `visual` has no naming-convention
+    equivalent, so it had nothing to attach to without this fix.
+    `apply_declared_metrics` now merges declared `tile`/`chart` entries
+    into naming-convention output (label override, or a new entry for a
+    fn convention inference wouldn't have found); `visual` items append
+    unconditionally, no top-level `WORKSPACES`-style second array — all
+    landing in the existing `CHARTS`/`STATS` JSON. `Panel` (E1) gained
+    the matching `render: PanelRender` field.
+  - [x] `ui_gen_template.html`: `renderDashboard`'s per-chart loop and
+    `renderPanel`'s own `reload()` both branch on `render`; three new
+    pure render functions (`renderForceGraph`, `renderHeatGrid`,
+    `renderTimelineList`) shared between both call sites, same inline-
+    SVG/zero-dependency/`var(--md-primary)`-token approach
+    `renderBarChart` already uses.
+  - [x] `LANGUAGE.md` §11c (new) documents `visual`/`render` and each
+    shape's JSON contract; §11's stale "no line/scatter/heatmap/..."
+    non-goal claim, and `compiler/UI_DSL_TODO.md`'s matching stale
+    claim, both corrected in the same pass rather than left contradicting
+    the new feature — `chart` itself is still permanently one bar-chart
+    type, only `visual` (and `panel`) gained the three new kinds.
+  - [x] Test coverage: `compiler/tests/visual_dsl.rs` (8 tests — parse/
+    typeck shape, every rejection case, panel/visual sharing the same
+    vocabulary, the "no visuals" regression guard), 2 new real
+    end-to-end `emit_ui.rs` cases (manifest wiring for both call sites,
+    and the declared-tile-label-override gap in isolation).
+  - [x] Applied to `examples/ctms/ctms.nir`: added `Wallet`/`WalletLink`
+    (a real new CRUD screen for `Wallet`, seed data for the graph),
+    `graph_wallet_clusters` (Module 7's Wallet Cluster Graph),
+    `heatmap_transaction_geo` (Module 5's Geo Heatmap, using
+    `Transaction`'s now-added `geo_lat`/`geo_lng`/`created_unix`
+    fields), two dashboard tiles, and reshaped the Investigation
+    Workspace's own Transactions panel to `render: "timeline"`.
+  - [x] Full `cargo test` (whole suite) green — verified above.
 
 - `[OPEN]` **E3. `field { render: "countdown" }` — live-SLA/live-status
   fields.** Unblocks Case Queue, Alert Queue, Compliance Flag Queue,
@@ -2235,12 +2270,14 @@ E6 is the one item that waits on all five.*
     example.
   - [ ] Full `cargo test` green before `[DONE]`.
 
-- `[BLOCKED: E2–E5]` **E6. Rebuild `examples/ctms/ctms.nir` end-to-end.**
-  E1 recreated the file as a real, verified `Matter`/`Transaction`/
-  `MatterNote` proof-of-concept (one `workspace`, two panels) — still
-  nowhere near the 8-struct plain-CRUD-only version `SCREENS.md`'s own
-  intro names as this whole initiative's starting point, let alone the
-  full 89-screen inventory. Once E2–E5 also land: rebuild it for real
+- `[BLOCKED: E3–E5]` **E6. Rebuild `examples/ctms/ctms.nir` end-to-end.**
+  E1+E2 grew the file into a real, verified `Matter`/`Transaction`/
+  `MatterNote`/`Wallet`/`WalletLink` proof-of-concept (one `workspace`,
+  two panels — one now a live timeline —, a dashboard with two tiles
+  and a graph/heatmap visual each) — still nowhere near the 8-struct
+  plain-CRUD-only version `SCREENS.md`'s own intro names as this whole
+  initiative's starting point, let alone the full 89-screen inventory.
+  Once E3–E5 also land: rebuild it for real
   against the actual CTMS screen inventory (`SCREENS.md`), not just the
   handful of worked-example screens E1–E5 individually touch — then
   verify it actually renders (`nirdosha emit-ui`) and serves (`nirdosha

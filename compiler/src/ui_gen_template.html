@@ -1194,6 +1194,149 @@ function renderBarChart(data) {
   return svg;
 }
 
+// ---- Track E2: `visual`/`render` -- graph, heatmap, timeline -----------
+// Three more pure render functions alongside `renderBarChart` (no
+// external charting library, same stance) -- shared between
+// `renderDashboard` (a `visual` item) and `renderPanel` (a `panel {
+// render: ... }`, E1's own workspace panels), since both just hand one
+// of these a plain JS value already shaped by `chart.fn`/`panel.source`.
+
+// **v1 is deliberately a static layout, not a physics simulation**
+// (`examples/ctms/UI_CONSTRUCTS.md` SS2/SS7's own disclosed limit):
+// nodes placed evenly around a circle, or -- when every node carries a
+// numeric `risk` -- concentric rings by risk band, highest risk
+// innermost. No drag/zoom/force-directed physics.
+function renderForceGraph(data) {
+  const nodes = Array.isArray(data && data.nodes) ? data.nodes : [];
+  const edges = Array.isArray(data && data.edges) ? data.edges : [];
+  const width = 480, height = 360, cx = width / 2, cy = height / 2, r = Math.min(width, height) / 2 - 40;
+  const pos = {};
+  const hasRisk = nodes.length > 0 && nodes.every((n) => typeof n.risk === "number");
+  if (hasRisk) {
+    const maxRisk = Math.max(1, ...nodes.map((n) => n.risk));
+    const bandCount = 3;
+    const bands = Array.from({ length: bandCount }, () => []);
+    for (const n of nodes) {
+      const band = Math.min(bandCount - 1, Math.floor(((maxRisk - n.risk) / maxRisk) * bandCount));
+      bands[band].push(n);
+    }
+    bands.forEach((bandNodes, band) => {
+      const bandR = r * ((band + 1) / bandCount);
+      bandNodes.forEach((n, i) => {
+        const angle = (2 * Math.PI * i) / Math.max(1, bandNodes.length);
+        pos[n.id] = { x: cx + bandR * Math.cos(angle), y: cy + bandR * Math.sin(angle) };
+      });
+    });
+  } else {
+    nodes.forEach((n, i) => {
+      const angle = (2 * Math.PI * i) / Math.max(1, nodes.length);
+      pos[n.id] = { x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle) };
+    });
+  }
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("width", "100%");
+  svg.setAttribute("height", String(height));
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "graph");
+  for (const e of edges) {
+    const a = pos[e.source], b = pos[e.target];
+    if (!a || !b) continue;
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", String(a.x));
+    line.setAttribute("y1", String(a.y));
+    line.setAttribute("x2", String(b.x));
+    line.setAttribute("y2", String(b.y));
+    line.setAttribute("stroke-width", String(Math.max(1, Number(e.weight) || 1)));
+    line.style.stroke = "var(--md-outline)";
+    svg.appendChild(line);
+  }
+  for (const n of nodes) {
+    const p = pos[n.id];
+    if (!p) continue;
+    const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    circle.setAttribute("cx", String(p.x));
+    circle.setAttribute("cy", String(p.y));
+    circle.setAttribute("r", "8");
+    circle.style.fill = "var(--md-primary)";
+    svg.appendChild(circle);
+    const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    label.setAttribute("x", String(p.x + 10));
+    label.setAttribute("y", String(p.y + 4));
+    label.setAttribute("font-size", "10");
+    label.style.fill = "var(--md-on-surface)";
+    label.textContent = String(n.label !== undefined ? n.label : n.id);
+    svg.appendChild(label);
+  }
+  return svg;
+}
+
+// A binned density grid -- equirectangular bucketing into a fixed 12x8
+// grid, each cell an SVG `<rect>` shaded by `var(--md-primary)` at an
+// opacity proportional to summed weight in that bucket. Explicitly
+// **not** a real map with tiles/borders -- `examples/ctms/
+// UI_CONSTRUCTS.md` SS2/SS7's own disclosed honesty limit.
+function renderHeatGrid(data) {
+  const cols = 12, rows = 8, width = 480, height = 280;
+  const cellW = width / cols, cellH = height / rows;
+  const points = data.filter((d) => typeof d.lat === "number" && typeof d.lng === "number");
+  const grid = {};
+  let maxWeight = 0;
+  for (const p of points) {
+    const col = Math.min(cols - 1, Math.max(0, Math.floor(((p.lng + 180) / 360) * cols)));
+    const row = Math.min(rows - 1, Math.max(0, Math.floor(((90 - p.lat) / 180) * rows)));
+    const key = row + "_" + col;
+    const w = Number(p.weight) || 1;
+    grid[key] = (grid[key] || 0) + w;
+    maxWeight = Math.max(maxWeight, grid[key]);
+  }
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("width", "100%");
+  svg.setAttribute("height", String(height));
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "heatmap");
+  for (const key of Object.keys(grid)) {
+    const [row, col] = key.split("_").map(Number);
+    const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    rect.setAttribute("x", String(col * cellW));
+    rect.setAttribute("y", String(row * cellH));
+    rect.setAttribute("width", String(Math.max(0, cellW - 1)));
+    rect.setAttribute("height", String(Math.max(0, cellH - 1)));
+    rect.style.fill = "var(--md-primary)";
+    rect.style.opacity = String(Math.max(0.1, maxWeight > 0 ? grid[key] / maxWeight : 0));
+    svg.appendChild(rect);
+  }
+  return svg;
+}
+
+// A vertical list, one row per event (timestamp left, label/detail
+// right) -- reuses the existing `row-enter`/`--stagger-ms` per-row
+// entrance animation every table already has, unchanged.
+function renderTimelineList(data) {
+  const sorted = [...data].sort((a, b) => (a.ts > b.ts ? 1 : a.ts < b.ts ? -1 : 0));
+  return el(
+    "div",
+    {},
+    sorted.map((d, i) =>
+      el(
+        "div",
+        {
+          class: "row-enter",
+          style: `display:flex;gap:12px;padding:8px 0;border-bottom:1px solid var(--md-outline);animation-delay: calc(var(--stagger-ms) * ${i} * 1ms)`,
+        },
+        [
+          el("div", { text: String(d.ts), style: "min-width:140px;color:var(--md-on-surface-variant);font-size:12px;" }),
+          el("div", {}, [
+            el("div", { text: d.label !== undefined ? String(d.label) : "" }),
+            d.detail !== undefined ? el("div", { text: String(d.detail), style: "font-size:12px;color:var(--md-on-surface-variant);" }) : null,
+          ]),
+        ],
+      ),
+    ),
+  );
+}
+
 async function renderDashboard() {
   const content = document.getElementById("content");
   content.textContent = "";
@@ -1228,9 +1371,17 @@ async function renderDashboard() {
     card.appendChild(holder);
     callFn(chart.fn, {}).then((data) => {
       holder.textContent = "";
+      if (chart.render === "graph") {
+        const nodes = data && Array.isArray(data.nodes) ? data.nodes : [];
+        if (nodes.length === 0) { holder.appendChild(el("div", { class: "empty-state", text: "No data yet." })); return; }
+        holder.appendChild(renderForceGraph(data));
+        return;
+      }
       const rows = Array.isArray(data) ? data : [];
       if (rows.length === 0) { holder.appendChild(el("div", { class: "empty-state", text: "No data yet." })); return; }
-      holder.appendChild(renderBarChart(rows));
+      if (chart.render === "heatmap") holder.appendChild(renderHeatGrid(rows));
+      else if (chart.render === "timeline") holder.appendChild(renderTimelineList(rows));
+      else holder.appendChild(renderBarChart(rows));
     });
   }
 
@@ -1377,11 +1528,24 @@ async function renderPanel(panel, container, id) {
       return;
     }
     const result = await callFn(panel.sourceFn, { [panel.sourceParam]: Number(id) });
+
+    // Track E2: a panel's `render: "..."` (default "table", unchanged
+    // behavior) reuses the exact same render functions `renderDashboard`
+    // uses for a `visual` item -- both just hand one of these whatever
+    // JS value the backing fn already resolved to.
+    if (panel.render === "graph") {
+      const nodes = result && Array.isArray(result.nodes) ? result.nodes : [];
+      if (nodes.length === 0) { body.appendChild(el("div", { class: "empty-state", text: "Nothing here yet." })); return; }
+      body.appendChild(renderForceGraph(result));
+      return;
+    }
     const list = Array.isArray(result) ? result : (result && typeof result === "object" ? [result] : []);
     if (list.length === 0) {
       body.appendChild(el("div", { class: "empty-state", text: "Nothing here yet." }));
       return;
     }
+    if (panel.render === "heatmap") { body.appendChild(renderHeatGrid(list)); return; }
+    if (panel.render === "timeline") { body.appendChild(renderTimelineList(list)); return; }
     const cols = Object.keys(list[0]);
     const table = el("table", {}, [el("thead", {}, [el("tr", {}, cols.map((c) => el("th", { text: c })))])]);
     const tbody = el("tbody", {}, []);
