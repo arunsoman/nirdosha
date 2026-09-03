@@ -2162,4 +2162,192 @@ fn stat_unacknowledged_drift_count() -> Result(i64, ErrorCode) requires(public) 
     return match db_connect("ctms.db") { Ok(conn) => stat_unacknowledged_drift_count_inner(conn), Err(e) => Err(DbError(e)) }
 }
 
+// ---- Module 6: Compliance and Regulatory Management --------------------
+//
+// Policy Management Engine: already built (Track E4's own worked
+// example, `CompliancePolicy` + `simulate_policy_threshold`) -- not
+// rebuilt here. Compliance Officer Home folds into the one dashboard{}
+// block below.
+
+module "Compliance" {
+    struct ComplianceFlagEntry {
+        id: i64,
+        rule_matched: str,
+        entity_ref: str,
+        threshold_value: i64,
+        severity: str,
+        flagged_unix: i64,
+        status: str,
+    }
+
+    struct ComplianceReportTemplate {
+        id: i64,
+        template_name: str,
+        report_kind: str,
+        schedule_rule: str,
+        field_mapping: str,
+    }
+
+    struct LegalHold {
+        id: i64,
+        matter_id: i64,
+        applied_by: str,
+        status: str,
+        expiry_unix: i64,
+    }
+
+    struct FilingDeadline {
+        id: i64,
+        jurisdiction: str,
+        report_kind: str,
+        due_unix: i64,
+        filed: bool,
+    }
+}
+
+fn list_compliance_flag_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS compliance_flag_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, rule_matched TEXT, entity_ref TEXT, threshold_value INTEGER, severity TEXT, flagged_unix INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, rule_matched, entity_ref, threshold_value, severity, flagged_unix, status FROM compliance_flag_entry ORDER BY flagged_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_compliance_flag_entry() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_compliance_flag_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_compliance_flag_entry_inner(conn: db, f: ComplianceFlagEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS compliance_flag_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, rule_matched TEXT, entity_ref TEXT, threshold_value INTEGER, severity TEXT, flagged_unix INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO compliance_flag_entry (rule_matched, entity_ref, threshold_value, severity, flagged_unix, status) VALUES (?, ?, ?, ?, ?, ?)", f.rule_matched, f.entity_ref, f.threshold_value, f.severity, f.flagged_unix, f.status) { Ok(n) => Ok(n), Err(err) => Err(DbError(err)) }
+    stop conn
+    return result
+}
+fn create_compliance_flag_entry(f: ComplianceFlagEntry) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => create_compliance_flag_entry_inner(conn, f), Err(err) => Err(DbError(err)) }
+}
+fn update_compliance_flag_entry_inner(conn: db, f: ComplianceFlagEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS compliance_flag_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, rule_matched TEXT, entity_ref TEXT, threshold_value INTEGER, severity TEXT, flagged_unix INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE compliance_flag_entry SET rule_matched = ?, entity_ref = ?, threshold_value = ?, severity = ?, flagged_unix = ?, status = ? WHERE id = ?", f.rule_matched, f.entity_ref, f.threshold_value, f.severity, f.flagged_unix, f.status, f.id) { Ok(n) => Ok(n), Err(err) => Err(DbError(err)) }
+    stop conn
+    return result
+}
+fn update_compliance_flag_entry(f: ComplianceFlagEntry) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => update_compliance_flag_entry_inner(conn, f), Err(err) => Err(DbError(err)) }
+}
+
+screen ComplianceFlagEntry {
+    title: "Compliance Flag Queue"
+}
+
+fn list_compliance_report_template_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS compliance_report_template (id INTEGER PRIMARY KEY AUTOINCREMENT, template_name TEXT, report_kind TEXT, schedule_rule TEXT, field_mapping TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, template_name, report_kind, schedule_rule, field_mapping FROM compliance_report_template ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_compliance_report_template() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_compliance_report_template_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_compliance_report_template_inner(conn: db, t: ComplianceReportTemplate) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS compliance_report_template (id INTEGER PRIMARY KEY AUTOINCREMENT, template_name TEXT, report_kind TEXT, schedule_rule TEXT, field_mapping TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO compliance_report_template (template_name, report_kind, schedule_rule, field_mapping) VALUES (?, ?, ?, ?)", t.template_name, t.report_kind, t.schedule_rule, t.field_mapping) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_compliance_report_template(t: ComplianceReportTemplate) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => create_compliance_report_template_inner(conn, t), Err(e) => Err(DbError(e)) }
+}
+fn update_compliance_report_template_inner(conn: db, t: ComplianceReportTemplate) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS compliance_report_template (id INTEGER PRIMARY KEY AUTOINCREMENT, template_name TEXT, report_kind TEXT, schedule_rule TEXT, field_mapping TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE compliance_report_template SET template_name = ?, report_kind = ?, schedule_rule = ?, field_mapping = ? WHERE id = ?", t.template_name, t.report_kind, t.schedule_rule, t.field_mapping, t.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_compliance_report_template(t: ComplianceReportTemplate) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => update_compliance_report_template_inner(conn, t), Err(e) => Err(DbError(e)) }
+}
+
+screen ComplianceReportTemplate {
+    title: "Report Generator & Scheduler"
+}
+
+fn list_legal_hold_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS legal_hold (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, applied_by TEXT, status TEXT, expiry_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, matter_id, applied_by, status, expiry_unix FROM legal_hold ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_legal_hold() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_legal_hold_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_legal_hold_inner(conn: db, h: LegalHold) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS legal_hold (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, applied_by TEXT, status TEXT, expiry_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO legal_hold (matter_id, applied_by, status, expiry_unix) VALUES (?, ?, ?, ?)", h.matter_id, h.applied_by, h.status, h.expiry_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_legal_hold(h: LegalHold) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => create_legal_hold_inner(conn, h), Err(e) => Err(DbError(e)) }
+}
+fn update_legal_hold_inner(conn: db, h: LegalHold) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS legal_hold (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, applied_by TEXT, status TEXT, expiry_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE legal_hold SET matter_id = ?, applied_by = ?, status = ?, expiry_unix = ? WHERE id = ?", h.matter_id, h.applied_by, h.status, h.expiry_unix, h.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_legal_hold(h: LegalHold) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => update_legal_hold_inner(conn, h), Err(e) => Err(DbError(e)) }
+}
+
+screen LegalHold {
+    title: "Legal Hold Management"
+}
+
+fn list_filing_deadline_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS filing_deadline (id INTEGER PRIMARY KEY AUTOINCREMENT, jurisdiction TEXT, report_kind TEXT, due_unix INTEGER, filed INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, jurisdiction, report_kind, due_unix, filed FROM filing_deadline ORDER BY due_unix") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_filing_deadline() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_filing_deadline_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_filing_deadline_inner(conn: db, d: FilingDeadline) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS filing_deadline (id INTEGER PRIMARY KEY AUTOINCREMENT, jurisdiction TEXT, report_kind TEXT, due_unix INTEGER, filed INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO filing_deadline (jurisdiction, report_kind, due_unix, filed) VALUES (?, ?, ?, ?)", d.jurisdiction, d.report_kind, d.due_unix, d.filed) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_filing_deadline(d: FilingDeadline) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => create_filing_deadline_inner(conn, d), Err(e) => Err(DbError(e)) }
+}
+fn update_filing_deadline_inner(conn: db, d: FilingDeadline) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS filing_deadline (id INTEGER PRIMARY KEY AUTOINCREMENT, jurisdiction TEXT, report_kind TEXT, due_unix INTEGER, filed INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE filing_deadline SET jurisdiction = ?, report_kind = ?, due_unix = ?, filed = ? WHERE id = ?", d.jurisdiction, d.report_kind, d.due_unix, d.filed, d.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_filing_deadline(d: FilingDeadline) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => update_filing_deadline_inner(conn, d), Err(e) => Err(DbError(e)) }
+}
+
+screen FilingDeadline {
+    title: "Regulatory Filing Calendar"
+    field due_unix {
+        label: "Due"
+        render: "countdown"
+    }
+}
+
+fn stat_pending_compliance_obligation_count_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS filing_deadline (id INTEGER PRIMARY KEY AUTOINCREMENT, jurisdiction TEXT, report_kind TEXT, due_unix INTEGER, filed INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM filing_deadline WHERE filed = 0") {
+        Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn stat_pending_compliance_obligation_count() -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => stat_pending_compliance_obligation_count_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
 fn main() {}
