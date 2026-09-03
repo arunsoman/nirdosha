@@ -451,3 +451,89 @@ fn struct_with_no_screen_block_is_completely_unaffected() {
     assert!(program.dashboard.is_none());
     typecheck(&program).expect("a program with no screen/dashboard block should typecheck as before");
 }
+
+// ── Track E3: `field { render: "countdown" }` ───────────────────────────
+
+#[test]
+fn countdown_render_on_an_integer_field_typechecks_cleanly() {
+    let src = r#"
+        struct Case {
+            id: i64,
+            sla_deadline_unix: i64,
+        }
+        fn main() {}
+
+        screen Case {
+            field sla_deadline_unix {
+                render: "countdown"
+            }
+        }
+    "#;
+    let program = parse_ok(src);
+    typecheck(&program).expect("render: \"countdown\" on an integer field should typecheck cleanly");
+}
+
+#[test]
+fn countdown_render_on_a_non_integer_field_is_rejected() {
+    let src = r#"
+        struct Case {
+            id: i64,
+            sla_deadline: str,
+        }
+        fn main() {}
+
+        screen Case {
+            field sla_deadline {
+                render: "countdown"
+            }
+        }
+    "#;
+    assert_eq!(
+        first_type_error(src),
+        TypeErrorKind::FieldValidationTypeMismatch {
+            struct_name: "Case".to_string(),
+            field_name: "sla_deadline".to_string(),
+            key: "render".to_string(),
+            field_ty: "Str".to_string(),
+        }
+    );
+}
+
+#[test]
+fn render_value_not_in_the_field_level_closed_set_is_rejected() {
+    let src = r#"
+        struct Case {
+            id: i64,
+            sla_deadline_unix: i64,
+        }
+        fn main() {}
+
+        screen Case {
+            field sla_deadline_unix {
+                render: "progress"
+            }
+        }
+    "#;
+    assert!(matches!(
+        first_type_error(src),
+        TypeErrorKind::UnknownRenderValue { render, allowed, .. } if render == "progress" && allowed == "\"countdown\""
+    ));
+}
+
+#[test]
+fn field_render_value_must_be_a_string_literal() {
+    let src = r#"
+        struct Case {
+            id: i64,
+            sla_deadline_unix: i64,
+        }
+        fn main() {}
+
+        screen Case {
+            field sla_deadline_unix {
+                render: 1
+            }
+        }
+    "#;
+    assert_eq!(first_type_error(src), TypeErrorKind::InvalidFieldValidationExpr { key: "render".to_string() });
+}

@@ -2184,7 +2184,7 @@ E6 is the one item that waits on all five.*
     Workspace's own Transactions panel to `render: "timeline"`.
   - [x] Full `cargo test` (whole suite) green — verified above.
 
-- `[OPEN]` **E3. `field { render: "countdown" }` — live-SLA/live-status
+- `[DONE]` **E3. `field { render: "countdown" }` — live-SLA/live-status
   fields.** Unblocks Case Queue, Alert Queue, Compliance Flag Queue,
   RTFDS Session/Fraud Alert Queue, Wallet Sanctions Screening Queue,
   Regulatory Filing Calendar, and the "SLA countdown per case" widgets
@@ -2192,30 +2192,51 @@ E6 is the one item that waits on all five.*
   grammar change** — `field_override`'s body is already generic
   `kv_entry*`; this is one new closed-vocabulary value, same precedent
   `field { format: "email" }` already set. Full design:
-  `UI_CONSTRUCTS.md` §3.
-  - [ ] AST/typeck: `typeck.rs::check_screen` gains a
-    `check_render_expr` sibling next to `check_pattern_expr`/
-    `check_format_expr`/`check_min_max_expr` — `render` must be a string
-    literal from the fixed set (`"countdown"` for v1), and only on an
-    integer-typed field.
-  - [ ] `ui_gen.rs`: `FieldSpec` gains `render: Option<&'static str>`,
+  `UI_CONSTRUCTS.md` §3. — 2026-09-03, verified: full `cargo test`
+  green (same pre-existing `mq.rs` Redis gap, unrelated), plus a real
+  `nirdosha serve --db` smoke test (created a `Matter` with a real
+  `sla_deadline_unix` 15 minutes out, read it back through `list_matter`,
+  confirmed `stat_cases_nearing_sla_breach` — a companion dashboard tile,
+  SQL's own clock via `strftime('%s','now')` since Nirdosha itself has
+  no wall-clock builtin — actually counted it) and a `node --check` pass
+  on the extracted client `<script>`.
+  - [x] AST/typeck: `typeck.rs::check_field_render_expr` — `render` must
+    be a string literal from the fixed set (`"countdown"` for v1), and
+    only on an integer-typed field. Reuses `check_render_expr`
+    (generalized past its original Track E2-only shape to take a
+    `valid: fn(&str) -> bool` + an `allowed` display string, since E2's
+    `visual`/`panel` and E3's field-level `render` share the same
+    "string literal from a closed set" shape check but have different
+    vocabularies) rather than a third near-duplicate implementation —
+    `TypeErrorKind::UnknownRenderValue` now serves all three contexts.
+  - [x] `ui_gen.rs`: `FieldSpec` gains `render: Option<&'static str>`,
     populated by `apply_field_overrides` alongside `pattern`/`min`/`max`.
-  - [ ] `ui_gen_template.html`: table-cell renderer branches on
-    `f.render === "countdown"` — client-side `Date.now()`-based
-    remaining-time text, one shared `setInterval` for every `.countdown`
-    node on the page (not one timer per row); an overdue row gets the
-    existing semantic error/warning color token, no new theme tokens.
-  - [ ] `LANGUAGE.md`: document `render` as a new `field { ... }` key
-    (§11 or its own subsection), alongside `pattern`/`format`/`min`/
-    `max`.
-  - [ ] New test coverage: a `tests/screen_dsl.rs` typeck case (wrong
-    field type/value rejected) plus a real end-to-end render check
-    (`tests/emit_ui.rs` or a browser-level check that the countdown
-    markup/interval is actually emitted).
-  - [ ] Apply to `examples/ctms/ctms.nir`: `screen Case { field
-    sla_deadline_unix { render: "countdown" } }` on the Case Queue
-    screen (Module 3), per `UI_CONSTRUCTS.md` §3's worked example.
-  - [ ] Full `cargo test` green before `[DONE]`.
+  - [x] `ui_gen_template.html`: table-cell rendering restructured
+    (`cellText` alone can't carry a `<span class="countdown">` child
+    element, only a plain string — `buildCellContent` now builds real
+    DOM per cell) and branches on `f.render === "countdown"` —
+    client-side `Date.now()`-based remaining-time text
+    (`formatCountdown`/`updateCountdownEl`), one shared `setInterval`
+    for every `.countdown` node on the page; an overdue row gets the
+    existing `var(--md-error)` semantic color token via a new
+    `.countdown-overdue` class, no new theme tokens.
+  - [x] `LANGUAGE.md` §11 documents `render` alongside `pattern`/
+    `format`/`min`/`max`, including the two named-but-undesigned
+    candidate siblings (`"badge"`/`"progress"`) the design doc itself
+    flagged, so `render` reads as an extensible key, not a countdown-
+    only hack.
+  - [x] Test coverage: 4 new `tests/screen_dsl.rs` typeck cases (correct
+    usage, wrong field type, unrecognized value, non-string value) plus
+    a real end-to-end `tests/emit_ui.rs` case (manifest wiring +
+    confirms the client-side countdown machinery is actually emitted).
+  - [x] Applied to `examples/ctms/ctms.nir`: `Matter` gained a real
+    `sla_deadline_unix: i64` field (threaded through every `matter`
+    CRUD/SQL statement, not just the struct declaration), `screen
+    Matter { field sla_deadline_unix { render: "countdown" } }`, plus
+    the companion `stat_cases_nearing_sla_breach` dashboard tile
+    `UI_CONSTRUCTS.md` §3's own "Open questions" named as the natural
+    pairing (an ordinary `stat_<name>() -> i64`, no `render` involved).
+  - [x] Full `cargo test` (whole suite) green — verified above.
 
 - `[OPEN]` **E4. `action { show_result: true }` — preview/simulate
   actions.** Unblocks the "simulate before apply" half of Rule Engine
@@ -2270,14 +2291,15 @@ E6 is the one item that waits on all five.*
     example.
   - [ ] Full `cargo test` green before `[DONE]`.
 
-- `[BLOCKED: E3–E5]` **E6. Rebuild `examples/ctms/ctms.nir` end-to-end.**
-  E1+E2 grew the file into a real, verified `Matter`/`Transaction`/
+- `[BLOCKED: E4–E5]` **E6. Rebuild `examples/ctms/ctms.nir` end-to-end.**
+  E1+E2+E3 grew the file into a real, verified `Matter`/`Transaction`/
   `MatterNote`/`Wallet`/`WalletLink` proof-of-concept (one `workspace`,
-  two panels — one now a live timeline —, a dashboard with two tiles
-  and a graph/heatmap visual each) — still nowhere near the 8-struct
-  plain-CRUD-only version `SCREENS.md`'s own intro names as this whole
-  initiative's starting point, let alone the full 89-screen inventory.
-  Once E3–E5 also land: rebuild it for real
+  two panels — one now a live timeline —, a dashboard with three tiles
+  (one live-SLA-aware) and a graph/heatmap visual each, plus a live SLA
+  countdown on the Matter Queue itself) — still nowhere near the
+  8-struct plain-CRUD-only version `SCREENS.md`'s own intro names as
+  this whole initiative's starting point, let alone the full 89-screen
+  inventory. Once E4–E5 also land: rebuild it for real
   against the actual CTMS screen inventory (`SCREENS.md`), not just the
   handful of worked-example screens E1–E5 individually touch — then
   verify it actually renders (`nirdosha emit-ui`) and serves (`nirdosha

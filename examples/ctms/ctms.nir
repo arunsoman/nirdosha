@@ -32,6 +32,10 @@ struct Matter {
     subject_name: str,
     status: str,
     risk_score: i64,
+    // Track E3's `field { render: "countdown" }` -- a unix-seconds SLA
+    // deadline, rendered as a live "23m left"/"OVERDUE" chip on the
+    // Matter Queue instead of a raw integer (`LANGUAGE.md` SS11c/SS3).
+    sla_deadline_unix: i64,
 }
 
 struct Transaction {
@@ -66,11 +70,11 @@ struct WalletLink {
 // ---- Matter: CRUD, SQLite-backed ---------------------------------------
 
 fn list_matter_inner(conn: db) -> Result(json, ErrorCode) {
-    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER)") {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") {
         Ok(n) => n,
         Err(e) => -1,
     }
-    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, subject_name, status, risk_score FROM matter ORDER BY id") {
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, subject_name, status, risk_score, sla_deadline_unix FROM matter ORDER BY id") {
         Ok(r) => Ok(r),
         Err(e) => Err(DbError(e)),
     }
@@ -86,11 +90,11 @@ fn list_matter() -> Result(json, ErrorCode) requires(public) {
 }
 
 fn get_matter_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
-    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER)") {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") {
         Ok(n) => n,
         Err(e) => -1,
     }
-    let row: Result(json, ErrorCode) = match db_query(conn, "SELECT id, subject_name, status, risk_score FROM matter WHERE id = ?", id) {
+    let row: Result(json, ErrorCode) = match db_query(conn, "SELECT id, subject_name, status, risk_score, sla_deadline_unix FROM matter WHERE id = ?", id) {
         Ok(r) => match json_array_get(r, 0) {
             Ok(one) => Ok(one),
             Err(e) => Err(DbError(e)),
@@ -109,11 +113,11 @@ fn get_matter(id: i64) -> Result(json, ErrorCode) requires(public) {
 }
 
 fn create_matter_inner(conn: db, m: Matter) -> Result(i64, ErrorCode) {
-    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER)") {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") {
         Ok(n) => n,
         Err(e) => -1,
     }
-    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO matter (subject_name, status, risk_score) VALUES (?, ?, ?)", m.subject_name, m.status, m.risk_score) {
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO matter (subject_name, status, risk_score, sla_deadline_unix) VALUES (?, ?, ?, ?)", m.subject_name, m.status, m.risk_score, m.sla_deadline_unix) {
         Ok(n) => Ok(n),
         Err(e) => Err(DbError(e)),
     }
@@ -129,11 +133,11 @@ fn create_matter(m: Matter) -> Result(i64, ErrorCode) requires(role: "investigat
 }
 
 fn update_matter_inner(conn: db, m: Matter) -> Result(i64, ErrorCode) {
-    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER)") {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") {
         Ok(n) => n,
         Err(e) => -1,
     }
-    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE matter SET subject_name = ?, status = ?, risk_score = ? WHERE id = ?", m.subject_name, m.status, m.risk_score, m.id) {
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE matter SET subject_name = ?, status = ?, risk_score = ?, sla_deadline_unix = ? WHERE id = ?", m.subject_name, m.status, m.risk_score, m.sla_deadline_unix, m.id) {
         Ok(n) => Ok(n),
         Err(e) => Err(DbError(e)),
     }
@@ -161,6 +165,18 @@ fn delete_matter(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
     return match db_connect("ctms.db") {
         Ok(conn) => delete_matter_inner(conn, id),
         Err(e) => Err(DbError(e)),
+    }
+}
+
+// Track E3 -- the Matter Queue's live SLA countdown. No grammar change:
+// `field { render: "countdown" }` is an ordinary `kv_entry` inside the
+// same `field <name> { ... }` block `label`/`pattern`/`min`/`max`
+// already use (`LANGUAGE.md` SS11c/SS3).
+screen Matter {
+    title: "Matter Queue"
+    field sla_deadline_unix {
+        label: "SLA"
+        render: "countdown"
     }
 }
 
@@ -406,7 +422,7 @@ fn create_wallet_link(l: WalletLink) -> Result(i64, ErrorCode) requires(role: "f
 // ---- Dashboard: tiles + Track E2's `visual`/`render` ------------------
 
 fn stat_open_matters_inner(conn: db) -> Result(i64, ErrorCode) {
-    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER)") {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") {
         Ok(n) => n,
         Err(e) => -1,
     }
@@ -453,6 +469,44 @@ fn stat_high_risk_wallet_count_inner(conn: db) -> Result(i64, ErrorCode) {
 fn stat_high_risk_wallet_count() -> Result(i64, ErrorCode) requires(public) {
     return match db_connect("ctms.db") {
         Ok(conn) => stat_high_risk_wallet_count_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+// The dashboard-tile companion to Track E3's per-row countdown chip
+// (`UI_CONSTRUCTS.md` SS3's own "Open questions": "just an ordinary
+// stat_<name>() -> i64 counting function -- no render involvement at
+// all"). `strftime('%s','now')` is SQLite's own clock, not Nirdosha's --
+// this language has no wall-clock builtin at all (`LANGUAGE.md` SS9's
+// deliberate no-wall-clock determinism stance), the same way this file
+// already leans on SQL's own `||`/`json_object` for what Nirdosha's own
+// expression grammar can't do, pushed into the query text rather than
+// the language itself.
+fn stat_cases_nearing_sla_breach_inner(conn: db) -> Result(i64, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, ErrorCode) = match db_query(
+        conn,
+        "SELECT COUNT(*) AS value FROM matter WHERE status = 'open' AND (sla_deadline_unix - strftime('%s','now')) BETWEEN 0 AND 3600"
+    ) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "value") {
+                Ok(n) => Ok(n),
+                Err(e) => Ok(0),
+            },
+            Err(e) => Ok(0),
+        },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn stat_cases_nearing_sla_breach() -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") {
+        Ok(conn) => stat_cases_nearing_sla_breach_inner(conn),
         Err(e) => Err(DbError(e)),
     }
 }
@@ -528,6 +582,7 @@ fn heatmap_transaction_geo() -> Result(json, ErrorCode) requires(public) {
 dashboard {
     tile "Open Matters" -> stat_open_matters
     tile "High-Risk Wallets" -> stat_high_risk_wallet_count
+    tile "Nearing SLA Breach" -> stat_cases_nearing_sla_breach
     visual "Wallet Clusters" -> graph_wallet_clusters {
         render: "graph"
     }

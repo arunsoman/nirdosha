@@ -342,6 +342,11 @@ __NIRDOSHA_THEME_SCRIPT__
   .mode-badge-demo { background: color-mix(in srgb, var(--brand-accent) 20%, transparent); color: var(--brand-accent); border: 1px solid color-mix(in srgb, var(--brand-accent) 45%, transparent); }
   .mode-badge-production { background: var(--md-surface-variant); color: var(--md-on-surface-variant); border: 1px solid var(--md-outline); }
   .gate-note { font-size: 12px; color: var(--md-error); margin-top: 4px; }
+  /* Track E3: field { render: "countdown" } -- live SLA countdown chip.
+     Reuses the existing semantic error color token for an overdue row,
+     no new theme tokens (`ROADMAP.md` Track E3). */
+  .countdown { font-variant-numeric: tabular-nums; }
+  .countdown-overdue { color: var(--md-error); font-weight: 500; }
   .row-actions { display: flex; gap: 6px; }
   .stub-note {
     font-size: 12px; color: var(--md-on-surface-variant); background: var(--md-surface-variant);
@@ -792,6 +797,45 @@ function cellText(f, row) {
   return v !== null && v !== undefined ? String(v) : "";
 }
 
+// ---- Track E3: field { render: "countdown" } -- live SLA/live-status
+// fields. Static-field, client-side ticking, zero new network traffic --
+// the deadline value itself already came down with the row like any
+// other field (`ROADMAP.md` Track E3, `LANGUAGE.md` SS11c's sibling
+// discussion). One shared `setInterval` for the whole page below walks
+// every `.countdown` node currently in the DOM, not one timer per row.
+function formatCountdown(deadlineUnix) {
+  const remaining = deadlineUnix - Math.floor(Date.now() / 1000);
+  if (remaining <= 0) return { text: "OVERDUE", overdue: true };
+  const h = Math.floor(remaining / 3600);
+  const m = Math.floor((remaining % 3600) / 60);
+  return { text: h > 0 ? `${h}h ${m}m left` : `${m}m left`, overdue: false };
+}
+
+function updateCountdownEl(node) {
+  const deadline = Number(node.dataset.deadline);
+  if (!Number.isFinite(deadline)) { node.textContent = ""; return; }
+  const { text, overdue } = formatCountdown(deadline);
+  node.textContent = text;
+  node.classList.toggle("countdown-overdue", overdue);
+}
+
+setInterval(() => {
+  document.querySelectorAll(".countdown").forEach(updateCountdownEl);
+}, 1000);
+
+// A table cell's own content -- a plain text node for every ordinary
+// field, or a live `.countdown` chip (immediately populated, not left
+// blank until the next tick) for one declared `render: "countdown"`.
+function buildCellContent(f, row) {
+  if (f.render === "countdown") {
+    const span = el("span", { class: "countdown" });
+    span.dataset.deadline = String(row ? row[f.name] : "");
+    updateCountdownEl(span);
+    return span;
+  }
+  return document.createTextNode(cellText(f, row));
+}
+
 // `openWorkspace`, when given (`renderScreen` passes the `WORKSPACES`
 // entry whose `subjectSnake` matches this screen, if any), adds one more
 // per-row button navigating to that instance's composite workspace
@@ -940,7 +984,7 @@ async function renderListScreen(screen, root, openWorkspace) {
     // ever multiplied here, not used as a CSS length directly.
     let rowIndex = 0;
     for (const row of list) {
-      const tds = visibleFields.map((f) => el("td", { text: cellText(f, row) }));
+      const tds = visibleFields.map((f) => el("td", {}, [buildCellContent(f, row)]));
       const colspan = visibleFields.length + (updateAction ? 1 : 0) + (deleteAction ? 1 : 0) + customActions.length + (openWorkspace ? 1 : 0);
       let tr, editRow = null;
       if (updateAction) {
