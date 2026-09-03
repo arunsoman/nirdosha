@@ -2019,7 +2019,7 @@ E6 is the one item that waits on all five.*
   construct at all — existing minimalism preserved, not inflated. —
   2026-09-03.
 
-- `[OPEN]` **E1. `workspace` / `panel` — composite multi-pane screens.**
+- `[DONE]` **E1. `workspace` / `panel` — composite multi-pane screens.**
   Highest-leverage item: ~18 of the 89 screens directly (Investigation
   Workspace, Alert Detail/Risk-Score Breakdown, Behavioural Profile, ML
   Model Management, Case Collaboration, Evidence Management, Decision
@@ -2030,47 +2030,75 @@ E6 is the one item that waits on all five.*
   lists from multiple structs, scoped to one subject-struct instance,
   onto a single screen; today's `screen <Struct> { ... }` is
   fundamentally one-struct-shaped and can't express this. Full design:
-  `UI_CONSTRUCTS.md` §1.
-  - [ ] Grammar: new `workspace_decl ::= "workspace" ident "{"
-    workspace_item* "}"`, `workspace_item ::= panel_decl | kv_entry`,
-    `panel_decl ::= "panel" string "{" panel_item* "}"`, `panel_item ::=
-    action_decl | kv_entry` (`GRAMMAR.md`, `item` production gains
-    `workspace_decl` alongside `screen_decl`/`dashboard_decl`); new
-    `parse_workspace_decl`/`parse_panel_decl` in `parser.rs`, mirroring
-    `parse_screen_decl`/`parse_field_override`.
-  - [ ] Cross-verify the grammar delta against `grammar_check/`'s
-    independent LALR(1) generator.
-  - [ ] Update `compiler/nirdosha.gbnf` to stay in sync with the new
-    productions.
-  - [ ] AST: `ast::WorkspaceDecl`/`PanelDecl`; `typeck.rs::check_workspace`
-    (mirroring `check_screen`) — `subject` resolves to a real struct with
-    an `id: i64` field, every panel's `source` resolves to a real fn
-    taking one `i64` param and returning `Result(json, E)`, every panel
-    `action`'s `->` target resolves, same shape checks `check_screen`'s
-    `action_decl` already gets.
-  - [ ] `ui_gen.rs`: new `struct Workspace`/`struct Panel`, a
-    `build_workspaces` pass alongside `build_screens`, a new `WORKSPACES`
-    top-level array in `manifest_json`.
-  - [ ] `ui_gen_template.html`: new `#/ws/<snake>/<id>` route,
-    `renderWorkspace` (subject header via existing singular-form
-    rendering, reused; each panel a `.card` fetched via the existing
-    `callFn`), panel actions reusing the existing action-button/confirm/
-    gating code path verbatim — same `.card`/`row-enter`/`--stagger-ms`
-    motion-token styling every other screen already uses, no new CSS or
-    animation vocabulary.
-  - [ ] `serve.rs`: confirm (this is the point of the design — expected
-    to be a no-op) that no new route is needed, since every panel
-    `source`/action is an ordinary already-secured `POST /api/<fn>` call.
-  - [ ] `LANGUAGE.md`: new `§15. workspace/panel` section, same register
-    as §11/§12/§14.
-  - [ ] New `compiler/tests/workspace_dsl.rs` (parse/typeck shape) plus
-    at least one real end-to-end case in `tests/emit_ui.rs`/a `serve`
-    integration test.
-  - [ ] Apply to `examples/ctms/ctms.nir`: build the Investigation
-    Workspace screen (Module 3) for real, per `UI_CONSTRUCTS.md` §1's
-    worked example.
-  - [ ] Full `cargo test` (whole suite) green before this item is
-    `[DONE]`.
+  `UI_CONSTRUCTS.md` §1. — 2026-09-03, verified: full `cargo test` green
+  (`mq.rs`'s pre-existing Redis-connection-refused failures unrelated,
+  present before this change), plus a real `nirdosha serve --db` smoke
+  test (create a matter, fetch it as the workspace header, create a
+  transaction, read it back through the panel `source` fn, add a note
+  through the panel `action`, read it back) and a `node --check` pass on
+  the extracted client `<script>` — not just "typechecks."
+  - [x] Grammar: `workspace_decl`/`panel_decl` added to `GRAMMAR.md` and
+    `compiler/nirdosha.gbnf`, `Tok::Workspace` (real reserved keyword)
+    + contextual `panel` in `token.rs`, `parse_workspace_decl`/
+    `parse_panel_decl` in `parser.rs`, mirroring `parse_screen_decl`
+    production-for-production.
+  - [x] Cross-verify against `grammar_check/`'s independent LALR(1)
+    generator — **found inapplicable, not silently skipped**: that
+    crate's `Item` production is still just `FnDecl` (pre-existing gap
+    predating this work — `struct`/`enum`/`screen`/`dashboard`/`module`/
+    `workflow` were never added there either, and the crate doesn't
+    build clean regardless, per its own README's disclosed statement-
+    boundary-ambiguity finding). Adding `workspace`/`panel` alone to a
+    crate that models none of the UI DSL would imply a cross-check that
+    doesn't exist — left undone, honestly, rather than faked.
+  - [x] `compiler/nirdosha.gbnf` updated (hand-maintained, not test-
+    verified — no `cargo test` target exercises it, confirmed by
+    inspection before assuming otherwise).
+  - [x] AST: `ast::WorkspaceDecl`/`PanelDecl` (`PanelActionDecl` is a
+    type alias to the existing `ActionDecl`, not a new type);
+    `typeck.rs::check_workspace` — `subject` resolves to a real struct
+    with an `id: i64` field, every panel's `source` resolves to a real
+    fn taking exactly one `i64` param and returning `Result(json, _)`
+    (`sig.ret` matched structurally, not just "resolves"), every panel
+    `action`'s `->` target resolves via the existing `check_fn_ref`.
+  - [x] `ui_gen.rs`: `struct Workspace`/`struct Panel`, `build_workspaces`
+    alongside `build_screens`, `workspaces_json`, a new `WORKSPACES`
+    top-level array threaded through `generate()` — no new parameter on
+    `generate()` itself, since workspaces come straight off the
+    already-passed `program`.
+  - [x] `ui_gen_template.html`: `#/ws/<snake>` (picker) and
+    `#/ws/<snake>/<id>` (the workspace) routes, `renderWorkspaceList`/
+    `renderWorkspace`/`renderPanel`, a "Workspaces" nav section. **One
+    real deviation from the design doc, disclosed**: the doc proposed
+    changing a subject screen's row click target; implemented instead as
+    an additive "Open Workspace" per-row button (`renderListScreen`
+    gained an optional 3rd `openWorkspace` param) — safer (doesn't
+    touch existing Edit/Delete semantics), same end capability. Panel
+    actions' param convention (first param = the workspace subject's own
+    id, pre-filled/hidden) was undesigned in the doc (its own "Panel
+    refresh" open question) — implemented and documented in both
+    `ui_gen_template.html` and `LANGUAGE.md` §15, not left silently
+    ambiguous.
+  - [x] `serve.rs`: confirmed a genuine no-op, as the design predicted —
+    not touched.
+  - [x] `LANGUAGE.md`: new `§15. workspace/panel` section.
+  - [x] `compiler/tests/workspace_dsl.rs` (10 tests: well-formed shape,
+    every rejection case — missing/unknown/id-less subject, missing/
+    unresolved/wrong-shape source, unresolved action target, and the
+    "no workspace block" regression guard) plus 2 real end-to-end cases
+    in `tests/emit_ui.rs` (manifest wiring incl. gating, and the
+    "no workspace" empty-array case).
+  - [x] Applied to `examples/ctms/ctms.nir` (recreated — it only existed
+    in git history at `c6d6e3e` before this). **A second real finding,
+    disclosed**: the worked example's `Case` struct was renamed
+    `Matter` — `CASE` (and, separately, `TRANSACTION`) are reserved SQL
+    keywords, confirmed by a real `sqlite3` failure
+    (`Parse error ... near "case": syntax error`) before this was
+    caught here rather than by a future author. This is deliberately a
+    proof-of-concept subset (`Matter`/`Transaction`/`MatterNote`, one
+    workspace, two panels) — not the full 89-screen rebuild, which is
+    still E6, blocked on E2–E5.
+  - [x] Full `cargo test` (whole suite) green — verified above.
 
 - `[OPEN]` **E2. `visual` dashboard/panel item + `render: "graph"|
   "heatmap"|"timeline"`.** Unblocks Case Linking/Entity Graph, Wallet
@@ -2198,19 +2226,17 @@ E6 is the one item that waits on all five.*
     example.
   - [ ] Full `cargo test` green before `[DONE]`.
 
-- `[BLOCKED: E1–E5]` **E6. Rebuild `examples/ctms/ctms.nir` end-to-end.**
-  The file doesn't exist in the working tree today — only in git history
-  (`git show c6d6e3e:examples/ctms/ctms.nir`), where it's the
-  8-struct/plain-CRUD-only version `SCREENS.md`'s own intro names as the
-  thing this whole initiative found falling short (no Investigation
-  Workspace, no graph views, no geo heatmap, no live-SLA queues, no
-  simulate actions, no workflow stepper). Once E1–E5 land: rebuild it
-  for real using all five constructs against the actual CTMS screen
-  inventory (`SCREENS.md`), not just the five worked-example screens
-  E1–E5 individually touch — then verify it actually renders
-  (`nirdosha emit-ui`) and serves (`nirdosha serve --db`) end to end,
-  the same "verified, not just written" bar this file holds every other
-  `[DONE]` item to.
+- `[BLOCKED: E2–E5]` **E6. Rebuild `examples/ctms/ctms.nir` end-to-end.**
+  E1 recreated the file as a real, verified `Matter`/`Transaction`/
+  `MatterNote` proof-of-concept (one `workspace`, two panels) — still
+  nowhere near the 8-struct plain-CRUD-only version `SCREENS.md`'s own
+  intro names as this whole initiative's starting point, let alone the
+  full 89-screen inventory. Once E2–E5 also land: rebuild it for real
+  against the actual CTMS screen inventory (`SCREENS.md`), not just the
+  handful of worked-example screens E1–E5 individually touch — then
+  verify it actually renders (`nirdosha emit-ui`) and serves (`nirdosha
+  serve --db`) end to end, the same "verified, not just written" bar
+  this file holds every other `[DONE]` item to.
 - `[DONE]` **E7. `PUBLIC_ROADMAP.md` — add a Track E entry.** Brief,
   external-facing mirror of Track D's own entry there — done as part of
   this same session, since it's small. — 2026-09-03.

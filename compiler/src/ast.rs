@@ -1437,6 +1437,12 @@ pub struct Program {
     /// never this field. Left populated (not drained) after lowering so
     /// diagnostics can still point at the original `workflow` syntax.
     pub workflows: Vec<WorkflowDecl>,
+    /// Declared `workspace Name { ... }` blocks (`ROADMAP.md` Track E1,
+    /// `examples/ctms/UI_CONSTRUCTS.md` §1) — composite multi-panel
+    /// screens, additive over `screens`/`dashboard` the same way those
+    /// are additive over pure naming-convention inference: a program
+    /// with no `workspace` block is unaffected.
+    pub workspaces: Vec<WorkspaceDecl>,
 }
 
 /// One `key: value` slot inside a `screen`/`dashboard`/`field`/`action`
@@ -1600,6 +1606,44 @@ pub struct WorkflowDecl {
     pub name: String,
     pub data: Vec<Field>,
     pub states: Vec<StateDecl>,
+    pub span: Span,
+}
+
+/// `action "<label>" -> <target_fn> { ... }` inside a `panel` block —
+/// syntactically the exact same production `screen`'s own `action_decl`
+/// uses (`parser.rs::parse_action_decl` is reused verbatim, not
+/// reimplemented), so this doesn't get its own type: a panel action IS
+/// an `ActionDecl`, just as `screen_item`'s own actions are.
+pub type PanelActionDecl = ActionDecl;
+
+/// `panel "<label>" { source: <fn> action "..." -> <fn> { ... } }` inside
+/// a `workspace` block — one composed section. `source` (and any other
+/// plain `key: value` slot, e.g. a future `render: "timeline"`) lives in
+/// `entries` like `screen`'s own top-level `kv_entry`s do; `ROADMAP.md`
+/// Track E1/E2 is what actually gives `render` meaning — this v1 parses
+/// and carries it, unexamined, exactly the forward-compatible posture
+/// `workflow`'s own `state_item::kv_entry` fallback already has.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PanelDecl {
+    pub title: String,
+    pub entries: Vec<KvEntry>,
+    pub actions: Vec<PanelActionDecl>,
+    pub span: Span,
+}
+
+/// `workspace <Name> { subject: <Struct> panel "<label>" { ... } ... }` —
+/// a composite, multi-panel screen scoped to one instance of `subject`
+/// (`UI_CONSTRUCTS.md` §1, `ROADMAP.md` Track E1). Unlike `screen`, which
+/// is fundamentally one-struct-shaped, a workspace composes fields/lists
+/// from several unrelated functions onto a single page, all keyed off
+/// one `subject` struct's `id`. `entries` holds top-level `key: value`
+/// slots (`title: "..."`, `subject: Case`) the same way `ScreenDecl`'s
+/// own `entries` do.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceDecl {
+    pub name: String,
+    pub entries: Vec<KvEntry>,
+    pub panels: Vec<PanelDecl>,
     pub span: Span,
 }
 

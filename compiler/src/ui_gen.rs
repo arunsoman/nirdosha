@@ -222,6 +222,42 @@ struct Screen {
     is_singular: bool,
 }
 
+/// One `panel "<label>" { source: <fn> ... }` inside a `workspace` block
+/// — a composed section, backed by a `source` fn already proven
+/// (`typeck.rs::check_workspace`) to take one `i64` param and return
+/// `Result(json, _)`. `source` is reused as an ordinary `Action` (kind
+/// `"source"`) purely for its existing gating-info plumbing
+/// (`requires_login`/`required_role`/`required_claim`) — the same reuse
+/// `WorkflowQueue::pending_fn` already makes of `Action` for a fn that
+/// isn't really a CRUD `list` either.
+struct Panel {
+    title: String,
+    source: Action,
+    actions: Vec<Action>,
+}
+
+/// `workspace <Name> { subject: <Struct> panel "..." { ... } }` — a
+/// composite, multi-panel screen scoped to one instance of `subject`
+/// (`ROADMAP.md` Track E1, `examples/ctms/UI_CONSTRUCTS.md` §1).
+/// `subject_fields` is `build_field_root` run over the subject struct's
+/// own fields — literally the same field→control mapping `Screen.fields`
+/// already uses, reused unchanged for the read-only header
+/// `ui_gen_template.html`'s `renderWorkspace` shows above the panels.
+struct Workspace {
+    name: String,
+    title: String,
+    subject_struct: String,
+    /// `get_<subject_snake>` if a real fn by that name exists (built via
+    /// `build_action`, same convention-fn lookup `build_screens` already
+    /// does for `get_<S>`); `None` only if the subject struct has no
+    /// `get_<S>` at all, in which case `ui_gen_template.html` skips the
+    /// read-only header fetch rather than guessing a fn name that would
+    /// just 404 — a disclosed degradation, not a broken feature.
+    subject_get: Option<Action>,
+    subject_fields: Vec<FieldSpec>,
+    panels: Vec<Panel>,
+}
+
 /// One derived "Workflows" nav entry (`WORKFLOW.md`'s "state ownership +
 /// a generated queue UI" section) — a declared `workflow` plus the two
 /// fns `workflow_lower.rs` always synthesizes for it
@@ -1052,6 +1088,87 @@ fn workflows_json(queues: &[WorkflowQueue]) -> String {
     serde_json::to_string(&value).expect("workflow manifest is built from plain strings/bools, always serializes")
 }
 
+/// One `Workspace` per declared `workspace` block — `typeck.rs::
+/// check_workspace` already proved `subject` names a real struct with an
+/// `id: i64` field and every panel's `source` has the right one-`i64`-
+/// param/`Result(json, _)` shape, so this trusts that the same way
+/// `build_screens`/`build_workflow_queues` trust their own typeck passes.
+/// A malformed workspace (already reported as an error) is simply
+/// skipped here rather than built partially — typecheck already failed
+/// the whole program in that case, so `ui_gen` never actually runs on it
+/// (`main.rs::typecheck_and_own` gates codegen on a clean typeck pass).
+fn build_workspaces(program: &Program, effects: &HashMap<String, FnEffects>) -> Vec<Workspace> {
+    let mut workspaces = vec![];
+    for wd in &program.workspaces {
+        let Some((_, Expr::Ident(subject_struct, _))) = wd.entries.iter().find(|(k, _)| k == "subject") else {
+            continue;
+        };
+        let snake = to_snake_case(subject_struct);
+        let subject_fields: Vec<FieldSpec> = resolve_struct(program, subject_struct)
+            .map(|s| s.fields.iter().map(|f| build_field_root(program, &f.name, &f.ty)).collect())
+            .unwrap_or_default();
+
+        let mut panels = vec![];
+        for pd in &wd.panels {
+            let Some((_, Expr::Ident(source_fn, _))) = pd.entries.iter().find(|(k, _)| k == "source") else {
+                continue;
+            };
+            let Some(source) = build_action(program, effects, "source", source_fn) else { continue };
+            let actions: Vec<Action> = pd.actions.iter().filter_map(|a| build_custom_action(program, effects, a)).collect();
+            panels.push(Panel { title: pd.title.clone(), source, actions });
+        }
+
+        let title = kv_str(&wd.entries, "title").map(str::to_string).unwrap_or_else(|| to_display_label(&wd.name));
+        let subject_get = build_action(program, effects, "get", &format!("get_{snake}"));
+        workspaces.push(Workspace {
+            name: wd.name.clone(),
+            title,
+            subject_struct: subject_struct.clone(),
+            subject_get,
+            subject_fields,
+            panels,
+        });
+    }
+    workspaces
+}
+
+fn workspaces_json(workspaces: &[Workspace]) -> String {
+    let value = serde_json::json!(workspaces
+        .iter()
+        .map(|w| serde_json::json!({
+            "name": w.name,
+            "snake": to_snake_case(&w.name),
+            "title": w.title,
+            "subject": w.subject_struct,
+            "subjectSnake": to_snake_case(&w.subject_struct),
+            "subjectGetFn": w.subject_get.as_ref().map(|a| a.fn_name.as_str()),
+            "subjectGetParam": w.subject_get.as_ref().and_then(|a| a.params.first()).map(|p| p.name.as_str()).unwrap_or("id"),
+            "subjectFields": w.subject_fields.iter().map(field_json).collect::<Vec<_>>(),
+            "panels": w.panels.iter().map(|p| serde_json::json!({
+                "title": p.title,
+                "sourceFn": p.source.fn_name,
+                // Guaranteed exactly one param by `typeck.rs::
+                // check_workspace`'s shape check before `ui_gen` ever
+                // runs (`main.rs::typecheck_and_own` gates codegen on a
+                // clean typeck pass) -- `unwrap_or("id")` is defensive
+                // only, never actually exercised.
+                "sourceParam": p.source.params.first().map(|f| f.name.as_str()).unwrap_or("id"),
+                "sourceRequiresLogin": p.source.requires_login,
+                "sourceRequiredRole": p.source.required_role,
+                "sourceRequiredClaim": p.source.required_claim,
+                "actions": p.actions.iter().map(|a| serde_json::json!({
+                    "fn": a.fn_name, "requiresLogin": a.requires_login,
+                    "requiredRole": a.required_role, "requiredClaim": a.required_claim,
+                    "badges": a.effect_badges,
+                    "params": a.params.iter().map(field_json).collect::<Vec<_>>(),
+                    "label": a.label, "style": a.style, "confirm": a.confirm,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }))
+        .collect::<Vec<_>>());
+    serde_json::to_string(&value).expect("workspace manifest is built from plain strings/bools, always serializes")
+}
+
 fn field_json(f: &FieldSpec) -> serde_json::Value {
     serde_json::json!({
         "name": f.name, "control": f.control, "required": f.required, "label": f.label,
@@ -1197,6 +1314,7 @@ pub fn generate(
     let stats = metrics_json(&build_stats(program));
     let charts = metrics_json(&build_charts(program));
     let workflows = workflows_json(&build_workflow_queues(program, effects));
+    let workspaces = workspaces_json(&build_workspaces(program, effects));
     let identity_base_js = match identity_base {
         Some(url) => serde_json::to_string(url).expect("a URL string always serializes"),
         None => "null".to_string(),
@@ -1208,6 +1326,7 @@ pub fn generate(
         .replace("__NIRDOSHA_STATS__", &stats)
         .replace("__NIRDOSHA_CHARTS__", &charts)
         .replace("__NIRDOSHA_WORKFLOWS__", &workflows)
+        .replace("__NIRDOSHA_WORKSPACES__", &workspaces)
         .replace("__NIRDOSHA_IDENTITY_BASE__", &identity_base_js)
         .replace("__NIRDOSHA_IDENTITY_CATALOG__", &identity_catalog)
         .replace("__NIRDOSHA_DEMO_MODE__", if demo_mode { "true" } else { "false" })
