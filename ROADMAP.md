@@ -2238,31 +2238,52 @@ E6 is the one item that waits on all five.*
     pairing (an ordinary `stat_<name>() -> i64`, no `render` involved).
   - [x] Full `cargo test` (whole suite) green — verified above.
 
-- `[OPEN]` **E4. `action { show_result: true }` — preview/simulate
+- `[DONE]` **E4. `action { show_result: true }` — preview/simulate
   actions.** Unblocks the "simulate before apply" half of Rule Engine
   Configuration, Scoring Weights Configuration, Policy Management
   Engine, RBAC/ABAC Policy Editor, Integrity/Tamper-Check, Audit Search
   & Export (~6 screens' worth of preview actions, not new screens on
   their own). **No grammar change** — one new boolean key inside the
-  existing `action_decl` body. Full design: `UI_CONSTRUCTS.md` §4.
-  - [ ] AST/typeck: `typeck.rs::check_screen`'s `action_decl` check
-    requires the target fn's return type be `Result(json, E)` whenever
-    `show_result: true` is present.
-  - [ ] `ui_gen.rs`: `Action` gains `show_result: bool` (default
-    `false`), threaded through `build_custom_action`.
-  - [ ] `ui_gen_template.html`: the existing action-button click handler
-    opens the existing modal/dialog primitive with the JSON response
-    pretty-printed, when `action.showResult` and the call succeeded — no
-    new CSS, no new animation.
-  - [ ] `LANGUAGE.md`: document `show_result` alongside `style`/
-    `confirm` in the `action` `kv_entry` list (§11).
-  - [ ] New test coverage: a typeck case (non-`Result(json, E)` target
-    rejected), plus a real end-to-end `serve` case confirming the
-    response is actually returned to the client for display.
-  - [ ] Apply to `examples/ctms/ctms.nir`: `"Simulate" -> 
-    simulate_policy_threshold { show_result: true }` on the Policy
-    Management Engine screen (Module 6), per `UI_CONSTRUCTS.md` §4's
-    worked example.
+  existing `action_decl` body. Full design: `UI_CONSTRUCTS.md` §4. —
+  2026-09-03, verified: full `cargo test` green (same pre-existing
+  `mq.rs` Redis gap, unrelated), plus a real `nirdosha serve --db`
+  smoke test (a real `CompliancePolicy` with a 10000-cent threshold,
+  two real transactions — one over, one under — `simulate_policy_threshold`
+  correctly returned `would_flag_count: 1`) and a `node --check` pass on
+  the extracted client `<script>`.
+  - [x] AST/typeck: `typeck.rs::check_action_show_result` — value must
+    be a bool literal; `true` requires the target fn's return type be
+    `Result(json, _)`, `false` (or absence) needs no shape at all.
+    Applies identically to a `screen`'s own action and, since both share
+    the exact same `ActionDecl`/`PanelActionDecl` type, a `workspace`
+    `panel`'s action too — not designed twice.
+  - [x] `ui_gen.rs`: `Action` gains `show_result: bool` (default
+    `false`), threaded through `build_custom_action` via a new
+    `kv_bool` helper (`kv_str`'s boolean sibling).
+  - [x] `ui_gen_template.html`: **found and closed a real gap in the
+    design's own assumption** — "the existing modal/dialog primitive"
+    doesn't exist; only a transient, auto-dismissing snackbar does,
+    unsuitable for a persistent JSON dump (confirmed by inspection
+    before assuming otherwise). Built `showResultModal` on a native
+    `<dialog>` element instead (built-in show/close semantics, zero
+    external dependency, same posture every other renderer here already
+    has) — wired into both action-click-handler call sites (a screen's
+    own custom row action, and a workspace panel's action).
+  - [x] `LANGUAGE.md` §11 documents `show_result` alongside `style`/
+    `confirm`, including that it's shared with `workspace` `panel`
+    actions.
+  - [x] Test coverage: 4 new `tests/screen_dsl.rs` typeck cases, 1 new
+    `tests/workspace_dsl.rs` case (panel-action reuse), 2 new real
+    end-to-end `tests/emit_ui.rs` cases (manifest wiring + confirms the
+    modal/click-handler wiring is actually emitted).
+  - [x] Applied to `examples/ctms/ctms.nir`: a real `CompliancePolicy`
+    struct + CRUD (Module 6's Policy Management Engine, a genuinely new
+    screen — this construct unblocks *actions inside* existing
+    CRUD screens, so there had to be one to attach it to) and
+    `simulate_policy_threshold` — `UI_CONSTRUCTS.md` §4's own worked
+    example, built for real against the actual `txn` table rather than
+    a sketch.
+  - [x] Full `cargo test` (whole suite) green — verified above.
   - [ ] Full `cargo test` green before `[DONE]`.
 
 - `[OPEN]` **E5. Workflow stage stepper.** Unblocks Case Workflow/Stage
@@ -2291,15 +2312,16 @@ E6 is the one item that waits on all five.*
     example.
   - [ ] Full `cargo test` green before `[DONE]`.
 
-- `[BLOCKED: E4–E5]` **E6. Rebuild `examples/ctms/ctms.nir` end-to-end.**
-  E1+E2+E3 grew the file into a real, verified `Matter`/`Transaction`/
-  `MatterNote`/`Wallet`/`WalletLink` proof-of-concept (one `workspace`,
-  two panels — one now a live timeline —, a dashboard with three tiles
-  (one live-SLA-aware) and a graph/heatmap visual each, plus a live SLA
-  countdown on the Matter Queue itself) — still nowhere near the
+- `[BLOCKED: E5]` **E6. Rebuild `examples/ctms/ctms.nir` end-to-end.**
+  E1+E2+E3+E4 grew the file into a real, verified `Matter`/`Transaction`/
+  `MatterNote`/`Wallet`/`WalletLink`/`CompliancePolicy` proof-of-concept
+  (one `workspace`, two panels — one now a live timeline —, a dashboard
+  with three tiles (one live-SLA-aware) and a graph/heatmap visual each,
+  a live SLA countdown on the Matter Queue, and a simulate-before-apply
+  action on the Policy Management Engine) — still nowhere near the
   8-struct plain-CRUD-only version `SCREENS.md`'s own intro names as
   this whole initiative's starting point, let alone the full 89-screen
-  inventory. Once E4–E5 also land: rebuild it for real
+  inventory. Once E5 also lands: rebuild it for real
   against the actual CTMS screen inventory (`SCREENS.md`), not just the
   handful of worked-example screens E1–E5 individually touch — then
   verify it actually renders (`nirdosha emit-ui`) and serves (`nirdosha

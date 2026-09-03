@@ -267,3 +267,33 @@ fn a_program_with_no_workspace_block_typechecks_exactly_as_before() {
     assert!(program.workspaces.is_empty());
     typecheck(&program).expect("a program with no workspace block should typecheck as before");
 }
+
+// ── Track E4: `action { show_result: true }` reused on a panel action ──
+
+#[test]
+fn panel_action_show_result_true_requires_a_json_result_too() {
+    let src = format!(
+        r#"
+        {PRELUDE}
+        struct Case {{ id: i64 }}
+        fn list_x(case_id: i64) -> Result(json, Text) {{
+            return match json_parse("[]") {{ Ok(v) => Ok(v), Err(e) => Err(Text(e)), }}
+        }}
+        fn do_thing(case_id: i64) -> i64 {{ return case_id }}
+        workspace W {{
+            subject: Case
+            panel "P" {{
+                source: list_x
+                action "Do" -> do_thing {{
+                    show_result: true
+                }}
+            }}
+        }}
+        fn main() {{}}
+    "#
+    );
+    assert!(matches!(
+        first_type_error(&src),
+        TypeErrorKind::ShowResultRequiresJsonResult { fn_name, .. } if fn_name == "do_thing"
+    ));
+}

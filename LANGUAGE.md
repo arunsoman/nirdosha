@@ -924,11 +924,20 @@ name); `field <name> { label: "..." }` overrides that field's displayed
 label everywhere one is shown (default: the raw field name); `list`/
 `create`/`update`/`delete` override which function backs that slot
 (default: the `<kind>_<snake_case_struct_name>` convention); a declared
-`action "<label>" -> <fn> { style: "filled"|"outlined", confirm: "..." }`
-renders as an extra per-row button beyond the inferred CRUD set, calling
-`<fn>` with just the row's own primary-key-shaped first param (the same
-single-param shape a declared `delete` action already uses) —
-`window.confirm(...)`-gated when `confirm` is set. `field { view, edit }`
+`action "<label>" -> <fn> { style: "filled"|"outlined", confirm: "...",
+show_result: true }` renders as an extra per-row button beyond the
+inferred CRUD set, calling `<fn>` with just the row's own primary-key-
+shaped first param (the same single-param shape a declared `delete`
+action already uses) — `window.confirm(...)`-gated when `confirm` is
+set. `show_result: true` (Track E4) opens `<fn>`'s own JSON response,
+pretty-printed, in a modal on success — for a "Simulate"/"Test"/"Preview"
+action whose entire value *is* its return value (a rule-change dry run
+naming how many transactions it would affect, say), rather than the
+plain row-refresh every other action already does. Typechecked: `<fn>`
+must return `Result(json, _)` whenever `show_result: true` is present —
+nothing else for the modal to show. Same key, same modal, also works on
+a `workspace` `panel`'s own `action` (§15) — both share the exact same
+`action "<label>" -> <fn> { ... }` shape. `field { view, edit }`
 (role/claim visibility) is enforced both client- and server-side (see
 below). `field { pattern: "<regex>" }` / `field { min/max: ... }`
 constrain a `str`/numeric field's value on both `create_<S>` and

@@ -426,6 +426,16 @@ pub enum TypeErrorKind {
     /// `InvalidFieldValidationExpr { key: "render" }` instead — this
     /// variant only ever fires once that shape check already passed.
     UnknownRenderValue { context: String, render: String, allowed: String },
+
+    // ---- Track E4's `action { show_result: true }` --------------------
+    /// `action "..." -> fn { show_result: true }` (on a `screen` or,
+    /// reused, a `workspace` `panel`) where `fn`'s return type isn't
+    /// `Result(json, _)` — nothing for `ui_gen_template.html`'s result
+    /// modal to actually show beyond what the row/panel refresh already
+    /// implies. `context` is a pre-formatted description (`"action
+    /// \"...\" on screen ..."` or `"...\" in workspace ..."`), the same
+    /// two-caller-one-check shape `UnknownRenderValue` already has.
+    ShowResultRequiresJsonResult { context: String, fn_name: String },
     /// A user `fn`'s parameter or return type is (or contains) `str` —
     /// the "enum favoring" rule: `str` may not cross a user function's
     /// call boundary, so categorical string data belongs in a real
@@ -777,6 +787,9 @@ impl std::fmt::Display for TypeError {
             TypeErrorKind::InvalidFieldValidationExpr { key } if key == "render" => {
                 write!(f, "{line}:{col}: `render` must be a string literal")
             }
+            TypeErrorKind::InvalidFieldValidationExpr { key } if key == "show_result" => {
+                write!(f, "{line}:{col}: `show_result` must be a boolean literal (`true`/`false`)")
+            }
             TypeErrorKind::InvalidFieldValidationExpr { key } => {
                 write!(f, "{line}:{col}: `{key}` must be an int or float literal")
             }
@@ -847,6 +860,11 @@ impl std::fmt::Display for TypeError {
             TypeErrorKind::UnknownRenderValue { context, render, allowed } => write!(
                 f,
                 "{line}:{col}: {context} {{ render: \"{render}\" }} — not a recognized render kind; use one of {allowed}"
+            ),
+            TypeErrorKind::ShowResultRequiresJsonResult { context, fn_name } => write!(
+                f,
+                "{line}:{col}: {context} {{ show_result: true }} — `{fn_name}` must return `Result(json, _)` \
+                 for there to be anything to show"
             ),
             TypeErrorKind::StrInFnSignature { fn_name, param_name: Some(param_name) } => write!(
                 f,
@@ -1572,7 +1590,45 @@ impl<'a> Checker<'a> {
         }
         for action in &screen.actions {
             self.check_fn_ref("action", &Expr::Ident(action.target_fn.clone(), action.span));
+            self.check_action_show_result(format!("`action \"{}\"` on `screen {}`", action.label, screen.struct_name), action);
         }
+    }
+
+    /// `action "..." -> fn { show_result: true }` (`ROADMAP.md` Track
+    /// E4) — on a `screen`'s own action or, reused unchanged since both
+    /// share the same `ActionDecl`/`PanelActionDecl` shape, a
+    /// `workspace` `panel`'s action. `show_result`'s value must be a
+    /// bool literal; when it's `true`, the target fn (already proven to
+    /// resolve by `check_fn_ref`) must return `Result(json, _)` — there
+    /// being nothing else `ui_gen_template.html`'s result modal could
+    /// show. `show_result: false`, or the key's plain absence, needs no
+    /// further check at all — the exact same "existence/shape only"
+    /// posture every other `screen`-block consumer here already has.
+    fn check_action_show_result(&mut self, context: String, action: &ActionDecl) {
+        let Some((_, value)) = action.entries.iter().find(|(k, _)| k == "show_result") else { return };
+        let Expr::Bool(show, _) = value else {
+            self.error(TypeErrorKind::InvalidFieldValidationExpr { key: "show_result".to_string() }, value.span());
+            return;
+        };
+        if !show {
+            return;
+        }
+        // `self.sigs.get(...)` borrows only `self.sigs`, with a `'a`
+        // lifetime independent of `&mut self` (`FnSig`'s own fields are
+        // owned, not references into `self`) -- but computing a plain
+        // `bool` first, the same "compute, then error" split
+        // `check_workspace`'s panel `source` shape check already uses,
+        // keeps this correct regardless and matches that precedent.
+        let is_json_result = self.sigs.get(&action.target_fn).map(|sig| matches!(&sig.ret, Ty::Named(n, args) if n == "Result" && args.first() == Some(&Ty::Json)));
+        if is_json_result == Some(false) {
+            self.error(
+                TypeErrorKind::ShowResultRequiresJsonResult { context, fn_name: action.target_fn.clone() },
+                value.span(),
+            );
+        }
+        // `None` (the fn doesn't resolve at all) is already reported by
+        // `check_fn_ref` above -- don't pile a second, confusing error
+        // about its return type on top of "this function doesn't exist."
     }
 
     /// `dashboard { tile "..." -> fn  chart "..." -> fn }` — each
@@ -1693,6 +1749,10 @@ impl<'a> Checker<'a> {
             }
             for action in &panel.actions {
                 self.check_fn_ref("action", &Expr::Ident(action.target_fn.clone(), action.span));
+                self.check_action_show_result(
+                    format!("`action \"{}\"` in `panel \"{}\"` on `workspace {}`", action.label, panel.title, ws.name),
+                    action,
+                );
             }
             // `panel "..." { render: "..." }` (Track E2) — same closed
             // vocabulary `visual`'s own `render` gets, reusing
