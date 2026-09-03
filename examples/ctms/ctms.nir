@@ -2012,4 +2012,154 @@ fn chart_violations_by_severity() -> Result(json, ErrorCode) requires(public) {
     return match db_connect("ctms.db") { Ok(conn) => chart_violations_by_severity_inner(conn), Err(e) => Err(DbError(e)) }
 }
 
+// ---- Module 5: Advanced Analytics, Reporting, and BI -------------------
+//
+// Executive/BI Home, Investigator Analytics View: fold into the one
+// program-wide `dashboard { }` block below, same "one dashboard per
+// program" constraint Module 3's role Homes already ran into. Geo
+// Heatmap: already built (Module 3's own "Transaction Geography"
+// visual, `heatmap_transaction_geo`) -- not rebuilt here. Graph Network
+// Explorer: already built (`graph_case_links`) -- reused, not rebuilt.
+// Self-Service Query Interface: **deliberately not built** --
+// `UI_CONSTRUCTS.md` SS7's own disclosed non-goal (an ad-hoc query
+// builder needs to compose arbitrary WHERE/SELECT text from user input,
+// which needs string concatenation Nirdosha's own expression grammar
+// doesn't have -- this isn't a small gap to route around, it's blocked
+// on a real language-level absence). Left honestly absent, not faked.
+
+module "Analytics & BI" {
+    struct AnalyticsReportSchedule {
+        id: i64,
+        template_name: str,
+        schedule_kind: str,
+        dispatch_channel: str,
+        last_dispatched_unix: i64,
+    }
+
+    struct DriftAlert {
+        id: i64,
+        entity_ref: str,
+        drift_score: i64,
+        acknowledged: bool,
+        detected_unix: i64,
+    }
+
+    struct AnalyticsAccessLogEntry {
+        id: i64,
+        accessed_by: str,
+        asset_name: str,
+        accessed_unix: i64,
+        action_kind: str,
+    }
+}
+
+fn list_analytics_report_schedule_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS analytics_report_schedule (id INTEGER PRIMARY KEY AUTOINCREMENT, template_name TEXT, schedule_kind TEXT, dispatch_channel TEXT, last_dispatched_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, template_name, schedule_kind, dispatch_channel, last_dispatched_unix FROM analytics_report_schedule ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_analytics_report_schedule() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_analytics_report_schedule_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_analytics_report_schedule_inner(conn: db, s: AnalyticsReportSchedule) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS analytics_report_schedule (id INTEGER PRIMARY KEY AUTOINCREMENT, template_name TEXT, schedule_kind TEXT, dispatch_channel TEXT, last_dispatched_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO analytics_report_schedule (template_name, schedule_kind, dispatch_channel, last_dispatched_unix) VALUES (?, ?, ?, ?)", s.template_name, s.schedule_kind, s.dispatch_channel, s.last_dispatched_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_analytics_report_schedule(s: AnalyticsReportSchedule) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => create_analytics_report_schedule_inner(conn, s), Err(e) => Err(DbError(e)) }
+}
+fn update_analytics_report_schedule_inner(conn: db, s: AnalyticsReportSchedule) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS analytics_report_schedule (id INTEGER PRIMARY KEY AUTOINCREMENT, template_name TEXT, schedule_kind TEXT, dispatch_channel TEXT, last_dispatched_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE analytics_report_schedule SET template_name = ?, schedule_kind = ?, dispatch_channel = ?, last_dispatched_unix = ? WHERE id = ?", s.template_name, s.schedule_kind, s.dispatch_channel, s.last_dispatched_unix, s.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_analytics_report_schedule(s: AnalyticsReportSchedule) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => update_analytics_report_schedule_inner(conn, s), Err(e) => Err(DbError(e)) }
+}
+
+screen AnalyticsReportSchedule {
+    title: "Analytics Report Generation & Scheduling"
+}
+
+fn list_drift_alert_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS drift_alert (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_ref TEXT, drift_score INTEGER, acknowledged INTEGER, detected_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, entity_ref, drift_score, acknowledged, detected_unix FROM drift_alert ORDER BY detected_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_drift_alert() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_drift_alert_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_drift_alert_inner(conn: db, d: DriftAlert) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS drift_alert (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_ref TEXT, drift_score INTEGER, acknowledged INTEGER, detected_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO drift_alert (entity_ref, drift_score, acknowledged, detected_unix) VALUES (?, ?, ?, ?)", d.entity_ref, d.drift_score, d.acknowledged, d.detected_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_drift_alert(d: DriftAlert) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => create_drift_alert_inner(conn, d), Err(e) => Err(DbError(e)) }
+}
+fn update_drift_alert_inner(conn: db, d: DriftAlert) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS drift_alert (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_ref TEXT, drift_score INTEGER, acknowledged INTEGER, detected_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE drift_alert SET entity_ref = ?, drift_score = ?, acknowledged = ?, detected_unix = ? WHERE id = ?", d.entity_ref, d.drift_score, d.acknowledged, d.detected_unix, d.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_drift_alert(d: DriftAlert) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms.db") { Ok(conn) => update_drift_alert_inner(conn, d), Err(e) => Err(DbError(e)) }
+}
+
+screen DriftAlert {
+    title: "Forecasting & Predictive Analytics"
+}
+
+fn list_analytics_access_log_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS analytics_access_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, accessed_by TEXT, asset_name TEXT, accessed_unix INTEGER, action_kind TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, accessed_by, asset_name, accessed_unix, action_kind FROM analytics_access_log_entry ORDER BY accessed_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_analytics_access_log_entry() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_analytics_access_log_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_analytics_access_log_entry_inner(conn: db, a: AnalyticsAccessLogEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS analytics_access_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, accessed_by TEXT, asset_name TEXT, accessed_unix INTEGER, action_kind TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO analytics_access_log_entry (accessed_by, asset_name, accessed_unix, action_kind) VALUES (?, ?, ?, ?)", a.accessed_by, a.asset_name, a.accessed_unix, a.action_kind) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_analytics_access_log_entry(a: AnalyticsAccessLogEntry) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms.db") { Ok(conn) => create_analytics_access_log_entry_inner(conn, a), Err(e) => Err(DbError(e)) }
+}
+
+screen AnalyticsAccessLogEntry {
+    title: "Analytics Access & Audit Log"
+}
+
+fn chart_windowed_txn_volume_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS txn (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, amount_cents INTEGER, geo_country TEXT, created_unix INTEGER, geo_lat REAL, geo_lng REAL)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT geo_country AS label, SUM(amount_cents) AS value FROM txn GROUP BY geo_country") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn chart_windowed_txn_volume() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => chart_windowed_txn_volume_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn stat_unacknowledged_drift_count_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS drift_alert (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_ref TEXT, drift_score INTEGER, acknowledged INTEGER, detected_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM drift_alert WHERE acknowledged = 0") {
+        Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn stat_unacknowledged_drift_count() -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => stat_unacknowledged_drift_count_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
 fn main() {}
