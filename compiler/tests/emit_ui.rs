@@ -778,3 +778,45 @@ fn an_action_with_no_show_result_key_still_serializes_it_as_false() {
     let html = emit_ui(include_str!("../../examples/ui_todo.nir"));
     assert!(html.contains(r#""showResult":false"#));
 }
+
+// ── Track E5: workflow stage stepper ────────────────────────────────────
+
+#[test]
+fn workflow_all_states_reach_the_manifest_in_declaration_order() {
+    let src = r#"
+        workflow CaseLifecycle {
+            data {
+                case_id: i64,
+            }
+            state Investigation {
+                on Escalate -> ComplianceEscalation
+            }
+            state ComplianceEscalation {
+                on Resolve -> Resolution
+            }
+            state Resolution {
+                on FileReport -> RegulatoryFiling
+            }
+            state RegulatoryFiling terminal {
+            }
+        }
+
+        fn main() {}
+    "#;
+    let html = emit_ui(src);
+
+    assert!(html.contains(
+        r#""allStates":["Investigation","ComplianceEscalation","Resolution","RegulatoryFiling"]"#
+    ));
+
+    // Client-side wiring: the stepper builder exists and is actually
+    // wired into the queue row renderer, replacing the old bare badge.
+    assert!(html.contains("function buildStepper(allStates, current, label)"));
+    assert!(html.contains("buildStepper(wf.allStates, row.state, row.state_label)"));
+}
+
+#[test]
+fn a_program_with_no_workflow_renders_an_empty_all_states_free_manifest() {
+    let html = emit_ui(include_str!("../../examples/ui_todo.nir"));
+    assert!(html.contains("const WORKFLOWS = [];"));
+}

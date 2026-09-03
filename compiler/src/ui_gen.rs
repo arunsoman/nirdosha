@@ -387,6 +387,14 @@ struct WorkflowQueue {
     /// action's single-id param already has.
     history_fn_name: String,
     data_fields: Vec<FieldSpec>,
+    /// `workflow Name { state A {} state B {} ... }`'s own `state` list,
+    /// in declaration order (`ROADMAP.md` Track E5) — read straight off
+    /// `ast::WorkflowDecl::states`, already parsed/typechecked, zero new
+    /// parsing. What lets the client draw a real "step 2 of 4" stepper
+    /// instead of a bare state-name label: a queue row's own `state`
+    /// only names *where* it is, never how many stages exist or which
+    /// came before/after.
+    all_states: Vec<String>,
 }
 
 /// `Todo` -> `todo`, `UserProfile` -> `user_profile`, `HTTPClient` ->
@@ -1218,6 +1226,7 @@ fn build_workflow_queues(program: &Program, effects: &HashMap<String, FnEffects>
             continue;
         };
         let data_fields: Vec<FieldSpec> = w.data.iter().map(|f| build_field_root(program, &f.name, &f.ty)).collect();
+        let all_states: Vec<String> = w.states.iter().map(|s| s.name.clone()).collect();
         queues.push(WorkflowQueue {
             name: w.name.clone(),
             title: to_display_label(&w.name),
@@ -1226,6 +1235,7 @@ fn build_workflow_queues(program: &Program, effects: &HashMap<String, FnEffects>
             submitted_by_me_fn,
             history_fn_name,
             data_fields,
+            all_states,
         });
     }
     queues
@@ -1244,6 +1254,7 @@ fn workflows_json(queues: &[WorkflowQueue]) -> String {
             "submittedByMeFn": q.submitted_by_me_fn.fn_name,
             "historyFn": q.history_fn_name,
             "dataFields": q.data_fields.iter().map(field_json).collect::<Vec<_>>(),
+            "allStates": q.all_states,
         }))
         .collect::<Vec<_>>());
     serde_json::to_string(&value).expect("workflow manifest is built from plain strings/bools, always serializes")

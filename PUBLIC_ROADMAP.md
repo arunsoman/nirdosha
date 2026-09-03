@@ -116,7 +116,12 @@ independent of Tracks A–D — see
 - [DONE] `action { show_result: true }` — a "Simulate"/"Preview" action
   shows its own JSON return value in a modal instead of just refreshing
   the row (`LANGUAGE.md` §11)
-- [OPEN] A workflow stage stepper — see `ROADMAP.md` Track E
+- [DONE] A workflow stage stepper — a real `●━●━○━○` progress stepper
+  on a workflow queue row instead of a bare state-name badge, no syntax
+  change (`LANGUAGE.md` §14)
+- [OPEN] Rebuild `examples/ctms/ctms.nir` end-to-end against the full
+  89-screen inventory — every construct it needs now exists — see
+  `ROADMAP.md` Track E
 
 ---
 
