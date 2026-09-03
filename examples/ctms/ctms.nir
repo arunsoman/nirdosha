@@ -756,6 +756,8 @@ dashboard {
     tile "Open Matters" -> stat_open_matters
     tile "High-Risk Wallets" -> stat_high_risk_wallet_count
     tile "Nearing SLA Breach" -> stat_cases_nearing_sla_breach
+    tile "Unread Notifications" -> stat_unread_notification_count
+    tile "Unhealthy Services" -> stat_unhealthy_service_count
     visual "Wallet Clusters" -> graph_wallet_clusters {
         render: "graph"
     }
@@ -3200,6 +3202,530 @@ fn stat_tamper_alert_count_inner(conn: db) -> Result(i64, ErrorCode) {
 }
 fn stat_tamper_alert_count() -> Result(i64, ErrorCode) requires(public) {
     return match db_connect("ctms.db") { Ok(conn) => stat_tamper_alert_count_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
+// ---- Cross-Cutting Screens (no single owning module) --------------------
+
+module "Cross-Cutting" {
+    struct NotificationEntry {
+        id: i64,
+        module_name: str,
+        alert_type: str,
+        source_ref: str,
+        message: str,
+        occurred_unix: i64,
+        read_status: bool,
+    }
+
+    // Global Search: a materialized cross-module index, faceted by
+    // module/entity type. A live free-text search bar isn't a built UI
+    // construct yet (no string-concatenation in Nirdosha's own expression
+    // grammar to build an ad-hoc `LIKE '%...%'` query from user input --
+    // same disclosed gap `UI_CONSTRUCTS.md`'s Self-Service Query
+    // Interface note names, Module 5) -- this ships the indexed data plus
+    // an exact-match-by-module filter fn, callable via the API today.
+    struct SearchIndexEntry {
+        id: i64,
+        entity_type: str,
+        entity_id: i64,
+        title: str,
+        module_name: str,
+        indexed_unix: i64,
+    }
+
+    struct UserSession {
+        id: i64,
+        username: str,
+        device_info: str,
+        ip_address: str,
+        login_unix: i64,
+        active: bool,
+    }
+
+    struct MfaEnrollment {
+        id: i64,
+        username: str,
+        method: str,
+        enrolled_unix: i64,
+        active: bool,
+    }
+
+    // System Health / Observability: a plain service-status list.
+    // "Prometheus/Grafana-style" implies a service x metric grid --
+    // `render: "heatmap"` needs lat/lng geo points (see
+    // `heatmap_transaction_geo`), so it's the wrong fit here; a real
+    // matrix visual isn't a built construct yet. This ships the
+    // underlying per-service health rows a matrix would be built from.
+    struct ServiceHealthEntry {
+        id: i64,
+        service_name: str,
+        status: str,
+        error_rate_pct: i64,
+        kafka_lag_ms: i64,
+        checked_unix: i64,
+    }
+
+    struct MasterEntity {
+        id: i64,
+        entity_name: str,
+        entity_type: str,
+        kyc_status: str,
+        risk_score: i64,
+        flagged: bool,
+    }
+
+    struct EntityTransactionLink {
+        id: i64,
+        entity_id: i64,
+        txn_ref: str,
+        amount_cents: i64,
+        occurred_unix: i64,
+    }
+
+    struct EntityCaseLink {
+        id: i64,
+        entity_id: i64,
+        case_ref: str,
+        case_status: str,
+    }
+
+    struct RiskScoreHistoryEntry {
+        id: i64,
+        entity_id: i64,
+        score: i64,
+        recorded_unix: i64,
+    }
+
+    struct EntityLink {
+        id: i64,
+        source_entity_id: i64,
+        target_entity_id: i64,
+        link_reason: str,
+    }
+
+    struct WalletKycSubmission {
+        id: i64,
+        exchange_name: str,
+        wallet_address: str,
+        kyc_document_ref: str,
+        review_status: str,
+        submitted_unix: i64,
+    }
+
+    struct InterBankAlert {
+        id: i64,
+        from_institution: str,
+        alert_message: str,
+        occurred_unix: i64,
+        acknowledged: bool,
+    }
+
+    struct FederatedWorkflowStatusEntry {
+        id: i64,
+        submission_id: i64,
+        stage: str,
+        updated_unix: i64,
+    }
+}
+
+// -- Global Notification / Alert Center -----------------------------------
+
+fn list_notification_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS notification_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, module_name TEXT, alert_type TEXT, source_ref TEXT, message TEXT, occurred_unix INTEGER, read_status INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, module_name, alert_type, source_ref, message, occurred_unix, read_status FROM notification_entry ORDER BY occurred_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_notification_entry() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_notification_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_notification_entry_inner(conn: db, n: NotificationEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS notification_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, module_name TEXT, alert_type TEXT, source_ref TEXT, message TEXT, occurred_unix INTEGER, read_status INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO notification_entry (module_name, alert_type, source_ref, message, occurred_unix, read_status) VALUES (?, ?, ?, ?, ?, ?)", n.module_name, n.alert_type, n.source_ref, n.message, n.occurred_unix, n.read_status) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_notification_entry(n: NotificationEntry) -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => create_notification_entry_inner(conn, n), Err(e) => Err(DbError(e)) }
+}
+fn mark_notification_read_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS notification_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, module_name TEXT, alert_type TEXT, source_ref TEXT, message TEXT, occurred_unix INTEGER, read_status INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE notification_entry SET read_status = 1 WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn mark_notification_read(id: i64) -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => mark_notification_read_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+fn stat_unread_notification_count_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS notification_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, module_name TEXT, alert_type TEXT, source_ref TEXT, message TEXT, occurred_unix INTEGER, read_status INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM notification_entry WHERE read_status = 0") {
+        Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn stat_unread_notification_count() -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => stat_unread_notification_count_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
+screen NotificationEntry {
+    title: "Global Notification / Alert Center"
+    action "Mark Read" -> mark_notification_read {
+        style: "outlined"
+    }
+}
+
+// -- Global Search ----------------------------------------------------------
+
+fn list_search_index_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS search_index_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT, entity_id INTEGER, title TEXT, module_name TEXT, indexed_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, entity_type, entity_id, title, module_name, indexed_unix FROM search_index_entry ORDER BY indexed_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_search_index_entry() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_search_index_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_search_index_entry_inner(conn: db, s: SearchIndexEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS search_index_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT, entity_id INTEGER, title TEXT, module_name TEXT, indexed_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO search_index_entry (entity_type, entity_id, title, module_name, indexed_unix) VALUES (?, ?, ?, ?, ?)", s.entity_type, s.entity_id, s.title, s.module_name, s.indexed_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_search_index_entry(s: SearchIndexEntry) -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => create_search_index_entry_inner(conn, s), Err(e) => Err(DbError(e)) }
+}
+fn search_index_entry_by_module_inner(conn: db, module_name: Text) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS search_index_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT, entity_id INTEGER, title TEXT, module_name TEXT, indexed_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, entity_type, entity_id, title, module_name FROM search_index_entry WHERE module_name = ? ORDER BY indexed_unix DESC", module_name.value) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn search_index_entry_by_module(module_name: Text) -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => search_index_entry_by_module_inner(conn, module_name), Err(e) => Err(DbError(e)) }
+}
+
+screen SearchIndexEntry {
+    title: "Global Search"
+}
+
+// -- User & Session Security (self-service) --------------------------------
+//
+// Login history reuses Module 9's `AccessLogEntry` list/detail (already
+// built) rather than a second copy of the same data.
+
+fn list_user_session_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS user_session (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, device_info TEXT, ip_address TEXT, login_unix INTEGER, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, username, device_info, ip_address, login_unix, active FROM user_session ORDER BY login_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_user_session() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_user_session_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_user_session_inner(conn: db, s: UserSession) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS user_session (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, device_info TEXT, ip_address TEXT, login_unix INTEGER, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO user_session (username, device_info, ip_address, login_unix, active) VALUES (?, ?, ?, ?, ?)", s.username, s.device_info, s.ip_address, s.login_unix, s.active) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_user_session(s: UserSession) -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => create_user_session_inner(conn, s), Err(e) => Err(DbError(e)) }
+}
+fn revoke_session_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS user_session (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, device_info TEXT, ip_address TEXT, login_unix INTEGER, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE user_session SET active = 0 WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn revoke_session(id: i64) -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => revoke_session_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
+screen UserSession {
+    title: "My Active Sessions"
+    action "Revoke Session" -> revoke_session {
+        style: "outlined"
+        confirm: "Sign this session out immediately?"
+    }
+}
+
+fn list_mfa_enrollment_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS mfa_enrollment (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, method TEXT, enrolled_unix INTEGER, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, username, method, enrolled_unix, active FROM mfa_enrollment ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_mfa_enrollment() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_mfa_enrollment_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_mfa_enrollment_inner(conn: db, m: MfaEnrollment) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS mfa_enrollment (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, method TEXT, enrolled_unix INTEGER, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO mfa_enrollment (username, method, enrolled_unix, active) VALUES (?, ?, ?, ?)", m.username, m.method, m.enrolled_unix, m.active) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_mfa_enrollment(m: MfaEnrollment) -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => create_mfa_enrollment_inner(conn, m), Err(e) => Err(DbError(e)) }
+}
+
+screen MfaEnrollment {
+    title: "MFA Setup"
+}
+
+// -- System Health / Observability -----------------------------------------
+
+fn list_service_health_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS service_health_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, service_name TEXT, status TEXT, error_rate_pct INTEGER, kafka_lag_ms INTEGER, checked_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, service_name, status, error_rate_pct, kafka_lag_ms, checked_unix FROM service_health_entry ORDER BY service_name") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_service_health_entry() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_service_health_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_service_health_entry_inner(conn: db, s: ServiceHealthEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS service_health_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, service_name TEXT, status TEXT, error_rate_pct INTEGER, kafka_lag_ms INTEGER, checked_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO service_health_entry (service_name, status, error_rate_pct, kafka_lag_ms, checked_unix) VALUES (?, ?, ?, ?, ?)", s.service_name, s.status, s.error_rate_pct, s.kafka_lag_ms, s.checked_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_service_health_entry(s: ServiceHealthEntry) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms.db") { Ok(conn) => create_service_health_entry_inner(conn, s), Err(e) => Err(DbError(e)) }
+}
+fn update_service_health_entry_inner(conn: db, s: ServiceHealthEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS service_health_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, service_name TEXT, status TEXT, error_rate_pct INTEGER, kafka_lag_ms INTEGER, checked_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE service_health_entry SET service_name = ?, status = ?, error_rate_pct = ?, kafka_lag_ms = ?, checked_unix = ? WHERE id = ?", s.service_name, s.status, s.error_rate_pct, s.kafka_lag_ms, s.checked_unix, s.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_service_health_entry(s: ServiceHealthEntry) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms.db") { Ok(conn) => update_service_health_entry_inner(conn, s), Err(e) => Err(DbError(e)) }
+}
+fn stat_unhealthy_service_count_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS service_health_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, service_name TEXT, status TEXT, error_rate_pct INTEGER, kafka_lag_ms INTEGER, checked_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM service_health_entry WHERE status != 'healthy'") {
+        Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn stat_unhealthy_service_count() -> Result(i64, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => stat_unhealthy_service_count_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
+screen ServiceHealthEntry {
+    title: "System Health / Observability"
+}
+
+// -- Entity 360 / Master Entity Profile --------------------------------------
+
+fn list_master_entity_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS master_entity (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_name TEXT, entity_type TEXT, kyc_status TEXT, risk_score INTEGER, flagged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, entity_name, entity_type, kyc_status, risk_score, flagged FROM master_entity ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_master_entity() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_master_entity_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_master_entity_inner(conn: db, m: MasterEntity) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS master_entity (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_name TEXT, entity_type TEXT, kyc_status TEXT, risk_score INTEGER, flagged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO master_entity (entity_name, entity_type, kyc_status, risk_score, flagged) VALUES (?, ?, ?, ?, ?)", m.entity_name, m.entity_type, m.kyc_status, m.risk_score, m.flagged) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_master_entity(m: MasterEntity) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") { Ok(conn) => create_master_entity_inner(conn, m), Err(e) => Err(DbError(e)) }
+}
+fn flag_entity_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS master_entity (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_name TEXT, entity_type TEXT, kyc_status TEXT, risk_score INTEGER, flagged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE master_entity SET flagged = 1 WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn flag_entity(id: i64) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") { Ok(conn) => flag_entity_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+fn add_entity_to_watchlist_inner(conn: db, entity_id: i64, reason: Text) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS watchlist_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_ref TEXT, reason TEXT, source TEXT, added_unix INTEGER, listed INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO watchlist_entry (entity_ref, reason, source, added_unix, listed) VALUES (CAST(? AS TEXT), ?, 'entity_360', CAST(strftime('%s','now') AS INTEGER), 1)", entity_id, reason.value) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn add_entity_to_watchlist(entity_id: i64, reason: Text) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") { Ok(conn) => add_entity_to_watchlist_inner(conn, entity_id, reason), Err(e) => Err(DbError(e)) }
+}
+fn open_new_case_for_entity_inner(conn: db, entity_id: i64, subject_name: Text) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO matter (subject_name, status, risk_score, sla_deadline_unix) VALUES (?, 'Open', 0, CAST(strftime('%s','now','+7 days') AS INTEGER))", subject_name.value) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn open_new_case_for_entity(entity_id: i64, subject_name: Text) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") { Ok(conn) => open_new_case_for_entity_inner(conn, entity_id, subject_name), Err(e) => Err(DbError(e)) }
+}
+
+fn list_entity_transaction_link_for_entity_inner(conn: db, entity_id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS entity_transaction_link (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_id INTEGER, txn_ref TEXT, amount_cents INTEGER, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT occurred_unix AS ts, (txn_ref || ' -- ' || CAST(amount_cents AS TEXT) || ' cents') AS label FROM entity_transaction_link WHERE entity_id = ? ORDER BY occurred_unix", entity_id) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_entity_transaction_link_for_entity(entity_id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") { Ok(conn) => list_entity_transaction_link_for_entity_inner(conn, entity_id), Err(e) => Err(DbError(e)) }
+}
+
+fn list_entity_case_link_for_entity_inner(conn: db, entity_id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS entity_case_link (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_id INTEGER, case_ref TEXT, case_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, case_ref, case_status FROM entity_case_link WHERE entity_id = ? ORDER BY id", entity_id) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_entity_case_link_for_entity(entity_id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") { Ok(conn) => list_entity_case_link_for_entity_inner(conn, entity_id), Err(e) => Err(DbError(e)) }
+}
+
+fn list_risk_score_history_entry_for_entity_inner(conn: db, entity_id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS risk_score_history_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_id INTEGER, score INTEGER, recorded_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT recorded_unix AS ts, ('Risk score ' || CAST(score AS TEXT)) AS label FROM risk_score_history_entry WHERE entity_id = ? ORDER BY recorded_unix", entity_id) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_risk_score_history_entry_for_entity(entity_id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") { Ok(conn) => list_risk_score_history_entry_for_entity_inner(conn, entity_id), Err(e) => Err(DbError(e)) }
+}
+
+// `entity_id` scopes the graph to just that entity's own neighborhood
+// (itself plus anything directly linked to it) -- the panel contract
+// (`UI_CONSTRUCTS.md` Track E1) requires every panel `source` to take
+// exactly one `i64` subject-id parameter, so this can't be the
+// unscoped whole-graph query `graph_case_links`/`graph_wallet_clusters`
+// use on the shared dashboard.
+fn graph_entity_links_inner(conn: db, entity_id: i64) -> Result(json, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS master_entity (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_name TEXT, entity_type TEXT, kyc_status TEXT, risk_score INTEGER, flagged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let c2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS entity_link (id INTEGER PRIMARY KEY AUTOINCREMENT, source_entity_id INTEGER, target_entity_id INTEGER, link_reason TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(json, ErrorCode) = match db_query(
+        conn,
+        "SELECT json_object('nodes', (SELECT json_group_array(json_object('id', id, 'label', entity_name, 'risk', risk_score)) FROM master_entity WHERE id = ? OR id IN (SELECT target_entity_id FROM entity_link WHERE source_entity_id = ?) OR id IN (SELECT source_entity_id FROM entity_link WHERE target_entity_id = ?)), 'edges', (SELECT json_group_array(json_object('source', source_entity_id, 'target', target_entity_id)) FROM entity_link WHERE source_entity_id = ? OR target_entity_id = ?)) AS value",
+        entity_id, entity_id, entity_id, entity_id, entity_id
+    ) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") {
+                Ok(s) => match json_parse(s) { Ok(v) => Ok(v), Err(e) => Err(DbError(e)) },
+                Err(e) => Err(DbError(e)),
+            },
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn graph_entity_links(entity_id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms.db") { Ok(conn) => graph_entity_links_inner(conn, entity_id), Err(e) => Err(DbError(e)) }
+}
+
+workspace EntityProfile {
+    title: "Entity 360"
+    subject: MasterEntity
+
+    panel "Transactions" {
+        source: list_entity_transaction_link_for_entity
+        render: "timeline"
+    }
+    panel "Alerts & Cases" {
+        source: list_entity_case_link_for_entity
+    }
+    panel "Risk Score Trend" {
+        source: list_risk_score_history_entry_for_entity
+        render: "timeline"
+    }
+    panel "Linked Entities" {
+        source: graph_entity_links
+        render: "graph"
+    }
+    panel "Actions" {
+        source: list_entity_case_link_for_entity
+        action "Flag Entity" -> flag_entity {
+            style: "outlined"
+            confirm: "Flag this entity for review?"
+        }
+        action "Add to Watchlist" -> add_entity_to_watchlist {
+            style: "outlined"
+        }
+        action "Open New Case" -> open_new_case_for_entity {
+            style: "filled"
+        }
+    }
+}
+
+// -- Exchange/Partner FI Portal -----------------------------------------------
+
+fn list_wallet_kyc_submission_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet_kyc_submission (id INTEGER PRIMARY KEY AUTOINCREMENT, exchange_name TEXT, wallet_address TEXT, kyc_document_ref TEXT, review_status TEXT, submitted_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, exchange_name, wallet_address, kyc_document_ref, review_status, submitted_unix FROM wallet_kyc_submission ORDER BY submitted_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_wallet_kyc_submission() -> Result(json, ErrorCode) requires(public) {
+    return match db_connect("ctms.db") { Ok(conn) => list_wallet_kyc_submission_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_wallet_kyc_submission_inner(conn: db, w: WalletKycSubmission) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet_kyc_submission (id INTEGER PRIMARY KEY AUTOINCREMENT, exchange_name TEXT, wallet_address TEXT, kyc_document_ref TEXT, review_status TEXT, submitted_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO wallet_kyc_submission (exchange_name, wallet_address, kyc_document_ref, review_status, submitted_unix) VALUES (?, ?, ?, 'pending', ?)", w.exchange_name, w.wallet_address, w.kyc_document_ref, w.submitted_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_wallet_kyc_submission(w: WalletKycSubmission) -> Result(i64, ErrorCode) requires(role: "exchange_partner") {
+    return match db_connect("ctms.db") { Ok(conn) => create_wallet_kyc_submission_inner(conn, w), Err(e) => Err(DbError(e)) }
+}
+
+fn list_inter_bank_alert_for_submission_inner(conn: db, submission_id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS inter_bank_alert (id INTEGER PRIMARY KEY AUTOINCREMENT, submission_id INTEGER, from_institution TEXT, alert_message TEXT, occurred_unix INTEGER, acknowledged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, from_institution, alert_message, occurred_unix, acknowledged FROM inter_bank_alert WHERE submission_id = ? ORDER BY occurred_unix DESC", submission_id) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_inter_bank_alert_for_submission(submission_id: i64) -> Result(json, ErrorCode) requires(role: "exchange_partner") {
+    return match db_connect("ctms.db") { Ok(conn) => list_inter_bank_alert_for_submission_inner(conn, submission_id), Err(e) => Err(DbError(e)) }
+}
+fn acknowledge_inter_bank_alert_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS inter_bank_alert (id INTEGER PRIMARY KEY AUTOINCREMENT, submission_id INTEGER, from_institution TEXT, alert_message TEXT, occurred_unix INTEGER, acknowledged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE inter_bank_alert SET acknowledged = 1 WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn acknowledge_inter_bank_alert(id: i64) -> Result(i64, ErrorCode) requires(role: "exchange_partner") {
+    return match db_connect("ctms.db") { Ok(conn) => acknowledge_inter_bank_alert_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
+fn list_federated_workflow_status_entry_for_submission_inner(conn: db, submission_id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS federated_workflow_status_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, submission_id INTEGER, stage TEXT, updated_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, stage, updated_unix FROM federated_workflow_status_entry WHERE submission_id = ? ORDER BY updated_unix DESC", submission_id) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_federated_workflow_status_entry_for_submission(submission_id: i64) -> Result(json, ErrorCode) requires(role: "exchange_partner") {
+    return match db_connect("ctms.db") { Ok(conn) => list_federated_workflow_status_entry_for_submission_inner(conn, submission_id), Err(e) => Err(DbError(e)) }
+}
+
+workspace ExchangePartnerPortal {
+    title: "Exchange / Partner FI Portal"
+    subject: WalletKycSubmission
+
+    panel "Inter-Bank Alerts" {
+        source: list_inter_bank_alert_for_submission
+        action "Acknowledge" -> acknowledge_inter_bank_alert {
+            style: "outlined"
+        }
+    }
+    panel "Federated Workflow Status" {
+        source: list_federated_workflow_status_entry_for_submission
+    }
 }
 
 fn main() {}
