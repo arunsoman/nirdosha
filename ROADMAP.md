@@ -2323,23 +2323,53 @@ E6 is the one item that waits on all five.*
     bare skeleton.
   - [x] Full `cargo test` (whole suite) green — verified above.
 
-- `[OPEN]` **E6. Rebuild `examples/ctms/ctms.nir` end-to-end.** E1–E5
-  are now all `[DONE]` — every construct this rebuild needs exists and
-  is verified. E1–E5 each grew the file into a real, verified
-  `Matter`/`Transaction`/`MatterNote`/`Wallet`/`WalletLink`/
-  `CompliancePolicy` proof-of-concept plus a `CaseLifecycle` workflow
-  (one `workspace`, two panels — one a live timeline —, a dashboard
-  with three tiles (one live-SLA-aware) and a graph/heatmap visual each,
-  a live SLA countdown on the Matter Queue, a simulate-before-apply
-  action on the Policy Management Engine, and a real 4-stage workflow
-  stepper) — still nowhere near the 8-struct plain-CRUD-only version
-  `SCREENS.md`'s own intro names as this whole initiative's starting
-  point, let alone the full 89-screen inventory. Now unblocked: rebuild
-  it for real against the actual CTMS screen inventory (`SCREENS.md`),
-  not just the handful of worked-example screens E1–E5 individually
-  touch — then verify it actually renders (`nirdosha emit-ui`) and
-  serves (`nirdosha serve --db`) end to end, the same "verified, not
-  just written" bar this file holds every other `[DONE]` item to.
+- `[DONE]` **E6. Rebuild `examples/ctms/ctms.nir` end-to-end.** All 10
+  modules plus the 6 cross-cutting screens from `SCREENS.md`'s 89-screen
+  inventory are now built, one module/batch per commit (10 module
+  commits + 1 cross-cutting commit), each independently typecheck +
+  `cargo build` + `emit-ui` + live `serve --db` smoke-test verified
+  before committing:
+  - Module 1 Data Ingestion, Module 2 Fraud Detection & Alerting
+    (`workspace AlertRiskBreakdown`), Module 3 Case Management
+    (`workspace CaseInvestigation`, `graph_case_links`,
+    `CaseLifecycle` workflow), Module 4 Regulatory & Secure Data
+    Exchange, Module 5 Analytics & BI (Self-Service Query Interface
+    explicitly scoped out — no string concatenation to build an ad-hoc
+    query, documented inline), Module 6 Compliance (Policy Management
+    Engine's `simulate_policy_threshold` show_result action,
+    `FilingDeadline`'s countdown chip), Module 7 Crypto/Virtual Asset
+    Risk (`simulate_card_crypto_detection` show_result), Module 8 RTFDS
+    (`graph_device_linkage`; `override_rtfds_action` left unwired to a
+    screen — no natural multi-param-action home, documented inline),
+    Module 9 IAM (`RoleElevationApproval`, proving multiple `workflow`
+    blocks coexist in one program — unlike the single-`dashboard{}`
+    constraint), Module 10 Audit & Logging (`IntegrityScan`'s "Run
+    Manual Scan" show_result action, `ArchiveObject`'s countdown chip).
+  - Cross-Cutting: Global Notification/Alert Center, Global Search
+    (materialized index + exact-match filter; a live free-text search
+    bar is out of scope for the same no-string-concatenation reason as
+    Module 5), User & Session Security self-service (login history
+    reuses Module 9's `AccessLogEntry`, documented inline), System
+    Health/Observability (a real service×metric matrix visual isn't
+    built — `render:"heatmap"` needs lat/lng geo points, wrong fit,
+    documented inline), Entity 360/Master Entity Profile
+    (`workspace EntityProfile`, 4 panels including a `graph_entity_links`
+    panel scoped to one entity's neighborhood via a 3-subquery self-join
+    — independently verified correct against a real sqlite3 db), and
+    Exchange/Partner FI Portal (`workspace ExchangePartnerPortal`).
+  - Every module's own "role home" dashboard folds into the single
+    shared `dashboard{}` block (only one `dashboard{}` per program is
+    allowed) — documented as the one systematic reuse/limitation.
+  - Full `cargo test` (whole suite) green throughout, except the same
+    pre-existing, unrelated `mq.rs` Redis-connection-refused failures
+    present before any of this Track E6 work. Final pass: `emit-ui`
+    confirms 77 distinct rendered titles across screens/panels/
+    workspaces; a representative `list_`/`stat_` endpoint from every
+    one of the 10 modules plus cross-cutting round-tripped 200 OK
+    against a live `serve --db`; both `CaseLifecycle` and
+    `RoleElevationApproval` workflows start and queue correctly in the
+    same served manifest; `node --check` on the extracted client
+    script passes. — 2026-09-03.
 - `[DONE]` **E7. `PUBLIC_ROADMAP.md` — add a Track E entry.** Brief,
   external-facing mirror of Track D's own entry there — done as part of
   this same session, since it's small. — 2026-09-03.
@@ -2358,7 +2388,5 @@ B1–B9 is the long track — pick up items as they become relevant to what's
 actually being built, not in lockstep. Track D runs independently of all
 of the above — D1 can start whenever native app delivery actually becomes
 a priority, without waiting on A/B/C. Track E runs independently of
-Tracks A–D too — E1 (`workspace`/`panel`, the highest-leverage item) can
-start any time, without waiting on Track D's mobile work or anything in
-A/B/C; only E6 (rebuilding `examples/ctms/ctms.nir`) waits on E1–E5
-actually landing first.
+Tracks A–D too, and is now fully `[DONE]` — E1–E7 all landed, including
+E6's full 89-screen `examples/ctms/ctms.nir` rebuild.
