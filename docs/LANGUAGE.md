@@ -1428,3 +1428,99 @@ error, not a miscompile) — same incremental-porting posture §10's
 compiled-vs-interpreted table already documents for `db`/`json`/`http`/
 etc. A program using no `module Ident { }`/`pub`/`use` at all — every
 existing `.nir` file — is completely unaffected by any of this.
+
+## 18. `layout { ... }` — composable screen arrangement (`docs/ROADMAP.md` Track F, F4)
+
+Full design reasoning in `docs/NEXT_GEN.md` §F4 — this section is the
+short, practical version. A `screen <Struct> { ... }` block's fields and
+actions used to render as one flat, implicit top-to-bottom list — no
+grouping, no columns, no tabs. `layout { ... }`, declared inside a
+`screen` block, is an optional arrangement tree on top of that same
+field/action set — the first construct in this language that can nest
+inside itself.
+
+```nirdosha
+screen Case {
+    action "Escalate" -> escalate_case
+
+    layout {
+        row {
+            column {
+                group "Details" {
+                    field case_number
+                    field status
+                    field priority
+                }
+                divider {}
+                group "Assignment" {
+                    field assigned_to
+                }
+            }
+            column {
+                tabs {
+                    tab "History" {
+                        timeline { source: list_case_history }
+                    }
+                    tab "Actions" {
+                        action "Escalate"
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+`row`/`column`/`grid` arrange their children horizontally, vertically,
+or in a fixed-column grid (`grid { columns: 3 ... }`); `group "Title" {
+... }` is a titled (optionally `collapsible: true`) box; `tabs { tab
+"Label" { ... } ... }` switches between panels. `field <name>` and
+`action "<label>"` **reference** — never duplicate — the screen's own
+existing `field`/`action` declarations by name; a name that doesn't
+resolve is a real, `screen`-block-style type error
+(`typeck::check_screen_layout`), the same "existence/shape checked, not
+guessed" posture every other DSL slot here already has. `field`/
+`action` overrides you'd already write (`view`/`edit`/`pattern`/
+`render`/...) stay exactly where they are today, outside `layout` — a
+`layout` block only decides *where* something renders, never *what* it
+is. A screen with no `layout` block renders exactly as it always has
+(the flat list) — this is purely additive.
+
+**The widget vocabulary, this phase**: `divider {}`, `card { title:
+"..." }`, and `timeline { source: <fn> }` (a live activity/audit feed,
+reusing the same rendering `dashboard`/`workspace` visuals already have
+for `render: "timeline"`). Two more widgets ship as `field` overrides,
+not `layout` leaves, since they're about one specific field, not a
+standalone box:
+
+- `field <name> { render: "badge" }` — an enum-typed field (zero-payload
+  variants) shown as a colored pill instead of plain text, in table
+  cells. Color is deterministic (hashed from the variant name), not
+  per-variant configurable yet.
+- `field <name> { render: "searchable_select" source: <Struct|fn> }` —
+  a text-input-driven dropdown with debounced search and scroll-
+  triggered pagination (load more as you scroll, not numbered pages).
+  `source: <Struct>` reuses the same generic `/_nirdosha/table/<table>`
+  route `nirdosha serve --db` already exposes for the main list screen
+  — real search plus real pagination, no backend code to write.
+  `source: <fn>` calls that function directly instead — one search,
+  unpaginated, the fallback when there's no `--db` or the struct's real
+  list logic is hand-written.
+
+**Styling**: every element still renders with the same default look
+(`--theme` JSON, app-wide tokens) `screen`/`dashboard` already use.
+A per-element `css: "..."` raw-CSS override is planned (Phase C, not
+shipped yet) — deliberately scoped to the web renderer only: a future
+non-web renderer (TUI/native mobile, `docs/NEXT_GEN.md` §F1) would
+simply ignore it, the same way this project already treats `db`/`json`/
+`http` as web/interpreter-only rather than blocking on a portable
+equivalent existing first.
+
+**What's still `[OPEN]`**: the remaining widget catalog (`progress`,
+`multi_select`, date/time pickers, `checkbox_group`/`radio_group`,
+`toggle`, `slider`, `breadcrumb`, `stepper`, and more); the `css:`
+escape hatch itself; and `searchable_select` for a `list_<Struct>` fn
+whose real logic isn't the generic table route (needs its own future
+`search:` parameter convention). A program using no `layout { }` block
+at all — every existing `.nir` file as of this writing — is completely
+unaffected by any of this.

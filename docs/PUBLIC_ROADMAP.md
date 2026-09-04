@@ -132,6 +132,12 @@ discussion, independent of every track above — see
   program across files, all real and tested — see `docs/ROADMAP.md` Track
   F, F2. The legacy `module "Display Name" { ... }` nav-label form
   (still just a nav label, no scoping) is untouched and still works.
+- [OPEN] A composable UI layout system — Phase A [DONE]: `screen
+  <Struct> { layout { row { column { group "..." { field x } } } } }`,
+  real containers (row/column/grid/group/tabs), plus a searchable +
+  scroll-paginated dropdown, a live timeline widget, and colored status
+  badges — see `docs/ROADMAP.md` Track F, F4. A per-element `css: "..."`
+  styling override and the rest of the widget catalog are still open.
 
 ---
 

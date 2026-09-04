@@ -2503,14 +2503,16 @@ E6 is the one item that waits on all five.*
 
 ## Track F — Next-generation language & UI architecture (`docs/NEXT_GEN.md`)
 
-*Priority: independent of Tracks A-E — none of F1-F3 change what's
+*Priority: independent of Tracks A-E — none of F1-F4 change what's
 already shipped; each is additive syntax/subsystem work, none block
-each other. Grew out of a direct 2026-09-03 design conversation,
+each other. F1-F3 grew out of a direct 2026-09-03 design conversation,
 prompted by two real CRUD-permission bugs fixed the same session in
 `examples/ctms/ctms.nir` (Track E, entry E8 and its `IntegrityScan`
-follow-up, both above). Full design detail, reasoning, and a running
-risk register (R1-R7) live in `docs/NEXT_GEN.md` — this section only tracks
-scoped status, doesn't duplicate the reasoning.*
+follow-up, both above); F4 grew out of a separate, later 2026-09-04
+conversation, a different axis (screen content/layout, not renderers).
+Full design detail, reasoning, and a running risk register (R1-R7) live
+in `docs/NEXT_GEN.md` — this section only tracks scoped status, doesn't
+duplicate the reasoning.*
 
 - `[OPEN]` **F1. Target-independent UI manifest + multiple renderers
   (web/TUI/mobile).** Generalize `ui_gen.rs`'s existing JSON manifest
@@ -2718,6 +2720,37 @@ scoped status, doesn't duplicate the reasoning.*
     the original three genuinely not resolved — real effort was spent
     establishing exactly why, not avoided.
   Full design detail and reasoning: `docs/NEXT_GEN.md` §F3.
+- `[OPEN]` **F4. Composable UI layout & widget catalog — Phase A
+  `[DONE]`, shipped 2026-09-04.** Grew out of a separate, later
+  conversation than F1-F3 (direct request: a fuller UI-element catalog,
+  real composability, per-element styling) — a different axis from F1
+  (F1 is renderers/action-vocabulary; F4 is screen content/layout), kept
+  as its own item so F1's own scope stays untouched. Phase A shipped
+  real and tested (`crates/compiler/tests/layout_dsl.rs`, 15 tests):
+  `screen <Struct> { layout { ... } }`, a new `ast::LayoutNode` tree
+  (`row`/`column`/`grid`/`group`/`tabs` containers, `field`/`action`
+  reference leaves, a `Widget` leaf) — the first genuinely recursive DSL
+  construct in this grammar (`parser::parse_layout_node` calls itself,
+  a new `MAX_LAYOUT_DEPTH` guard) — plus a generic `renderLayoutNode`
+  manifest-node dispatcher in the web template (also a first: every
+  prior visual concept was its own hardcoded `render*` function, not a
+  registry). Three widgets pulled forward from Phase B on direct
+  request: `searchable_select` (debounced search + scroll-triggered
+  pagination, reusing the existing `/_nirdosha/table/<table>` route —
+  zero new backend work), `timeline` (reuses the existing
+  `renderTimelineList`), `badge` (extends `FieldSpec.render`'s
+  vocabulary past `"countdown"`, the exact extension `docs/LANGUAGE.md`
+  had already flagged as a future candidate). The `css:` per-element
+  escape hatch is a deliberate, explicit choice — real raw CSS,
+  **web-renderer-only**, ignored by any future TUI/mobile renderer, the
+  same disclosed-narrowing pattern `db`/`json`/`http` already have on
+  the compiled path — but its own mechanism (a per-element scoped
+  class, a real CSS sanitizer) is Phase C, not built yet. Two real bugs
+  found and fixed via manual browser testing, not caught by
+  typechecking alone (a `kv_str`-vs-bare-ident manifest-extraction bug
+  that silently dropped every `source:` value; an append-vs-replace bug
+  in the searchable dropdown's pre-filled value) — full writeup of both,
+  plus everything still `[OPEN]` in Phases B/C: `docs/NEXT_GEN.md` §F4.
 
 ---
 
