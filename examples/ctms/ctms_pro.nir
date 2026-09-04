@@ -1624,6 +1624,235 @@ fn stat_investigation_nearing_sla_breach() -> Result(i64, ErrorCode) requires(ro
     return match db_connect("ctms_pro.db") { Ok(conn) => stat_investigation_nearing_sla_breach_inner(conn), Err(e) => Err(DbError(e)) }
 }
 
+// =========================================================================
+// Module 4: Regulatory and Secure Data Exchange
+// Doc: "Secure Transmission Layer" / "Access Gateway" / "Consent & Data
+// Handling Policy Engine" / "Regulatory Reporting Queue" / "Audit and
+// Compliance Dashboard".
+// =========================================================================
+
+module "Secure Data Exchange" {
+    struct DataSharingLogEntry {
+        id: i64,
+        who: str,
+        what: str,
+        destination: str,
+        occurred_unix: i64,
+        signature_status: SignatureStatus,
+    }
+
+    struct AbacPolicy {
+        id: i64,
+        name: str,
+        attribute_condition: str,
+        active: bool,
+    }
+
+    struct ConsentRecord {
+        id: i64,
+        subject_ref: str,
+        status: ConsentStatus,
+        recorded_unix: i64,
+    }
+
+    struct RetentionPolicy {
+        id: i64,
+        data_category: str,
+        retention_days: i64,
+        erasure_on_expiry: bool,
+    }
+}
+
+// ---- DataSharingLogEntry: the secure data sharing log (read-mostly). --
+
+fn list_data_sharing_log_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS data_sharing_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, who TEXT, what TEXT, destination TEXT, occurred_unix INTEGER, signature_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, who, what, destination, occurred_unix, signature_status FROM data_sharing_log_entry ORDER BY occurred_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_data_sharing_log_entry() -> Result(json, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_data_sharing_log_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_data_sharing_log_entry_inner(conn: db, e: DataSharingLogEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS data_sharing_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, who TEXT, what TEXT, destination TEXT, occurred_unix INTEGER, signature_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO data_sharing_log_entry (who, what, destination, occurred_unix, signature_status) VALUES (?, ?, ?, ?, ?)", e.who, e.what, e.destination, e.occurred_unix, e.signature_status) { Ok(n) => Ok(n), Err(err) => Err(DbError(err)) }
+    stop conn
+    return result
+}
+fn create_data_sharing_log_entry(e: DataSharingLogEntry) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_data_sharing_log_entry_inner(conn, e), Err(err) => Err(DbError(err)) }
+}
+
+screen DataSharingLogEntry {
+    title: "Secure Data Sharing Log"
+    field signature_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field who
+                field what
+                field destination
+            }
+            column {
+                field signature_status
+                field occurred_unix
+            }
+        }
+    }
+}
+
+// ---- AbacPolicy: attribute-based access policy config. ----------------
+
+fn list_abac_policy_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS abac_policy (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, attribute_condition TEXT, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, name, attribute_condition, active FROM abac_policy ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_abac_policy() -> Result(json, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_abac_policy_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_abac_policy_inner(conn: db, p: AbacPolicy) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS abac_policy (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, attribute_condition TEXT, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO abac_policy (name, attribute_condition, active) VALUES (?, ?, ?)", p.name, p.attribute_condition, p.active) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_abac_policy(p: AbacPolicy) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_abac_policy_inner(conn, p), Err(e) => Err(DbError(e)) }
+}
+fn update_abac_policy_inner(conn: db, p: AbacPolicy) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS abac_policy (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, attribute_condition TEXT, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE abac_policy SET name = ?, attribute_condition = ?, active = ? WHERE id = ?", p.name, p.attribute_condition, p.active, p.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_abac_policy(p: AbacPolicy) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => update_abac_policy_inner(conn, p), Err(e) => Err(DbError(e)) }
+}
+
+screen AbacPolicy {
+    title: "ABAC Policy Config"
+
+    layout {
+        row {
+            field name
+            field attribute_condition
+            field active
+        }
+    }
+}
+
+// ---- ConsentRecord: consent logging. -----------------------------------
+
+fn list_consent_record_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS consent_record (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_ref TEXT, status TEXT, recorded_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, subject_ref, status, recorded_unix FROM consent_record ORDER BY recorded_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_consent_record() -> Result(json, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_consent_record_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_consent_record_inner(conn: db, c: ConsentRecord) -> Result(i64, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS consent_record (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_ref TEXT, status TEXT, recorded_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO consent_record (subject_ref, status, recorded_unix) VALUES (?, ?, ?)", c.subject_ref, c.status, c.recorded_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_consent_record(c: ConsentRecord) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_consent_record_inner(conn, c), Err(e) => Err(DbError(e)) }
+}
+fn revoke_consent_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS consent_record (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_ref TEXT, status TEXT, recorded_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let updated: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE consent_record SET status = 'ConsentStatusRevoked' WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let confirm: Result(json, ErrorCode) = match updated {
+        Ok(n) => match db_query(conn, "SELECT id, status FROM consent_record WHERE id = ?", id) {
+            Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(e),
+    }
+    stop conn
+    return confirm
+}
+fn revoke_consent(id: i64) -> Result(json, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => revoke_consent_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
+screen ConsentRecord {
+    title: "Consent Register"
+    field status {
+        render: "badge"
+    }
+    action "Revoke" -> revoke_consent {
+        style: "outlined"
+        confirm: "Revoke this subject's consent? This is logged and cannot be undone."
+        show_result: true
+    }
+
+    layout {
+        row {
+            field subject_ref
+            field status
+            field recorded_unix
+            action "Revoke"
+        }
+    }
+}
+
+// ---- RetentionPolicy: GDPR retention/erasure config. -------------------
+
+fn list_retention_policy_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS retention_policy (id INTEGER PRIMARY KEY AUTOINCREMENT, data_category TEXT, retention_days INTEGER, erasure_on_expiry INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, data_category, retention_days, erasure_on_expiry FROM retention_policy ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_retention_policy() -> Result(json, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_retention_policy_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_retention_policy_inner(conn: db, p: RetentionPolicy) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS retention_policy (id INTEGER PRIMARY KEY AUTOINCREMENT, data_category TEXT, retention_days INTEGER, erasure_on_expiry INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO retention_policy (data_category, retention_days, erasure_on_expiry) VALUES (?, ?, ?)", p.data_category, p.retention_days, p.erasure_on_expiry) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_retention_policy(p: RetentionPolicy) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_retention_policy_inner(conn, p), Err(e) => Err(DbError(e)) }
+}
+
+screen RetentionPolicy {
+    title: "Retention & Erasure Policy"
+
+    layout {
+        row {
+            field data_category
+            field retention_days
+            field erasure_on_expiry
+        }
+    }
+}
+
+// ---- Module 4 dashboard contributions. ---------------------------------
+
+fn stat_shared_volume_count_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS data_sharing_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, who TEXT, what TEXT, destination TEXT, occurred_unix INTEGER, signature_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM data_sharing_log_entry") {
+        Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn stat_shared_volume_count() -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => stat_shared_volume_count_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
 // === APPEND POINT ===
 
 fn main() {}
