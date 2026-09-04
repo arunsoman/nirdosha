@@ -3885,7 +3885,7 @@ module "Cross-Cutting" {
         exchange_name: str,
         wallet_address: str,
         kyc_document_ref: str,
-        review_status: str,
+        review_status: KycReviewStatus,
         submitted_unix: i64,
     }
 
@@ -4295,7 +4295,7 @@ fn list_wallet_kyc_submission() -> Result(json, ErrorCode) requires(public) {
 }
 fn create_wallet_kyc_submission_inner(conn: db, w: WalletKycSubmission) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet_kyc_submission (id INTEGER PRIMARY KEY AUTOINCREMENT, exchange_name TEXT, wallet_address TEXT, kyc_document_ref TEXT, review_status TEXT, submitted_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
-    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO wallet_kyc_submission (exchange_name, wallet_address, kyc_document_ref, review_status, submitted_unix) VALUES (?, ?, ?, 'pending', ?)", w.exchange_name, w.wallet_address, w.kyc_document_ref, w.submitted_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO wallet_kyc_submission (exchange_name, wallet_address, kyc_document_ref, review_status, submitted_unix) VALUES (?, ?, ?, 'KycReviewStatusPending', ?)", w.exchange_name, w.wallet_address, w.kyc_document_ref, w.submitted_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
     stop conn
     return result
 }
@@ -4330,6 +4330,31 @@ fn list_federated_workflow_status_entry_for_submission_inner(conn: db, submissio
 }
 fn list_federated_workflow_status_entry_for_submission(submission_id: i64) -> Result(json, ErrorCode) requires(role: "exchange_partner") {
     return match db_connect("ctms.db") { Ok(conn) => list_federated_workflow_status_entry_for_submission_inner(conn, submission_id), Err(e) => Err(DbError(e)) }
+}
+
+screen WalletKycSubmission {
+    title: "Wallet KYC Submission Queue"
+    field review_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Submission" {
+                    field exchange_name
+                    field wallet_address
+                    field kyc_document_ref
+                }
+            }
+            column {
+                group "Review" {
+                    field review_status
+                    field submitted_unix
+                }
+            }
+        }
+    }
 }
 
 workspace ExchangePartnerPortal {
