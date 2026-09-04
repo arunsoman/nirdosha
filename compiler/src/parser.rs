@@ -273,6 +273,8 @@ impl Parser {
         let mut dashboard = None;
         let mut workflows = Vec::new();
         let mut workspaces = Vec::new();
+        let mut validates = Vec::new();
+        let mut imports = Vec::new();
         while self.peek().tok != Tok::Eof {
             match self.peek().tok {
                 Tok::Struct => structs.push(self.parse_struct_decl()?),
@@ -280,6 +282,7 @@ impl Parser {
                 Tok::Screen => screens.push(self.parse_screen_decl()?),
                 Tok::Workflow => workflows.push(self.parse_workflow_decl()?),
                 Tok::Workspace => workspaces.push(self.parse_workspace_decl()?),
+                Tok::Validate => validates.push(self.parse_validate_decl()?),
                 Tok::Dashboard => {
                     let d = self.parse_dashboard_decl()?;
                     if dashboard.is_some() {
@@ -299,11 +302,29 @@ impl Parser {
                 _ => fns.push(self.parse_fn_decl()?),
             }
         }
-        let mut program = Program { fns, structs, enums, screens, dashboard, workflows, workspaces };
+        let mut program = Program { fns, structs, enums, screens, dashboard, workflows, workspaces, validates, imports };
         crate::workflow_lower::lower(&mut program)?;
         Ok(program)
     }
-
+    /// `validate_decl ::= "validate" IDENT "{" kv_entry* "}"` — same
+    /// no-comma-separator, no-sub-block shape `screen`'s own plain
+    /// `kv_entry` slots use (`parse_kv_entry`, reused unchanged: `pre`/
+    /// `post` are ordinary keys with an `Expr` value, not a dedicated
+    /// value grammar). `fn_name` is resolved against a real `fn` later,
+    /// by `typeck.rs::check_validate` — this layer only parses the
+    /// shape.
+    fn parse_validate_decl(&mut self) -> PResult<ValidateDecl> {
+        let span = self.span();
+        self.expect(&Tok::Validate, "`validate`")?;
+        let fn_name = self.expect_ident()?;
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut entries = Vec::new();
+        while self.peek().tok != Tok::RBrace {
+            entries.push(self.parse_kv_entry()?);
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(ValidateDecl { fn_name, entries, span })
+    }
     /// `module_decl ::= "module" STRING "{" (fn_decl | struct_decl |
     /// enum_decl)* "}"` (`GRAMMAR.md`) — pure nav-grouping sugar, not a
     /// real scoping construct. Every declaration inside is parsed by the

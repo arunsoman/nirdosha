@@ -1250,9 +1250,22 @@ pub enum ErrorKind {
     /// what's proven (a real `join`-cycle, or every live thread
     /// simultaneously blocked) versus what's a disclosed gap (a `recv`
     /// blocked forever alongside an unrelated thread that's still busy).
-    /// A structured trap, never a silent hang — `ROADMAP.md`'s
+    /// A structured trap, never a silent hang — `docs/ROADMAP.md`'s
     /// deadlock-detection entry.
     Deadlock { message: String },
+    /// A `validate <fn_name> { pre: ... post: ... }` contract's
+    /// `pre`/`post` predicate evaluated to `false` on a *real* call
+    /// (`docs/ROADMAP.md` Track F, F3; `docs/NEXT_GEN.md` §F3) — `call()`'s
+    /// runtime backstop, which re-checks every `validate` block on
+    /// every actual invocation regardless of whether
+    /// `contract_check::check_program_contracts` could statically prove
+    /// it at build time. This is the only enforcement path at all for a
+    /// contract on a fn Tier-1's SMT walker can't model (touches `db`/
+    /// `json`/`http`, calls another fn, or loops — true of nearly every
+    /// real fn) — see `contract_check::unsupported_validate_notes`'s own
+    /// doc comment for why that's a disclosed, non-fatal-at-build-time
+    /// gap rather than a silent one.
+    ContractViolation { fn_name: String, phase: String, predicate: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1338,6 +1351,10 @@ impl std::fmt::Display for RuntimeError {
                  succeeded (retries exhausted)"
             ),
             ErrorKind::Deadlock { message } => write!(f, "{line}:{col}: {message}"),
+            ErrorKind::ContractViolation { fn_name, phase, predicate } => write!(
+                f,
+                "{line}:{col}: `validate {fn_name}`'s `{phase}` contract is violated: `{predicate}`"
+            ),
         }
     }
 }
@@ -5293,6 +5310,12 @@ impl Interpreter {
                 self.check_ty(v, &p.ty, span)?;
                 env.define(&p.name, v.clone(), p.ty.clone());
             }
+            // `validate <fn_name> { pre: ... }`'s runtime backstop
+            // (`docs/ROADMAP.md` Track F, F3) — checked here, once params are
+            // bound and before the body runs at all, so a violated
+            // precondition never lets the body execute on an input it
+            // wasn't meant to handle.
+            self.check_validate_phase(name, "pre", &mut env, span)?;
 
             match self.exec_block(&f.body, &mut env) {
                 Ok(_) => {
@@ -5300,6 +5323,11 @@ impl Interpreter {
                     // (the last expression-statement, or Unit) is only a valid
                     // function result if the declared return type is Unit.
                     if f.ret == Ty::Unit {
+                        env.push();
+                        env.define("result", Value::Unit, Ty::Unit);
+                        let post_check = self.check_validate_phase(name, "post", &mut env, span);
+                        env.pop();
+                        post_check?;
                         Ok(Value::Unit)
                     } else {
                         err(ErrorKind::MissingReturn { fn_name: name.to_string() }, f.span)
@@ -5307,6 +5335,21 @@ impl Interpreter {
                 }
                 Err(Signal::Return(v)) => {
                     self.check_ty(&v, &f.ret, span)?;
+                    // `validate <fn_name> { post: ... }`'s runtime
+                    // backstop — `result` bound to the real, concrete
+                    // return value in a fresh scope over the (still
+                    // param-populated, `exec_block` pops its own pushed
+                    // scope on the way out) base `env`. Unlike the
+                    // static Tier-1 prover (`contract_check.rs`, integer
+                    // params/return only), this has no such restriction
+                    // — it can meaningfully check a `db`-touching,
+                    // struct/`Result`-returning fn's postcondition too,
+                    // exactly the majority case Tier-1 can't reach.
+                    env.push();
+                    env.define("result", v.clone(), f.ret.clone());
+                    let post_check = self.check_validate_phase(name, "post", &mut env, span);
+                    env.pop();
+                    post_check?;
                     Ok(v)
                 }
                 Err(Signal::Err(e)) => Err(e),
@@ -5333,6 +5376,44 @@ impl Interpreter {
         let result = run();
         tracer.record_span(effect, span, "call", Some(Arc::from(name)), start, outcome_of_runtime_result(&result));
         result
+    }
+
+    /// `call()`'s runtime backstop for `validate <fn_name> { pre: ...
+    /// post: ... }` (`docs/ROADMAP.md` Track F, F3) — re-checks every
+    /// `phase`-keyed predicate against `env`'s real, concrete values on
+    /// *every* actual invocation, unconditionally (not gated on whether
+    /// `contract_check::check_program_contracts` could statically prove
+    /// it at build time — a fn it already proved still re-checks here
+    /// too, redundantly but cheaply, for one shared enforcement path
+    /// instead of two separate ones). A predicate that fails to
+    /// evaluate as `Ok(Value::Bool(true))` — an `eval_expr` error, or a
+    /// non-bool result, both possible since (unlike `contract_check.rs`'s
+    /// own static walker) nothing here type-checks `pre`/`post` against
+    /// `name`'s real signature ahead of time, `typeck::check_validate`'s
+    /// own doc comment discloses this — is a violation, never silently
+    /// passed: "couldn't confirm this holds" must never behave like
+    /// "confirmed it holds." No-op, one cheap empty-iterator check, for
+    /// the overwhelmingly common case of a program with no `validate`
+    /// blocks at all.
+    fn check_validate_phase(&self, name: &str, phase: &'static str, env: &mut Env, span: Span) -> Result<(), RuntimeError> {
+        for v in self.program.validates.iter().filter(|v| v.fn_name == name) {
+            for (key, expr) in &v.entries {
+                if key != phase {
+                    continue;
+                }
+                if !matches!(self.eval_expr(expr, env), Ok(Value::Bool(true))) {
+                    return err(
+                        ErrorKind::ContractViolation {
+                            fn_name: name.to_string(),
+                            phase: phase.to_string(),
+                            predicate: format!("{expr:?}"),
+                        },
+                        span,
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `call()`'s effect tag: the target function's own inferred

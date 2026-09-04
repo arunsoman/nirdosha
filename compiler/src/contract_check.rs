@@ -116,6 +116,248 @@ pub fn check_fn_contract(
             Err(msg) => return ContractCheckResult::PredicateParseError(msg),
         }
     }
+    check_fn_contract_parsed(f, &pre_exprs, &post_exprs, extra_bindings, &HashMap::new())
+}
+
+/// Same Tier-1 walker as `check_fn_contract` above, fed a `.nir`
+/// `validate <fn_name> { pre: <expr>  post: <expr> }` block's
+/// already-parsed `Expr`s directly (`ast::ValidateDecl` —
+/// `docs/ROADMAP.md` Track F, F3) instead of predicate strings parsed out of
+/// an extraction JSON. No `extra_bindings` — a `validate` block can only
+/// reference `fn_name`'s own real parameters (and `result`, in `post`);
+/// the `extra_bindings` escape hatch stays scoped to the string-based
+/// extraction pipeline above, which needs it for exactly the disclosed
+/// "the spec references a quantity the code doesn't parameterize on"
+/// case (this module's own doc comment) that inline `.nir` source
+/// doesn't have a symmetric problem with — an author writing a contract
+/// against their own fn can just... use the fn's real parameter names.
+/// `{:?}` Debug-formats each expr for use as its own "predicate name" in
+/// a `Counterexample`/error message, since there's no original source
+/// string to quote post-parse (same precedent this file's own
+/// `int_expr`/`bool_expr` already set for an `Unsupported` message). No
+/// interprocedural summaries either — a single isolated call gets none
+/// of the other `validate` blocks in the same program as context; see
+/// `run_program_validates` for the whole-program version that builds
+/// and uses them.
+pub fn check_fn_contract_exprs(program: &Program, fn_name: &str, pre: &[Expr], post: &[Expr]) -> ContractCheckResult {
+    check_fn_contract_exprs_with_summaries(program, fn_name, pre, post, &HashMap::new())
+}
+
+fn check_fn_contract_exprs_with_summaries(
+    program: &Program,
+    fn_name: &str,
+    pre: &[Expr],
+    post: &[Expr],
+    summaries: &HashMap<String, Summary>,
+) -> ContractCheckResult {
+    let Some(f) = program.fns.iter().find(|f| f.name == fn_name) else {
+        return ContractCheckResult::NoSuchFunction(fn_name.to_string());
+    };
+    let pre_exprs: Vec<(String, Expr)> = pre.iter().map(|e| (format!("{e:?}"), e.clone())).collect();
+    let post_exprs: Vec<(String, Expr)> = post.iter().map(|e| (format!("{e:?}"), e.clone())).collect();
+    check_fn_contract_parsed(f, &pre_exprs, &post_exprs, &HashMap::new(), summaries)
+}
+
+/// A callee's independently-*proven* Hoare contract, promoted to a fact
+/// any caller's own proof may use about the result of calling it
+/// (`docs/ROADMAP.md` Track F, F3's disclosed "no per-function pre/
+/// postcondition inference exists yet" gap — closed for the bounded,
+/// sound case this covers). Used as `pre(callee's args) =>
+/// post(callee's args, result)`, an implication, never an unconditional
+/// fact — so a call site whose arguments don't (or can't be shown to)
+/// satisfy the callee's own precondition gets a vacuous, uninformative
+/// axiom instead of a wrong one; see `Eval::int_expr`'s `Expr::Call` arm
+/// for where this is actually asserted. Built once, up front, by
+/// `run_program_validates` below, and only ever for a callee whose own
+/// contract was independently `Proved` first — never for one that's
+/// merely declared, `Unsupported`, or itself depends on an
+/// as-yet-unproven callee. That's the one invariant that keeps this
+/// sound rather than assuming away the exact class of bug this whole
+/// file exists to catch: a summary can only be *used* once it's
+/// genuinely *earned*.
+struct Summary {
+    params: Vec<Param>,
+    ret: Ty,
+    pre: Vec<Expr>,
+    post: Vec<Expr>,
+}
+
+/// One `validate <fn_name> { ... }` block's static-check outcome —
+/// `run_program_validates`' own return shape, consumed two different
+/// ways by `check_program_contracts`/`unsupported_validate_notes` below.
+pub struct ValidateOutcome {
+    pub fn_name: String,
+    pub result: ContractCheckResult,
+}
+
+/// Runs every `validate` block in `program`, splitting each
+/// `ValidateDecl.entries` into its `pre`/`post` `Expr`s first (the
+/// AST-level shape `ast::ValidateDecl` stores them in — the same
+/// generic `KvEntry` list `screen`/`dashboard` already use, filtered
+/// here rather than given dedicated struct fields) — and, unlike a
+/// single isolated `check_fn_contract_exprs` call, doing it as a real
+/// **bounded fixed-point pass across the whole program**: a `Call`
+/// inside one `validate` block's target fn (previously an automatic
+/// `Unsupported`, no exceptions) can now be resolved using another
+/// already-`validate`d function's own *proven* summary as an axiom
+/// (`Summary`, above) — the interprocedural reasoning this file's own
+/// module doc has disclosed as missing since A12. Each pass re-checks
+/// every block with whatever summaries the *previous* pass managed to
+/// prove; any block that newly resolves to `Proved` is promoted into
+/// `summaries` for the *next* pass. Bounded by `program.validates.len()`
+/// iterations — each pass either promotes at least one new summary or
+/// changes nothing at all, in which case every further pass can only
+/// repeat the same result, so a fixed point is reached well before that
+/// bound in practice; no separate cycle-detection needed; a fn whose own
+/// contract depends on a callee's, whose contract depends back on the
+/// first (mutual recursion) simply never gets promoted by either pass
+/// and stays honestly `Unsupported` — not a wrong answer, the same
+/// "decline rather than guess" discipline this whole file already holds
+/// to. A function with more than one `validate` block uses the *first*
+/// one (declaration order) that resolves to `Proved` as its summary,
+/// deliberately not a union of all of them — simpler, still fully
+/// sound (a strict subset of what's actually provable), and avoids a
+/// second merging step for a shape (`validate max_of {...} validate
+/// max_of {...}`) rare enough not to need it.
+pub fn run_program_validates(program: &Program) -> Vec<ValidateOutcome> {
+    let mut summaries: HashMap<String, Summary> = HashMap::new();
+    let mut outcomes: Vec<ValidateOutcome> = Vec::new();
+    for _ in 0..=program.validates.len() {
+        let mut progressed = false;
+        outcomes = program
+            .validates
+            .iter()
+            .map(|v| {
+                let pre: Vec<Expr> = v.entries.iter().filter(|(k, _)| k == "pre").map(|(_, e)| e.clone()).collect();
+                let post: Vec<Expr> = v.entries.iter().filter(|(k, _)| k == "post").map(|(_, e)| e.clone()).collect();
+                let result = check_fn_contract_exprs_with_summaries(program, &v.fn_name, &pre, &post, &summaries);
+                if result == ContractCheckResult::Proved && !summaries.contains_key(&v.fn_name) {
+                    if let Some(f) = program.fns.iter().find(|f| f.name == v.fn_name) {
+                        summaries.insert(
+                            v.fn_name.clone(),
+                            Summary { params: f.params.clone(), ret: f.ret.clone(), pre, post },
+                        );
+                        progressed = true;
+                    }
+                }
+                ValidateOutcome { fn_name: v.fn_name.clone(), result }
+            })
+            .collect();
+        if !progressed {
+            break;
+        }
+    }
+    outcomes
+}
+
+/// The build-time "self-check and fail" gate (`docs/ROADMAP.md` Track F, F3
+/// — called once from `main.rs::typecheck_and_own_impl`, right after
+/// `typeck`/`ownership` both pass, so it runs for every command that
+/// owns a typechecked program: `build`/`run`/`serve`/`emit-ui`/
+/// `emit-llvm`/`typecheck`). Hard-fails only on a genuine, *proven*
+/// defect — a real Z3 counterexample, an identifier the contract
+/// references that doesn't resolve, or (defensively; `typeck::
+/// check_validate` already catches this earlier) a `fn_name` that
+/// doesn't exist. **Does not fail on `Unsupported`** — a contract this
+/// Tier-1 walker can't statically model (the fn touches `db`/`json`/
+/// `http`, calls another fn, or loops — true of nearly every real fn in
+/// a real app) is neither proved nor disproved here; it's still
+/// enforced, just at runtime instead (`interpreter.rs::call`) — see
+/// `unsupported_validate_notes` for the matching non-fatal notice.
+pub fn check_program_contracts(program: &Program) -> Result<(), Vec<String>> {
+    let errors: Vec<String> = run_program_validates(program).iter().filter_map(contract_error_message).collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// `--format=json`'s structured sibling of `check_program_contracts`
+/// above — same hard-fail criteria (a genuine, *proven* defect only;
+/// `Unsupported` never appears here either), same underlying
+/// `run_program_validates` computation, just paired with `span` (the
+/// *`validate` block's own* span, `ast::ValidateDecl.span` — the fn
+/// itself is unannotated; the contract is what actually failed) for
+/// `lib.rs::Diagnostic::Contract`, `run_diagnostic_*`'s one JSON-shaped
+/// consumer.
+pub fn check_program_contracts_diagnostics(program: &Program) -> Vec<ContractDiagnostic> {
+    program
+        .validates
+        .iter()
+        .zip(run_program_validates(program).iter())
+        .filter_map(|(decl, outcome)| Some(ContractDiagnostic { message: contract_error_message(outcome)?, span: decl.span }))
+        .collect()
+}
+
+/// `None` for `Proved`/`Unsupported` (nothing to report — see
+/// `check_program_contracts`'s own doc comment for why `Unsupported`
+/// specifically is never an error here); `Some(message)` for every
+/// other `ContractCheckResult`, shared verbatim by both public entry
+/// points above so their wording never drifts apart.
+fn contract_error_message(outcome: &ValidateOutcome) -> Option<String> {
+    match &outcome.result {
+        ContractCheckResult::Proved | ContractCheckResult::Unsupported(_) => None,
+        ContractCheckResult::Counterexample { violated_predicate, bindings, result } => {
+            let bindings_str = bindings.iter().map(|(n, v)| format!("{n} = {v}")).collect::<Vec<_>>().join(", ");
+            Some(format!(
+                "`validate {}`: `{violated_predicate}` is violated when {bindings_str} (fn returns {})",
+                outcome.fn_name,
+                result.map(|r| r.to_string()).unwrap_or_else(|| "<uncomputed>".to_string())
+            ))
+        }
+        ContractCheckResult::UnboundIdentifier(name) => Some(format!(
+            "`validate {}`: `{name}` is neither `result` nor one of `{}`'s own parameters",
+            outcome.fn_name, outcome.fn_name
+        )),
+        ContractCheckResult::NoSuchFunction(name) => {
+            Some(format!("`validate {name}`: no such function (should have been caught by typeck)"))
+        }
+        ContractCheckResult::PredicateParseError(msg) => {
+            Some(format!("`validate {}`: {msg} (should be unreachable — already a parsed `.nir` expr)", outcome.fn_name))
+        }
+    }
+}
+
+/// `check_program_contracts_diagnostics`'s one payload shape —
+/// `lib.rs::Diagnostic::Contract`'s inner type, same `{message, span}`
+/// flatness `LexError`/`ParseError` already use for a diagnostic with no
+/// further structured `kind` breakdown (`lib.rs::Diagnostic`'s own doc
+/// comment on why `Lex`/`Parse` stay flat).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ContractDiagnostic {
+    pub message: String,
+    pub span: crate::token::Span,
+}
+
+/// The non-fatal half of `check_program_contracts`: one human-readable
+/// note per `validate` block this Tier-1 walker honestly couldn't
+/// statically decide, so an author sees *why* — same "surface the
+/// previously-silent case" precedent `typeck::TypeWarning`/
+/// `print_ungated_fn_warnings` already set for an ungated `fn`. Callers
+/// print these (or not) and continue either way; nothing here blocks a
+/// build. Still enforced — just at runtime, unconditionally, by
+/// `interpreter.rs::call`.
+pub fn unsupported_validate_notes(program: &Program) -> Vec<String> {
+    run_program_validates(program)
+        .into_iter()
+        .filter_map(|o| match o.result {
+            ContractCheckResult::Unsupported(msg) => Some(format!(
+                "note: `validate {}`'s contract could not be proven statically ({msg}) — enforced at runtime on every call instead",
+                o.fn_name
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn check_fn_contract_parsed(
+    f: &FnDecl,
+    pre_exprs: &[(String, Expr)],
+    post_exprs: &[(String, Expr)],
+    extra_bindings: &HashMap<String, i64>,
+    summaries: &HashMap<String, Summary>,
+) -> ContractCheckResult {
     for p in &f.params {
         if !p.ty.is_integer() {
             return ContractCheckResult::Unsupported(format!(
@@ -127,7 +369,8 @@ pub fn check_fn_contract(
     }
     if !f.ret.is_integer() {
         return ContractCheckResult::Unsupported(format!(
-            "`{fn_name}` returns `{}` — Tier 1 only models an integer-returning function today",
+            "`{}` returns `{}` — Tier 1 only models an integer-returning function today",
+            f.name,
             f.ret.name()
         ));
     }
@@ -163,12 +406,12 @@ pub fn check_fn_contract(
     }
 
     let mut scopes = Scopes(vec![top]);
-    let mut eval = Eval { solver: &solver, post_logic: &post_exprs, outcome: None };
+    let mut eval = Eval { solver: &solver, post_logic: &post_exprs, outcome: None, summaries };
     // Assert every precondition as a hypothesis *before* walking the
     // body — everything downstream (including every `return` point's
     // counterexample search) then only ever considers inputs where
     // `pre_logic` actually holds.
-    for (src, e) in &pre_exprs {
+    for (src, e) in pre_exprs {
         match eval.bool_expr(e, &mut scopes) {
             Ok(b) => solver.assert(b),
             Err(msg) => return ContractCheckResult::Unsupported(format!("pre_logic `{src}`: {msg}")),
@@ -317,22 +560,94 @@ struct Eval<'s> {
     /// the cheapest possible short-circuit (a single counterexample
     /// already disproves "holds for every input").
     outcome: Option<ContractCheckResult>,
+    /// Independently-*proven* summaries of other `validate`d functions
+    /// (`run_program_validates`'s whole-program fixed point) — consulted
+    /// by `int_expr`'s `Expr::Call` arm, the interprocedural reasoning
+    /// `Summary`'s own doc comment describes. Empty for a single isolated
+    /// `check_fn_contract`/`check_fn_contract_exprs` call, same as
+    /// before this existed — a `Call` inside such a check is still an
+    /// honest `Unsupported`.
+    summaries: &'s HashMap<String, Summary>,
 }
 
 type EvalResult<T> = Result<T, String>;
 
+/// What happens to control flow after one statement, on whatever path
+/// reaches it — `stmt`'s own return type (`docs/ROADMAP.md` Track F, F3:
+/// found live, via `validate`'s first real exercise of this walker on
+/// ordinary early-return-shaped code, not the single hand-picked
+/// flagship demo `check_fn_contract` had before — `if cond { return x }
+/// return y`-style statement-position early return, ubiquitous
+/// throughout this codebase's own `.nir` examples, is a completely
+/// different shape from `required_eyes_for_amount`'s single
+/// value-position `if {...} else {...}`, which never needed this).
+/// Before this type existed, a `Stmt::Return` inside an `if` branch was
+/// checked correctly (`check_return` ran under that branch's own pushed
+/// condition) but its "definitely returned" fact was then silently
+/// dropped — `stmts`' loop just kept walking the *next* sibling
+/// statement unconditionally, with no branch condition asserted at all,
+/// so a genuinely unreachable trailing `return` got checked as if
+/// reachable for *every* input, producing real, wrong `Counterexample`s
+/// against genuinely-correct functions — precisely the "silently wrong
+/// answer" this module's own doc comment says the walker must never
+/// produce (over-approximating what's reachable is unsound for a
+/// counterexample the exact same way over-approximating an unmodelable
+/// expression already was). The same `Result<Value, Signal::Return(_)>`
+/// propagation shape `interpreter.rs::exec_stmts`'s real, correct
+/// control flow already uses — this walker just never modeled it.
+enum Flow {
+    /// An ordinary statement — falls through unconditionally.
+    Continues,
+    /// Every path through this statement hits `return` — nothing after
+    /// it, in the same straight-line sequence, is reachable at all.
+    Returns,
+    /// An `if` where exactly one branch returns and the other falls
+    /// through — code after it is reachable only under the surviving
+    /// branch's own condition, which `stmts` must assert for the *rest*
+    /// of the enclosing sequence (not just re-check for this one
+    /// statement) — an absent `else` behaves exactly like a `then` that
+    /// returns and an implicit empty `else` that doesn't.
+    ContinuesUnder(Bool),
+}
+
 impl Eval<'_> {
-    fn stmts(&mut self, stmts: &[Stmt], scopes: &mut Scopes) -> EvalResult<()> {
+    /// `Ok(true)` means every path through `stmts` definitely hit a
+    /// `return` — a real reachability fact, not just "no error
+    /// occurred," consumed by an enclosing `if`'s own `Flow` computation
+    /// (`stmt`'s `Expr::If` arm, below) — see `Flow`'s own doc comment
+    /// for why this exists and what it fixed. A `Flow::ContinuesUnder`
+    /// reported by one statement is asserted onto the solver for every
+    /// statement *after* it in this same call — correctly narrowing
+    /// which inputs can even reach them — and popped once this whole
+    /// sequence is done being walked; on an `Err` (`Unsupported`) exit
+    /// the pushes are simply abandoned, harmless since the whole
+    /// `Solver` this walker owns is discarded right after by its one
+    /// caller, `check_fn_contract_parsed`.
+    fn stmts(&mut self, stmts: &[Stmt], scopes: &mut Scopes) -> EvalResult<bool> {
+        let mut extra_pushes = 0usize;
         for s in stmts {
             if self.outcome.is_some() {
-                return Ok(());
+                self.solver.pop(extra_pushes as u32);
+                return Ok(false);
             }
-            self.stmt(s, scopes)?;
+            match self.stmt(s, scopes)? {
+                Flow::Continues => {}
+                Flow::Returns => {
+                    self.solver.pop(extra_pushes as u32);
+                    return Ok(true);
+                }
+                Flow::ContinuesUnder(cond) => {
+                    self.solver.push();
+                    self.solver.assert(cond);
+                    extra_pushes += 1;
+                }
+            }
         }
-        Ok(())
+        self.solver.pop(extra_pushes as u32);
+        Ok(false)
     }
 
-    fn stmt(&mut self, s: &Stmt, scopes: &mut Scopes) -> EvalResult<()> {
+    fn stmt(&mut self, s: &Stmt, scopes: &mut Scopes) -> EvalResult<Flow> {
         match s {
             Stmt::Let { name, ty, value, .. } => {
                 if !ty.is_integer() {
@@ -341,45 +656,54 @@ impl Eval<'_> {
                 let term = self.int_expr(value, scopes)?;
                 assert_bounds(self.solver, &term, ty);
                 scopes.define(name, term);
-                Ok(())
+                Ok(Flow::Continues)
             }
             Stmt::Return { value: Some(e), .. } => {
                 let term = self.int_expr(e, scopes)?;
-                self.check_return(term, scopes)
+                self.check_return(term, scopes)?;
+                Ok(Flow::Returns)
             }
-            Stmt::Return { value: None, .. } => Ok(()),
+            Stmt::Return { value: None, .. } => Ok(Flow::Returns),
             Stmt::Expr(Expr::If { cond, then_block, else_block, .. }) => {
                 let cond_term = self.bool_expr(cond, scopes)?;
                 self.solver.push();
                 self.solver.assert(cond_term.clone());
-                self.block(then_block, scopes)?;
+                let then_returns = self.block(then_block, scopes)?;
                 self.solver.pop(1);
 
                 self.solver.push();
                 self.solver.assert(cond_term.not());
-                match else_block.as_deref() {
+                let else_returns = match else_block.as_deref() {
                     Some(ElseBranch::Block(b)) => self.block(b, scopes)?,
-                    Some(ElseBranch::If(e2)) => self.stmt(&Stmt::Expr(e2.clone()), scopes)?,
-                    None => {}
-                }
+                    Some(ElseBranch::If(e2)) => matches!(self.stmt(&Stmt::Expr(e2.clone()), scopes)?, Flow::Returns),
+                    // No `else` at all: the "condition didn't hold" path
+                    // always falls through to whatever comes after this
+                    // `if` — never a return by itself.
+                    None => false,
+                };
                 self.solver.pop(1);
-                Ok(())
+                Ok(match (then_returns, else_returns) {
+                    (true, true) => Flow::Returns,
+                    (true, false) => Flow::ContinuesUnder(cond_term.not()),
+                    (false, true) => Flow::ContinuesUnder(cond_term),
+                    (false, false) => Flow::Continues,
+                })
             }
             Stmt::Expr(e) => {
                 self.int_expr(e, scopes)?;
-                Ok(())
+                Ok(Flow::Continues)
             }
             Stmt::While { .. } => Err("Tier 1 doesn't model loops (no invariant synthesis, same conservative choice smt.rs's own Tier-1 pass makes)".to_string()),
             Stmt::Audited { body, .. } => {
                 scopes.push();
                 let r = self.stmts(body, scopes);
                 scopes.pop();
-                r
+                r.map(|returns| if returns { Flow::Returns } else { Flow::Continues })
             }
         }
     }
 
-    fn block(&mut self, b: &Block, scopes: &mut Scopes) -> EvalResult<()> {
+    fn block(&mut self, b: &Block, scopes: &mut Scopes) -> EvalResult<bool> {
         scopes.push();
         let r = self.stmts(&b.stmts, scopes);
         scopes.pop();
@@ -479,7 +803,52 @@ impl Eval<'_> {
                 self.solver.pop(1);
                 Ok(cond_term.ite(&then_val, &else_val?))
             }
-            other => Err(format!("Tier 1 doesn't model `{other:?}` — only integer literals/identifiers, +-*, and if/else are supported")),
+            // Interprocedural reasoning (`docs/ROADMAP.md` Track F, F3;
+            // `Summary`'s own doc comment) — bounded and sound: only a
+            // callee whose own `validate` contract was *already proven*
+            // (by an earlier pass of `run_program_validates`) has a
+            // `Summary` here at all; anything else (no `validate` block,
+            // one that's `Unsupported`, or a mutual-recursion cycle that
+            // never resolves) is still an honest `Unsupported`, exactly
+            // as before this arm existed.
+            Expr::Call(name, args, _) => {
+                let Some(summary) = self.summaries.get(name.as_str()) else {
+                    return Err(format!(
+                        "Tier 1 doesn't model a call to `{name}` (no independently-proven `validate` contract on it to use as a summary)"
+                    ));
+                };
+                if summary.params.len() != args.len() {
+                    return Err(format!("Tier 1: call to `{name}` has the wrong argument count (should be unreachable, typeck already checked this)"));
+                }
+                // Each argument is evaluated in *this* call's own scope
+                // (the caller's params/locals), then bound to the
+                // callee's own parameter names in a fresh, separate
+                // scope below — the callee's `pre`/`post` never see the
+                // caller's names at all, only its own.
+                let arg_terms: Vec<Int> =
+                    args.iter().map(|a| self.int_expr(a, scopes)).collect::<Result<_, _>>()?;
+                let result_term = Int::fresh_const(&format!("{name}_call"));
+                assert_bounds(self.solver, &result_term, &summary.ret);
+                let mut call_scope = Scopes(vec![HashMap::new()]);
+                for (p, term) in summary.params.iter().zip(arg_terms.iter()) {
+                    call_scope.define(&p.name, term.clone());
+                }
+                let mut pre_conjunction = Bool::from_bool(true);
+                for pre_e in &summary.pre {
+                    pre_conjunction = pre_conjunction & self.bool_expr(pre_e, &mut call_scope)?;
+                }
+                call_scope.define("result", result_term.clone());
+                // `pre => post`, an implication, never `post` on its own
+                // — a call site whose arguments don't satisfy the
+                // callee's own precondition gets a vacuous axiom here
+                // (true regardless of `result`), not a wrong one.
+                for post_e in &summary.post {
+                    let post_term = self.bool_expr(post_e, &mut call_scope)?;
+                    self.solver.assert(pre_conjunction.clone().not() | post_term);
+                }
+                Ok(result_term)
+            }
+            other => Err(format!("Tier 1 doesn't model `{other:?}` — only integer literals/identifiers, +-*, if/else, and a call to an independently-proven `validate`d fn are supported")),
         }
     }
 

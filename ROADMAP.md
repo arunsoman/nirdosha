@@ -1265,15 +1265,15 @@ of Track B has landed.*
   `role_mapping`, `field_rbac`, `serve` — every fixture already declared
   `"kty":"oct"`) re-verified green with no changes needed. Full
   `cargo test` green. Full design and remaining scope (mobile identity,
-  a multi-IdP registry) unchanged: `API_TRUST_MODEL.md` §3.
+  a multi-IdP registry) unchanged: `docs/API_TRUST_MODEL.md` §3.
 - `[DONE]` **A12. Verbatim, mathematical verification of a PRD
-  extraction against real `.nir` code** — `API_TRUST_MODEL.md` §7.5's
+  extraction against real `.nir` code** — `docs/API_TRUST_MODEL.md` §7.5's
   Tier 1 (an SMT obligation channel for a human/extractor-written
   predicate) and a new sibling structural construct for `workflow`
   shape, both built and demonstrated against a real extraction file,
   `scratch/extracted_typed_v1.json`, not a synthetic fixture.
   - **`contract_check::check_fn_contract`** (new
-    `compiler/src/contract_check.rs`) — Tier 1, for real: takes a real
+    `crates/compiler/src/contract_check.rs`) — Tier 1, for real: takes a real
     Hoare pair (`pre_logic`/`post_logic`, straight out of the extraction
     JSON's own shape) and a real named `.nir` function, parses each
     predicate with the exact same grammar every `.nir` expression gets
@@ -1300,7 +1300,7 @@ of Track B has landed.*
     value. That threshold is exactly §7.1a's "the spec references a
     quantity the code doesn't parameterize on" case:
     `required_eyes_for_amount` takes no such parameter, the real code
-    hardcodes 5,000,000 (`ROADMAP.md` A9), so `check_fn_contract`
+    hardcodes 5,000,000 (`docs/ROADMAP.md` A9), so `check_fn_contract`
     requires it as an explicit `extra_bindings` input — omitted, it
     returns `UnboundIdentifier` rather than a misleading answer;
     supplied wrong (6,000,000), it correctly returns a real
@@ -2370,9 +2370,311 @@ E6 is the one item that waits on all five.*
     `RoleElevationApproval` workflows start and queue correctly in the
     same served manifest; `node --check` on the extracted client
     script passes. — 2026-09-03.
-- `[DONE]` **E7. `PUBLIC_ROADMAP.md` — add a Track E entry.** Brief,
+- `[DONE]` **E7. `docs/PUBLIC_ROADMAP.md` — add a Track E entry.** Brief,
   external-facing mirror of Track D's own entry there — done as part of
   this same session, since it's small. — 2026-09-03.
+
+- `[DONE]` **E8. `examples/ctms/ctms.nir` — Audit module: a real
+  unauthenticated write bug, found by "does every struct really need a
+  full CRUD screen?"** Prompted directly (`nirdosha` chat, 2026-09-03):
+  "not everything needs a CRUD operation ... look at the audit menu."
+  Inspecting the served manifest showed `AuditLogEntry`'s "Audit Search &
+  Export" screen (Module 10) rendering a manual "Create" form —
+  `SCREENS.md`'s own row for this screen lists its actions as "Search,
+  export (signed PDF/CSV/JSON), verify integrity" only, no create at
+  all, and conceptually an audit trail is supposed to be an append-only
+  side effect of *other* modules' actions, never something a human
+  types into a form. Worse than a stray button: `create_audit_log_entry`
+  was `requires(public)` — literally any unauthenticated caller could
+  `POST /api/create_audit_log_entry` with an attacker-chosen `actor`/
+  `justification`/`occurred_unix`/`legal_hold_ref` and have it accepted
+  as a real entry in what's supposed to be the tamper-evident record of
+  who did what, in a fraud-investigation compliance system. Every
+  sibling struct in the same module (`SecurityAlertEntry`/
+  `IntegrityScan`/`ArchiveObject`) already gated its own `create_`/
+  `update_` behind `role: "admin"`/`role: "compliance_officer"` —
+  `AuditLogEntry` alone hadn't been brought in line.
+  Fixed by renaming `create_audit_log_entry` → `record_audit_log_entry`
+  (steps outside `ui_gen`'s `create_<snake>` naming-convention inference,
+  so the screen stops rendering a create action at all — zero-effort
+  correct-by-construction fix, no new "hide this action" mechanism
+  needed) and gating it `requires(role: "admin")`. Verified live against
+  a running server: the manifest's `AuditLogEntry` screen now has only
+  `list`/`get` actions; the old route is a 404; the new route 403s an
+  unauthenticated caller and a non-admin token, and succeeds (`{"ok":
+  <id>}`, visible in a follow-up `list_audit_log_entry`) for a real
+  admin token. `list_audit_log_entry`/`get_audit_log_entry` left
+  untouched (still `requires(public)`) — flagged, not silently changed:
+  all three sibling structs' own `list_` fns are `requires(public)` too,
+  so that's this module's established, consistent pattern, not an
+  isolated `AuditLogEntry` anomaly the way the create bug was; whether
+  Module 10's reads should be public at all is a separate, wider
+  question than what was asked, left for the user to decide. `cargo
+  test --test serve` (24 tests) green throughout — an example `.nir`
+  file change, not a compiler change.
+
+  **Same-day follow-up, `IntegrityScan` ("Integrity / Tamper-Check"),
+  asked directly:** same shape as E8's `AuditLogEntry` bug, one level
+  more subtle. `create_integrity_scan(s: IntegrityScan)` let an admin's
+  own form submission set `tamper_detected`/`verification_status`
+  directly — i.e. an admin could create a "scan" that already claims
+  `verified, no tampering` without any actual check ever running,
+  undermining the one thing a tamper-detection screen exists to prove.
+  `SCREENS.md`'s own row lists this screen's actions as "Run manual
+  scan, view tamper detail" only — no create at all — but unlike
+  `AuditLogEntry`, a legitimate need remains (registering a new scan
+  *kind* to track over time), so this wasn't a rename-away-from-`create_`
+  case. Fixed by narrowing the fn's own signature instead of removing
+  it: `create_integrity_scan(scan_kind: Text)` — `ui_gen.rs::
+  build_action` renders whatever params a `create_<snake>` fn actually
+  declares, not necessarily the whole struct, so the form itself now
+  honestly only asks for a name; the two falsifiable columns are
+  hardcoded server-side to `tamper_detected: false, verification_status:
+  "pending"` on every insert, true until `run_integrity_scan` (the
+  screen's real "Run manual scan" action) actually sets them. Confirmed
+  `check_edit_gates`/`update_gates_for_fn` (this file's own field
+  `edit:`-gate mechanism) would NOT have covered this even if used —
+  both are explicitly `update_<S>`-only by design ("`serve.rs`'s
+  write-enforcement path only ever rejects an edit to an existing row,
+  never a create," `ui_gen.rs`'s own doc comment on `update_gates_for_fn`)
+  — a real, confirmed architectural gap: there is no field-level
+  enforcement lever for `create_<S>` at all today, only the coarse
+  "narrow the fn signature" escape hatch used here. Verified live: the
+  manifest's `create_integrity_scan` action now has one param
+  (`scan_kind`); an admin-created row reads back `tamper_detected: 0,
+  verification_status: "pending"`, never caller-supplied. `cargo test
+  --test serve` still green.
+
+  **Flagged, not fixed, same pattern spotted while looking:**
+  `SecurityAlertEntry` ("SIEM-Style Security Alert Dashboard") and
+  `ArchiveObject` ("WORM Archive Browser") both have a `create_<snake>`
+  taking their whole struct too, and neither screen's `SCREENS.md` row
+  lists "create" as an action either (`SecurityAlertEntry`: "Acknowledge,
+  escalate"; `ArchiveObject`: "View, verify lock status, request extended
+  retention" — the latter's name is literally Write-Once-Read-Many).
+  Not touched this session — only asked about `IntegrityScan`
+  specifically; noted here so a future pass doesn't have to
+  re-discover it.
+
+---
+
+## Track F — Next-generation language & UI architecture (`docs/NEXT_GEN.md`)
+
+*Priority: independent of Tracks A-E — none of F1-F3 change what's
+already shipped; each is additive syntax/subsystem work, none block
+each other. Grew out of a direct 2026-09-03 design conversation,
+prompted by two real CRUD-permission bugs fixed the same session in
+`examples/ctms/ctms.nir` (Track E, entry E8 and its `IntegrityScan`
+follow-up, both above). Full design detail, reasoning, and a running
+risk register (R1-R7) live in `docs/NEXT_GEN.md` — this section only tracks
+scoped status, doesn't duplicate the reasoning.*
+
+- `[OPEN]` **F1. Target-independent UI manifest + multiple renderers
+  (web/TUI/mobile).** Generalize `ui_gen.rs`'s existing JSON manifest
+  into a real multi-renderer contract: a bounded interaction-verb
+  vocabulary (replacing today's fixed 6 `Action.kind`s), a style/token
+  layer instead of literal CSS, and a second renderer — TUI, chosen
+  specifically for being cheap to prove out (no native toolchain) —
+  before or alongside Track D's already-scoped native mobile renderer.
+  Full detail: `docs/NEXT_GEN.md` §F1.
+- `[DONE]` **F2. Real module/package system.** Shipped 2026-09-03, same
+  session scoped in. All three pieces real, tested end-to-end
+  (`crates/compiler/tests/modules.rs`, 12 tests), not stubbed: namespacing
+  (`module Ident { ... }`, a new form dispatched alongside the
+  unchanged legacy `module "string" { ... }` sugar), visibility
+  (`pub`), separate compilation (`use "path.nir"`, `crates/compiler/src/
+  loader.rs`). Both documented collision bugs (`struct Pair` vs. the
+  prelude's own; two enums sharing a variant name, `CurrencyCode::SAR`-
+  shaped) fixed and covered by a real test each. Full detail, including
+  the design's one deliberate ergonomic cost (no implicit same-module
+  bare access — every reference to a namespaced item, even from a
+  sibling in its own module, needs its `Mod::Name` qualification) and
+  what's still `[OPEN]` (compiled-path support, `screen`/`dashboard`/
+  `workflow`/`workspace` referencing a namespaced struct, `--format=json`
+  not yet `use`-aware): `docs/NEXT_GEN.md` §F2; short practical version:
+  `docs/LANGUAGE.md` §17.
+- `[DONE]` **F3. Hoare-style per-function contracts ("validators").**
+  Requested directly (`nirdosha` chat, 2026-09-03: "do it first so its
+  taken care of"), same session F3 was first scoped in. Real `.nir`
+  syntax now feeds the already-proven `contract_check::
+  check_fn_contract` Z3-backed prover (A12), plus a second, independent
+  runtime backstop for everything that prover can't statically reach —
+  both pieces this entry originally called for, both real, both tested
+  end-to-end, not stubbed.
+  - **Syntax**: `validate <fn_name> { pre: <expr>  post: <expr> ... }`
+    — a new reserved keyword (`token.rs::Tok::Validate`), a new
+    top-level `ast::ValidateDecl` (`entries: Vec<KvEntry>`, the same
+    generic shape `ScreenDecl` already uses — `pre`/`post` are ordinary
+    contextual keys, not new syntax of their own), parsed by
+    `parser.rs::parse_validate_decl` reusing `parse_kv_entry` unchanged.
+    `typeck.rs::check_validate` checks `fn_name` resolves and every key
+    is `pre`/`post` — deliberately does *not* type-check the predicates
+    themselves against `fn_name`'s real signature (disclosed gap,
+    below).
+  - **Build-time static gate**: `contract_check::
+    check_fn_contract_exprs` (a small refactor of the existing
+    string-based `check_fn_contract` — extracted the shared Z3-walking
+    tail into `check_fn_contract_parsed`, zero behavior change,
+    reverified against all 8 pre-existing A12 tests) feeds it real
+    parsed `.nir` `Expr`s instead of extraction-JSON strings.
+    `check_program_contracts` runs this for every `validate` block and
+    hard-fails the build on a genuine, *proven* counterexample or an
+    unbound identifier — never on `Unsupported`, which isn't a proven
+    defect. Wired into the one choke point every command that owns a
+    typechecked program actually goes through: `main.rs::
+    typecheck_and_own_impl` (`build`/`serve`/`emit-ui`/`emit-llvm`) —
+    deliberately *not* alongside `smt::analyze` in `cmd_build`, since
+    codegen doesn't support `db` yet and nearly every real app is
+    `db`-backed, so that spot would never actually run for them — plus
+    `lib.rs::run_with_tracer_transact_and_workflow_log` (plain
+    `nirdosha <file.nir>`, a separate pipeline `main.rs`'s own doesn't
+    reach). `--format=json`'s structured path
+    (`run_diagnostic_with_tracer_transact_and_workflow_log`) gets the
+    same gate too, via a new `Diagnostic::Contract` variant
+    (`contract_check::ContractDiagnostic { message, span }`,
+    `check_program_contracts_diagnostics`) — not left as a silent,
+    narrower gap the way `--format=json`'s pre-existing
+    `DuplicateConstructor` panic already is.
+  - **Runtime backstop**: `interpreter.rs::call` (the one dispatcher
+    every function call goes through — `Expr::Call`, `call_named`,
+    `serve.rs`'s `/api/<fn>` alike) re-checks every `pre`/`post`
+    against the real, concrete argument/return values on *every actual
+    call*, unconditionally — new `check_validate_phase` helper, new
+    `ErrorKind::ContractViolation`. `pre` checked right after params
+    bind, before the body runs at all (a violated precondition never
+    lets the body execute); `post` checked with `result` bound to the
+    real return value in a fresh scope. Unlike the static prover, has
+    no integer-only restriction — it can meaningfully check a
+    `db`-touching, struct/`Result`-returning function's postcondition
+    too, exactly the majority case Tier-1 can't reach. A predicate that
+    fails to evaluate as `Ok(Value::Bool(true))` (an eval error, or a
+    non-bool result — possible since `typeck::check_validate`
+    deliberately doesn't type-check `pre`/`post` against the target
+    fn's real signature) is a violation, never silently passed.
+  - **A real, previously-undiscovered soundness bug found and fixed
+    along the way, not worked around**: `contract_check.rs`'s Tier-1
+    statement walker — present since A12, unchanged by this item until
+    now — never modeled unreachability after an early `return` inside
+    an `if` with no `else` (`if cond { return x } return y`-style
+    statement-position early return, ubiquitous throughout this
+    codebase's own `.nir` examples). `stmts`' loop kept walking
+    trailing sibling statements with no branch condition asserted at
+    all, so a genuinely unreachable `return` got checked as reachable
+    for *every* input — producing real, wrong `Counterexample`s against
+    genuinely-correct functions the moment `validate`'s own tests first
+    exercised the walker on anything beyond A12's single hand-picked
+    flagship demo (`required_eyes_for_amount`, which uses a
+    value-position `if {...} else {...}` that happens to sidestep this
+    exact shape). Fixed by giving `stmt` a real `Flow` result
+    (`Continues`/`Returns`/`ContinuesUnder(Bool)`) instead of a bare
+    `EvalResult<()>`, so a partially-returning `if` correctly narrows
+    the solver context for whatever comes after it, the same
+    `Result<Value, Signal::Return(_)>` propagation shape
+    `interpreter.rs`'s real, correct control flow already uses. All 8
+    pre-existing A12 tests + `smt.rs`/`refine.rs` (unaffected,
+    different modules) reverified green after the fix.
+  - **Verified end-to-end**, not just unit-level: new
+    `crates/compiler/tests/validate_contracts.rs` (12 tests) — a real
+    counterexample fails the build with the actual violating bindings
+    named; a genuinely-true contract proves and the program runs; an
+    unknown `fn_name`/key is a real type error; an unbound identifier
+    in a predicate is reported by name; a loop-shaped function is
+    `Unsupported` statically but still builds, with a note explaining
+    why; that same function's contract is verified for real at runtime
+    (both a true and a deliberately-false postcondition); a violated
+    precondition stops the body from running at all (confirmed by
+    checking the error names the contract, not a downstream
+    `DivByZero`); a program with no `validate` blocks at all is a true
+    no-op; the early-return reachability fix has a dedicated regression
+    pin. Also confirmed live against the real `nirdosha` binary (not
+    just `cargo test`): a correct contract runs silently, a violated
+    one fails the build with a real counterexample naming the exact
+    input, an unsupported-but-true contract runs fine with a `note:`
+    printed under `emit-ui`. Full `cargo test --release` reverified —
+    71 test binaries, zero regressions beyond the pre-existing,
+    unrelated `mq.rs` Redis-connection-refused failures present before
+    any of this session's work.
+  - **Follow-up, same session, all three originally-disclosed gaps
+    revisited on request ("plz fix these first")** — two genuinely
+    fixed, one investigated in real depth and found to be a materially
+    bigger, pre-existing finding than first described, not something
+    to force a fix onto:
+    1. **Fixed — `typeck::check_validate` now type-checks `pre`/`post`
+       for real.** Reuses `Checker::check` (the exact entry point an
+       ordinary `if` condition/`let` initializer already goes through)
+       against a `Scopes` seeded from `fn_name`'s own real parameter
+       names/types (plus `result: <return type>` inside `post`) — the
+       same "seed `Scopes` from a caller-supplied map, reuse the
+       ordinary checker" shape `validate_fragment`/`FragmentEnv`
+       established first. A non-bool predicate or an unbound identifier
+       is now a real, span-located `TypeError` at build time — for
+       *every* `validate` block, including one on a function Tier-1's
+       prover could never reach at all (a struct param, a `db`-touching
+       body), not just the provable minority. 3 new tests pin this
+       (an unbound identifier, a non-bool predicate, and the same
+       non-bool mistake on a loop-shaped/Tier-1-`Unsupported` fn).
+    2. **Investigated thoroughly, not fixed — a real, deeper finding,
+       not a small bug.** Root-caused via a from-scratch, minimal
+       LALRPOP reproduction (`/tmp/mini_lalr`, not kept): nirdosha's
+       real grammar — no statement separator at all between elements of
+       a `stmt*`/`block`, combined with unary `-` being a valid
+       expression prefix — is **not expressible as an unambiguous
+       LALR(1) grammar**, independent of `validate`/`ValidateDecl`
+       entirely (confirmed with a 6-line minimal grammar containing
+       only arithmetic + a bare statement list, no `if`/`screen`/
+       anything else). `Comparison "<" Additive`, `Equality "==" Comparison`, and
+       every other left-recursive precedence level shows the identical
+       shift/reduce conflict for the identical reason — two lines
+       `foo` / `-bar` are genuinely ambiguous between "two statements"
+       and "one, `foo - bar`" for a context-free grammar with 1 token
+       of lookahead; nirdosha's real hand-written parser resolves this
+       deterministically (always greedily extend), which is exactly a
+       "prefer shift" resolution LALRPOP has no mechanism to express
+       (confirmed: unlike yacc/bison's `%left`/`%right`/`%prec`,
+       LALRPOP requires the grammar itself to already be unambiguous —
+       conflicts are always a hard build error, never auto-resolved).
+       Fixing this for real means either the `.lalrpop` file stops
+       being a faithful, literal transliteration of docs/GRAMMAR.md (its
+       whole stated purpose) by inventing disambiguation docs/GRAMMAR.md
+       itself doesn't specify, or replacing LALRPOP with a tool that
+       supports canonical LR(1)/GLR parsing. Both are real, separately-
+       scoped decisions, not a bug fix — left open, not silently
+       claimed done; `crates/grammar_check/src/nirdosha.lalrpop` does still
+       carry the correct `ValidateDecl` production for whenever this
+       gets resolved.
+    3. **Fixed — bounded, sound interprocedural reasoning.** A `Call`
+       inside a `validate`d function's body is no longer an automatic
+       `Unsupported`: `contract_check::run_program_validates` now runs
+       a real fixed-point pass over the whole program — a callee whose
+       *own* `validate` contract independently resolves to `Proved`
+       gets promoted into a `Summary` (new struct), which any other
+       `validate` block's `Call` to that same function can then use as
+       an axiom, asserted as `callee_pre => callee_post` (an
+       implication, never `post` unconditionally — a call site that
+       doesn't provably satisfy the callee's own precondition gets a
+       vacuous, uninformative axiom, never a wrong one). Soundness is
+       load-bearing here, not incidental: a callee whose *declared*
+       contract is `false` never gets promoted at all (verified by a
+       dedicated test — `double`'s own wrong contract stays a real,
+       reported violation, and its caller's genuinely-true contract
+       stays honestly `Unsupported`, never wrongly "proved" off a false
+       premise). Bounded by `program.validates.len()` passes
+       (terminates cheaply; a mutual-recursion cycle simply never
+       resolves on either side, staying honestly `Unsupported`, not a
+       wrong answer). 4 new tests: an unvalidated callee stays
+       `Unsupported`; a proven callee lets its caller be proved too
+       (confirmed live via `nirdosha::run`, not just the checker in
+       isolation); the interprocedural path still finds a real
+       counterexample in the caller when one exists; an unproven
+       (false) callee is never used as an axiom. Full design detail for
+       both the investigation and what "sound" means here:
+       `docs/NEXT_GEN.md` §F3.
+    Full `cargo test --release` reverified after all three: 71 test
+    binaries, same zero regressions beyond the pre-existing `mq.rs`
+    Redis failures. `nirdosha.lalrpop`'s conflict is the one item of
+    the original three genuinely not resolved — real effort was spent
+    establishing exactly why, not avoided.
+  Full design detail and reasoning: `docs/NEXT_GEN.md` §F3.
 
 ---
 

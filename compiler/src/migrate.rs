@@ -242,7 +242,17 @@ mod tests {
     }
 
     fn empty_program() -> Program {
-        Program { fns: vec![], structs: vec![], enums: vec![], screens: vec![], dashboard: None, workflows: vec![], workspaces: vec![] }
+        Program {
+            fns: vec![],
+            structs: vec![],
+            enums: vec![],
+            screens: vec![],
+            dashboard: None,
+            workflows: vec![],
+            workspaces: vec![],
+            validates: vec![],
+            imports: vec![],
+        }
     }
 
     #[test]

@@ -1437,12 +1437,75 @@ pub struct Program {
     /// never this field. Left populated (not drained) after lowering so
     /// diagnostics can still point at the original `workflow` syntax.
     pub workflows: Vec<WorkflowDecl>,
-    /// Declared `workspace Name { ... }` blocks (`ROADMAP.md` Track E1,
+    /// Declared `workspace Name { ... }` blocks (`docs/ROADMAP.md` Track E1,
     /// `examples/ctms/UI_CONSTRUCTS.md` §1) — composite multi-panel
     /// screens, additive over `screens`/`dashboard` the same way those
     /// are additive over pure naming-convention inference: a program
     /// with no `workspace` block is unaffected.
     pub workspaces: Vec<WorkspaceDecl>,
+    /// Declared `validate <fn_name> { pre: <expr>  post: <expr> ... }`
+    /// blocks (`docs/ROADMAP.md` Track F, F3; `docs/NEXT_GEN.md` §F3) — a Hoare
+    /// contract layered onto an existing fn, never a replacement for
+    /// anything: a fn with no `ValidateDecl` is completely unaffected.
+    /// Consumed two ways, both additive: `contract_check::
+    /// check_program_contracts` (called once, at typecheck time)
+    /// statically proves it or hard-fails the build with a real
+    /// counterexample for the Tier-1-provable subset (pure, loop-free,
+    /// integer-only, no calls — same scope `check_fn_contract` itself
+    /// already had before this field existed); `interpreter.rs::call`
+    /// re-checks every `pre`/`post` at runtime, on every actual call,
+    /// unconditionally — the backstop for everything outside that
+    /// static subset (a fn touching `db`/`json`/`http`, calling another
+    /// fn, or looping — true of nearly every real fn in a real app).
+    pub validates: Vec<ValidateDecl>,
+    /// Leading `use "path.nir"` directives (`docs/ROADMAP.md` Track F, F2
+    /// piece 3) — already resolved and merged into `fns`/`structs`/
+    /// `enums` above by the time this `Program` reaches `typeck`/the
+    /// interpreter/`ui_gen` (`main.rs`'s multi-file loader consumes
+    /// this field and does the merge right after parsing, before
+    /// anything else touches the `Program`). Left populated (not
+    /// drained), same "keep the original syntax around for
+    /// diagnostics" reasoning `workflows` above already documents for
+    /// itself.
+    pub imports: Vec<ImportDecl>,
+}
+
+/// `validate <fn_name> { pre: <expr>  post: <expr> ... }` — one Hoare
+/// contract, declared separately from the fn it targets (mirrors
+/// `screen <Struct> { ... }`'s own "separate top-level declaration
+/// referencing an existing item" shape, rather than new per-parameter
+/// annotation syntax on the `fn` line itself). `entries` holds the raw
+/// `pre`/`post` slots, same `KvEntry` shape every other block already
+/// uses — `contract_check.rs`/`interpreter.rs` each filter it for the
+/// keys they need rather than this getting dedicated `pre`/`post`
+/// fields, so a third contextual key can be added later (e.g. a named
+/// `extra_bindings`-shaped escape hatch) without another AST change.
+/// Multiple `pre`/`post` entries are allowed and meaningful — every
+/// `pre` is a conjunctive hypothesis, every `post` is checked
+/// independently, mirroring `contract_check::check_fn_contract`'s own
+/// `&[String]` list-of-predicates shape exactly (this is the same
+/// prover, just fed already-parsed `.nir` `Expr`s instead of strings
+/// parsed out of an extraction JSON — see `check_fn_contract_exprs`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ValidateDecl {
+    pub fn_name: String,
+    pub entries: Vec<KvEntry>,
+    pub span: Span,
+}
+
+/// `use "relative/path.nir"` — one import (`docs/ROADMAP.md` Track F, F2
+/// piece 3; `docs/NEXT_GEN.md` §F2), only ever legal in the leading run at
+/// the very start of a program (`parser::parse_program`), before any
+/// other item. `path` is exactly the string literal as written, always
+/// resolved relative to the *importing* file's own directory — never
+/// interpreted here (this is one file's own parse result; resolving,
+/// loading, and merging another file's `pub` real-namespace
+/// declarations is `main.rs`'s job, since only it knows the importing
+/// file's own path on disk).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ImportDecl {
+    pub path: String,
+    pub span: Span,
 }
 
 /// One `key: value` slot inside a `screen`/`dashboard`/`field`/`action`

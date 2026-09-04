@@ -14,14 +14,14 @@ match {
     "fn", "let", "return", "if", "else", "while", "box",
     "true", "false",
     "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "bool", "unit",
-    // Row 11/12/`WORKFLOW.md`/Track E1 declaration keywords -- real
+    // Row 11/12/`docs/WORKFLOW.md`/Track E1 declaration keywords -- real
     // reserved keywords in `token.rs` (unlike `field`/`action`/
     // `paginate`/`tile`/`chart`/`panel`/`data`/`on_entry`/`on_exit`/
     // `on`/`terminal`/`link` below, which stay modeled as plain `IDENT`
     // -- see the note above `ScreenItem` for why lalrpop can't
     // faithfully reserve a *contextual* keyword the way `parser.rs`
     // does).
-    "struct", "enum", "screen", "dashboard", "module", "workflow", "workspace", "state",
+    "struct", "enum", "screen", "dashboard", "module", "workflow", "workspace", "state", "validate",
     "(", ")", "{", "}", ":", ",", "->", "=",
     "+", "-", "*", "/",
     "==", "!=", "<=", ">=", "<", ">",
@@ -56,6 +56,7 @@ Item: () = {
     ModuleDecl => (),
     WorkflowDecl => (),
     WorkspaceDecl => (),
+    ValidateDecl => (),
 };
 
 // ---- Row 11: struct/enum (product/sum types) --------------------------
@@ -127,7 +128,18 @@ ModuleItem: () = {
     EnumDecl => (),
 };
 
-// ---- `WORKFLOW.md`'s durable state machine -----------------------------
+// ---- `validate <fn_name> { pre: ... post: ... }` (`docs/ROADMAP.md` Track
+// F, F3; `docs/NEXT_GEN.md` §F3) -- a Hoare contract on an existing `fn`,
+// declared separately, same shape as `ScreenDecl` above. `pre`/`post`
+// stay plain `IDENT` (matched by identifier text only inside
+// `parser.rs::parse_validate_decl`), the same "keyword only within
+// this one leading position" treatment `field`/`action`/`paginate`
+// already get inside `ScreenItem` -- so this production is just
+// `KvEntry*`, nothing new for lalrpop to disambiguate.
+
+ValidateDecl: () = { "validate" IDENT "{" KvEntry* "}" => () };
+
+// ---- `docs/WORKFLOW.md`'s durable state machine -----------------------------
 //
 // `data`/`on_entry`/`on_exit`/`on`/`terminal`/`link` all stay plain
 // `IDENT` for the same reason `field`/`action`/`paginate` do above.
