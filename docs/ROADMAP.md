@@ -2807,6 +2807,21 @@ sequencing in `docs/ECOSYSTEM.md`; this entry only tracks status.*
   standard `nirdosha` CLI doesn't find a declared plugin dependency on
   its own yet); the native-code-sandboxing open question is still just
   that, open. Stage 2 (Kind B, pure-`.nir`-source crates) not started.
+
+  **2026-09-05 — gap-closing pass, built and verified.** A five-plugin
+  reference gallery against real external systems (MySQL, ActiveMQ,
+  Cassandra, Neo4j, HBase — `crates/plugin-example-*/`, `crates/
+  plugin-support/`), a real live unsoundness in effect-checking found
+  and fixed (`rfcs/0003-plugin-abi-v2.md`), `serve`/`build`/`emit-llvm`
+  now plugin-aware (the first of the two disclosed gaps above —
+  `serve` can serve a plugin builtin over real HTTP now; `build`/
+  `emit-llvm` cleanly reject one instead of hitting an untested path),
+  and a first real answer to the sandboxing question
+  (`TRUSTED_PLUGINS.md` + `rfcs/0004-native-plugin-sandboxing.md`).
+  Full details in `docs/ECOSYSTEM.md` §G1's own dated entry. Still
+  open: Cargo.toml-driven auto-discovery (`rfcs/0001`, unassigned
+  shepherd), a first-class `Ty::Handle` for compiler-enforced
+  plugin-resource safety, and Stage 2 (Kind B) entirely.
 - `[OPEN]` **G2. Editor/tooling ecosystem.** No LSP, no tree-sitter
   grammar, no formatter, no debugger (`cie`, a related repo, already
   documents this gap from the outside — Nirdosha handled via AST dump

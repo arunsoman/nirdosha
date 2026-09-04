@@ -172,6 +172,56 @@ crates.io-hosted `.nir`-source-only crate needs:
    automatically; that auto-discovery layer, and the security/sandboxing
    open question below, are what's left before this is safe to hand to
    a real third party.
+
+   **2026-09-05 — Stage 1 gap-closing pass, built and verified.**
+   Prompted by a concrete question ("how would a developer actually use
+   HBase or Cassandra from Nirdosha?") that Stage 1 alone couldn't
+   honestly answer yet:
+
+   - **A real reference-plugin gallery**, not just `rot13`:
+     `crates/plugin-example-{mysql,activemq,cassandra,neo4j,hbase}/`,
+     each a genuine Kind-A plugin against a real external system, each
+     verified against a real Docker container (MySQL, ActiveMQ,
+     Cassandra, Neo4j all live-tested this session; HBase's live test
+     is written but wasn't run against a container this session — see
+     its own README). `crates/plugin-support/` is the reusable
+     `HandleRegistry<T>` + shared-Tokio-runtime helper every
+     stateful/async-backed plugin in the gallery builds on, instead of
+     each hand-rolling its own. `docs/PLUGIN_AUTHORING_FOR_LLMS.md` is
+     the recipe these five were actually built from — real sharp edges
+     included (a duplicate-`thrift`-crate-version Cargo conflict, an
+     ext-trait method that didn't resolve against a published crate
+     build, `neo4rs`'s lazy-connect-doesn't-validate behavior), not a
+     sanitized retelling.
+   - **A real, live unsoundness found and fixed**
+     (`rfcs/0003-plugin-abi-v2.md`): a plugin builtin contributed *zero*
+     effect tags to `effects.rs`'s inference — invisible the whole time
+     `rot13` was the only plugin (it does nothing effectful), live the
+     moment a real network-backed plugin existed. `PluginBuiltin` now
+     carries a required `effects` field; two regression tests in
+     `crates/compiler/tests/effects.rs` prove the fix.
+   - **`serve`/`build`/`emit-llvm` now see plugins** — the first half
+     of the gap named above. `serve::run` takes a `plugins` parameter
+     (proven reachable over real HTTP in `tests/serve.rs`); `build`/
+     `emit-llvm` cleanly *reject* a plugin call with a named error
+     (`codegen::check_supported_with_plugins`) rather than the untested
+     "unknown function" path a plugin call would otherwise have hit —
+     plugins stay permanently interpreter-only for the compiled path
+     (no stable calling convention from generated LLVM IR into an
+     opaque `Arc<dyn Fn>` exists), a deliberate limit, not an oversight.
+   - **`TRUSTED_PLUGINS.md`** and **`rfcs/0004-native-plugin-sandboxing.md`**
+     give the security open question below a real, if partial, answer:
+     a lightweight self-declared trust listing (ship now) plus a
+     concrete, cheap effect-based capability-disclosure design
+     (reuses `effect(...)`'s existing machinery, not built yet) — with
+     WASM sandboxing explicitly scoped out as a future "Kind C," not
+     Kind A's problem to solve.
+
+   Auto-discovery (Cargo-graph-driven, not built) and a first-class
+   `Ty::Handle` (compiler-enforced affine safety for plugin-held
+   resources, today a plain `i64` via `nirdosha-plugin-support`) remain
+   real, named gaps — `rfcs/0001-package-manifest-format.md` and
+   `rfcs/0003-plugin-abi-v2.md`'s own open questions, respectively.
 2. **Stage 2 — Kind B.** Only after Stage 1 is real and F2 itself has
    had more mileage; needs the resolver work above plus a decision (see
    open questions) on whether crates.io is even the right home for
@@ -187,8 +237,14 @@ nothing above requires it.
   the binary — full execution, no sandbox. That cuts directly against
   Nirdosha's own memory/overflow-safety-proof value proposition unless
   plugins are either vetted somehow or compiled to WASM and sandboxed
-  instead of natively linked. Worth its own design pass before Stage 1
-  ships publicly, not solved by this doc.
+  instead of natively linked. **Partially addressed 2026-09-05**:
+  `TRUSTED_PLUGINS.md` (self-declared trust listing, shipped) and
+  `rfcs/0004-native-plugin-sandboxing.md` (the design pass this bullet
+  asked for — recommends effect-based capability disclosure as a cheap
+  real next step, WASM sandboxing scoped out as a future "Kind C," not
+  a Kind A retrofit). The RFC is honest that neither option is a real
+  security boundary against an adversarial plugin author — still an
+  open, harder question if that threat model ever becomes real.
 - **Two version resolvers.** Once F2's own module/visibility system
   and Cargo's semver both exist for Kind B packages, a project can end
   up with two overlapping notions of "which version of X am I using."
