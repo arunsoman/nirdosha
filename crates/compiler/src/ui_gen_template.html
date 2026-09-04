@@ -38,7 +38,13 @@ __NIRDOSHA_THEME_SCRIPT__
        --md-surface -- right at WCAG 1.4.11's 3:1 floor for a UI-
        component border, with essentially zero margin) to a real 3.86:1. */
     --md-outline: #827ea0;
-    --md-error: #c4433a;
+    /* 2026-09-04, contrast pass: #c4433a measured 4.99:1 against white/
+       --md-surface -- technically AA-legal for normal text (`.gate-note`,
+       `.countdown-overdue` both use this as a direct text color, not just
+       a fill) but with essentially no margin. #b3261e keeps the same
+       warm red the brand's error state reads as, darkened to a real
+       6.54:1. */
+    --md-error: #b3261e;
     --md-on-error: #ffffff;
     --md-error-container: #fbe4e1;
     /* Same 2026-09-03 pass: `.snackbar.error` was pairing `--md-on-error`
