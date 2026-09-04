@@ -2756,7 +2756,7 @@ module "Crypto Risk" {
         mcc_code: str,
         amount_cents: i64,
         occurred_unix: i64,
-        risk_priority: str,
+        risk_priority: Severity,
     }
 
     struct MerchantEntry {
@@ -2770,7 +2770,7 @@ module "Crypto Risk" {
         id: i64,
         wallet_address: str,
         counterparty_info: str,
-        validation_status: str,
+        validation_status: ValidationStatus,
         checked_unix: i64,
     }
 
@@ -2786,13 +2786,13 @@ module "Crypto Risk" {
         wallet_address: str,
         list_source: str,
         match_confidence: i64,
-        status: str,
+        status: SanctionsHitStatus,
     }
 
     struct CryptoLegalHold {
         id: i64,
         wallet_address: str,
-        status: str,
+        status: HoldStatus,
         applied_unix: i64,
     }
 }
@@ -2842,9 +2842,33 @@ fn simulate_card_crypto_detection(id: i64) -> Result(json, ErrorCode) requires(r
 
 screen CardCryptoTxn {
     title: "Fiat-Crypto Correlation"
+    field risk_priority {
+        render: "badge"
+    }
     action "Run Detection Simulation" -> simulate_card_crypto_detection {
         style: "outlined"
         show_result: true
+    }
+
+    layout {
+        row {
+            column {
+                group "Transaction" {
+                    field card_ref
+                    field merchant_name
+                    field mcc_code
+                    field amount_cents
+                }
+            }
+            column {
+                group "Risk" {
+                    field risk_priority
+                    field occurred_unix
+                }
+                divider {}
+                action "Run Detection Simulation"
+            }
+        }
     }
 }
 
@@ -2909,6 +2933,22 @@ fn update_travel_rule_check(t: TravelRuleCheck) -> Result(i64, ErrorCode) requir
 
 screen TravelRuleCheck {
     title: "Travel Rule Compliance"
+    field validation_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field wallet_address
+                field counterparty_info
+            }
+            column {
+                field validation_status
+                field checked_unix
+            }
+        }
+    }
 }
 
 fn list_crypto_compliance_report_inner(conn: db) -> Result(json, ErrorCode) {
@@ -2964,6 +3004,22 @@ fn update_wallet_sanctions_hit(h: WalletSanctionsHit) -> Result(i64, ErrorCode) 
 
 screen WalletSanctionsHit {
     title: "Wallet Sanctions Screening Queue"
+    field status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field wallet_address
+                field list_source
+            }
+            column {
+                field match_confidence
+                field status
+            }
+        }
+    }
 }
 
 fn list_crypto_legal_hold_inner(conn: db) -> Result(json, ErrorCode) {
@@ -2987,6 +3043,17 @@ fn create_crypto_legal_hold(h: CryptoLegalHold) -> Result(i64, ErrorCode) requir
 
 screen CryptoLegalHold {
     title: "Crypto Legal Hold"
+    field status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            field wallet_address
+            field status
+            field applied_unix
+        }
+    }
 }
 
 fn stat_sanctioned_wallet_count_inner(conn: db) -> Result(i64, ErrorCode) {
