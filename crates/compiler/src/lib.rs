@@ -14,6 +14,7 @@ pub mod migrate;
 pub mod observability;
 pub mod ownership;
 pub mod parser;
+pub mod plugin;
 pub mod pool;
 pub mod rqlite;
 pub mod thread_pool;
@@ -175,6 +176,41 @@ pub fn run_program_with_tracer_transact_and_workflow_log(
             Err(e) => return Err(format!("workflow log error during crash replay: {e}")),
         }
     }
+    interp.run_main_on_big_stack().map_err(|e| format!("runtime error: {e}"))
+}
+
+/// `docs/ROADMAP.md` Track G, G1 / `docs/ECOSYSTEM.md` §G1's Stage 1
+/// entrypoint: same lex/parse/typecheck/ownership/contract-check/run
+/// pipeline `run` itself uses, with `plugins` threaded into both the
+/// static checking stage (`typeck::typecheck_with_plugins`, so a call to
+/// a plugin builtin is proved well-typed *before* anything runs, the
+/// same discipline every other builtin already gets) and the evaluation
+/// stage (`Interpreter::with_plugins`). Deliberately a separate, minimal
+/// entrypoint rather than one more parameter threaded through the
+/// `run_with_tracer_transact_and_workflow_log` family above — combining
+/// plugins with tracer/transact-log/workflow-log support is real future
+/// work (`docs/ECOSYSTEM.md` §G1 stays honest about that), not silently
+/// implied by this function's existence today.
+pub fn run_with_plugins(src: &str, plugins: &[plugin::PluginBuiltin]) -> Result<Value, String> {
+    let toks = Lexer::new(src)
+        .tokenize()
+        .map_err(|e| format!("lex error at {}:{}: {}", e.span.line, e.span.col, e.message))?;
+    let program = Parser::new(toks)
+        .parse_program()
+        .map_err(|e| format!("parse error at {}:{}: {}", e.span.line, e.span.col, e.message))?;
+    if let Err(errors) = typeck::typecheck_with_plugins(&program, plugins) {
+        let joined = errors.iter().map(|e| format!("type error: {e}")).collect::<Vec<_>>().join("\n");
+        return Err(joined);
+    }
+    if let Err(errors) = ownership::check_ownership(&program) {
+        let joined = errors.iter().map(|e| format!("ownership error: {e}")).collect::<Vec<_>>().join("\n");
+        return Err(joined);
+    }
+    if let Err(errors) = contract_check::check_program_contracts(&program) {
+        return Err(errors.join("\n"));
+    }
+    let interp =
+        Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src)).with_plugins(plugins);
     interp.run_main_on_big_stack().map_err(|e| format!("runtime error: {e}"))
 }
 

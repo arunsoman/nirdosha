@@ -1,0 +1,29 @@
+[package]
+name = "nirdosha-plugin-rot13"
+version = "0.1.0"
+edition = "2024"
+description = "Reference Nirdosha plugin crate (docs/ROADMAP.md Track G, G1 / docs/ECOSYSTEM.md #G1 Stage 1): adds one new builtin, rot13(s: str) -> str, via the NirdoshaPlugin trait."
+
+# The Kind-A native-plugin convention docs/ECOSYSTEM.md #G1 proposes: a
+# metadata block, read by tooling (not Cargo itself, which ignores
+# unknown [package.metadata] keys), declaring which builtins this crate
+# provides and their signatures -- the same information `builtins()`
+# returns at runtime, duplicated here in a *statically greppable* form
+# so "what does installing this plugin add to my program?" is answerable
+# without compiling or running anything, the same way `docs/LANGUAGE.md`
+# is a static reference for the builtins nirdosha ships with today.
+[package.metadata.nirdosha]
+kind = "native"
+builtins = [
+    { name = "rot13", params = ["str"], ret = "str" },
+]
+
+[dependencies]
+# Path dependency within this workspace for local development/testing;
+# a real third-party plugin crate published to crates.io would instead
+# depend on a released `nirdosha = "0.1"` -- the exact "cargo add" story
+# docs/ECOSYSTEM.md #G1 describes. Kept a normal (not dev-)dependency:
+# `NirdoshaPlugin`/`PluginBuiltin`/`Ty`/`Value`/`RuntimeError` all live
+# in the `nirdosha` crate itself (see plugin.rs's own doc comment for
+# why there's no separate, smaller "plugin-api" crate).
+nirdosha = { path = "../compiler" }

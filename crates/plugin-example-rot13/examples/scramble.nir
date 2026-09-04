@@ -1,0 +1,16 @@
+// A real .nir program calling a plugin-contributed builtin (`rot13`,
+// added by this very crate — see ../src/lib.rs). Not runnable via the
+// plain `nirdosha` CLI, which knows nothing about plugins yet
+// (docs/ECOSYSTEM.md §G1's disclosed Stage 1 gap) — run it through
+// ../examples/run.rs instead:
+//
+//   cargo run -p nirdosha-plugin-rot13 --example run -- \
+//       crates/plugin-example-rot13/examples/scramble.nir
+
+struct Text { value: str }
+
+fn main() -> Text {
+    let scrambled: str = rot13("Nirdosha")
+    print(scrambled)
+    return Text(scrambled)
+}

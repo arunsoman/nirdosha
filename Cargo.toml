@@ -6,4 +6,5 @@ members = [
     "crates/grammar_export",
     "crates/bench",
     "crates/presence-gateway",
+    "crates/plugin-example-rot13",
 ]

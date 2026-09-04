@@ -1219,6 +1219,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nirdosha-plugin-rot13"
+version = "0.1.0"
+dependencies = [
+ "nirdosha",
+]
+
+[[package]]
 name = "nirdosha-presence-gateway"
 version = "0.1.0"
 dependencies = [
