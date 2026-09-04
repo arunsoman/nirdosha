@@ -1266,6 +1266,12 @@ pub enum ErrorKind {
     /// doc comment for why that's a disclosed, non-fatal-at-build-time
     /// gap rather than a silent one.
     ContractViolation { fn_name: String, phase: String, predicate: String },
+    /// `docs/ROADMAP.md` Track G, G1 / `docs/ECOSYSTEM.md` §G1's Stage 1: a
+    /// plugin builtin's own `PluginFn` returned `Err`. Deliberately its
+    /// own variant, not a reuse of `ChannelIoError`'s shape — a plugin
+    /// error has a real, distinct source (third-party code, not this
+    /// crate's own I/O layer) worth keeping visible in a diagnostic.
+    PluginError { plugin: String, message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1355,6 +1361,7 @@ impl std::fmt::Display for RuntimeError {
                 f,
                 "{line}:{col}: `validate {fn_name}`'s `{phase}` contract is violated: `{predicate}`"
             ),
+            ErrorKind::PluginError { plugin, message } => write!(f, "{line}:{col}: plugin `{plugin}`: {message}"),
         }
     }
 }
@@ -3824,6 +3831,16 @@ pub struct Interpreter {
     /// spawning more tasks needs them all landing in one shared pool, not
     /// each starting its own.
     thread_pool: Arc<crate::thread_pool::ThreadPool>,
+    /// `docs/ROADMAP.md` Track G, G1 / `docs/ECOSYSTEM.md` §G1's Stage 1:
+    /// name -> implementation for every plugin builtin `typeck.rs` has
+    /// already proved well-typed (`Checker::plugins`'s runtime
+    /// counterpart). Empty for every caller but `with_plugins`, the same
+    /// "one field, no cost when unused" shape `tracer`/`sandbox_exe`
+    /// already have. Cheap to clone (`Arc`-wrapped closures) — propagated
+    /// to every spawned child `Interpreter` in `Expr::Spawn`'s handler
+    /// the same way `sandbox_exe`/`tracer` already are, so a plugin
+    /// builtin is callable from a spawned thread too, not just `main`.
+    plugins: HashMap<String, crate::plugin::PluginFn>,
 }
 
 /// Past this many nested `call()`s, fail cleanly instead of overflowing
@@ -3998,6 +4015,7 @@ impl Interpreter {
             deadlock_registry: Arc::new(DeadlockRegistry::new()),
             current_task: TaskId::MAIN,
             thread_pool: crate::thread_pool::ThreadPool::new(),
+            plugins: HashMap::new(),
         }
     }
 
@@ -4029,6 +4047,17 @@ impl Interpreter {
 
     pub fn with_sandbox_exe(mut self, path: std::path::PathBuf) -> Self {
         self.sandbox_exe = Some(path);
+        self
+    }
+
+    /// `docs/ROADMAP.md` Track G, G1 / `docs/ECOSYSTEM.md` §G1's Stage 1
+    /// builder — same shape as `with_sandbox_exe`/`with_tracer`.
+    /// `lib.rs::run_with_plugins` is the one caller today; `plugin::
+    /// implementations` does the `&[PluginBuiltin] -> HashMap` shaping,
+    /// the same split `typeck::typecheck_with_plugins` makes on the
+    /// signature side via `plugin::signatures`.
+    pub fn with_plugins(mut self, plugins: &[crate::plugin::PluginBuiltin]) -> Self {
+        self.plugins = crate::plugin::implementations(plugins);
         self
     }
 
@@ -4557,6 +4586,7 @@ impl Interpreter {
         let source = Arc::clone(&self.source);
         let sandbox_exe = self.sandbox_exe.clone();
         let tracer = self.tracer.clone();
+        let plugins = self.plugins.clone();
         let name_owned = name.to_string();
         let args_owned = args.to_vec();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -4568,6 +4598,7 @@ impl Interpreter {
             if let Some(t) = tracer {
                 interp = interp.with_tracer(t);
             }
+            interp.plugins = plugins;
             let result = interp.call(&name_owned, &args_owned, span);
             let _ = tx.send(result);
         });
@@ -5785,6 +5816,24 @@ impl Interpreter {
                     }
                     return eval_builtin(name, &vals, *span, &self.rng).map_err(Signal::Err);
                 }
+                // `docs/ROADMAP.md` Track G, G1 / `docs/ECOSYSTEM.md` §G1's
+                // Stage 1: a plugin builtin — `typeck.rs::infer_builtin_call`
+                // has already proved `name` resolves and every argument is
+                // the declared type, so this is a plain dispatch, not a
+                // second round of validation. Checked after the real
+                // `is_builtin(name)` block (a plugin can never share a name
+                // with a real builtin — `typecheck_with_plugins`'s
+                // registration-time guards already proved that) and before
+                // the struct/enum-variant-construction checks below, same
+                // precedence order `typeck.rs::infer_call`'s own
+                // `is_builtin_or_plugin` gate uses.
+                if let Some(plugin_fn) = self.plugins.get(name).cloned() {
+                    let mut vals = Vec::with_capacity(arg_exprs.len());
+                    for a in arg_exprs {
+                        vals.push(self.eval_expr(a, env)?);
+                    }
+                    return plugin_fn(&vals, *span).map_err(Signal::Err);
+                }
                 // Row 11: a struct's own name, or an enum variant's name,
                 // called like a function, constructs a value -- "an
                 // ordinary call, not a new literal form"
@@ -6118,6 +6167,9 @@ impl Interpreter {
                     // threads through (see `tracer`'s doc comment) — every
                     // task's spans land in the same exporter/file.
                     let tracer = self.tracer.clone();
+                    // Same reasoning as `tracer` above — `docs/ROADMAP.md`
+                    // Track G, G1.
+                    let plugins = self.plugins.clone();
                     let name = name.clone();
                     let call_span = *span;
                     // Same `Arc::clone` pattern as `tracer`/`sandbox_exe`
@@ -6152,6 +6204,7 @@ impl Interpreter {
                             .with_deadlock_registry(Arc::clone(&deadlock_registry_child))
                             .with_current_task(task_id)
                             .with_thread_pool(Arc::clone(&thread_pool));
+                        interp.plugins = plugins;
                         // Contained here, not left to `thread_pool.rs`'s own
                         // worker loop, so this closure can deliver the
                         // panic payload itself as part of `TaskOutcome`,

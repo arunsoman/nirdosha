@@ -5,6 +5,7 @@
 [![Wiki](https://img.shields.io/badge/docs-wiki-blue)](https://github.com/arunsoman/nirdosha/wiki)
 [![Contributing](https://img.shields.io/badge/CONTRIBUTING-read-blue)](./CONTRIBUTING.md)
 [![Roadmap](https://img.shields.io/badge/ROADMAP-view-purple)](./docs/PUBLIC_ROADMAP.md)
+[![Maintainers](https://img.shields.io/badge/maintainers-3-green)](./deploy/helm/nirdosha/Chart.yaml)
 [![Sponsor](https://img.shields.io/badge/%E2%9D%A4-Sponsor-ea4aaa)](https://github.com/sponsors/arunsoman)
 
 > **A systems language designed for LLMs to write, with a grammar so
