@@ -1,13 +1,14 @@
 # Contributing to Nirdosha
 
-Thanks for being here. Nirdosha is a research-stage systems language and
-every contribution — code, docs, examples, tests, issue triage, or
-design feedback — helps.
+Thanks for being here. Nirdosha is an actively developed systems
+language and every contribution — code, docs, examples, tests, issue
+triage, or design feedback — helps.
 
 ## Quick ways to help
 
-- **Try it and report what breaks.** Build from source (below) or use
-  a prebuilt binary once one's published, run a few `examples/*.nir`
+- **Try it and report what breaks.** Build from source (below) or grab
+  a [prebuilt binary](https://github.com/arunsoman/nirdosha/releases/latest),
+  run a few `examples/*.nir`
   files, open an issue for anything confusing or wrong.
 - **Improve docs.** Typos, unclear explanations, and missing examples
   are all welcome fixes.
@@ -75,16 +76,34 @@ the right design doc for whatever you're changing.
 
 ## Response time
 
-This is presently a solo-maintained research project. Expect a response
-within about a week; feel free to ping the thread if you haven't heard
-back.
+**Triage SLA: 48 hours** to a first response (a label, a question, or
+just "seen, will look") on a new issue or PR. That's not the same as a
+full resolution — this is a small team (see
+[`MAINTAINERS.md`](./MAINTAINERS.md) for who has write access today and
+how active each is), so expect a real answer or merge within about a
+week; feel free to ping the thread if you haven't heard back past that.
+
+## Breaking changes
+
+A change to the language surface, grammar, or a public interface (CLI
+flags, the manifest format, the plugin ABI) goes through the
+[RFC process](./rfcs/README.md) before it lands — a written proposal
+and a review window, not a change that just appears in one commit. See
+[`GOVERNANCE.md`](./GOVERNANCE.md) for the full policy and
+[`docs/adr/0002-ban-str-in-fn-signatures.md`](./docs/adr/0002-ban-str-in-fn-signatures.md)
+for the real precedent (a breaking change shipped in one session, no
+proposal, no window) that made this a written rule instead of an
+assumption.
 
 ## Community
 
 - **GitHub Discussions** for long-form questions and design conversations.
-- All substantive design decisions happen in public GitHub issues —
-  nothing gets decided in private that affects the language or its
-  roadmap.
+- All substantive design decisions happen in public GitHub issues,
+  [RFCs](./rfcs/README.md), or Discussions — nothing gets decided in
+  private that affects the language or its roadmap.
+- See [`GOVERNANCE.md`](./GOVERNANCE.md) for roles (owner/maintainer/
+  triager), [`MAINTAINERS.md`](./MAINTAINERS.md) for who holds them
+  today, and [`AREAS.md`](./AREAS.md) for who owns which subsystem.
 
 ## Code of Conduct
 

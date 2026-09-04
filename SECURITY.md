@@ -17,19 +17,19 @@ Please include:
   process isolation, `transact`/`workflow` durability, or the
   generated UI client)
 
-You should get an initial response within a week. This is a
-solo-maintained research project, not a funded security team — response
-time is best-effort, not SLA-backed.
+You should get an initial response within a week. This is a small team
+(see [`MAINTAINERS.md`](./MAINTAINERS.md)), not a funded security team —
+response time is best-effort, not SLA-backed.
 
 ## Scope
 
-Nirdosha is an active research prototype (see `README.md` §11, "Honest
-scope"). Some safety properties are proven today (ownership/affine
-types, SMT-discharged overflow bounds, the concurrency model); others
-are explicitly aspirational and documented as such. A report that a
-*documented, disclosed* limitation is exploitable is still useful —
-please file it — but it's triaged differently from a violation of a
-claim the project actually makes.
+Nirdosha is under active development. Some safety properties are proven
+today (ownership/affine types, SMT-discharged overflow bounds, the
+concurrency model); others are explicitly aspirational and documented
+as such — see [Honest Scope & Roadmap](https://github.com/arunsoman/nirdosha/wiki/Honest-Scope-and-Roadmap).
+A report that a *documented, disclosed* limitation is exploitable is
+still useful — please file it — but it's triaged differently from a
+violation of a claim the project actually makes.
 
 Areas most worth scrutiny, since they're the actual security
 boundary in a real deployment:
