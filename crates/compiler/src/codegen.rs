@@ -671,6 +671,29 @@ fn has_cyclic_layout(ty: &Ty, registry: &TypeRegistry, visiting: &mut Vec<String
 }
 
 pub fn check_supported(program: &Program) -> Result<(), CodegenError> {
+    check_supported_with_plugins(program, &std::collections::HashSet::new())
+}
+
+/// Same as [`check_supported`], plus a set of plugin builtin names
+/// (`docs/ROADMAP.md` Track G, G1 / rfcs/0003-plugin-abi-v2.md's plugin
+/// gallery) to reject explicitly rather than silently falling through.
+/// Before this existed, a plugin builtin's name matched neither
+/// `is_builtin` (deliberately excluded from `ast::BUILTIN_NAMES`) nor
+/// any rejection arm here, so `check_expr`'s `Expr::Call` case walked
+/// straight past it into the argument loop and returned `Ok(())` for
+/// the call itself — meaning the moment `typecheck_with_plugins` made
+/// a plugin call pass typechecking, it would reach real codegen
+/// (`Codegen::call`) with no matching entry in either the builtin or
+/// user-fn tables, an untested "unknown function" path rather than a
+/// clean, named rejection. `check_supported` itself keeps its exact
+/// existing signature (an empty `plugin_names` set) — its one real
+/// caller (`emit_llvm_ir`) is unaffected until a future plugin-aware
+/// `build`/`emit-llvm` path (not yet wired up — plugins are
+/// interpreter-only for the CLI today) calls this sibling instead.
+pub fn check_supported_with_plugins(
+    program: &Program,
+    plugin_names: &std::collections::HashSet<String>,
+) -> Result<(), CodegenError> {
     // Real namespacing/`pub`/`use` (`docs/ROADMAP.md` Track F, F2;
     // `docs/NEXT_GEN.md` §F2) isn't ported to the compiled path yet — same
     // incremental-porting pattern Track B already uses for `transact`/
@@ -746,46 +769,46 @@ pub fn check_supported(program: &Program) -> Result<(), CodegenError> {
             llvm_ty(&p.ty, &registry)?;
         }
         llvm_ty(&f.ret, &registry)?;
-        check_stmts(&f.body.stmts, &registry)?;
+        check_stmts(&f.body.stmts, plugin_names, &registry)?;
     }
     Ok(())
 }
 
-fn check_stmts(stmts: &[Stmt], registry: &TypeRegistry) -> Result<(), CodegenError> {
+fn check_stmts(stmts: &[Stmt], plugin_names: &std::collections::HashSet<String>, registry: &TypeRegistry) -> Result<(), CodegenError> {
     for s in stmts {
-        check_stmt(s, registry)?;
+        check_stmt(s, plugin_names, registry)?;
     }
     Ok(())
 }
 
-fn check_stmt(s: &Stmt, registry: &TypeRegistry) -> Result<(), CodegenError> {
+fn check_stmt(s: &Stmt, plugin_names: &std::collections::HashSet<String>, registry: &TypeRegistry) -> Result<(), CodegenError> {
     match s {
         Stmt::Let { ty, value, .. } => {
             llvm_ty(ty, registry)?;
-            check_expr(value, registry)
+            check_expr(value, plugin_names, registry)
         }
-        Stmt::Return { value: Some(e), .. } => check_expr(e, registry),
+        Stmt::Return { value: Some(e), .. } => check_expr(e, plugin_names, registry),
         Stmt::Return { value: None, .. } => Ok(()),
         Stmt::While { cond, body, .. } => {
-            check_expr(cond, registry)?;
-            check_stmts(&body.stmts, registry)
+            check_expr(cond, plugin_names, registry)?;
+            check_stmts(&body.stmts, plugin_names, registry)
         }
-        Stmt::Expr(e) => check_expr(e, registry),
+        Stmt::Expr(e) => check_expr(e, plugin_names, registry),
         // `audited` only suppresses guard *emission* (`Codegen::audited`,
         // checked inside `guard_in_range`/the division trap) -- every
         // statement inside still has to be otherwise codegen-supported,
         // so this walks in exactly like `While`'s body.
-        Stmt::Audited { body, .. } => check_stmts(body, registry),
+        Stmt::Audited { body, .. } => check_stmts(body, plugin_names, registry),
     }
 }
 
-fn check_expr(e: &Expr, registry: &TypeRegistry) -> Result<(), CodegenError> {
+fn check_expr(e: &Expr, plugin_names: &std::collections::HashSet<String>, registry: &TypeRegistry) -> Result<(), CodegenError> {
     match e {
         Expr::Int(_, _) | Expr::Bool(_, _) | Expr::Ident(_, _) | Expr::Float(_, _) | Expr::Str(_, _) => Ok(()),
-        Expr::Unary(_, inner, _) => check_expr(inner, registry),
+        Expr::Unary(_, inner, _) => check_expr(inner, plugin_names, registry),
         Expr::Binary(_, l, r, _) => {
-            check_expr(l, registry)?;
-            check_expr(r, registry)
+            check_expr(l, plugin_names, registry)?;
+            check_expr(r, plugin_names, registry)
         }
         Expr::Call(name, args, _) => {
             // A struct/variant constructor call is syntactically just
@@ -820,33 +843,50 @@ fn check_expr(e: &Expr, registry: &TypeRegistry) -> Result<(), CodegenError> {
                     "codegen doesn't support `{name}` yet — this builtin is interpreter-only \
                      for now (numeric codegen lands in a later phase)"
                 ));
+            } else if plugin_names.contains(name) {
+                // rfcs/0003-plugin-abi-v2.md: a plugin builtin's `call`
+                // is an opaque `Arc<dyn Fn>` with no stable calling
+                // convention into generated LLVM IR — interpreter-only,
+                // permanently, not "not yet" the way a real numeric
+                // builtin above might be. Named and rejected explicitly
+                // here rather than falling through to `Codegen::call`'s
+                // user-fn lookup, which has no entry for a plugin name
+                // (plugins are never part of `program.fns`) and would
+                // hit an untested "unknown function" path instead of a
+                // clean, actionable error.
+                return unsupported(format!(
+                    "codegen doesn't support plugin builtin `{name}` yet — plugin calls are \
+                     interpreter-only; `nirdosha build`/`emit-llvm` can't link an opaque Rust \
+                     closure into generated native code without a stable C-ABI plugin-calling \
+                     convention, which doesn't exist yet"
+                ));
             }
             for a in args {
-                check_expr(a, registry)?;
+                check_expr(a, plugin_names, registry)?;
             }
             Ok(())
         }
         Expr::If { cond, then_block, else_block, .. } => {
-            check_expr(cond, registry)?;
-            check_stmts(&then_block.stmts, registry)?;
+            check_expr(cond, plugin_names, registry)?;
+            check_stmts(&then_block.stmts, plugin_names, registry)?;
             match else_block.as_deref() {
-                Some(ElseBranch::Block(b)) => check_stmts(&b.stmts, registry),
-                Some(ElseBranch::If(e2)) => check_expr(e2, registry),
+                Some(ElseBranch::Block(b)) => check_stmts(&b.stmts, plugin_names, registry),
+                Some(ElseBranch::If(e2)) => check_expr(e2, plugin_names, registry),
                 None => Ok(()),
             }
         }
-        Expr::Assign(_, rhs, _) => check_expr(rhs, registry),
+        Expr::Assign(_, rhs, _) => check_expr(rhs, plugin_names, registry),
         // Row 11: both now recurse structurally, same "walk, don't
         // reject" treatment every other now-supported construct gets —
         // real type-directed validation (the affine check) happens where
         // `Codegen`'s own methods can see a base/scrutinee's actual
         // resolved type (`Codegen::field_access`/`Codegen::match_expr`),
         // not in this purely-syntactic pre-pass.
-        Expr::FieldAccess(base, _, _) => check_expr(base, registry),
+        Expr::FieldAccess(base, _, _) => check_expr(base, plugin_names, registry),
         Expr::Match { scrutinee, arms, .. } => {
-            check_expr(scrutinee, registry)?;
+            check_expr(scrutinee, plugin_names, registry)?;
             for arm in arms {
-                check_expr(&arm.body, registry)?;
+                check_expr(&arm.body, plugin_names, registry)?;
             }
             Ok(())
         }
@@ -857,7 +897,7 @@ fn check_expr(e: &Expr, registry: &TypeRegistry) -> Result<(), CodegenError> {
         // job, at real IR-gen time), so it just recurses into whatever's
         // inside — same "walk, don't reject" treatment every other
         // already-supported unary-ish construct gets.
-        Expr::Box(inner, _) | Expr::Deref(inner, _) | Expr::Ref(inner, _) => check_expr(inner, registry),
+        Expr::Box(inner, _) | Expr::Deref(inner, _) | Expr::Ref(inner, _) => check_expr(inner, plugin_names, registry),
         Expr::Spawn(_, _, _) | Expr::Join(_, _) => {
             unsupported("codegen doesn't support `spawn`/`join` yet — interpreter-only for now")
         }
@@ -878,10 +918,10 @@ fn check_expr(e: &Expr, registry: &TypeRegistry) -> Result<(), CodegenError> {
         // actually see its type via `local_ty_of`.
         Expr::Chan(_) => unsupported("codegen doesn't support `chan` yet — interpreter-only for now"),
         Expr::Send(chan, value, _) => {
-            check_expr(chan, registry)?;
-            check_expr(value, registry)
+            check_expr(chan, plugin_names, registry)?;
+            check_expr(value, plugin_names, registry)
         }
-        Expr::Recv(chan, _) => check_expr(chan, registry),
+        Expr::Recv(chan, _) => check_expr(chan, plugin_names, registry),
         // Same reasoning as `send`/`recv` above: `stop` is one AST node
         // (`Expr::StopSandbox`) shared by `sandbox`/`tcp`/`tcp_listener`,
         // dispatched on the operand's type — `sandbox` itself stays
@@ -891,7 +931,7 @@ fn check_expr(e: &Expr, registry: &TypeRegistry) -> Result<(), CodegenError> {
         Expr::SpawnSandbox(_, _, _) => {
             unsupported("codegen doesn't support `sandbox` yet — interpreter-only for now")
         }
-        Expr::StopSandbox(inner, _) => check_expr(inner, registry),
+        Expr::StopSandbox(inner, _) => check_expr(inner, plugin_names, registry),
         // `open`/file I/O is interpreter-only for now, same treatment
         // `Expr::Chan`/`Expr::SpawnSandbox` above get — no type info at
         // this structural pre-pass, so straight rejection rather than
@@ -900,11 +940,11 @@ fn check_expr(e: &Expr, registry: &TypeRegistry) -> Result<(), CodegenError> {
             unsupported("codegen doesn't support `open`/file I/O yet — interpreter-only for now")
         }
         Expr::Connect(host, port, _) => {
-            check_expr(host, registry)?;
-            check_expr(port, registry)
+            check_expr(host, plugin_names, registry)?;
+            check_expr(port, plugin_names, registry)
         }
-        Expr::Listen(port, _) => check_expr(port, registry),
-        Expr::Accept(listener, _) => check_expr(listener, registry),
+        Expr::Listen(port, _) => check_expr(port, plugin_names, registry),
+        Expr::Accept(listener, _) => check_expr(listener, plugin_names, registry),
         // Vector/Matrix indexing lands as of this phase — the base and
         // every index expression are walked the same way `ArrayLit`'s
         // elements are, so a still-unsupported construct nested inside
@@ -912,9 +952,9 @@ fn check_expr(e: &Expr, registry: &TypeRegistry) -> Result<(), CodegenError> {
         // rejection reason instead of being silently accepted because
         // `Expr::Index` itself is now fine.
         Expr::Index(base, indices, _) => {
-            check_expr(base, registry)?;
+            check_expr(base, plugin_names, registry)?;
             for idx in indices {
-                check_expr(idx, registry)?;
+                check_expr(idx, plugin_names, registry)?;
             }
             Ok(())
         }
@@ -926,7 +966,7 @@ fn check_expr(e: &Expr, registry: &TypeRegistry) -> Result<(), CodegenError> {
         // `ArrayLit` shape itself is now fine.
         Expr::ArrayLit(elements, _) => {
             for e in elements {
-                check_expr(e, registry)?;
+                check_expr(e, plugin_names, registry)?;
             }
             Ok(())
         }

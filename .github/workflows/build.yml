@@ -24,6 +24,44 @@ jobs:
       - name: Build
         working-directory: crates/compiler
         run: cargo build --release
+      # Closes a real, previously-silent gap (found while building the
+      # plugin-ecosystem gallery, Track B of that plan): this job never
+      # ran ANY test suite for anything (only `cargo build`, above) --
+      # `crates/plugin-example-rot13`'s own tests, and now this
+      # gallery's, were never exercised by CI at all, only by hand.
+      # Scoped to just these plugin crates, not a first "also run
+      # nirdosha's own test suite on Linux" step -- that's a separate,
+      # bigger, unverified change (macOS/Windows already do it; Linux
+      # never has) left for its own follow-up. Each step's
+      # `working-directory` mirrors the `Build` step's own pattern:
+      # running `cargo test` from inside one workspace member's
+      # directory (not the workspace root) tests only that package, the
+      # same reason this job has never been tripped up by
+      # `crates/grammar_check`'s own build failure.
+      - name: Test plugin-support
+        working-directory: crates/plugin-support
+        run: cargo test
+      - name: Test plugin-example-rot13
+        working-directory: crates/plugin-example-rot13
+        run: cargo test
+      - name: Test plugin-example-mysql (static tests only -- live tests need a real MySQL, see .github/workflows/plugin-integration.yml)
+        working-directory: crates/plugin-example-mysql
+        run: cargo test
+      - name: Test plugin-example-activemq (static tests only)
+        working-directory: crates/plugin-example-activemq
+        run: cargo test
+      - name: Test plugin-example-cassandra (static tests only)
+        working-directory: crates/plugin-example-cassandra
+        run: cargo test
+      - name: Test plugin-example-neo4j (static tests only)
+        working-directory: crates/plugin-example-neo4j
+        run: cargo test
+      - name: Test plugin-example-hbase (static tests only)
+        working-directory: crates/plugin-example-hbase
+        run: cargo test
+      - name: Test the 5-plugin composition (crates/plugin-examples)
+        working-directory: crates/plugin-examples
+        run: cargo test
 
   # macOS didn't get a CI job of its own until now — it was only ever
   # actually built when a `v*` tag triggered release.yml, so a regular

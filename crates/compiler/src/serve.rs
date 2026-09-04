@@ -422,6 +422,18 @@ pub fn run(
     // `main.rs::cmd_serve`'s validation) — gates whether `/auth/login`/
     // `/auth/callback` exist at all.
     sso: Option<OidcSsoConfig>,
+    // Track B of the plugin-ecosystem plan (rfcs/0003-plugin-abi-v2.md):
+    // the stock `nirdosha` CLI has no plugin to pass here (`&[]` at its
+    // one call site, `main.rs::cmd_serve`) — this parameter exists so a
+    // *custom* binary linking a real plugin crate can call `serve::run`
+    // directly with its own `NirdoshaPlugin::builtins()` list, the same
+    // way `run_with_plugins` already lets one do for the interpreter
+    // path. `serve`'s own request loop is synchronous, single-threaded
+    // (no `thread::spawn` anywhere in this file) — a borrowed slice
+    // living for this function's whole (non-returning, under normal
+    // operation) lifetime needs no `Arc`/`'static` bound to stay valid
+    // across every request `dispatch` handles.
+    plugins: &[crate::plugin::PluginBuiltin],
 ) -> Result<(), String> {
     // `impl Into<LogTarget>` on the two params above so every existing
     // `PathBuf`-passing caller (every test in this repo included) keeps
@@ -592,7 +604,8 @@ pub fn run(
     {
         let replay_interp = Interpreter::new(Arc::clone(&program), Arc::from(""))
             .with_transact_log_path((*transact_log_path).clone())
-            .with_workflow_log_path((*workflow_log_path).clone());
+            .with_workflow_log_path((*workflow_log_path).clone())
+            .with_plugins(plugins);
         match replay_interp.replay_pending_transactions() {
             Ok(outcomes) => {
                 for o in &outcomes {
@@ -914,6 +927,7 @@ pub fn run(
                         table_db.as_deref(),
                         tracer.as_ref(),
                         role_mapping_cache.as_deref(),
+                        plugins,
                     )
                 })) {
                     Ok(result) => result,
@@ -1832,6 +1846,7 @@ fn dispatch(
     table_db: Option<&std::sync::Mutex<rusqlite::Connection>>,
     tracer: Option<&Arc<crate::observability::Tracer>>,
     role_mapping: Option<&std::sync::Mutex<RoleMappingCache>>,
+    plugins: &[crate::plugin::PluginBuiltin],
 ) -> (u16, String) {
     let Some(f) = program.fns.iter().find(|f| f.name == fn_name) else {
         return (404, json_err(&format!("no such function `{fn_name}`")));
@@ -1989,7 +2004,8 @@ fn dispatch(
     let program_arc = Arc::clone(program);
     let mut interp = Interpreter::new(program_arc, Arc::from(""))
         .with_transact_log_path(transact_log_path.clone())
-        .with_workflow_log_path(workflow_log_path.clone());
+        .with_workflow_log_path(workflow_log_path.clone())
+        .with_plugins(plugins);
     if let Some(t) = tracer {
         interp = interp.with_tracer(Arc::clone(t));
     }

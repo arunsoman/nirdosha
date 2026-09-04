@@ -62,7 +62,7 @@ fn start_server(auth: Option<AuthConfig>) -> u16 {
     let transact_log = std::env::temp_dir().join(format!("nirdosha-test-transact-{port}.db"));
     let workflow_log = std::env::temp_dir().join(format!("nirdosha-test-workflow-{port}.db"));
     std::thread::spawn(move || {
-        nirdosha::serve::run(program, "127.0.0.1", port, auth, None, transact_log, workflow_log, None, None, None, None, None, None, false, None)
+        nirdosha::serve::run(program, "127.0.0.1", port, auth, None, transact_log, workflow_log, None, None, None, None, None, None, false, None, &[])
             .expect("serve::run should not fail to bind");
     });
     for _ in 0..100 {
@@ -171,6 +171,7 @@ fn start_demo_server() -> u16 {
             None,
             true,
             None,
+            &[],
         )
         .expect("serve::run should not fail to bind");
     });
@@ -363,6 +364,7 @@ fn start_server_with_otel(otel_token: &str) -> (u16, u16) {
             Some(token),
             false,
             None,
+            &[],
         )
         .expect("serve::run should not fail to bind");
     });
@@ -499,6 +501,7 @@ fn readyz_reports_real_db_connectivity_when_db_is_configured() {
             None,
             false,
             None,
+            &[],
         )
         .expect("serve::run should not fail to bind");
     });
@@ -554,6 +557,7 @@ fn db_flag_pointed_at_postgres_is_rejected_with_a_clear_error_not_silently_misus
         None,
         false,
         None,
+        &[],
     );
     let err = result.expect_err("a postgres:// --db value must be rejected outright, not passed to rusqlite::Connection::open");
     assert!(err.contains("--db"), "error should name the flag, got: {err}");
@@ -755,4 +759,134 @@ fn otel_token_file_satisfies_the_otel_port_all_or_nothing_check() {
     for suffix in [".transact.db", ".transact.db.lock", ".workflow.db", ".workflow.db.lock"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", src_file.display()));
     }
+}
+
+// ---- plugin-aware serve (Track B of the plugin-ecosystem plan) ------------
+//
+// `serve::run` gained a `plugins: &[PluginBuiltin]` parameter
+// (rfcs/0003-plugin-abi-v2.md) -- every other test in this file passes
+// `&[]` at that new trailing position (unaffected by this addition,
+// confirmed by every one of them still passing). This is the real
+// proof the parameter does something: a program calling a plugin
+// builtin, typechecked with `typecheck_with_plugins` and served with
+// that same plugin list, is actually reachable over `POST /api/<fn>`.
+
+fn doubling_plugin() -> nirdosha::plugin::PluginBuiltin {
+    nirdosha::plugin::PluginBuiltin {
+        name: "double_it".to_string(),
+        params: vec![nirdosha::ast::Ty::I64],
+        ret: nirdosha::ast::Ty::I64,
+        effects: Default::default(),
+        call: std::sync::Arc::new(|args, _span| {
+            let nirdosha::interpreter::Value::Int(n) = args[0] else { unreachable!() };
+            Ok(nirdosha::interpreter::Value::Int(n * 2))
+        }),
+    }
+}
+
+#[test]
+fn a_plugin_builtin_is_reachable_over_http_when_serve_is_given_its_plugin_list() {
+    let plugins = [doubling_plugin()];
+    let src = r#"
+        fn use_plugin(x: i64) -> i64 {
+            return double_it(x)
+        }
+        fn main() {}
+    "#;
+    let toks = Lexer::new(src).tokenize().expect("lex should succeed");
+    let program = Parser::new(toks).parse_program().expect("parse should succeed");
+    nirdosha::typeck::typecheck_with_plugins(&program, &plugins).expect("plugin call should typecheck cleanly");
+    check_ownership(&program).expect("ownership check should succeed");
+    let program = Arc::new(program);
+
+    let port = free_port();
+    let transact_log = std::env::temp_dir().join(format!("nirdosha-test-plugin-transact-{port}.db"));
+    let workflow_log = std::env::temp_dir().join(format!("nirdosha-test-plugin-workflow-{port}.db"));
+    std::thread::spawn(move || {
+        nirdosha::serve::run(
+            program,
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            transact_log,
+            workflow_log,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            &plugins,
+        )
+        .expect("serve::run should not fail to bind");
+    });
+    for _ in 0..100 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let (status, body) = http_request(port, "POST", "/api/use_plugin", r#"{"x":21}"#, None);
+    assert_eq!(status, 200);
+    assert_eq!(body, "42", "the plugin builtin should actually run and double its argument");
+}
+
+/// Without the plugin list, the exact same program is a 500 the moment
+/// the call is reached (`Interpreter::with_plugins` never having been
+/// called means `double_it` is an unknown function at *runtime*, even
+/// though `serve::run` itself never re-typechecks — proving the plugin
+/// list genuinely has to reach `Interpreter::new(...).with_plugins(...)`
+/// for this to work, not just typecheck).
+#[test]
+fn without_its_plugin_list_serve_cannot_actually_run_a_plugin_call_it_was_typechecked_against() {
+    let plugins = [doubling_plugin()];
+    let src = r#"
+        fn use_plugin(x: i64) -> i64 {
+            return double_it(x)
+        }
+        fn main() {}
+    "#;
+    let toks = Lexer::new(src).tokenize().expect("lex should succeed");
+    let program = Parser::new(toks).parse_program().expect("parse should succeed");
+    nirdosha::typeck::typecheck_with_plugins(&program, &plugins).expect("plugin call should typecheck cleanly");
+    check_ownership(&program).expect("ownership check should succeed");
+    let program = Arc::new(program);
+
+    let port = free_port();
+    let transact_log = std::env::temp_dir().join(format!("nirdosha-test-noplugin-transact-{port}.db"));
+    let workflow_log = std::env::temp_dir().join(format!("nirdosha-test-noplugin-workflow-{port}.db"));
+    std::thread::spawn(move || {
+        nirdosha::serve::run(
+            program,
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            transact_log,
+            workflow_log,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            &[], // <- the whole point of this test
+        )
+        .expect("serve::run should not fail to bind");
+    });
+    for _ in 0..100 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let (status, _body) = http_request(port, "POST", "/api/use_plugin", r#"{"x":21}"#, None);
+    assert_eq!(status, 500, "an unregistered plugin call must fail loudly (500), not silently succeed");
 }

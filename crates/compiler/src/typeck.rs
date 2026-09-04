@@ -1099,6 +1099,20 @@ pub fn typecheck_optional_main(program: &Program) -> Result<(), Vec<TypeError>> 
     typecheck_impl(program, false, &HashMap::new(), &HashMap::new())
 }
 
+/// Same relationship `typecheck_with_plugins` has to `typecheck` --
+/// `typecheck_optional_main`'s own plugin-aware sibling, for a
+/// plugin-aware `serve`/`emit-ui`/`--sandbox-worker`-shaped caller
+/// (Track B of the plugin-ecosystem plan). The one function this
+/// pattern was missing: `typecheck`/`typecheck_with_plugins`/
+/// `typecheck_optional_main` already existed as a matched trio; this
+/// completes the square.
+pub fn typecheck_optional_main_with_plugins(
+    program: &Program,
+    plugins: &[crate::plugin::PluginBuiltin],
+) -> Result<(), Vec<TypeError>> {
+    typecheck_impl(program, false, &crate::plugin::signatures(plugins), &crate::plugin::effect_map(plugins))
+}
+
 /// A non-fatal diagnostic — unlike `TypeError`, this never blocks
 /// `typecheck`/compilation; a caller prints it (or not) and continues
 /// either way. The one kind that exists today is `docs/ROADMAP.md` A10 /
