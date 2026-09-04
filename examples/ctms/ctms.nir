@@ -3531,14 +3531,14 @@ module "Audit" {
         scan_kind: str,
         last_run_unix: i64,
         tamper_detected: bool,
-        verification_status: str,
+        verification_status: VerificationStatus,
     }
 
     struct ArchiveObject {
         id: i64,
         object_name: str,
         retention_expiry_unix: i64,
-        object_lock_status: str,
+        object_lock_status: LockStatus,
     }
 }
 
@@ -3677,7 +3677,7 @@ fn list_integrity_scan() -> Result(json, ErrorCode) requires(public) {
 // `record_audit_log_entry`.
 fn create_integrity_scan_inner(conn: db, scan_kind: Text) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS integrity_scan (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_kind TEXT, last_run_unix INTEGER, tamper_detected INTEGER, verification_status TEXT)") { Ok(n) => n, Err(e) => -1 }
-    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO integrity_scan (scan_kind, last_run_unix, tamper_detected, verification_status) VALUES (?, 0, 0, 'pending')", scan_kind.value) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO integrity_scan (scan_kind, last_run_unix, tamper_detected, verification_status) VALUES (?, 0, 0, 'VerificationStatusPending')", scan_kind.value) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
     stop conn
     return result
 }
@@ -3686,7 +3686,7 @@ fn create_integrity_scan(scan_kind: Text) -> Result(i64, ErrorCode) requires(rol
 }
 fn run_integrity_scan_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS integrity_scan (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_kind TEXT, last_run_unix INTEGER, tamper_detected INTEGER, verification_status TEXT)") { Ok(n) => n, Err(e) => -1 }
-    let updated: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE integrity_scan SET verification_status = 'verified', tamper_detected = 0 WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let updated: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE integrity_scan SET verification_status = 'VerificationStatusVerified', tamper_detected = 0 WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
     let result: Result(json, ErrorCode) = match updated {
         Ok(n) => match db_query(conn, "SELECT id, verification_status, tamper_detected FROM integrity_scan WHERE id = ?", id) {
             Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
@@ -3703,9 +3703,26 @@ fn run_integrity_scan(id: i64) -> Result(json, ErrorCode) requires(role: "admin"
 
 screen IntegrityScan {
     title: "Integrity / Tamper-Check"
+    field verification_status {
+        render: "badge"
+    }
     action "Run Manual Scan" -> run_integrity_scan {
         style: "filled"
         show_result: true
+    }
+
+    layout {
+        row {
+            column {
+                field scan_kind
+                field last_run_unix
+            }
+            column {
+                field verification_status
+                field tamper_detected
+                action "Run Manual Scan"
+            }
+        }
     }
 }
 
@@ -3733,6 +3750,21 @@ screen ArchiveObject {
     field retention_expiry_unix {
         label: "Retention Expiry"
         render: "countdown"
+    }
+    field object_lock_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field object_name
+            }
+            column {
+                field object_lock_status
+                field retention_expiry_unix
+            }
+        }
     }
 }
 
@@ -3804,7 +3836,7 @@ module "Cross-Cutting" {
     struct ServiceHealthEntry {
         id: i64,
         service_name: str,
-        status: str,
+        status: ServiceHealthStatus,
         error_rate_pct: i64,
         kafka_lag_ms: i64,
         checked_unix: i64,
@@ -3814,7 +3846,7 @@ module "Cross-Cutting" {
         id: i64,
         entity_name: str,
         entity_type: str,
-        kyc_status: str,
+        kyc_status: KycReviewStatus,
         risk_score: i64,
         flagged: bool,
     }
@@ -4051,7 +4083,7 @@ fn update_service_health_entry(s: ServiceHealthEntry) -> Result(i64, ErrorCode) 
 }
 fn stat_unhealthy_service_count_inner(conn: db) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS service_health_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, service_name TEXT, status TEXT, error_rate_pct INTEGER, kafka_lag_ms INTEGER, checked_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
-    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM service_health_entry WHERE status != 'healthy'") {
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM service_health_entry WHERE status != 'ServiceHealthStatusHealthy'") {
         Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
         Err(e) => Err(DbError(e)),
     }
@@ -4064,6 +4096,23 @@ fn stat_unhealthy_service_count() -> Result(i64, ErrorCode) requires(public) {
 
 screen ServiceHealthEntry {
     title: "System Health / Observability"
+    field status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field service_name
+                field status
+            }
+            column {
+                field error_rate_pct
+                field kafka_lag_ms
+                field checked_unix
+            }
+        }
+    }
 }
 
 // -- Entity 360 / Master Entity Profile --------------------------------------
@@ -4172,6 +4221,31 @@ fn graph_entity_links_inner(conn: db, entity_id: i64) -> Result(json, ErrorCode)
 }
 fn graph_entity_links(entity_id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
     return match db_connect("ctms.db") { Ok(conn) => graph_entity_links_inner(conn, entity_id), Err(e) => Err(DbError(e)) }
+}
+
+screen MasterEntity {
+    title: "Master Entity Registry"
+    field kyc_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Entity" {
+                    field entity_name
+                    field entity_type
+                }
+            }
+            column {
+                group "Risk" {
+                    field kyc_status
+                    field risk_score
+                    field flagged
+                }
+            }
+        }
+    }
 }
 
 workspace EntityProfile {
