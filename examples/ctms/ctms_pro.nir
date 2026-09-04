@@ -1149,15 +1149,41 @@ fn chart_alert_volume_by_severity() -> Result(json, ErrorCode) requires(role: "f
 // Investigation & Enrichment").
 // =========================================================================
 
-struct Investigation {
-    id: i64,
-    subject_name: str,
-    status: CaseStatus,
-    severity: Severity,
-    risk_score: i64,
-    // Doc: "SLA-based queues (e.g., P1 must be touched within 30 mins)".
-    sla_deadline_unix: i64,
-    assigned_to: str,
+module "Case Management" {
+    struct Investigation {
+        id: i64,
+        subject_name: str,
+        status: CaseStatus,
+        severity: Severity,
+        risk_score: i64,
+        // Doc: "SLA-based queues (e.g., P1 must be touched within 30 mins)".
+        sla_deadline_unix: i64,
+        assigned_to: str,
+    }
+
+    struct CaseEscalation {
+        id: i64,
+        investigation_id: i64,
+        reason: str,
+        target: str,
+        referral_status: ReviewStatus,
+        regulator_response: str,
+    }
+
+    struct SlaRoutingRule {
+        id: i64,
+        severity_tier: Severity,
+        sla_minutes: i64,
+        jurisdiction_scope: str,
+        skillset_required: str,
+    }
+
+    struct CaseLink {
+        id: i64,
+        source_investigation_id: i64,
+        target_investigation_id: i64,
+        link_reason: str,
+    }
 }
 
 fn list_investigation_inner(conn: db) -> Result(json, ErrorCode) {
@@ -1392,16 +1418,8 @@ workspace CaseInvestigation {
     }
 }
 
-// ---- CaseEscalation: regulatory escalation / legal-hold referral. ----
-
-struct CaseEscalation {
-    id: i64,
-    investigation_id: i64,
-    reason: str,
-    target: str,
-    referral_status: ReviewStatus,
-    regulator_response: str,
-}
+// ---- CaseEscalation: regulatory escalation / legal-hold referral
+// (struct declared in the `module "Case Management" { }` block above). --
 
 fn list_case_escalation_inner(conn: db) -> Result(json, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS case_escalation (id INTEGER PRIMARY KEY AUTOINCREMENT, investigation_id INTEGER, reason TEXT, target TEXT, referral_status TEXT, regulator_response TEXT)") { Ok(n) => n, Err(e) => -1 }
@@ -1456,15 +1474,7 @@ screen CaseEscalation {
     }
 }
 
-// ---- SlaRoutingRule: workload routing config. --------------------------
-
-struct SlaRoutingRule {
-    id: i64,
-    severity_tier: Severity,
-    sla_minutes: i64,
-    jurisdiction_scope: str,
-    skillset_required: str,
-}
+// ---- SlaRoutingRule: workload routing config (struct declared above). -
 
 fn list_sla_routing_rule_inner(conn: db) -> Result(json, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS sla_routing_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, severity_tier TEXT, sla_minutes INTEGER, jurisdiction_scope TEXT, skillset_required TEXT)") { Ok(n) => n, Err(e) => -1 }
@@ -1502,14 +1512,8 @@ screen SlaRoutingRule {
 }
 
 // ---- CaseLink: "linked cases by common entity or pattern (case
-// graphing)" -- feeds the Case Linking / Entity Graph dashboard visual.
-
-struct CaseLink {
-    id: i64,
-    source_investigation_id: i64,
-    target_investigation_id: i64,
-    link_reason: str,
-}
+// graphing)" -- feeds the Case Linking / Entity Graph dashboard visual
+// (struct declared above). ------------------------------------------------
 
 fn create_case_link_inner(conn: db, l: CaseLink) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS case_link (id INTEGER PRIMARY KEY AUTOINCREMENT, source_investigation_id INTEGER, target_investigation_id INTEGER, link_reason TEXT)") { Ok(n) => n, Err(e) => -1 }
