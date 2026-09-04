@@ -680,166 +680,108 @@ clock/entropy reads anywhere in the builtin set).
 
 ## 10. What's compiled vs. interpreter-only
 
-**Updated 22 Aug 2026** — corrected against `check_supported`'s actual
-`unsupported(...)` call sites and real compiled-binary test runs, not
-just this section's own prior prose: `box`/`&`/`*`, `str`, and
-`tcp`/`tcp_listener`/`connect`/`listen`/`accept` were previously (and
-incorrectly) listed below as interpreter-only — all three have real
-codegen and were confirmed working end-to-end (a compiled `box i64`
-round-tripped through a function param and `*`; a compiled `str`
-program branched on `==` and printed the result; a compiled binary did
-a real `connect`/`send`/`recv`/`stop` round trip against a live TCP
-server). This drift is exactly why this doc note now says to verify
-against `check_supported` directly before trusting this section, rather
-than the reverse.
+**Verify against `codegen::check_supported` directly before trusting
+this table** — it drifted stale once already (22 Aug 2026: `box`/`&`/
+`*`, `str`, and `tcp`/`tcp_listener`/`connect`/`listen`/`accept` sat
+mislabeled interpreter-only here for a while after they'd already
+gained real codegen, caught only by testing real compiled binaries —
+box round-tripping through a function param, `str` branching on `==`,
+a live TCP round trip — not by re-reading this section's own prose).
 
-`nirdosha build`/`emit-llvm` now support:
+| Construct | Compiled? | Key caveat |
+|---|---|---|
+| `i8`–`i64`, `u8`–`usize`, `bool`, `unit`, `f64` | Yes | All integer arithmetic runs at `i64` width internally (widen on load, narrow on store); unsigned range capped `[0, i64::MAX]`. See below. |
+| Scalar arith/comparison, `if`/`while`, calls incl. recursion, `print` | Yes | `print(bool)` → `1`/`0`, not `"true"`/`"false"` (cosmetic only). `print(unit)` → `"()"`. |
+| Tier-1/2 bounds + div-by-zero guards, `audited` | Yes | Elided where §8 proves safety. |
+| `box`/`&`/`*` | Yes | Real `nir_alloc` + automatic `nir_free` (`ownership.rs`'s `FreeMap`) — not a leak. |
+| `str` | Yes | Literals, `==`/`!=`, `if`-condition, `print`, fn params/returns — `main() -> str` compiles directly. |
+| `tcp`/`tcp_listener` | Yes | `connect`/`listen`/`accept`/`send`/`recv`/`stop` over real sockets. |
+| `sha256_hex`/`constant_time_str_eq` | Yes | Isolated from-scratch SHA-256, bit-verified. Output buffer leaks — see below. |
+| `rand_seed`/`rand_f64`/`rand_gaussian` | Yes | Same algorithm as the interpreter, process-wide state — see below. |
+| `Vector`/`Matrix`, fully | Yes | Two codegen strategies — see below. |
+| `struct`/`enum`/`match`, non-affine payloads | Yes | Real LLVM types — see below. Affine payloads: no (Phase 4b). |
+| `struct`/`enum`/`match` with an affine field/payload | No | Phase 4b, deferred (below) — a non-affine one compiles now. |
+| `thread`/`spawn`/`join`, `chan`/`send`/`recv`, `sandbox`/`stop` | No | `chan` here means the channel type — distinct from the already-compiled `tcp`. |
+| `file`/`open` | No | `docs/PROTOLANG_PORT.md`'s file I/O port. |
+| `dec128` + `dec_*` builtins | No | Not yet in `Ty`/`codegen.rs`'s builtin allowlists. |
+| `json`/`db`/`mq`, Row 12 identity/session/API-key builtins | No | Identity ones also blocked on `VerifiedIdentity`/`RoleView`/`ClaimView` being structs. |
+| `http_get`/`http_post`/`https_get`/`https_post`, `mock_issue_token` | No | Not in `codegen.rs`'s builtin allowlists. |
+| `transact` | No | |
+| `workflow` | No | Desugars to `send_email`/`send_sms`/`send_push`/`notify`/`__workflow_*`, none compiled. |
+| `fn(..)->..`/`acquire`/`requires(...)` | No | First-class/privileged functions (§6a). |
+| `screen`/`dashboard` | Inert, not rejected | `codegen.rs` never inspects these — a program containing them compiles cleanly with nothing to lower to. |
 
-- `i8`/`i16`/`i32`/`i64`, `bool`, `unit`, `f64` scalars, and their
-  unsigned counterparts `u8`/`u16`/`u32`/`u64`/`usize` — same LLVM
-  widths as the signed types. This backend computes all integer
-  arithmetic at `i64` width internally regardless of a value's declared
-  width (widening on load, narrowing back on store), and every unsigned
-  type's legal range is capped at `[0, i64::MAX]` (`Ty::bounds()`,
-  never touching the sign bit) — so the one real signed-vs-unsigned
-  instruction choice this needs is at the widen-on-load step
-  (`zext` for unsigned, `sext` for signed, `codegen.rs::widen_to_i64`);
-  every downstream `+`/`-`/`*`/comparison/`/` is byte-identical between
-  the two once correctly widened, confirmed by compiling and running
-  comparison/division/boundary-value/underflow-trap programs for all
-  five unsigned types, not just reasoned about.
-- All scalar arithmetic/comparison operators, `if`/`while`, function
-  calls (including recursion), `print` on integer/`f64`/`str`/`bool`/
-  `unit` args — every scalar shape. `print` on a `bool` prints `1`/`0`,
-  not `"true"`/`"false"` (the interpreter's own `render()`) — a
-  disclosed, cosmetic-only difference, not semantic. `print` on a
-  `unit`-typed argument (only reachable via a call to a `-> unit`
-  function — there's no `unit` literal syntax) prints the fixed string
-  `"()"`, matching the interpreter exactly.
-- Tier-1/2 bounds and divide-by-zero guards (elided where proven safe —
-  see §8), and `audited`'s suppression of them.
-- **`box`/`&`/`*`** — real heap allocation (`nir_alloc`) *and* real,
-  automatic free (`nir_free`) driven by `ownership.rs`'s `FreeMap`
-  (`emit_box_free`, called at each binding's last use) — not a leak.
-- **`str`** — literals, `==`/`!=`, use as an `if` condition, `print`,
-  and function parameters/returns, `main`'s own included: `main() ->
-  str` compiles directly now (prints the returned string and exits 0 —
-  the same `%.*s`-format printf sequence `print` itself uses, since
-  there's no sensible integer exit code for a `str` value the way there
-  is for an integer/`f64` one).
-- **`tcp`/`tcp_listener`** — `connect`/`listen`/`accept`/`send`/`recv`/
-  `stop` over real sockets.
-- **`sha256_hex`/`constant_time_str_eq`** — linked calls into a
-  from-scratch SHA-256 in `compiler/src/runtime_kernels.rs` (that file
-  has no access to the `sha2` crate `interpreter.rs` uses — it's
-  compiled as an isolated `rustc --crate-type staticlib` invocation with
-  no `--extern` flags, `build.rs`'s doc comment), verified bit-for-bit
-  against the standard's own test vectors, an independent Python
-  `hashlib.sha256` cross-check at every padding-boundary message length,
-  and the interpreter's `sha2`-backed output. `sha256_hex`'s output
-  buffer is heap-allocated (`nir_alloc`) and never freed — `str` isn't
-  affine, so there's no scope-closing point to hook a matching
-  `nir_free` onto (a real, small, disclosed leak, not a silent one; see
-  `runtime_kernels.rs::nir_sha256_hex`'s doc comment).
-- **`rand_seed`/`rand_f64`/`rand_gaussian`** — the same SplitMix64/
-  Box-Muller algorithm as the interpreter (§9), now with real RNG state
-  in generated code: a process-wide stream in `runtime_kernels.rs`
-  (necessarily process-wide, not per-"instance" the way the interpreter
-  keeps it — §9's determinism section explains why that's an honest
-  equivalent today, and when it stops being one). Calling `rand_f64`/
-  `rand_gaussian` before `rand_seed` aborts the process (`nir_alloc`'s
-  own allocation-failure path is the same precedent), matching the
-  interpreter's `RngNotSeeded` runtime error in spirit, just via
-  `abort()` instead of a catchable `Result`.
-- **`Vector`/`Matrix`, fully** — literals, dynamic (runtime-expression)
-  indexing with a proven-or-checked bounds guard, all elementwise operators
-  and every legal shape of `*`, `==`/`!=`, and every dense-linear-algebra/
-  geometry/Kalman-filter builtin. Two different codegen strategies underly
-  this, worth knowing about if you're reasoning about performance: shape-driven
-  operations (elementwise ops, `*`, `transpose`, `dot`, `cross`, `zeros`/
-  `ones`/`identity`, `sum`, `len`, the norms, `trace`, `is_*`, the geometry
-  builtins, `kf_predict_*`) are **fully unrolled at compile time** into
-  straight-line IR — dimensions are always compile-time literals, so this
-  is always possible, and it's more aggressively optimizable than an
-  equivalent runtime loop. The genuinely data-dependent ones (`det`, `inv`,
-  `solve`, `rank`, `kf_update_*` — partial-pivot row selection is real,
-  value-dependent control flow) instead **call into a small native runtime
-  library** (`compiler/src/runtime_kernels.rs`, compiled once at `nirdosha`'s
-  own build time via `compiler/build.rs`, linked into every output binary)
-  rather than hand-emitting branchy LLVM IR — reusing the interpreter's own
-  proven-correct algorithms instead of a second, independently-written copy.
-  This is not a performance compromise (a native `call` costs what inlined
-  IR costs) but it is a real, measured tradeoff against hand-specialized C:
-  the runtime kernels are generic over matrix size `n`, so they can't be
-  specialized for a fixed small `n` the way C's `det4()` can — see
-  `benchmarks/RESULTS.md`'s Group A "honest asterisk" for the actual numbers
-  this produces (Nirdosha beats C on the fully-unrolled operations, loses to
-  it on the runtime-library ones).
-- **`struct`/`enum`/`match` (Row 11), non-affine payloads** — construction
-  (an ordinary `Expr::Call`, no dedicated AST node), `expr.field` access,
-  and `match` (both enum-variant arms with a real LLVM `switch` on the
-  declaration-order variant tag, and literal-pattern `str`/`i64`/`bool`
-  arms — `str` as a sequential `nir_str_eq` chain, no native string
-  switch). A `struct`/`enum` lowers to a real named LLVM type: a struct
-  to `{ field_lltys... }` (LLVM computes the real padding), an enum to a
-  hand-rolled `{ i64 tag, [N x i64] payload }` tagged union (`N` a
-  compile-time word count, conservatively over-allocated so the same
-  buffer fits every variant). Generic instantiations get distinct mangled
-  named types (`%Result$i64$str`). **The one real caveat (Phase 4b,
-  deferred):** a `struct`/`enum` whose fields/payloads *transitively*
-  contain an affine type (`box`/`&`/`thread`/`chan`/`tcp`/`file`/`db`/`mq`)
-  is still rejected — freeing an affine field nested inside a struct, or
-  inside a *live* enum variant's payload, needs `ownership.rs`'s `FreeMap`
-  generalized beyond its current `Ty::Box`-only `still_owned_boxes` plus
-  a new `at_match_arm_end` entry for match-bound affine payloads, not
-  attempted in this phase. `check_supported` rejects such a type up front
-  with a message naming the affine/Phase-4b reason, the same
-  "reject, don't mis-compile" treatment every other still-unsupported
-  construct gets.
+**Scalar width mechanics.** Same LLVM widths as the signed types for
+every unsigned counterpart; the one real signed-vs-unsigned instruction
+choice is at the widen-on-load step (`zext` for unsigned, `sext` for
+signed, `codegen.rs::widen_to_i64`) — every downstream `+`/`-`/`*`/
+comparison/`/` is byte-identical between the two once correctly
+widened, confirmed by compiling and running comparison/division/
+boundary-value/underflow-trap programs for all five unsigned types, not
+just reasoned about.
 
-Interpreter-only (rejected by `check_supported` with a specific reason,
-never silently mis-compiled):
+**`sha256_hex`.** Linked calls into a from-scratch SHA-256 in
+`crates/compiler/src/runtime_kernels.rs` (isolated `rustc --crate-type
+staticlib`, no `--extern` flags — that file can't reach `interpreter.rs`'s
+`sha2` crate), verified bit-for-bit against the standard's own test
+vectors, an independent Python `hashlib.sha256` cross-check at every
+padding-boundary length, and the interpreter's own output. Its output
+buffer is heap-allocated and never freed — `str` isn't affine, so
+there's no scope-closing point to hook a `nir_free` onto (a real, small,
+disclosed leak, not a silent one — `runtime_kernels.rs::
+nir_sha256_hex`'s doc comment).
 
-- `struct`/`enum`/`match` (Row 11) with an **affine** field/payload
-  (`box`/`&`/`tcp`/`file`/`db`/`mq`, transitively) — the Phase 4b boundary
-  named above; a non-affine `struct`/`enum`/`match` compiles now.
-- `thread`/`spawn`/`join`, `chan`/`send`/`recv` (channel — distinct from
-  the already-compiled `tcp`), `sandbox`/`stop`.
-- `file`/`open` (`PROTOLANG_PORT.md`'s file I/O port).
-- `dec128` and its `dec_*` builtins (§2, §5) — not yet in `Ty` or
-  `codegen.rs`'s builtin allowlists.
-- `json`/`db`/`mq` (`Ty::Json`/`Ty::Db`/`Ty::Mq`) and every Row 12
-  identity/session/API-key builtin (`oidc_validate_token`,
-  `check_role(_path)`, `extract_claim(_path)`, sessions, refresh,
-  revocation) — the identity ones are additionally blocked on
-  `VerifiedIdentity`/`RoleView`/`ClaimView` being structs.
-- `http_get`/`http_post`/`https_get`/`https_post`, `mock_issue_token` —
-  every builtin not in `codegen.rs`'s `PHASE4_BUILTINS`/
-  `PHASE5_BUILTINS`/`STR_CRYPTO_BUILTINS`/`RAND_BUILTINS` lists.
-- `transact`.
-- `workflow` (§14, `WORKFLOW.md`) — its desugared functions call
-  `send_email`/`send_sms`/`send_push`/`notify`/`__workflow_*`, none of
-  which are in `codegen.rs`'s builtin allowlists, so `check_supported`
-  rejects them the same clean, named way it already rejects `transact`.
-- `fn(..)->..`/`acquire`/`requires(...)` — first-class and privileged
-  functions (§6a), joining the affine-field `struct`/`enum`/`match` entry
-  above on this list.
-- `screen`/`dashboard` (§11, Row 12) — consumed only by `nirdosha emit-ui`/
-  `nirdosha serve`. Unlike everything else on this list, these aren't
-  *rejected* by `nirdosha build`/`emit-llvm` — `codegen.rs` never
-  inspects `Program.screens`/`.dashboard` at all, so a program containing
-  them compiles cleanly; the declarations are just inert to codegen, with
-  nothing for them to lower to.
+**RNG.** A process-wide stream in `runtime_kernels.rs`, necessarily —
+there's no "interpreter instance" in a native binary the way §9's
+per-instance guarantee assumes (an honest equivalent today only because
+compiled `thread`/`spawn` don't exist yet; revisit when they do).
+Calling `rand_f64`/`rand_gaussian` before `rand_seed` aborts the
+process, matching the interpreter's `RngNotSeeded` in spirit, via
+`abort()` instead of a catchable `Result`.
 
-**This matters directly for benchmarking**: a `Vector`/`Matrix` comparison
-against Julia is now compiled-vs-JIT, not interpreter-vs-JIT — see
-`benchmarks/RESULTS.md` for the re-run numbers (all four Group A benchmarks
-now decisively beat Julia; the historical interpreted numbers are kept there
-too, labeled, for the record). A benchmark touching an *affine-field*
-`struct`/`enum`/`match`, `thread`/`chan`/`sandbox`, `file`, `json`/`db`/`mq`,
-or any Row 12 identity builtin is still necessarily interpreted for now —
-a non-affine `struct`/`enum`/`match`, and `box`/`tcp`/`str`, no longer carry
-that caveat.
+**`Vector`/`Matrix` — two codegen strategies**, worth knowing for
+performance reasoning: shape-driven operations (elementwise ops, `*`,
+`transpose`, `dot`, `cross`, `zeros`/`ones`/`identity`, `sum`, `len`,
+the norms, `trace`, `is_*`, the geometry builtins, `kf_predict_*`) are
+**fully unrolled at compile time** into straight-line IR — dimensions
+are always compile-time literals, so this is always possible and more
+optimizable than an equivalent runtime loop. The data-dependent ones
+(`det`/`inv`/`solve`/`rank`/`kf_update_*` — partial-pivot row selection
+is real, value-dependent control flow) instead **call into
+`runtime_kernels.rs`**, reusing the interpreter's own proven algorithms
+rather than a second copy. Not a performance compromise (a native
+`call` costs what inlined IR costs), but a real, measured tradeoff
+against hand-specialized C: the kernels are generic over matrix size
+`n`, so they can't be specialized for a fixed small `n` the way C's
+`det4()` can — `benchmarks/RESULTS.md`'s Group A "honest asterisk" has
+the numbers (beats C on the unrolled operations, loses on the
+runtime-library ones).
+
+**`struct`/`enum`/`match`.** Construction is an ordinary `Expr::Call`
+(no dedicated AST node); `match` gets a real LLVM `switch` on the
+declaration-order variant tag for enum arms, a sequential `nir_str_eq`
+chain (no native string switch) for `str` literal-pattern arms. Lowers
+to a real named LLVM type: a struct to `{ field_lltys... }` (LLVM
+computes real padding), an enum to a hand-rolled `{ i64 tag, [N x i64]
+payload }` tagged union (`N` a compile-time word count, over-allocated
+to fit every variant); generic instantiations get distinct mangled
+names (`%Result$i64$str`). **Phase 4b, deferred:** a `struct`/`enum`
+whose fields/payloads *transitively* contain an affine type (`box`/`&`/
+`thread`/`chan`/`tcp`/`file`/`db`/`mq`) is still rejected — freeing an
+affine field nested in a struct, or in a *live* enum variant's payload,
+needs `ownership.rs`'s `FreeMap` generalized beyond its current
+`Ty::Box`-only `still_owned_boxes`, plus a new `at_match_arm_end` entry
+for match-bound affine payloads. `check_supported` names the reason,
+same "reject, don't mis-compile" treatment as everything else here.
+
+**For benchmarking**: a `Vector`/`Matrix` comparison against Julia is
+now compiled-vs-JIT, not interpreter-vs-JIT (`benchmarks/RESULTS.md` —
+all four Group A benchmarks now decisively beat Julia; the historical
+interpreted numbers are kept there too, labeled). A benchmark touching
+an affine-field `struct`/`enum`/`match`, `thread`/`chan`/`sandbox`,
+`file`, `json`/`db`/`mq`, or any Row 12 identity builtin is still
+necessarily interpreted — a non-affine `struct`/`enum`/`match`, and
+`box`/`tcp`/`str`, no longer carry that caveat.
 
 ---
 
@@ -904,52 +846,33 @@ value` slot is an ordinary expression — `parse_expr()` handles a string
 alike, with no separate value grammar to learn.
 
 **What's checked today** (existence/shape only — typeck, not the
-parser): `screen <Name>` must name a real `struct`; every `field
-<fname>` must name a real field of it; `list`/`create`/`update`/
-`delete`, and every `action`'s `->` target, must resolve to a real
-function; `view`/`edit` must be `role(...)`/`claim(...)` calls with
-string-literal arguments (the same shape `requires(...)` itself already
-accepts); `pattern` must be a string literal that compiles as a valid
-regex, and only on a `str` field; `format` must be one of a fixed set
-of named shapes (below), and only on a `str` field; `min`/`max` must be
-an int/float literal, and only on a numeric field; `pattern` and
-`format` may not both be declared on the same field; `render` (Track E3)
-must be `"countdown"` (the only value with meaning so far), and only on
-an integer field; `dashboard`'s `tile`/`chart`/`visual` targets must
-resolve to real functions.
+parser):
+
+| Key | Rule |
+|---|---|
+| `screen <Name>` | Must name a real `struct`. |
+| `field <fname>` | Must name a real field of that struct. |
+| `list`/`create`/`update`/`delete`, an `action`'s `->` target | Must resolve to a real function. |
+| `view`/`edit` | Must be `role(...)`/`claim(...)` with string-literal args — the same shape `requires(...)` itself accepts. |
+| `pattern` | String literal, valid regex; `str` field only. |
+| `format` | One of a fixed set of named shapes (below); `str` field only. |
+| `min`/`max` | Int/float literal; numeric field only. |
+| `pattern` + `format` | May not both be declared on the same field. |
+| `render` (Track E3) | Must be `"countdown"` (the only value with meaning so far); integer field only. |
+| `dashboard`'s `tile`/`chart`/`visual` targets | Must resolve to real functions. |
 
 **What `screen`/`dashboard` currently change in the generated UI**:
-`title` overrides the nav label/heading/toast text (default: the struct
-name); `field <name> { label: "..." }` overrides that field's displayed
-label everywhere one is shown (default: the raw field name); `list`/
-`create`/`update`/`delete` override which function backs that slot
-(default: the `<kind>_<snake_case_struct_name>` convention); a declared
-`action "<label>" -> <fn> { style: "filled"|"outlined", confirm: "...",
-show_result: true }` renders as an extra per-row button beyond the
-inferred CRUD set, calling `<fn>` with just the row's own primary-key-
-shaped first param (the same single-param shape a declared `delete`
-action already uses) — `window.confirm(...)`-gated when `confirm` is
-set. `show_result: true` (Track E4) opens `<fn>`'s own JSON response,
-pretty-printed, in a modal on success — for a "Simulate"/"Test"/"Preview"
-action whose entire value *is* its return value (a rule-change dry run
-naming how many transactions it would affect, say), rather than the
-plain row-refresh every other action already does. Typechecked: `<fn>`
-must return `Result(json, _)` whenever `show_result: true` is present —
-nothing else for the modal to show. Same key, same modal, also works on
-a `workspace` `panel`'s own `action` (§15) — both share the exact same
-`action "<label>" -> <fn> { ... }` shape. `field { view, edit }`
-(role/claim visibility) is enforced both client- and server-side (see
-below). `field { pattern: "<regex>" }` / `field { min/max: ... }`
-constrain a `str`/numeric field's value on both `create_<S>` and
-`update_<S>` — a violating submission is rejected with a `400` naming
-the offending field, both as native HTML5 `pattern`/`min`/`max`
-attributes on the generated form (client-side, cosmetic) and, the real
-boundary, in `serve.rs::check_field_validations` before the fn's own
-body ever runs. `field { format: "..." }` is sugar over `pattern` for a
-fixed, closed vocabulary — `"email"`, `"phone"`, `"date"`, `"url"`,
-`"uuid"` — expanding to the matching regex at typeck/`ui_gen` time
-(`ast::well_known_format_pattern`); anything else needs a hand-written
-`pattern`.
+
+| Key | Effect | Default when absent |
+|---|---|---|
+| `title` | Overrides the nav label/heading/toast text. | The struct name. |
+| `field <name> { label: "..." }` | Overrides that field's displayed label everywhere one is shown. | The raw field name. |
+| `list`/`create`/`update`/`delete` | Overrides which function backs that slot. | `<kind>_<snake_case_struct_name>` convention. |
+| `action "<label>" -> <fn> { style, confirm, show_result }` | Extra per-row button beyond the inferred CRUD set; calls `<fn>` with just the row's primary-key-shaped first param (same single-param shape a declared `delete` already uses); `window.confirm(...)`-gated when `confirm` is set. | — |
+| `show_result: true` (Track E4) | Opens `<fn>`'s own JSON response, pretty-printed, in a modal on success — for a "Simulate"/"Test"/"Preview" action whose entire value *is* its return value (a rule-change dry run naming how many transactions it would affect, say), instead of the plain row-refresh every other action does. Typechecked: `<fn>` must return `Result(json, _)` whenever present. Same key, same modal, also works on a `workspace` `panel`'s own `action` (§15) — identical `action "<label>" -> <fn> { ... }` shape. | — |
+| `field { view, edit }` | Role/claim visibility — enforced both client- *and* server-side (see below). | — |
+| `field { pattern: "<regex>" }` / `field { min/max: ... }` | Constrains a `str`/numeric field's value on both `create_<S>` and `update_<S>` — a violation is rejected with a `400` naming the field, both as a native HTML5 attribute (client-side, cosmetic) and, the real boundary, in `serve.rs::check_field_validations` before the fn's own body ever runs. | — |
+| `field { format: "..." }` | Sugar over `pattern` for a fixed, closed vocabulary — `"email"`, `"phone"`, `"date"`, `"url"`, `"uuid"` — expanded to the matching regex at typeck/`ui_gen` time (`ast::well_known_format_pattern`); anything else needs a hand-written `pattern`. | — |
 
 `field { render: "countdown" }` (Track E3) is display-only, never a
 validation rule the way `pattern`/`format`/`min`/`max` are — an integer
@@ -1207,15 +1130,17 @@ diffed against the live SQLite schema:
 - nothing missing → nothing happens (the common case on every
   steady-state restart)
 
-Field type → SQL column type: `I8/16/32/64`/`U8/16/32/64`/`Usize` →
-`INTEGER`; `F64` → `REAL`; `Bool` → `INTEGER` (0/1, matching
-`db_execute`'s own existing encoding); `Str` → `TEXT`; `Option(T)` → same
-type as `T` (SQLite columns are nullable by default, so this needs no
-distinct shape); a zero-payload enum → `TEXT` (the variant name — same
-round-trip `sql_bind_params`/`decode_enum_value` already give a plain
-`db_execute`/`db_query` call). A field named literally `id` of type `i64`
-becomes `INTEGER PRIMARY KEY AUTOINCREMENT`, the convention every
-hand-written schema in this codebase already follows.
+Field type → SQL column type:
+
+| Field type | SQL column | Note |
+|---|---|---|
+| `I8/16/32/64`/`U8/16/32/64`/`Usize` | `INTEGER` | |
+| `F64` | `REAL` | |
+| `Bool` | `INTEGER` | 0/1, matching `db_execute`'s own existing encoding. |
+| `Str` | `TEXT` | |
+| `Option(T)` | Same as `T` | SQLite columns are nullable by default — no distinct shape needed. |
+| Zero-payload enum | `TEXT` | The variant name — same round-trip `sql_bind_params`/`decode_enum_value` already give a plain `db_execute`/`db_query` call. |
+| A field literally named `id`, type `i64` | `INTEGER PRIMARY KEY AUTOINCREMENT` | The convention every hand-written schema in this codebase already follows. |
 
 **Deliberately additive-only.** A struct field whose type has no
 single-column SQL shape (a nested struct, `Vector`/`Matrix`, a
