@@ -111,12 +111,14 @@ fn lower_one(w: &WorkflowDecl, program: &mut Program) -> Result<(), ParseError> 
         variants: event_names.iter().map(|e| Variant { name: e.clone(), payload: vec![], span }).collect(),
         span,
         module: None,
+        ns: None,
+        exported: true,
     });
 
     // 2. `<Workflow>LinkToken { value: str }` — only if this workflow has
     // at least one `link`-marked transition. A fresh, workflow-scoped
     // carrier struct rather than depending on the user having declared
-    // their own `Text` (LANGUAGE.md §6b's convention name) — guarantees no
+    // their own `Text` (docs/LANGUAGE.md §6b's convention name) — guarantees no
     // collision with whatever the program itself declares.
     let mut link_events: Vec<String> = Vec::new();
     for s in &w.states {
@@ -134,6 +136,8 @@ fn lower_one(w: &WorkflowDecl, program: &mut Program) -> Result<(), ParseError> 
             fields: vec![Field { name: "value".to_string(), ty: Ty::Str }],
             span,
             module: None,
+            ns: None,
+            exported: true,
         });
     }
 
@@ -151,11 +155,13 @@ fn lower_one(w: &WorkflowDecl, program: &mut Program) -> Result<(), ParseError> 
         fields: w.data.clone(),
         span,
         module: None,
+        ns: None,
+        exported: true,
     });
 
     // 3. `start_<workflow_snake>(identity: Option(VerifiedIdentity), data:
     // <Workflow>Data) -> Result(i64, WorkflowActionError)` — `identity` is
-    // a real, disclosed breaking-change param (`WORKFLOW.md`'s "who
+    // a real, disclosed breaking-change param (`docs/WORKFLOW.md`'s "who
     // submitted this" section), *optional* rather than required like
     // `advance_<workflow>`'s own `identity: VerifiedIdentity`: unlike
     // firing a state's transition, starting a workflow is legitimately
@@ -184,10 +190,12 @@ fn lower_one(w: &WorkflowDecl, program: &mut Program) -> Result<(), ParseError> 
         requires: None,
         explicit_public: false,
         module: None,
+        ns: None,
+        exported: true,
     });
 
     // 3b. `list_<workflow_snake>_submitted_by_me(identity: VerifiedIdentity)
-    // -> Result(json, WorkflowActionError)` — `WORKFLOW.md`'s "who
+    // -> Result(json, WorkflowActionError)` — `docs/WORKFLOW.md`'s "who
     // submitted this" section, read side: every instance whose
     // `started_by_subject` (`workflow_log.rs`) matches the caller's own
     // subject. Unlike `start_*` above, `identity` here is **required**,
@@ -207,16 +215,18 @@ fn lower_one(w: &WorkflowDecl, program: &mut Program) -> Result<(), ParseError> 
         requires: None,
         explicit_public: false,
         module: None,
+        ns: None,
+        exported: true,
     });
 
     // 3c. `get_<workflow_snake>_history(identity: VerifiedIdentity,
     // instance_id: i64) -> Result(json, WorkflowActionError)` —
-    // `WORKFLOW.md`'s "audit trail" section: the full, append-only
+    // `docs/WORKFLOW.md`'s "audit trail" section: the full, append-only
     // transition log for one instance (who/when/via-link-or-not/comment,
     // oldest first). Gated to "any signed-in identity may view any
     // instance's history" — a disclosed simplification, not a per-viewer
     // ACL (only participants/the original requester, say) — see
-    // `WORKFLOW.md`'s own note on this.
+    // `docs/WORKFLOW.md`'s own note on this.
     program.fns.push(FnDecl {
         name: format!("get_{}_history", to_snake_case(&w.name)),
         params: vec![
@@ -234,12 +244,14 @@ fn lower_one(w: &WorkflowDecl, program: &mut Program) -> Result<(), ParseError> 
         requires: None,
         explicit_public: false,
         module: None,
+        ns: None,
+        exported: true,
     });
 
     // 4. `advance_<workflow_snake>(identity: VerifiedIdentity, instance_id:
     // i64, event: <Workflow>Event, payload: json) -> Result(bool,
     // WorkflowActionError)` — `identity` is a real, disclosed breaking
-    // change from the pre-ownership signature (`WORKFLOW.md`'s "state
+    // change from the pre-ownership signature (`docs/WORKFLOW.md`'s "state
     // ownership" section): one `advance_*` fn serves every instance/state
     // of this workflow, so *who* may fire the current state's transition
     // can only be checked at runtime, against the live instance
@@ -274,10 +286,12 @@ fn lower_one(w: &WorkflowDecl, program: &mut Program) -> Result<(), ParseError> 
         requires: None,
         explicit_public: false,
         module: None,
+        ns: None,
+        exported: true,
     });
 
     // 4b. `list_<workflow_snake>_pending_for_me(identity: VerifiedIdentity)
-    // -> Result(json, WorkflowActionError)` — `WORKFLOW.md`'s "state
+    // -> Result(json, WorkflowActionError)` — `docs/WORKFLOW.md`'s "state
     // ownership" section, read side: every instance currently sitting in
     // a state whose `owner` `identity` satisfies. Same "gains a real
     // `VerifiedIdentity` param, no `requires`" posture as `advance_*`
@@ -299,6 +313,8 @@ fn lower_one(w: &WorkflowDecl, program: &mut Program) -> Result<(), ParseError> 
         requires: None,
         explicit_public: false,
         module: None,
+        ns: None,
+        exported: true,
     });
 
     // 5. `<event>_via_link(instance_id: i64, token: <Workflow>LinkToken,
@@ -330,14 +346,16 @@ fn lower_one(w: &WorkflowDecl, program: &mut Program) -> Result<(), ParseError> 
             declared_effects: None,
             requires: None,
             // Genuinely intentional, not an oversight — the documented
-            // carve-out `API_TRUST_MODEL.md` §1 names explicitly (a
+            // carve-out `docs/API_TRUST_MODEL.md` §1 names explicitly (a
             // single-use magic-link token compare stands in for
             // `IdentityValid` here). Marking it so keeps the new
-            // ungated-fn warning (`ROADMAP.md` A10) silent for exactly
+            // ungated-fn warning (`docs/ROADMAP.md` A10) silent for exactly
             // this one deliberately-public shape, not every `workflow`
             // function.
             explicit_public: true,
             module: None,
+            ns: None,
+            exported: true,
         });
     }
 

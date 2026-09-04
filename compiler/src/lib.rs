@@ -9,6 +9,7 @@ pub mod extraction_schema;
 pub mod init;
 pub mod instance_lock;
 pub mod interpreter;
+pub mod loader;
 pub mod migrate;
 pub mod observability;
 pub mod ownership;
@@ -90,6 +91,27 @@ pub fn run_with_tracer_transact_and_workflow_log(
     let program = Parser::new(toks)
         .parse_program()
         .map_err(|e| format!("parse error at {}:{}: {}", e.span.line, e.span.col, e.message))?;
+    run_program_with_tracer_transact_and_workflow_log(program, src, tracer, transact_log_path, workflow_log_path)
+}
+
+/// Same pipeline as `run_with_tracer_transact_and_workflow_log`, but
+/// takes an already-parsed `Program` instead of lexing/parsing `src`
+/// itself — the piece that fn factors out. The one real caller: `main.rs
+/// ::cmd_interpret`, for a program whose `use "path.nir"` directives
+/// (`docs/ROADMAP.md` Track F, F2 piece 3) `loader::load_program` has
+/// already resolved and merged — this crate's own `run*` family stays
+/// on a bare `src: &str` with no file path to resolve a relative import
+/// against (unaffected either way for the overwhelming common case: a
+/// program with no `use` directives behaves identically through
+/// either entry point, since `Program.imports` is simply empty and
+/// nothing here reads it again after parsing).
+pub fn run_program_with_tracer_transact_and_workflow_log(
+    program: ast::Program,
+    src: &str,
+    tracer: Option<std::sync::Arc<observability::Tracer>>,
+    transact_log_path: Option<durability::LogTarget>,
+    workflow_log_path: Option<durability::LogTarget>,
+) -> Result<Value, String> {
     if let Err(errors) = typeck::typecheck(&program) {
         let joined = errors.iter().map(|e| format!("type error: {e}")).collect::<Vec<_>>().join("\n");
         return Err(joined);

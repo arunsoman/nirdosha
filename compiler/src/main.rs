@@ -182,10 +182,6 @@ fn cmd_interpret(
     transact_log_path: Option<String>,
     workflow_log_path: Option<String>,
 ) -> ExitCode {
-    let src = match read_source(path) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
     // Observability layer 1: `--otel-console` builds one `Tracer` up
     // front and hands it down through `lib.rs`'s `_with_tracer` variants
     // — `None` here is exactly `run`/`run_diagnostic`'s own behavior, so
@@ -205,10 +201,22 @@ fn cmd_interpret(
     let transact_log =
         nirdosha::durability::LogTarget::from_cli_arg(&transact_log_path.unwrap_or_else(|| format!("{path}.transact.db")));
     // `workflow { ... }`'s durable store: same default-path convention as
-    // `transact_log` above (`WORKFLOW.md`).
+    // `transact_log` above (`docs/WORKFLOW.md`).
     let workflow_log =
         nirdosha::durability::LogTarget::from_cli_arg(&workflow_log_path.unwrap_or_else(|| format!("{path}.workflow.db")));
     if format_json {
+        // `--format=json`'s structured `Diagnostic`s are tied to a
+        // single-file lex/parse (`Diagnostic::Lex`/`Parse` each carry
+        // one `Span`, meaningful only relative to one known source
+        // text) — `use "..."` resolution (`docs/ROADMAP.md` Track F, F2
+        // piece 3) isn't wired into this path yet, a real, disclosed
+        // gap (`docs/NEXT_GEN.md` §F2), unlike every other command below.
+        // A program with no `use` directives is completely unaffected
+        // either way. `read_source` (not the loader) is deliberate here.
+        let src = match read_source(path) {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
         return match nirdosha::run_diagnostic_with_tracer_transact_and_workflow_log(
             &src,
             tracer,
@@ -223,7 +231,20 @@ fn cmd_interpret(
             }
         };
     }
-    match nirdosha::run_with_tracer_transact_and_workflow_log(&src, tracer, Some(transact_log), Some(workflow_log)) {
+    let (program, src) = match nirdosha::loader::load_program(path) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match nirdosha::run_program_with_tracer_transact_and_workflow_log(
+        program,
+        &src,
+        tracer,
+        Some(transact_log),
+        Some(workflow_log),
+    ) {
         Ok(v) => print_value(&v),
         Err(msg) => {
             eprintln!("{msg}");
@@ -232,27 +253,32 @@ fn cmd_interpret(
     }
 }
 
-/// Lex -> parse -> typecheck -> ownership-check, shared by `build` and
-/// `emit-llvm` — same static gates `nirdosha::run` applies before ever
-/// interpreting, applied here before ever generating code. Codegen's own
+/// Load (resolving any `use "..."` — `docs/ROADMAP.md` Track F, F2 piece 3)
+/// -> typecheck -> ownership-check, shared by `build` and `emit-llvm` —
+/// same static gates `nirdosha::run` applies before ever interpreting,
+/// applied here before ever generating code. Codegen's own
 /// `check_supported` (a third, narrower gate — signed-integer/bool/unit
 /// only, no `box`/`&`/`*`) runs separately, inside `codegen::build`/
 /// `emit_llvm_ir` themselves, since it's specific to this backend, not a
-/// property of the language generally.
-fn typecheck_and_own(src: &str) -> Result<nirdosha::ast::Program, String> {
-    typecheck_and_own_impl(src, true)
+/// property of the language generally. Returns the entry file's own
+/// source alongside the (possibly multi-file-merged) `Program` — the
+/// one caller that still needs it directly is `cmd_sandbox_worker`
+/// (`Interpreter::new`'s own `source` argument); every other caller
+/// just uses the `Program`.
+fn typecheck_and_own(path: &str) -> Result<(nirdosha::ast::Program, String), String> {
+    typecheck_and_own_impl(path, true)
 }
 
 /// Same as `typecheck_and_own`, but does not require a `fn main()` — for
 /// commands that never execute an entrypoint (`serve`, `emit-ui`,
 /// `--sandbox-worker`; see `typeck::typecheck_optional_main`'s doc
 /// comment for why each of those doesn't need one).
-fn typecheck_and_own_optional_main(src: &str) -> Result<nirdosha::ast::Program, String> {
-    typecheck_and_own_impl(src, false)
+fn typecheck_and_own_optional_main(path: &str) -> Result<(nirdosha::ast::Program, String), String> {
+    typecheck_and_own_impl(path, false)
 }
 
 /// Prints `typeck::ungated_fn_warnings` to stderr — non-fatal, unlike a
-/// `TypeError` (`ROADMAP.md` A10). Called only from `serve`/`emit-ui`,
+/// `TypeError` (`docs/ROADMAP.md` A10). Called only from `serve`/`emit-ui`,
 /// the two commands where "reachable via `/api/<fn>`" is actually the
 /// question being asked; `run`/`build`/`emit-llvm` never serve anything,
 /// so warning about HTTP reachability there would be noise unrelated to
@@ -269,13 +295,8 @@ fn print_ungated_fn_warnings(program: &nirdosha::ast::Program) {
     }
 }
 
-fn typecheck_and_own_impl(src: &str, require_main: bool) -> Result<nirdosha::ast::Program, String> {
-    let toks = nirdosha::token::Lexer::new(src)
-        .tokenize()
-        .map_err(|e| format!("lex error at {}:{}: {}", e.span.line, e.span.col, e.message))?;
-    let program = nirdosha::parser::Parser::new(toks)
-        .parse_program()
-        .map_err(|e| format!("parse error at {}:{}: {}", e.span.line, e.span.col, e.message))?;
+fn typecheck_and_own_impl(path: &str, require_main: bool) -> Result<(nirdosha::ast::Program, String), String> {
+    let (program, src) = nirdosha::loader::load_program(path)?;
     let type_result =
         if require_main { nirdosha::typeck::typecheck(&program) } else { nirdosha::typeck::typecheck_optional_main(&program) };
     if let Err(errors) = type_result {
@@ -307,7 +328,7 @@ fn typecheck_and_own_impl(src: &str, require_main: bool) -> Result<nirdosha::ast
     if let Err(errors) = nirdosha::contract_check::check_program_contracts(&program) {
         return Err(errors.join("\n"));
     }
-    Ok(program)
+    Ok((program, src))
 }
 
 /// Prints `contract_check::unsupported_validate_notes` to stderr —
@@ -480,11 +501,7 @@ fn cmd_build(mut args: impl Iterator<Item = String>) -> ExitCode {
         eprintln!("usage: nirdosha build <file.nir> -o <out> [--opt0]");
         return ExitCode::FAILURE;
     };
-    let src = match read_source(&path) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let program = match typecheck_and_own(&src) {
+    let (program, _src) = match typecheck_and_own(&path) {
         Ok(p) => p,
         Err(msg) => {
             eprintln!("{msg}");
@@ -509,11 +526,7 @@ fn cmd_emit_llvm(mut args: impl Iterator<Item = String>) -> ExitCode {
         eprintln!("usage: nirdosha emit-llvm <file.nir>");
         return ExitCode::FAILURE;
     };
-    let src = match read_source(&path) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let program = match typecheck_and_own(&src) {
+    let (program, _src) = match typecheck_and_own(&path) {
         Ok(p) => p,
         Err(msg) => {
             eprintln!("{msg}");
@@ -547,21 +560,17 @@ fn cmd_emit_ast(mut args: impl Iterator<Item = String>) -> ExitCode {
         eprintln!("usage: nirdosha emit-ast <file.nir>");
         return ExitCode::FAILURE;
     };
-    let src = match read_source(&path) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let toks = match nirdosha::token::Lexer::new(&src).tokenize() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("lex error at {}:{}: {}", e.span.line, e.span.col, e.message);
-            return ExitCode::FAILURE;
-        }
-    };
-    let program = match nirdosha::parser::Parser::new(toks).parse_program() {
+    // `loader::load_program` resolves any `use "..."` (`docs/ROADMAP.md`
+    // Track F, F2 piece 3) but — like the plain lex/parse this replaces
+    // — never typechecks the *entry* file itself (only an imported
+    // file, before its `pub` items are merged in, which has to be
+    // well-typed for the merge to be sound at all): this command's own
+    // "AST of a program that doesn't yet typecheck is still legitimate
+    // to inspect" contract, above, is unaffected.
+    let (program, _src) = match nirdosha::loader::load_program(&path) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("parse error at {}:{}: {}", e.span.line, e.span.col, e.message);
+        Err(msg) => {
+            eprintln!("{msg}");
             return ExitCode::FAILURE;
         }
     };
@@ -651,11 +660,7 @@ fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
         eprintln!("usage: nirdosha emit-ui <file.nir> [-o out.html] [--theme theme.json]");
         return ExitCode::FAILURE;
     };
-    let src = match read_source(&path) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let program = match typecheck_and_own_optional_main(&src) {
+    let (program, _src) = match typecheck_and_own_optional_main(&path) {
         Ok(p) => p,
         Err(msg) => {
             eprintln!("{msg}");
@@ -902,11 +907,7 @@ fn cmd_serve(
         eprintln!("--oidc-* flags require --jwks-file/--issuer/--audience too — SSO validates on top of a real token, it doesn't replace one");
         return ExitCode::FAILURE;
     }
-    let src = match read_source(&path) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let program = match typecheck_and_own_optional_main(&src) {
+    let (program, _src) = match typecheck_and_own_optional_main(&path) {
         Ok(p) => p,
         Err(msg) => {
             eprintln!("{msg}");
@@ -1007,11 +1008,7 @@ fn cmd_sandbox_worker(mut args: impl Iterator<Item = String>) -> ExitCode {
         eprintln!("usage: nirdosha --sandbox-worker <file.nir> <fn-name> [args...]");
         return ExitCode::FAILURE;
     };
-    let src = match read_source(&path) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let program = match typecheck_and_own_optional_main(&src) {
+    let (program, src) = match typecheck_and_own_optional_main(&path) {
         Ok(p) => p,
         Err(msg) => {
             eprintln!("{msg}");

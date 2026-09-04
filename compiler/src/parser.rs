@@ -116,6 +116,29 @@ impl Parser {
         }
     }
 
+    /// `IDENT ("::" IDENT)*`, joined into one canonical dotted-path
+    /// string (`"Mod::Name"`, `"Mod::Enum::Variant"`, ...) — used at
+    /// every *reference* site (never a declaration site: `fn`/`struct`/
+    /// `enum`/`module` names stay plain single identifiers via
+    /// `expect_ident`, since a declaration can't itself live at a
+    /// path). `docs/ROADMAP.md` Track F, F2. See `ast::scope_key`'s doc
+    /// comment for why a reference's own literal text — qualified or
+    /// not — is exactly the canonical registry key a namespaced
+    /// declaration is stored under, with no separate `Path` AST node
+    /// needed: this returns one plain `String`, the same shape
+    /// `expect_ident` always returned, just possibly containing `::`.
+    fn parse_qualified_name(&mut self) -> PResult<(String, Span)> {
+        let span = self.span();
+        let mut out = self.expect_ident()?;
+        while self.peek().tok == Tok::ColonColon {
+            self.bump();
+            let seg = self.expect_ident()?;
+            out.push_str("::");
+            out.push_str(&seg);
+        }
+        Ok((out, span))
+    }
+
     /// A bare non-negative integer literal in *type* position — a
     /// `Vector`/`Matrix` dimension. Dimensions are fixed at compile time
     /// ("Sized by Default" — the unified plan's §2), so this only ever
@@ -231,11 +254,10 @@ impl Parser {
             // job (`TypeErrorKind::UnknownType`/`WrongTypeArity`), not this
             // parser's — it has no declaration table to check against, and
             // Nirdosha's functions/types are already resolved by name in a
-            // table built after parsing completes (`LANGUAGE.md` §6), not
+            // table built after parsing completes (`docs/LANGUAGE.md` §6), not
             // as each name is scanned.
-            Tok::Ident(name) => {
-                let n = name.clone();
-                self.bump();
+            Tok::Ident(_) => {
+                let (n, _) = self.parse_qualified_name()?;
                 let mut args = Vec::new();
                 if self.peek().tok == Tok::LParen {
                     self.bump();
@@ -274,7 +296,19 @@ impl Parser {
         let mut workflows = Vec::new();
         let mut workspaces = Vec::new();
         let mut validates = Vec::new();
+        // `use "path.nir"` (`docs/ROADMAP.md` Track F, F2 piece 3) — only
+        // legal in this leading run, before any other item; a `use`
+        // anywhere else falls through to the main loop below and hits
+        // the ordinary "expected an item" parse error (`parse_fn_decl`'s
+        // `Tok::Fn` expectation), same as any other keyword misplaced
+        // outside its one legal slot elsewhere in this grammar.
         let mut imports = Vec::new();
+        while self.peek().tok == Tok::Use {
+            let span = self.span();
+            self.bump();
+            let path = self.expect_str_lit("an import path")?;
+            imports.push(ImportDecl { path, span });
+        }
         while self.peek().tok != Tok::Eof {
             match self.peek().tok {
                 Tok::Struct => structs.push(self.parse_struct_decl()?),
@@ -325,22 +359,21 @@ impl Parser {
         self.expect(&Tok::RBrace, "`}`")?;
         Ok(ValidateDecl { fn_name, entries, span })
     }
-    /// `module_decl ::= "module" STRING "{" (fn_decl | struct_decl |
-    /// enum_decl)* "}"` (`GRAMMAR.md`) — pure nav-grouping sugar, not a
-    /// real scoping construct. Every declaration inside is parsed by the
-    /// exact same `parse_fn_decl`/`parse_struct_decl`/`parse_enum_decl`
-    /// the top-level loop itself calls (each self-consumes its own
-    /// leading keyword, so they work standalone here unchanged), then
-    /// tagged with this module's display name and returned for the
-    /// caller to fold into its own flat `fns`/`structs`/`enums` — there
-    /// is no separate `Program`-shaped nested item list anywhere, no new
-    /// namespace, nothing else in the checker even knows this block
-    /// existed. Single-level only: nesting a `module` inside a `module`,
-    /// or a `screen`/`dashboard` inside one, is a parse error, matching
-    /// this grammar's existing fixed-arity/no-arbitrary-nesting
-    /// discipline elsewhere (e.g. `transact` slots never nest either).
+    /// `module_decl ::= "module" (STRING | namespace_module) "{" ... "}"`
+    /// (`docs/GRAMMAR.md`) — two forms, dispatched on the token right after
+    /// `module`, chosen deliberately so every pre-existing `.nir`
+    /// program (always the `STRING` form) keeps parsing byte-for-byte
+    /// identically: **`STRING`** is pure nav-grouping sugar, unchanged
+    /// since before `docs/ROADMAP.md` Track F, F2 — every declaration inside
+    /// still registers into the exact same flat global namespace as a
+    /// top-level one, just tagged with this module's display name for
+    /// `ui_gen.rs`. **`IDENT`** (new, F2) is a real namespace — see
+    /// `parse_namespace_module_decl`'s own doc comment.
     fn parse_module_decl(&mut self) -> PResult<(Vec<FnDecl>, Vec<StructDecl>, Vec<EnumDecl>)> {
         self.expect(&Tok::Module, "`module`")?;
+        if matches!(self.peek().tok, Tok::Ident(_)) {
+            return self.parse_namespace_module_decl();
+        }
         let name = self.expect_str_lit("a module display name")?;
         self.expect(&Tok::LBrace, "`{`")?;
         let mut fns = Vec::new();
@@ -379,6 +412,89 @@ impl Parser {
                 _ => {
                     let mut f = self.parse_fn_decl()?;
                     f.module = Some(name.clone());
+                    fns.push(f);
+                }
+            }
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok((fns, structs, enums))
+    }
+
+    /// `namespace_module ::= IDENT "{" ("nav" ":" STRING)?`
+    /// `(pub? (struct_decl | enum_decl | fn_decl))* "}"` — the real
+    /// namespace form (`docs/ROADMAP.md` Track F, F2; `docs/NEXT_GEN.md` §F2).
+    /// Every item's `ns` becomes `Some(ident)` (`ast::scope_key` is
+    /// what actually gives it teeth — see that fn's doc comment for the
+    /// full resolution rule) and `exported` becomes whatever `pub`
+    /// prefix it had (defaulting `false` — private unless marked,
+    /// unlike every declaration that predates F2, which is always
+    /// `exported: true`). `nav:`, if present, sets the *same* `module`
+    /// display-string field the legacy `STRING` form uses (so
+    /// `ui_gen.rs` needs no changes at all: it already only ever reads
+    /// `module`, never `ns`) — defaults to the identifier itself
+    /// (`Ident`) when omitted, the same "override defaults to
+    /// inferred" pattern `screen { title: "..." }` already establishes.
+    /// Single-level only, same restriction as the legacy form: no
+    /// nesting, and `screen`/`dashboard` must stay top-level.
+    fn parse_namespace_module_decl(&mut self) -> PResult<(Vec<FnDecl>, Vec<StructDecl>, Vec<EnumDecl>)> {
+        let ident = self.expect_ident()?;
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut nav = ident.clone();
+        if let Tok::Ident(k) = &self.peek().tok {
+            if k == "nav" {
+                self.bump();
+                self.expect(&Tok::Colon, "`:`")?;
+                nav = self.expect_str_lit("a nav display name")?;
+            }
+        }
+        let mut fns = Vec::new();
+        let mut structs = Vec::new();
+        let mut enums = Vec::new();
+        while self.peek().tok != Tok::RBrace {
+            let exported = if self.peek().tok == Tok::Pub {
+                self.bump();
+                true
+            } else {
+                false
+            };
+            match self.peek().tok {
+                Tok::Struct => {
+                    let mut s = self.parse_struct_decl()?;
+                    s.module = Some(nav.clone());
+                    s.ns = Some(ident.clone());
+                    s.exported = exported;
+                    structs.push(s);
+                }
+                Tok::Enum => {
+                    let mut e = self.parse_enum_decl()?;
+                    e.module = Some(nav.clone());
+                    e.ns = Some(ident.clone());
+                    e.exported = exported;
+                    enums.push(e);
+                }
+                Tok::Module => {
+                    return Err(ParseError {
+                        message: "`module` blocks cannot be nested".to_string(),
+                        span: self.span(),
+                    });
+                }
+                Tok::Screen | Tok::Dashboard => {
+                    return Err(ParseError {
+                        message: "`screen`/`dashboard` blocks must be declared at top level, outside any `module`".to_string(),
+                        span: self.span(),
+                    });
+                }
+                Tok::Eof => {
+                    return Err(ParseError {
+                        message: "unterminated `module` block, expected `}`".to_string(),
+                        span: self.span(),
+                    });
+                }
+                _ => {
+                    let mut f = self.parse_fn_decl()?;
+                    f.module = Some(nav.clone());
+                    f.ns = Some(ident.clone());
+                    f.exported = exported;
                     fns.push(f);
                 }
             }
@@ -811,7 +927,7 @@ impl Parser {
             }
         }
         self.expect(&Tok::RBrace, "`}`")?;
-        Ok(StructDecl { name, type_params, fields, span, module: None })
+        Ok(StructDecl { name, type_params, fields, span, module: None, ns: None, exported: true })
     }
 
     // enum_decl ::= "enum" ident ("(" ident ("," ident)* ")")?
@@ -855,7 +971,7 @@ impl Parser {
             }
         }
         self.expect(&Tok::RBrace, "`}`")?;
-        Ok(EnumDecl { name, type_params, variants, span, module: None })
+        Ok(EnumDecl { name, type_params, variants, span, module: None, ns: None, exported: true })
     }
 
     // fn_decl ::= "fn" ident "(" params? ")" ("->" type)? block
@@ -888,7 +1004,7 @@ impl Parser {
         let declared_effects = self.parse_effect_annotation()?;
         let (requires, explicit_public) = self.parse_requires_annotation()?;
         let body = self.parse_block()?;
-        Ok(FnDecl { name, params, ret, body, span, declared_effects, requires, explicit_public, module: None })
+        Ok(FnDecl { name, params, ret, body, span, declared_effects, requires, explicit_public, module: None, ns: None, exported: true })
     }
 
     /// `effect(pure)` / `effect(io, network)` / ... — `None` if there's no
@@ -1137,7 +1253,11 @@ impl Parser {
                     self.bump();
                     ("_".to_string(), Some(LiteralPattern::Wildcard))
                 }
-                _ => (self.expect_ident()?, None),
+                // A `match` arm's variant name may itself be qualified
+                // (`Mod::Enum::Variant`) — the same `docs/ROADMAP.md` Track F,
+                // F2 qualified-name grammar `expect_type`/`parse_primary`
+                // use, not a separate production.
+                _ => (self.parse_qualified_name()?.0, None),
             };
             let mut bindings = Vec::new();
             // Only the enum-variant form ever binds a payload — a
@@ -1658,8 +1778,8 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Bool(false, span))
             }
-            Tok::Ident(name) => {
-                self.bump();
+            Tok::Ident(_) => {
+                let (name, span) = self.parse_qualified_name()?;
                 Ok(Expr::Ident(name, span))
             }
             Tok::LParen => {

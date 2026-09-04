@@ -671,6 +671,44 @@ fn has_cyclic_layout(ty: &Ty, registry: &TypeRegistry, visiting: &mut Vec<String
 }
 
 pub fn check_supported(program: &Program) -> Result<(), CodegenError> {
+    // Real namespacing/`pub`/`use` (`docs/ROADMAP.md` Track F, F2;
+    // `docs/NEXT_GEN.md` §F2) isn't ported to the compiled path yet — same
+    // incremental-porting pattern Track B already uses for `transact`/
+    // `db`/`json`/`mq`/etc. A namespaced (`module Ident { ... }`)
+    // declaration's own `name` is deliberately left unmangled (`ast::
+    // StructDecl::ns`'s doc comment: every pre-F2 consumer, including
+    // this one, reads `.name` directly), so two such declarations in
+    // different modules sharing a bare name would silently collide as
+    // the exact same unmangled LLVM symbol if this ever reached real
+    // codegen — rejected up front, honestly, rather than risking a
+    // miscompile. A program with no real (`ns: Some(_)`) declaration is
+    // completely unaffected — every existing `.nir` program, and every
+    // legacy string-named `module "Display Name" { ... }` block.
+    if let Some(f) = program.fns.iter().find(|f| f.ns.is_some()) {
+        return unsupported(format!(
+            "`{}` is declared inside a real `module {} {{ ... }}` namespace -- modules/`pub`/`use` \
+             aren't supported by the compiled path (`nirdosha build`/`emit-llvm`) yet, only the \
+             interpreter (`nirdosha <file>`/`serve`)",
+            f.name,
+            f.ns.as_deref().unwrap_or("")
+        ));
+    }
+    if let Some(s) = program.structs.iter().find(|s| s.ns.is_some()) {
+        return unsupported(format!(
+            "`{}` is declared inside a real `module {} {{ ... }}` namespace -- modules/`pub`/`use` \
+             aren't supported by the compiled path yet, only the interpreter",
+            s.name,
+            s.ns.as_deref().unwrap_or("")
+        ));
+    }
+    if let Some(e) = program.enums.iter().find(|e| e.ns.is_some()) {
+        return unsupported(format!(
+            "`{}` is declared inside a real `module {} {{ ... }}` namespace -- modules/`pub`/`use` \
+             aren't supported by the compiled path yet, only the interpreter",
+            e.name,
+            e.ns.as_deref().unwrap_or("")
+        ));
+    }
     let registry = TypeRegistry::build(program);
     // Reject a cyclic struct/enum *declaration* itself, before any
     // function signature or body is even walked — the same "reject,
@@ -1366,10 +1404,10 @@ impl Codegen<'_> {
             let type_args = self.infer_type_args(&type_params, &decl_tys, args, scopes)?;
             Some(Ty::Named(name.to_string(), type_args))
         } else if let Some((enum_name, variant)) = self.registry.find_variant(name) {
-            let type_params = self.registry.enum_type_params(enum_name)?.to_vec();
+            let type_params = self.registry.enum_type_params(&enum_name)?.to_vec();
             let decl_tys = variant.payload.clone();
             let type_args = self.infer_type_args(&type_params, &decl_tys, args, scopes)?;
-            Some(Ty::Named(enum_name.to_string(), type_args))
+            Some(Ty::Named(enum_name, type_args))
         } else {
             None
         }
@@ -1450,7 +1488,7 @@ impl Codegen<'_> {
         if self.registry.is_struct(name) {
             self.construct_struct(name, args, expected, &dest, span, scopes)?;
         } else if let Some((enum_name, variant)) = self.registry.find_variant(name) {
-            self.construct_variant(enum_name, variant, args, expected, &dest, span, scopes)?;
+            self.construct_variant(&enum_name, variant, args, expected, &dest, span, scopes)?;
         } else {
             unreachable!("typeck.rs already proved `{name}` is a struct or variant constructor")
         }

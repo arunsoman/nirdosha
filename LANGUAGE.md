@@ -1141,18 +1141,25 @@ kept serving, never a crash or a broken response.
 
 ## 12. `module "Name" { ... }` — nav grouping, not scoping
 
+**This section covers the legacy, string-named form only — completely
+unaffected by, and unrelated to, the real namespace/`pub`/`use` system
+§17 adds.** `parser.rs` tells the two forms apart by the very next
+token after `module` (a string literal here; a bare identifier for
+§17's real form) — nothing about this section's behavior changed when
+that was added.
+
 `emit-ui`'s nav is one flat list of screens by default. A `module "Display
 Name" { ... }` block wrapping `fn`/`struct`/`enum` declarations tags each
 one with that display name — `ui_gen.rs` groups nav screens by it into
 collapsible primary-menu sections; `Dashboard` always stays outside every
-group, first. That is the *only* thing `module` does: it is **pure
-syntactic sugar**, not a namespace. Everything inside a `module` block
-still registers into the exact same single flat global namespace a
-top-level declaration would (`typeck.rs` never even inspects `module` —
-only `ui_gen.rs` does), so two functions in different `module` blocks can
-call each other exactly as freely as two top-level ones always could, and
-a program that never uses `module` at all renders exactly as it did
-before this construct existed (flat, ungrouped nav).
+group, first. That is the *only* thing this form of `module` does: it is
+**pure syntactic sugar**, not a namespace. Everything inside it still
+registers into the exact same single flat global namespace a top-level
+declaration would (`typeck.rs` never even inspects it — only `ui_gen.rs`
+does), so two functions in different string-named `module` blocks can call
+each other exactly as freely as two top-level ones always could, and a
+program that never uses `module` at all renders exactly as it did before
+this construct existed (flat, ungrouped nav).
 
 ```nirdosha
 module "Billing" {
@@ -1352,3 +1359,147 @@ heatmap grid, no basemap) §11c discloses for `dashboard { visual ... }`.
 
 Like `module`/`workflow`, a program that declares no `workspace` is
 byte-for-byte unaffected.
+
+## 16. `validate` — Hoare contracts on a function (`docs/ROADMAP.md` Track F, F3)
+
+Full design in `docs/NEXT_GEN.md` §F3 — this section is the short version.
+
+`requires(role: "...")`/`requires(claim: ..., ...)` (§6) gate *who* may
+call a function. `validate` is a different, orthogonal thing: it states
+a fact the function itself must honor, checked two ways at once.
+
+```nirdosha
+fn max_of(a: i64, b: i64) -> i64 {
+    if a > b { return a }
+    return b
+}
+
+validate max_of {
+    post: result >= a
+    post: result >= b
+}
+```
+
+`pre: <expr>` — a hypothesis about the arguments, asserted before the
+function runs at all. `post: <expr>` — a fact about `result` (a
+reserved name bound to the real return value, meaningful only inside a
+`post`) that must hold whenever the function returns. Multiple `pre`/
+`post` entries are meaningful: every `pre` is a conjunctive hypothesis,
+every `post` is checked independently, so a violation names exactly
+which clause failed. `pre`/`post` are ordinary `kv_entry`s, not new
+syntax — their value is `expr`, the same grammar every other value
+position already uses.
+
+**Two independent enforcement paths, not one:**
+
+| | Static, at build time | Dynamic, at runtime |
+|---|---|---|
+| Runs | `nirdosha build`/`run`/`serve`/`emit-ui` | Every actual call, unconditionally |
+| Basis | A genuine Z3 proof, not a heuristic | The real concrete argument/return values |
+| Scope | Tier 1 only: integer params/return, no loop, no division in the checked function. A `Call` is supported too, but only when *that* callee's own `validate` contract is *already independently proven* — its proof is reused as a fact about the result (`pre` implies `post`, never `post` alone, so a call site that doesn't itself satisfy the callee's precondition gets an uninformative axiom, never a wrong one). A call to an unproven/undeclared callee still falls through to the runtime path — never a guess. | None of the static pass's restrictions — the only enforcement path for a function touching `db`/`json`/`http`, calling another function, or looping, which in practice is most real functions. |
+| On failure | Hard build failure, naming a real counterexample | `pre` stops the body from running at all; `post` reports the real return value that violated it |
+| Can't decide | Falls through to the runtime path (`Unsupported`) — `nirdosha emit-ui`/`serve` print a `note:` explaining why | Treated as a violation, never silently passed (a predicate that errors evaluating, or isn't boolean-shaped) |
+
+A function with no `validate` block is byte-for-byte unaffected by
+either path — same "declares nothing, changes nothing" posture
+`workspace`/`workflow`/`module` already hold themselves to.
+
+**What this doesn't do.** Interprocedural reasoning only ever chains one
+level deep through *proven* summaries — a call into a function whose
+own contract is itself only provable *using another as-yet-unproven
+callee's* summary won't resolve on the first pass, though a real
+multi-pass fixed point (`contract_check::run_program_validates`) does
+let a short chain of provable functions bootstrap each other; genuine
+mutual recursion between two `validate`d functions still never resolves
+on either side, honestly, not a wrong answer. `pre`/`post` are now
+type-checked against the target function's real signature ahead of
+time (`typeck::check_validate`) — a badly-shaped predicate is a
+build-time diagnostic regardless of whether the target function is in
+Tier-1's provable subset at all. Full detail on both:
+`docs/ROADMAP.md` Track F, F3.
+
+## 17. Real namespacing, `pub`, and `use` (`docs/ROADMAP.md` Track F, F2)
+
+Full design reasoning in `docs/NEXT_GEN.md` §F2 — this section is the short,
+practical version. Unrelated to §12's `module "Display Name" { ... }`
+form, which this doesn't change at all: `parser.rs` tells the two apart
+by the token right after `module` (a string vs. a bare identifier), so
+every existing `.nir` program keeps parsing byte-for-byte identically.
+
+**The problem this closes.** Before this, every `struct`/`enum`/`fn`
+name in a program — prelude included — lived in one single flat
+namespace. A user `struct Pair` collided with the prelude's own `Pair`;
+any two enums anywhere in a program sharing a variant name (`SAR`, say,
+against the prelude `CurrencyCode`'s own `SAR`) was an unconditional
+`DuplicateConstructor` error, with no way to opt out.
+
+```nirdosha
+module Audit {
+    pub struct Entry {
+        id: i64,
+    }
+    struct Internal {
+        secret: i64,
+    }
+    pub fn make(id: i64) -> Audit::Entry {
+        return Audit::Entry(id)
+    }
+}
+
+fn main() -> i64 {
+    let e: Audit::Entry = Audit::make(1)
+    return e.id
+}
+```
+
+`module Ident { ... }` (a bare identifier, not a string) is a **real
+namespace** — every declaration inside registers under its own
+qualified key (`Audit::Entry`, not bare `Entry`), so it can share a
+short name with the prelude, or with another module's declaration,
+with zero collision. `pub` marks a declaration visible from outside its
+own module; omitted, it's private (visible only via its own module's
+qualified self-reference). An optional `nav: "Display Name"` line right
+after the `{` sets the same nav-grouping string §12's form sets
+directly, defaulting to the identifier itself.
+
+**The one real ergonomic cost, deliberate, not an oversight:** a
+namespaced declaration is reachable **only** by its qualified form,
+`Mod::Name` — never bare, *even from a sibling declaration inside the
+very same module*. `Audit::make` above has to write `Audit::Entry`, not
+bare `Entry`, to name its own module's struct. This is what makes
+adding a namespace incapable of ever introducing a *new* ambiguity: a
+bare reference always means exactly what it meant before this feature
+existed (the one non-namespaced declaration of that name, if any,
+completely unaffected by how many namespaced ones with the same short
+name also exist), and a qualified one is unambiguous by construction.
+An enum variant follows the identical rule, spelled `Enum::Variant` (or
+`Mod::Enum::Variant` for a namespaced enum) in both construction and a
+`match` arm — `SAR(...)` alone always means whichever *non-namespaced*
+enum has a bare `SAR`, `Mine::ReportType::SAR()` always means that
+specific namespaced one, and the two can never collide.
+
+**`use "relative/path.nir"`** — only legal in the leading run at the
+very top of a file, before any other item — imports another file's
+`pub`, namespaced declarations into the importing program. A
+non-namespaced (top-level) declaration in the imported file, or a
+namespaced one that isn't `pub`, never crosses the file boundary — the
+imported file is typechecked completely on its own first (its own
+diagnostics, at its own file's line:col), so anything it exports is
+already known-sound before it's merged in. Two different files each
+declaring the same module identifier is a real, reported collision, not
+a silent overwrite; an import cycle is a clean error, not a hang. This
+is wired into every command that actually loads a `.nir` file from disk
+(`nirdosha <file>`, `build`, `emit-llvm`, `emit-ui`, `serve`,
+`--sandbox-worker`) — `nirdosha <file> --format=json`'s structured
+`--format=json` diagnostics are the one disclosed exception, not yet
+`use`-aware (`docs/NEXT_GEN.md` §F2's own risk register).
+
+**What's still `[OPEN]`, disclosed rather than silently unsupported:**
+a `screen`/`dashboard`/`workflow`/`workspace` block can't reference a
+namespaced struct — those stay top-level-only in this pass; the
+*compiled* path (`nirdosha build`/`emit-llvm`) rejects a program
+containing any real-namespace declaration outright (a clear, named
+error, not a miscompile) — same incremental-porting posture §10's
+compiled-vs-interpreted table already documents for `db`/`json`/`http`/
+etc. A program using no `module Ident { }`/`pub`/`use` at all — every
+existing `.nir` file — is completely unaffected by any of this.

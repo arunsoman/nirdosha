@@ -498,7 +498,7 @@ impl<'a> Checker<'a> {
             self.scopes = pre.clone();
             self.scopes.push();
             if let Some((owner, v)) = self.registry.find_variant(&arm.variant) {
-                let type_params = self.registry.enum_type_params(owner).unwrap_or(&[]);
+                let type_params = self.registry.enum_type_params(&owner).unwrap_or(&[]);
                 let subst: HashMap<&str, &Ty> = match &concrete_args {
                     Some(args) if args.len() == type_params.len() => zip_type_params(type_params, args),
                     _ => type_params.iter().map(|p| (p.as_str(), &sentinel)).collect(),
