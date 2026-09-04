@@ -516,7 +516,8 @@ fn render_value_not_in_the_field_level_closed_set_is_rejected() {
     "#;
     assert!(matches!(
         first_type_error(src),
-        TypeErrorKind::UnknownRenderValue { render, allowed, .. } if render == "progress" && allowed == "\"countdown\""
+        TypeErrorKind::UnknownRenderValue { render, allowed, .. }
+            if render == "progress" && allowed == "\"countdown\", \"badge\", \"searchable_select\""
     ));
 }
 

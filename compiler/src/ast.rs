@@ -1635,17 +1635,102 @@ pub struct ActionDecl {
     pub span: Span,
 }
 
+/// `layout { ... }` inside a `screen` block (`docs/ROADMAP.md` Track F,
+/// F1's UI-composability work) — an optional, additive arrangement
+/// tree for a screen's detail/form view. **Deliberately a *reference*
+/// tree, not an owning one**: `Field`/`ActionRef` name an existing
+/// `ScreenDecl.fields`/`actions` entry rather than embedding one, so
+/// `ui_gen.rs::field_gates_for_fn`/`update_gates_for_fn`/
+/// `field_validations_for_fn` — all keyed purely by field name over
+/// `ScreenDecl.fields`, which stays exactly the flat list it always
+/// was — need zero changes and can't regress. A screen with no
+/// `layout` block (`ScreenDecl.layout: None`, every screen before
+/// this existed) renders exactly as before — same additive-only rule
+/// `screen`/`workspace`/`validate` already hold themselves to. The
+/// first genuinely recursive node in this DSL family (`parser::
+/// parse_layout_node` calls itself for a container's children) — see
+/// that fn's own doc comment for the grammar and recursion-depth
+/// guard.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum LayoutNode {
+    /// Lays its children out left-to-right (`display: flex; flex-
+    /// direction: row` on the web renderer — see `docs/ROADMAP.md`'s F-track
+    /// note that a non-web renderer maps this to its own equivalent,
+    /// same "each renderer honors the same manifest its own way"
+    /// posture `Screen`/`FieldSpec` already have). `entries` carries
+    /// the optional `gap: <int>` key — every container variant here
+    /// uses the same uniform `entries`-first shape (`parser::
+    /// parse_layout_container_body`), so a new option (or a whole new
+    /// container kind) never needs a new AST field, only a new key
+    /// `typeck::check_screen_layout` recognizes.
+    Row { children: Vec<LayoutNode>, entries: Vec<KvEntry>, span: Span },
+    /// Top-to-bottom — `Row`'s mirror image.
+    Column { children: Vec<LayoutNode>, entries: Vec<KvEntry>, span: Span },
+    /// A grid container — `entries` carries the required `columns:
+    /// <int>` key and the optional `gap: <int>` key; each child
+    /// occupies the next cell (no per-child column-span control in
+    /// this first pass — a real, disclosed narrowing, not an
+    /// oversight).
+    Grid { children: Vec<LayoutNode>, entries: Vec<KvEntry>, span: Span },
+    /// A titled, optionally collapsible box — the general-purpose
+    /// container everything else composes with. `entries` carries
+    /// `title`/`collapsible`/any future kv-shaped option, the same
+    /// "typeck narrows each key" convention every other DSL slot here
+    /// already uses.
+    Group { children: Vec<LayoutNode>, entries: Vec<KvEntry>, span: Span },
+    /// `tabs { tab "Label" { ... } ... }` — each tab's own child list
+    /// switches visibility together; `String` is the tab's display
+    /// label.
+    Tabs { tabs: Vec<(String, Vec<LayoutNode>)>, span: Span },
+    /// References one of this screen's own `ScreenDecl.fields`
+    /// overrides (or, if none, the struct's own field) by name —
+    /// resolved against `ScreenDecl.struct_name`'s real fields at
+    /// typecheck time (`typeck::check_screen_layout`), same
+    /// `UnknownLayoutRef`-shaped error `check_screen` already uses for
+    /// its own field-override name checks.
+    Field { name: String, span: Span },
+    /// References one of this screen's own `ScreenDecl.actions` (or an
+    /// inferred CRUD action) by its display label.
+    ActionRef { label: String, span: Span },
+    /// A leaf widget with no children — `divider {}`, `card { title:
+    /// "..." }`, and every future `render`-vocabulary widget
+    /// (`docs/ROADMAP.md` Track F, F1 Phase B) land here uniformly, kept in
+    /// the same closed-vocabulary-checked-by-typeck shape
+    /// `MetricRender`/`PanelRender` already established, not a new
+    /// mechanism per widget kind.
+    Widget { kind: String, entries: Vec<KvEntry>, span: Span },
+}
+
+impl LayoutNode {
+    pub fn span(&self) -> Span {
+        match self {
+            LayoutNode::Row { span, .. }
+            | LayoutNode::Column { span, .. }
+            | LayoutNode::Grid { span, .. }
+            | LayoutNode::Group { span, .. }
+            | LayoutNode::Tabs { span, .. }
+            | LayoutNode::Field { span, .. }
+            | LayoutNode::ActionRef { span, .. }
+            | LayoutNode::Widget { span, .. } => *span,
+        }
+    }
+}
+
 /// `screen <StructName> { ... }` — a top-level declaration overriding/
 /// supplementing the inferred UI for one struct. `entries` holds the
 /// screen-level `key: value` slots (`title: "..."`, `list: list_product`,
 /// `paginate { ... }` folds its own entries in under the `"paginate"`
 /// key as a nested-entries convenience — see `parse_screen_decl`).
+/// `layout` (`docs/ROADMAP.md` Track F, F1) is `None` for every screen that
+/// predates it, or simply doesn't declare one — see `LayoutNode`'s own
+/// doc comment for what that means for rendering.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScreenDecl {
     pub struct_name: String,
     pub entries: Vec<KvEntry>,
     pub fields: Vec<FieldOverride>,
     pub actions: Vec<ActionDecl>,
+    pub layout: Option<LayoutNode>,
     pub span: Span,
 }
 

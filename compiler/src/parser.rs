@@ -52,6 +52,18 @@ pub struct Parser {
 /// so this constant has to stay safe on the *default* stack outright.
 const MAX_PARSE_DEPTH: usize = 50;
 
+/// Past this many nested `layout { }` containers (`row`/`column`/
+/// `grid`/`group`/`tabs` inside one another — `docs/ROADMAP.md` Track F,
+/// F1), fail with a normal `ParseError` instead of recursing further.
+/// Much smaller than `MAX_PARSE_DEPTH`: a hand-authored screen layout
+/// has no legitimate reason to nest anywhere near as deep as an
+/// arithmetic expression might — this exists for the same adversarial-
+/// input reason `MAX_PARSE_DEPTH` does (an unbounded recursive-descent
+/// parse function is a real stack-overflow surface), sized instead for
+/// this construct's own realistic ceiling (a deeply nested UI a human
+/// would actually design tops out well under this).
+const MAX_LAYOUT_DEPTH: usize = 12;
+
 type PResult<T> = Result<T, ParseError>;
 
 impl Parser {
@@ -77,6 +89,19 @@ impl Parser {
 
     fn peek(&self) -> &Token {
         &self.toks[self.pos]
+    }
+
+    /// One token past `peek()` — safe even at end of input since
+    /// `bump()`'s own doc (below) already establishes `toks` always
+    /// ends in `Tok::Eof` and never advances `pos` past it, so the
+    /// worst case here just re-reads that same trailing `Eof` token.
+    /// Used only where a single token of lookahead is genuinely
+    /// ambiguous with plain one-token dispatch — `parse_layout_
+    /// container_body`'s "is this a `key: value` config entry or the
+    /// start of a nested layout item" check (`docs/ROADMAP.md` Track F,
+    /// F1), the first place this grammar has needed it.
+    fn peek2(&self) -> &Token {
+        self.toks.get(self.pos + 1).unwrap_or_else(|| self.toks.last().unwrap())
     }
 
     fn span(&self) -> Span {
@@ -517,21 +542,32 @@ impl Parser {
     }
 
     /// `screen_decl ::= "screen" IDENT "{" screen_item* "}"`
-    /// `screen_item ::= paginate_block | field_override | action_decl | kv_entry`
+    /// `screen_item ::= paginate_block | field_override | action_decl | layout_decl | kv_entry`
     ///
     /// Dispatch inside the body is on the first token's identifier TEXT
-    /// alone — `"paginate"`/`"field"`/`"action"` vs. anything else is a
-    /// plain `kv_entry` — so this stays LL(1) with no second-token
-    /// lookahead. `field`/`action`/`paginate` are therefore reserved only
-    /// as a screen body's leading key, exactly like `role`/`claim` inside
-    /// `requires(...)`; they remain ordinary identifiers everywhere else
-    /// (`trade_finance.nir` already uses `action` as a struct field name).
+    /// alone — `"paginate"`/`"field"`/`"action"`/`"layout"` vs. anything
+    /// else is a plain `kv_entry` — so this stays LL(1) with no second-
+    /// token lookahead at *this* level (`layout`'s own body is where
+    /// `parse_layout_container_body` needs one token of extra
+    /// lookahead — see its doc comment). `field`/`action`/`paginate`/
+    /// `layout` are therefore reserved only as a screen body's leading
+    /// key, exactly like `role`/`claim` inside `requires(...)`; they
+    /// remain ordinary identifiers everywhere else (`trade_finance.nir`
+    /// already uses `action` as a struct field name).
     ///
     /// `paginate { ... }` gets no dedicated `ScreenDecl` field — its
     /// entries are folded directly into the screen's own `entries` list,
     /// each key prefixed `"paginate."` (`paginate { page_size: 25 }`
     /// becomes the entry `("paginate.page_size", 25)`). Flat and
     /// prefix-filterable by typeck/`ui_gen.rs`, no new AST node needed.
+    ///
+    /// `layout { ... }` (`docs/ROADMAP.md` Track F, F1), by contrast, *does*
+    /// get a dedicated field (`ScreenDecl.layout: Option<LayoutNode>`)
+    /// — unlike `paginate`'s flat kv-pairs, a layout is a real tree, the
+    /// first one this grammar has needed (see `ast::LayoutNode`'s own
+    /// doc comment). At most one `layout { }` per screen — a second is
+    /// a parse error, the same "at most one" discipline `dashboard { }`
+    /// already holds itself to at the program level.
     fn parse_screen_decl(&mut self) -> PResult<ScreenDecl> {
         let span = self.span();
         self.expect(&Tok::Screen, "`screen`")?;
@@ -540,9 +576,12 @@ impl Parser {
         let mut entries = Vec::new();
         let mut fields = Vec::new();
         let mut actions = Vec::new();
+        let mut layout: Option<LayoutNode> = None;
         while self.peek().tok != Tok::RBrace {
-            let is_kw = matches!(&self.peek().tok, Tok::Ident(s) if s == "paginate" || s == "field" || s == "action");
+            let is_kw =
+                matches!(&self.peek().tok, Tok::Ident(s) if s == "paginate" || s == "field" || s == "action" || s == "layout");
             if is_kw {
+                let kw_span = self.span();
                 let kw = self.expect_ident()?;
                 match kw.as_str() {
                     "paginate" => {
@@ -555,6 +594,15 @@ impl Parser {
                     }
                     "field" => fields.push(self.parse_field_override()?),
                     "action" => actions.push(self.parse_action_decl()?),
+                    "layout" => {
+                        if layout.is_some() {
+                            return Err(ParseError {
+                                message: "only one `layout { ... }` block is allowed per screen".to_string(),
+                                span: kw_span,
+                            });
+                        }
+                        layout = Some(self.parse_layout_decl()?);
+                    }
                     _ => unreachable!(),
                 }
             } else {
@@ -562,7 +610,7 @@ impl Parser {
             }
         }
         self.expect(&Tok::RBrace, "`}`")?;
-        Ok(ScreenDecl { struct_name, entries, fields, actions, span })
+        Ok(ScreenDecl { struct_name, entries, fields, actions, layout, span })
     }
 
     /// `field_override ::= "field" IDENT "{" kv_entry* "}"`
@@ -597,10 +645,163 @@ impl Parser {
         Ok(ActionDecl { label, target_fn, entries, span })
     }
 
+    /// `layout_decl ::= "layout" "{" layout_node* "}"` — the screen
+    /// body's own `layout` keyword is already consumed by
+    /// `parse_screen_decl` before this runs. The top-level list of
+    /// `layout_node`s is wrapped into one synthetic root
+    /// `LayoutNode::Column` (top-to-bottom is this grammar's default
+    /// stacking direction, same as an ordinary flat screen today) —
+    /// authors never have to write a redundant outer `column { }`
+    /// just to hold their screen's top-level items.
+    fn parse_layout_decl(&mut self) -> PResult<LayoutNode> {
+        let span = self.span();
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut children = Vec::new();
+        while self.peek().tok != Tok::RBrace {
+            children.push(self.parse_layout_node(1)?);
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(LayoutNode::Column { children, entries: Vec::new(), span })
+    }
+
+    /// One item inside a `layout { }` tree (`docs/ROADMAP.md` Track F, F1):
+    ///
+    /// `layout_node ::= ("row" | "column" | "grid" | "group" STRING?) layout_body
+    ///                | "tabs" "{" ("tab" STRING "{" layout_node* "}")* "}"
+    ///                | "field" IDENT
+    ///                | "action" STRING
+    ///                | IDENT layout_body           // widget leaf, e.g. `divider {}`
+    /// layout_body ::= "{" kv_entry* layout_node* "}"
+    ///
+    /// `row`/`column`/`grid`/`group`/`tabs`/`field`/`action` are
+    /// contextual keywords, reserved only as a `layout_node`'s own
+    /// leading identifier — same "keyword only within this one slot"
+    /// treatment `field`/`action`/`paginate` already get one level up,
+    /// inside `screen_item`. Any *other* identifier is a widget leaf
+    /// (`kind` = that identifier's text, `docs/ROADMAP.md`'s F1-Phase-B
+    /// vocabulary — `divider`, `card`, `timeline`, ... — validated
+    /// against a closed list by `typeck::check_screen_layout`, not the
+    /// parser, same "parser accepts any name, typeck narrows it" split
+    /// `screen { field <name> { render: "..." } }` already uses for
+    /// its own `render` vocabulary).
+    ///
+    /// `depth` is `parse_layout_decl`'s `1`, incremented on every
+    /// recursive call for a container's children — capped at
+    /// `MAX_LAYOUT_DEPTH`, that constant's own doc comment has the
+    /// full reasoning (the same adversarial-input stack-overflow
+    /// concern `MAX_PARSE_DEPTH` guards against for expressions, sized
+    /// for this construct's much shallower realistic ceiling instead).
+    fn parse_layout_node(&mut self, depth: usize) -> PResult<LayoutNode> {
+        let span = self.span();
+        if depth > MAX_LAYOUT_DEPTH {
+            return Err(ParseError { message: "layout nested too deeply".to_string(), span });
+        }
+        let Tok::Ident(name) = self.peek().tok.clone() else {
+            return Err(ParseError { message: format!("expected a layout item, found {:?}", self.peek().tok), span });
+        };
+        match name.as_str() {
+            "row" => {
+                self.bump();
+                let (entries, children) = self.parse_layout_container_body(depth)?;
+                Ok(LayoutNode::Row { children, entries, span })
+            }
+            "column" => {
+                self.bump();
+                let (entries, children) = self.parse_layout_container_body(depth)?;
+                Ok(LayoutNode::Column { children, entries, span })
+            }
+            "grid" => {
+                self.bump();
+                let (entries, children) = self.parse_layout_container_body(depth)?;
+                Ok(LayoutNode::Grid { children, entries, span })
+            }
+            "group" => {
+                self.bump();
+                let mut entries = Vec::new();
+                if let Tok::Str(title) = self.peek().tok.clone() {
+                    self.bump();
+                    entries.push(("title".to_string(), Expr::Str(title, span)));
+                }
+                let (mut body_entries, children) = self.parse_layout_container_body(depth)?;
+                entries.append(&mut body_entries);
+                Ok(LayoutNode::Group { children, entries, span })
+            }
+            "tabs" => {
+                self.bump();
+                self.expect(&Tok::LBrace, "`{`")?;
+                let mut tabs = Vec::new();
+                while self.peek().tok != Tok::RBrace {
+                    let is_tab = matches!(&self.peek().tok, Tok::Ident(s) if s == "tab");
+                    if !is_tab {
+                        return Err(ParseError {
+                            message: format!("expected `tab`, found {:?}", self.peek().tok),
+                            span: self.span(),
+                        });
+                    }
+                    self.expect_ident()?; // "tab"
+                    let label = self.expect_str_lit("a tab label")?;
+                    self.expect(&Tok::LBrace, "`{`")?;
+                    let mut children = Vec::new();
+                    while self.peek().tok != Tok::RBrace {
+                        children.push(self.parse_layout_node(depth + 1)?);
+                    }
+                    self.expect(&Tok::RBrace, "`}`")?;
+                    tabs.push((label, children));
+                }
+                self.expect(&Tok::RBrace, "`}`")?;
+                Ok(LayoutNode::Tabs { tabs, span })
+            }
+            "field" => {
+                self.bump();
+                let name = self.expect_ident()?;
+                Ok(LayoutNode::Field { name, span })
+            }
+            "action" => {
+                self.bump();
+                let label = self.expect_str_lit("an action label")?;
+                Ok(LayoutNode::ActionRef { label, span })
+            }
+            _ => {
+                self.bump();
+                self.expect(&Tok::LBrace, "`{`")?;
+                let mut entries = Vec::new();
+                while self.peek().tok != Tok::RBrace {
+                    entries.push(self.parse_kv_entry()?);
+                }
+                self.expect(&Tok::RBrace, "`}`")?;
+                Ok(LayoutNode::Widget { kind: name, entries, span })
+            }
+        }
+    }
+
+    /// The shared `"{" kv_entry* layout_node* "}"` body every container
+    /// kind (`row`/`column`/`grid`/`group`) uses: plain `key: value`
+    /// config entries (`gap: 16`, `columns: 3`) must come first, then
+    /// nested `layout_node`s — once a non-kv-shaped item is seen, every
+    /// remaining item is parsed as a `layout_node` (no interleaving).
+    /// Telling the two apart needs `peek2()` (this grammar's first use
+    /// of two-token lookahead): a leading `Tok::Ident` immediately
+    /// followed by `Tok::Colon` is a `kv_entry`; anything else (a
+    /// `{`/string/bare-ident-then-nothing, matching `row`/`field`/a
+    /// widget leaf's own shapes) starts a nested item instead.
+    fn parse_layout_container_body(&mut self, depth: usize) -> PResult<(Vec<KvEntry>, Vec<LayoutNode>)> {
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut entries = Vec::new();
+        while matches!(self.peek().tok, Tok::Ident(_)) && self.peek2().tok == Tok::Colon {
+            entries.push(self.parse_kv_entry()?);
+        }
+        let mut children = Vec::new();
+        while self.peek().tok != Tok::RBrace {
+            children.push(self.parse_layout_node(depth + 1)?);
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok((entries, children))
+    }
+
     /// `dashboard_decl ::= "dashboard" "{" dashboard_item* "}"`
     /// `dashboard_item ::= ("tile" | "chart") STRING "->" IDENT
     ///                   | "visual" STRING "->" IDENT ("{" kv_entry* "}")?`
-    /// (`ROADMAP.md` Track E2) Same first-token-text dispatch as
+    /// (`docs/ROADMAP.md` Track E2) Same first-token-text dispatch as
     /// `screen`'s body; `tile`/`chart`/`visual` are reserved only as a
     /// dashboard body's leading item keyword. `visual`'s trailing
     /// `{ kv_entry* }` is optional, the same "label+target alone is a

@@ -354,6 +354,21 @@ pub enum TypeErrorKind {
     /// `field <fname>` inside a `screen <Struct>` where `<Struct>` has no
     /// field named `<fname>`.
     UnknownScreenField { struct_name: String, field_name: String },
+    /// `layout { action "<label>" }` (`docs/ROADMAP.md` Track F, F1) where
+    /// `<label>` matches neither a custom `screen { action "..." -> ... }`
+    /// nor one of the five inferred CRUD kinds (`"list"`/`"create"`/
+    /// `"update"`/`"delete"`/`"get"`).
+    UnknownLayoutAction { struct_name: String, label: String },
+    /// `field <name> { render: "searchable_select" source: <name> }`
+    /// where `<name>` names neither a declared struct nor a real
+    /// function — the one shape `check_fn_ref`'s bare "must be a fn"
+    /// rule doesn't fit, since `source` may legitimately name either.
+    SearchableSelectSourceNotFound { struct_name: String, field_name: String, source: String },
+    /// `layout { timeline { } }` with no `source: <fn>` entry at all —
+    /// distinct from `ScreenFnNotAnIdent` (which fires when `source` is
+    /// present but not a bare identifier); this fires when the key is
+    /// missing outright.
+    TimelineWidgetMissingSource { struct_name: String },
     /// A `list`/`create`/`update`/`delete` screen entry, or an `action`'s
     /// `->` target, that doesn't resolve to a real user-defined function.
     ScreenFnNotFound { key: String, fn_name: String },
@@ -788,6 +803,20 @@ impl std::fmt::Display for TypeError {
             TypeErrorKind::UnknownScreenField { struct_name, field_name } => write!(
                 f,
                 "{line}:{col}: `field {field_name}` — struct `{struct_name}` has no field named `{field_name}`"
+            ),
+            TypeErrorKind::UnknownLayoutAction { struct_name, label } => write!(
+                f,
+                "{line}:{col}: `layout {{ action \"{label}\" }}` — `screen {struct_name}` has no custom action \
+                 labeled `{label}`, and it isn't one of `list`/`create`/`update`/`delete`/`get`"
+            ),
+            TypeErrorKind::SearchableSelectSourceNotFound { struct_name, field_name, source } => write!(
+                f,
+                "{line}:{col}: `field {field_name}` on `{struct_name}` — `source: {source}` names neither a \
+                 declared struct nor a declared function"
+            ),
+            TypeErrorKind::TimelineWidgetMissingSource { struct_name } => write!(
+                f,
+                "{line}:{col}: `layout {{ timeline {{ ... }} }}` in `screen {struct_name}` needs a `source: <fn>` entry"
             ),
             TypeErrorKind::ScreenFnNotFound { key, fn_name } => write!(
                 f,
@@ -1590,27 +1619,37 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// `field <name> { render: "..." }` (`ROADMAP.md` Track E3) — value
-    /// must be a string literal from the fixed set (`"countdown"` for
-    /// v1 — `LANGUAGE.md`'s own "candidate siblings, not designed yet"
-    /// note names `"badge"`/`"progress"` as future extensions of this
-    /// same key, not a one-off hack), reusing `check_render_expr`'s
-    /// shape check; `"countdown"` specifically only applies to an
-    /// integer-typed field (a unix-seconds deadline) — the one thing
-    /// `visual`/`panel`'s own `render` never needed, since neither is
-    /// attached to any one struct's field to cross-check a type against.
+    /// `field <name> { render: "..." }` (`docs/ROADMAP.md` Track E3, extended
+    /// by Track F, F1 Phase A) — value must be a string literal from
+    /// the fixed set `"countdown"` / `"badge"` / `"searchable_select"`
+    /// (`docs/LANGUAGE.md`'s own original "candidate siblings, not designed
+    /// yet" note named `"badge"` as a future extension of this exact
+    /// key, not a one-off hack), reusing `check_render_expr`'s shape
+    /// check. Each has its own field-type requirement — `"countdown"`
+    /// only on an integer field (a unix-seconds deadline); `"badge"`
+    /// only on an enum-typed field (colors the variant as a pill);
+    /// `"searchable_select"` has no field-type requirement of its own
+    /// (works on an `i64` id-shaped field or a struct-typed one alike)
+    /// but requires a companion `source: <Struct|fn>` entry, checked
+    /// separately by `check_screen`'s own field-entries loop since
+    /// `source` is a sibling key, not part of `render`'s own value.
     fn check_field_render_expr(&mut self, struct_name: &str, field_name: &str, field_ty: Option<&Ty>, value: &Expr) {
-        self.check_render_expr(format!("`field {field_name}` on `{struct_name}`"), value, |s| s == "countdown", "\"countdown\"");
+        self.check_render_expr(
+            format!("`field {field_name}` on `{struct_name}`"),
+            value,
+            |s| matches!(s, "countdown" | "badge" | "searchable_select"),
+            "\"countdown\", \"badge\", \"searchable_select\"",
+        );
         let Some(ty) = field_ty else { return };
-        // Already reported (wrong literal shape, or not "countdown") by
-        // `check_render_expr` above — don't pile a second, confusing
-        // type-mismatch error on top of a value that was never going to
-        // be valid regardless of the field's type.
-        if !matches!(value, Expr::Str(s, _) if s == "countdown") {
+        let Expr::Str(render, _) = value else {
+            // Already reported (wrong literal shape) by `check_render_expr`
+            // above — don't pile a second, confusing type-mismatch error
+            // on top of a value that was never going to be valid regardless
+            // of the field's type.
             return;
-        }
-        if !ty.is_integer() {
-            self.error(
+        };
+        match render.as_str() {
+            "countdown" if !ty.is_integer() => self.error(
                 TypeErrorKind::FieldValidationTypeMismatch {
                     struct_name: struct_name.to_string(),
                     field_name: field_name.to_string(),
@@ -1618,8 +1657,51 @@ impl<'a> Checker<'a> {
                     field_ty: format!("{ty:?}"),
                 },
                 value.span(),
-            );
+            ),
+            "badge" => {
+                let is_enum = matches!(ty, Ty::Named(n, _) if self.registry.is_enum(n));
+                if !is_enum {
+                    self.error(
+                        TypeErrorKind::FieldValidationTypeMismatch {
+                            struct_name: struct_name.to_string(),
+                            field_name: field_name.to_string(),
+                            key: "render".to_string(),
+                            field_ty: format!("{ty:?}"),
+                        },
+                        value.span(),
+                    );
+                }
+            }
+            // "searchable_select": no field-type requirement, and
+            // "countdown" on an integer field is already fine — nothing
+            // further to check here in either case.
+            _ => {}
         }
+    }
+
+    /// `field <name> { render: "searchable_select" source: <Struct|fn>
+    /// }` (`docs/ROADMAP.md` Track F, F1 Phase A) — `source` must be a bare
+    /// identifier naming either a declared struct (resolved to its own
+    /// table for the scroll-paginated `/_nirdosha/table/<snake>` path,
+    /// `ui_gen.rs`) or a declared function (the unpaginated `callFn`
+    /// fallback) — the one shape `check_fn_ref`'s "must be a fn, full
+    /// stop" rule doesn't fit, since either is legitimate here.
+    fn check_searchable_select_source_expr(&mut self, struct_name: &str, field_name: &str, value: &Expr) {
+        let Expr::Ident(name, span) = value else {
+            self.error(TypeErrorKind::InvalidFieldValidationExpr { key: "source".to_string() }, value.span());
+            return;
+        };
+        if self.registry.is_struct(name) || self.sigs.contains_key(name) {
+            return;
+        }
+        self.error(
+            TypeErrorKind::SearchableSelectSourceNotFound {
+                struct_name: struct_name.to_string(),
+                field_name: field_name.to_string(),
+                source: name.clone(),
+            },
+            *span,
+        );
     }
 
     /// `screen <Struct> { ... }` — existence/shape checks only; see the
@@ -1668,6 +1750,7 @@ impl<'a> Checker<'a> {
                     "format" => self.check_format_expr(&screen.struct_name, &fo.field_name, field_ty, value),
                     "min" | "max" => self.check_min_max_expr(&screen.struct_name, &fo.field_name, key, field_ty, value),
                     "render" => self.check_field_render_expr(&screen.struct_name, &fo.field_name, field_ty, value),
+                    "source" => self.check_searchable_select_source_expr(&screen.struct_name, &fo.field_name, value),
                     _ => {}
                 }
             }
@@ -1675,6 +1758,96 @@ impl<'a> Checker<'a> {
         for action in &screen.actions {
             self.check_fn_ref("action", &Expr::Ident(action.target_fn.clone(), action.span));
             self.check_action_show_result(format!("`action \"{}\"` on `screen {}`", action.label, screen.struct_name), action);
+        }
+        if let Some(layout) = &screen.layout {
+            self.check_screen_layout(screen, layout);
+        }
+    }
+
+    /// `layout { ... }` (`docs/ROADMAP.md` Track F, F1) — walks the tree
+    /// recursively; a `Field`/`ActionRef` leaf must name something the
+    /// screen actually declares, a `Widget` leaf's `kind` must be one of
+    /// this pass's closed vocabulary (`"divider"`/`"card"`/`"timeline"`
+    /// — Phase B grows this list, not this check's own shape). Runs
+    /// *after* `screen.fields`/`screen.actions` have already been
+    /// checked above, so `field_names`/action labels are recomputed
+    /// fresh here rather than threaded through — cheap (a handful of
+    /// fields/actions per screen), and keeps this fn a clean, separate
+    /// entry point mirroring `check_dashboard`/`check_workspace`'s own
+    /// "one fn per top-level DSL construct" shape.
+    fn check_screen_layout(&mut self, screen: &ScreenDecl, node: &LayoutNode) {
+        let field_names: std::collections::HashSet<&str> =
+            self.registry.struct_fields(&screen.struct_name).map(|fs| fs.iter().map(|f| f.name.as_str()).collect()).unwrap_or_default();
+        let action_labels: std::collections::HashSet<&str> =
+            screen.actions.iter().map(|a| a.label.as_str()).collect();
+        self.check_layout_node(screen, node, &field_names, &action_labels);
+    }
+
+    fn check_layout_node(
+        &mut self,
+        screen: &ScreenDecl,
+        node: &LayoutNode,
+        field_names: &std::collections::HashSet<&str>,
+        action_labels: &std::collections::HashSet<&str>,
+    ) {
+        match node {
+            LayoutNode::Row { children, .. } | LayoutNode::Column { children, .. } | LayoutNode::Grid { children, .. } => {
+                for c in children {
+                    self.check_layout_node(screen, c, field_names, action_labels);
+                }
+            }
+            LayoutNode::Group { children, entries, .. } => {
+                for c in children {
+                    self.check_layout_node(screen, c, field_names, action_labels);
+                }
+                let _ = entries; // `title`/`collapsible`: no shape check needed yet (any string/bool).
+            }
+            LayoutNode::Tabs { tabs, .. } => {
+                for (_, children) in tabs {
+                    for c in children {
+                        self.check_layout_node(screen, c, field_names, action_labels);
+                    }
+                }
+            }
+            LayoutNode::Field { name, span } => {
+                if !field_names.contains(name.as_str()) {
+                    self.error(
+                        TypeErrorKind::UnknownScreenField { struct_name: screen.struct_name.clone(), field_name: name.clone() },
+                        *span,
+                    );
+                }
+            }
+            LayoutNode::ActionRef { label, span } => {
+                let is_crud_kind = matches!(label.as_str(), "list" | "create" | "update" | "delete" | "get");
+                if !is_crud_kind && !action_labels.contains(label.as_str()) {
+                    self.error(
+                        TypeErrorKind::UnknownLayoutAction { struct_name: screen.struct_name.clone(), label: label.clone() },
+                        *span,
+                    );
+                }
+            }
+            LayoutNode::Widget { kind, entries, span } => {
+                if !matches!(kind.as_str(), "divider" | "card" | "timeline") {
+                    self.error(
+                        TypeErrorKind::UnknownRenderValue {
+                            context: format!("`layout` in `screen {}`", screen.struct_name),
+                            render: kind.clone(),
+                            allowed: "\"divider\", \"card\", \"timeline\"".to_string(),
+                        },
+                        *span,
+                    );
+                    return;
+                }
+                if kind == "timeline" {
+                    match entries.iter().find(|(k, _)| k == "source") {
+                        Some((_, value)) => self.check_fn_ref("source", value),
+                        None => self.error(
+                            TypeErrorKind::TimelineWidgetMissingSource { struct_name: screen.struct_name.clone() },
+                            *span,
+                        ),
+                    }
+                }
+            }
         }
     }
 
