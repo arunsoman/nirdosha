@@ -202,11 +202,44 @@ variant     ::= ident ("(" type ("," type)* ")")?
 // deliberately reusing the general expression grammar rather than
 // inventing a second value grammar just for this DSL.
 screen_decl    ::= "screen" ident "{" screen_item* "}"
-screen_item    ::= paginate_block | field_override | action_decl | kv_entry
+screen_item    ::= paginate_block | field_override | action_decl | layout_decl | kv_entry
 paginate_block ::= "paginate" "{" kv_entry* "}"
 field_override ::= "field" ident "{" kv_entry* "}"
 action_decl    ::= "action" string "->" ident ("{" kv_entry* "}")?
 kv_entry       ::= ident ":" expr
+
+// `layout { ... }` (`docs/ROADMAP.md` Track F, F4 Phase A) -- an
+// optional, additive arrangement tree for a screen's detail/form view,
+// the first genuinely *recursive* production in this grammar
+// (`layout_node` contains more `layout_node`s). At most one per screen
+// (`layout` itself is reserved only as a `screen_item`'s leading key,
+// same non-global-keyword treatment `field`/`action`/`paginate` already
+// get). The top-level list of `layout_node`s is wrapped into one
+// synthetic root `column` -- authors never write a redundant outer
+// `column { }` just to hold their screen's top-level items.
+//
+// `row`/`column`/`grid`/`group`/`tabs`/`field`/`action` are contextual
+// keywords too, reserved only as a `layout_node`'s own leading
+// identifier -- any *other* identifier is a widget leaf (`kind` = that
+// identifier's text; `divider`/`card`/`timeline` this phase, validated
+// against a closed list by `typeck::check_screen_layout`, not the
+// parser -- the same "parser accepts any name, typeck narrows it" split
+// `field { render: "..." }` already uses for its own vocabulary).
+//
+// `layout_body`'s `kv_entry*` (a container's own `gap`/`columns`/
+// `title`/`collapsible` config) must come *before* any nested
+// `layout_node` -- `parser::parse_layout_container_body`'s own doc
+// comment has the two-token-lookahead rule (`peek2()`, this grammar's
+// first use of it) that tells the two apart: a leading `ident`
+// immediately followed by `:` is a `kv_entry`; anything else starts a
+// nested item instead.
+layout_decl ::= "layout" "{" layout_node* "}"
+layout_node ::= ("row" | "column" | "grid" | "group" string?) layout_body
+              | "tabs" "{" ("tab" string "{" layout_node* "}")* "}"
+              | "field" ident
+              | "action" string
+              | ident layout_body            // widget leaf, e.g. `divider {}`
+layout_body ::= "{" kv_entry* layout_node* "}"
 
 dashboard_decl ::= "dashboard" "{" dashboard_item* "}"
 dashboard_item ::= ("tile" | "chart") string "->" ident

@@ -348,6 +348,171 @@ Three real gaps between that and what "validators" would need:
   shipping the syntax + runtime-fallback path above, which can land
   first and cover the majority of real functions on day one.
 
+## F4 — Composable UI layout & widget catalog
+
+**Status: Phase A `[DONE]`, shipped 2026-09-04. Phases B and C `[OPEN]`,
+not silently implied by A.** Grew out of a separate, later conversation
+than F1-F3 above (the user asking directly for a fuller UI-element
+catalog, real composability, and per-element styling) — related to F1's
+own ambition but a genuinely different axis: F1 is about *renderers*
+(one manifest, many targets) and the *action* vocabulary; F4 is about
+*screen content* — arranging fields/widgets on one screen, and what
+widgets exist to arrange. Kept as its own numbered item rather than
+folded into F1, since F1's own scope (bounded interaction-verb
+vocabulary, style/*token* layer, a TUI renderer) is untouched by any of
+this and stays entirely `[OPEN]` — see the Sequencing note below for
+the real, if narrow, way the two now do connect (R1's manifest-
+versioning risk).
+
+### The problem
+
+`screen`/`dashboard`/`workspace` were flat: one struct's fields/actions
+rendered as one implicit top-to-bottom list, with no container element
+and no way to group/tab/arrange them, and no per-element style hook
+beyond one app-wide `--theme` JSON. Confirmed by a three-agent
+exploration pass before any code landed: **no recursive DSL construct
+existed anywhere in this grammar** (every `parse_*_decl` fn is called
+from exactly one site, none call themselves — `workspace`'s own `panel`
+came closest but is hard-coded to exactly one level, no self-reference
+in its own AST node) and **no generic "render this manifest node"
+dispatcher existed in the template** (every visual concept — dashboard
+tiles, workspace panels — is its own named `render*` function,
+hardcoded to specific call sites, not a registry). Building a real
+composability primitive meant introducing both of these mechanisms for
+the first time, not generalizing something half-built.
+
+### What Phase A actually shipped
+
+- **`layout { ... }` inside `screen`** — a new, optional, additive
+  field (`ScreenDecl.layout: Option<LayoutNode>`) holding a real tree:
+  `row`/`column`/`grid`/`group`/`tabs` containers, `field`/`action`
+  leaves that *reference* (never own) the screen's existing flat
+  `fields`/`actions` lists by name, and a `Widget { kind, entries }`
+  leaf for anything else (`divider`, `card`, `timeline` this phase).
+  **Deliberately a reference tree, not an owning one** — this is the
+  one design choice everything else depends on: `ui_gen.rs::
+  field_gates_for_fn`/`update_gates_for_fn`/`field_validations_for_fn`
+  all key purely by field name over the existing flat `ScreenDecl.
+  fields`, so keeping overrides there instead of moving them inside the
+  layout tree meant those three RBAC/validation functions needed *zero*
+  changes and can't have regressed. A screen with no `layout` block
+  renders exactly as before this shipped.
+- **The first real recursive parser function** (`parser::
+  parse_layout_node`, calling itself for a container's children, capped
+  by a new `MAX_LAYOUT_DEPTH` — the same adversarial-input stack-
+  overflow reasoning `MAX_PARSE_DEPTH` already has for expressions,
+  sized far smaller since a hand-authored screen has no reason to nest
+  anywhere near that deep). A container's own config (`gap`, `columns`,
+  `title`, `collapsible`) is parsed as ordinary leading `kv_entry`s
+  before any nested item — resolved by one new `peek2()` (this
+  grammar's first two-token lookahead), not a special positional
+  syntax, keeping every container the same uniform `{ kv_entry*
+  layout_node* }` shape.
+- **`typeck::check_screen_layout`** — walks the tree, confirms every
+  `field`/`action` reference resolves (reusing `UnknownScreenField`; a
+  new `UnknownLayoutAction` for actions, accepting either a custom
+  action's own label or one of the five inferred CRUD kind names), and
+  validates each `Widget`'s `kind` against a closed vocabulary
+  (`UnknownRenderValue`, the same check `visual`/`panel`'s own `render`
+  keys already share).
+- **The generic dispatcher this was all building toward**:
+  `renderLayoutNode(node, ctx)` in the web template — the first "take
+  an arbitrary manifest node, render it by its own `type`" registry in
+  this codebase. Every container wraps and recurses; a `field` leaf
+  still goes through the *exact same* `buildFieldControl` every flat
+  `buildForm` already used, an `action` leaf mirrors the existing row/
+  custom-action click handler (`confirm`/`showResult` honored
+  identically); nothing about field/action rendering was reimplemented,
+  only arranged differently.
+- **Three widgets pulled forward from Phase B on direct request**,
+  proving the mechanism against real needs, not just its own structure:
+  - **`searchable_select`** (`field <name> { render: "searchable_select"
+    source: <Struct|fn> }`) — the scroll-paginated, search-as-you-type
+    dropdown asked for by name. `source` naming a struct reuses the
+    *already-existing* `/_nirdosha/table/<table>` route
+    (`serve.rs::dispatch_table_query`) exactly as the main list
+    screen's own pagination already does — real search plus scroll-
+    triggered "load next page and append," with **zero new backend
+    work**. `source` naming a fn instead falls back to one unpaginated
+    `callFn` (a real, disclosed narrowing for the no-`--db` case, not a
+    stub).
+  - **`timeline`** — a `Widget` leaf that reuses the *already-
+    implemented* `renderTimelineList` template function (previously
+    reachable only from dashboard/workspace-panel contexts), now
+    placeable directly in a layout.
+  - **`badge`** — extends `FieldSpec.render`'s vocabulary past
+    `"countdown"` (the exact extension `docs/LANGUAGE.md` had already
+    flagged as a "candidate sibling, not designed yet") to a zero-
+    payload-enum field, shown as a colored pill (a fixed 6-hue palette,
+    deterministically hashed from the variant name — no per-variant
+    config surface added this pass).
+- **The `css:` escape hatch decision, made explicit rather than left
+  ambiguous**: raw CSS, full power, **web-renderer-only** — a future
+  TUI/native-mobile renderer simply ignores it, the same disclosed-
+  narrowing pattern already used for `db`/`json`/`http` on the compiled
+  path. This directly overrides F1's own original "style/token layer
+  instead of literal CSS" framing for *this* escape hatch specifically
+  (F1's reasoning — CSS means nothing outside a browser — is still
+  correct and still applies to F1's own eventual TUI renderer; the
+  user's explicit choice here was to ship the web-only power now rather
+  than wait on a portable token vocabulary). **Not yet implemented in
+  Phase A** — no per-element scoped class exists yet on any manifest
+  node; this is Phase C's own first task, tracked separately below.
+
+**Two real bugs found and fixed by manually testing in a real browser
+(`nirdosha serve --db`), not caught by typechecking alone** — logged
+here since both are the same class of lesson: a value's *shape*
+(string literal vs. bare identifier) and a widget's *initial state*
+matter beyond what type-level checking sees.
+- `ui_gen.rs`'s `kv_str` (string-literal extraction) was used to read
+  `source:`'s value for both `timeline` and `searchable_select` — but
+  `source` always names a real fn/struct, a bare `Expr::Ident`, never a
+  string literal, so it silently extracted `None` every time despite
+  `typeck`'s own `check_fn_ref`/`check_searchable_select_source_expr`
+  correctly requiring exactly that shape. Fixed by adding `kv_ident`
+  (`ast.rs`'s `Expr::Ident` sibling of `kv_str`) and using it at both
+  call sites; the type-level check was right all along; the value-level
+  *extraction* on the manifest-building side was the actual bug.
+- `buildSearchableSelect`'s pre-filled value (the raw stored id, e.g.
+  `"7"` — there's no cheap way to resolve "id 7 is which row" without
+  an extra fetch this phase doesn't do) sat in the input with the
+  cursor merely placed after it; typing then *appended* (`"7carl"`)
+  instead of replacing it, exactly the everyday browser-native-input
+  behavior a real user would also hit. Fixed with `input.select()` on
+  focus whenever a value is pre-filled — the next keystroke now
+  replaces it.
+
+### What's still genuinely `[OPEN]`
+
+- **Phase B — the rest of the widget catalog**: `progress`,
+  `multi_select`, `tag_input`, date/datetime pickers, `checkbox_group`/
+  `radio_group`, `toggle`, `slider`, `breadcrumb`, `stepper`, plus
+  Tier-2 items (`file_upload` blocked on R5's missing file/blob type;
+  `calendar`/`gantt`/`org_chart`/`comment_thread`). Each is meant to be
+  a small slice of the exact same `FieldSpec.render`-vocabulary-plus-
+  typeck-check pattern `badge`/`searchable_select` already established,
+  sequenced by which screens in `examples/ctms/ctms.nir`/
+  `examples/trade-finance/trade_finance.nir` would actually use them —
+  not built speculatively ahead of a real need.
+- **Phase C — the `css:` per-element escape hatch itself**: no
+  `FieldSpec`/`LayoutNode`/`Action` carries a generated scoped CSS
+  class yet; `theme_value_is_safe`'s existing sanitizer (rejects
+  `< > { }` outright) is too strict to reuse for real CSS rule bodies
+  and needs its own real validation (balanced braces, no `<script`/
+  `</style` breakout, no `@import`/`url(javascript:...)`) since this
+  would splice server-side into the page's one `<style>` block.
+- **A `list_<Struct>` fn not backed by the generic table route** (custom
+  join/computed-column logic, `serverTableApi: false`) still has no
+  `searchable_select` search/pagination story — would need a new
+  `.nir`-level `search: str` parameter convention the fn author opts
+  into, deliberately not solved this phase.
+- **No scroll-pagination widget test exists beyond manual verification**
+  — confirmed by hand against a real seeded SQLite table (search
+  narrowing correctly, debounce, the append-vs-replace fix), but
+  `compiler/tests/layout_dsl.rs` has no automated coverage of the
+  *client-side* JS at all (this codebase has no JS test harness of any
+  kind yet, for anything — not a gap unique to this feature).
+
 ## Risk register — surfaced the same session, not yet scoped as their own items
 
 Found while discussing F1-F3 above; listed here so a future pass
@@ -359,7 +524,11 @@ fix.
   `ui_gen.rs` emits; becomes a real compatibility problem the moment a
   compiled, non-hot-reloading consumer (Track D mobile, or F1's TUI
   renderer) exists. Needs solving as part of F1, before Track D ships
-  a first renderer.
+  a first renderer. **F4 makes this a bigger surface, not a new risk**:
+  `layout`'s own `LayoutNode` JSON shape (container/field/action/widget
+  nodes) is now part of what any future non-web renderer would need to
+  understand, on top of everything R1 already named — still owned by
+  F1's own eventual fix, not scoped separately here.
 - **R2 — Field-level write authorization is convention-matched, not
   declared.** `serve.rs::check_edit_gates` recognizes exactly one
   shape (`update_<S>` taking the whole struct positionally, comparing
@@ -412,12 +581,25 @@ exist. F2 shipped second, also without needing F1: name resolution
 F2's own explicit scope boundary (`screen`/`dashboard`/`workflow`/
 `workspace` stay bare-name-only, can't reference a namespaced struct)
 kept it that way deliberately — confirming the independence claim a
-second time. **F1 is now the only item left `[OPEN]`.** R1-R7 above are
-the only real cross-dependencies among what's left (R1 depends on F1,
-R3 relates to F1's action-vocabulary work; R2, listed as related to F3
-when this was first written, turned out to be exactly the class of bug
-F3's own build closed for `validate`-declared functions — it remains
-open for ordinary `create_<S>`/`update_<S>` actions with no `validate`
-block at all; R4 blocks part of F1's click-behavior ambition
-specifically). None of R1-R7 depend on F2, and F2's own landing didn't
-close or reshape any of them.
+second time. R1-R7 above are the only real cross-dependencies among
+what's left (R1 depends on F1, R3 relates to F1's action-vocabulary
+work; R2, listed as related to F3 when this was first written, turned
+out to be exactly the class of bug F3's own build closed for
+`validate`-declared functions — it remains open for ordinary
+`create_<S>`/`update_<S>` actions with no `validate` block at all; R4
+blocks part of F1's click-behavior ambition specifically). None of
+R1-R7 depend on F2, and F2's own landing didn't close or reshape any of
+them.
+
+F4 (Phase A) shipped third, also independent of F1 — it touches
+`ui_gen.rs`'s manifest and `ui_gen_template.html`'s renderer, which F1
+would eventually touch too, but F4 added a genuinely new tree
+(`layout`) alongside the existing flat shapes rather than changing
+anything F1's own bounded-action-vocabulary/style-token/TUI-renderer
+plan already described — no rework needed on either side. **F1 remains
+the only item still fully `[OPEN]`**, with F4's own Phases B and C
+open alongside it (see F4's "What's still genuinely `[OPEN]`" above).
+R1 is the one real link forward: whenever F1's own manifest-versioning
+fix lands, it now has to account for `layout`'s tree shape too, not
+just the flat `fields`/`actions` shapes that existed when R1 was first
+written.
