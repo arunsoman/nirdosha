@@ -277,33 +277,51 @@ not this doc.
 
 ---
 
-## G5 — Community/governance depth
+## G5 — Community/governance depth — `[DONE]` 2026-09-04
 
-**Problem:** solo-maintained. GitHub's own contributor graph shows
-`arunsoman` only, 94 contributions — no RFC process for breaking
-changes, no bus-factor resilience if that one person is unavailable.
+**Problem, as of this doc's original writing:** solo-maintained.
+GitHub's own contributor graph showed `arunsoman` only, 94
+contributions — no RFC process for breaking changes, no bus-factor
+resilience if that one person was unavailable.
 
-**This is a people/process gap, not a design gap** — the fix isn't a
-spec doc, it's action:
+**Closed 2026-09-04.** Everything this section flagged now has a real
+document or a real GitHub setting behind it, not just this design doc:
 
-- **An RFC-lite process for breaking changes**, living in
-  `CONTRIBUTING.md` — this is the same root cause as G4's Track A4
-  (compatibility/versioning policy): a documented policy that a
-  breaking change (like the str-ban shipped in one session, per
-  Track A4's own note) goes through a written proposal + review window
-  before landing, not silently in one commit.
-- **Real maintainer access, not just a metadata field.**
-  `deploy/helm/nirdosha/Chart.yaml`'s `maintainers:` list now names
-  `lekshmideepu` and `maheshmindlabs` (added this session) — that's a
-  Helm chart field, not GitHub repo access. Turning that into real
-  governance means actually inviting them as GitHub collaborators/
-  maintainers with real review rights, and enabling branch protection
-  (required review before merge to `main`) so a second set of eyes is
-  structurally required, not optional. **This doc flags it; it isn't
-  done by this doc** — granting real repository access is a
-  maintainer-only action for the repo owner to take directly on
-  GitHub, not something to do silently as a side effect of writing a
-  design doc.
+- **RFC process** — [`rfcs/README.md`](../rfcs/README.md), seeded with
+  two real drafts: [`rfcs/0001-package-manifest-format.md`](../rfcs/0001-package-manifest-format.md)
+  (this section's own G1) and
+  [`rfcs/0002-editor-tooling-lsp-tree-sitter.md`](../rfcs/0002-editor-tooling-lsp-tree-sitter.md)
+  (G2). The breaking-change policy referenced below lives in
+  [`GOVERNANCE.md`](../GOVERNANCE.md) and
+  [`CONTRIBUTING.md`](../CONTRIBUTING.md#breaking-changes), and the
+  str-ban precedent that motivated it is recorded (after the fact) as
+  [`docs/adr/0002-ban-str-in-fn-signatures.md`](./adr/0002-ban-str-in-fn-signatures.md).
+- **Real maintainer access.** Confirmed via GitHub's API (not just the
+  Helm chart field this section originally flagged as insufficient):
+  `lekshmideepu`, `maheshmindlabs`, plus `arulrajan123` and
+  `Baskarrajcodeflow`, all hold real repo write access today. See
+  [`MAINTAINERS.md`](../MAINTAINERS.md) for the honest read on this —
+  access exists, but three of the four have no commits/reviews on
+  record yet, so the practical bus factor is still closer to 1–2 than
+  5 until they're activated into an assigned area.
+- **Branch protection** — enabled on `main` 2026-09-04: 1 required
+  approving review, green `build`/`build-windows` CI, no force-push/
+  delete, admin bypass kept for genuine emergencies. Details:
+  [`GOVERNANCE.md`#branch-protection](../GOVERNANCE.md#branch-protection).
+- **ADRs** for decisions made outside the RFC process:
+  [`docs/adr/`](./adr/README.md).
+- **Areas/ownership** — [`AREAS.md`](../AREAS.md), consumed by
+  [`.github/CODEOWNERS`](../.github/CODEOWNERS).
+- **Contributor funnel** — 48h triage SLA
+  (`CONTRIBUTING.md`#response-time), GitHub Discussions (already
+  enabled), and the full label set live on GitHub, reconciled with
+  [`.github/labels.yml`](../.github/labels.yml).
+- **Release credentials** — audited, not changed: `release.yml`/
+  `docker.yml` already authenticate via the ephemeral `GITHUB_TOKEN`/
+  OIDC, not a personal token (`gh secret list` returns none). Signed
+  release tags are documented as policy in `GOVERNANCE.md` but not yet
+  enforced — needs each maintainer's signing key registered first, a
+  real follow-up, not done here.
 
 ---
 
@@ -314,9 +332,10 @@ the two highest-leverage, lowest-risk starting points — both are
 additive (nothing existing has to change), both have a concrete first
 artifact (one reference plugin; one grammar file checked against
 `crates/grammar_check/`), and both are the kind of thing a new
-contributor could plausibly pick up — which itself starts chipping
-away at G5. G3 (wire a real model into the existing bench harness) is
-similarly small and fast, and closes a gap the project's own docs
-already admit to. G4 stays inside Track A. G5's process piece
-(RFC-lite in `CONTRIBUTING.md`) is cheap to write; the access-granting
-half needs the repo owner, not more design.
+contributor could plausibly pick up — which itself now has somewhere
+real to land, per G5's `rfcs/`. G3 (wire a real model into the
+existing bench harness) is similarly small and fast, and closes a gap
+the project's own docs already admit to. G4 stays inside Track A. G5
+itself is `[DONE]` (see above) — what's left there is activation
+(named maintainers actually using their access), not more design or
+process.
