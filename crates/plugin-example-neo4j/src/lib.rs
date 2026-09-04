@@ -9,7 +9,7 @@
 //! `neo4j_run(handle: i64, cypher: str) -> str` (JSON array of row
 //! objects), `neo4j_close(handle: i64) -> i64`.
 
-use nirdosha::ast::Ty;
+use nirdosha::ast::{Effect, Ty};
 use nirdosha::interpreter::{RuntimeError, Value};
 use nirdosha::plugin::{NirdoshaPlugin, PluginBuiltin};
 use nirdosha::token::Span;
@@ -34,18 +34,21 @@ impl NirdoshaPlugin for Neo4jPlugin {
                 name: "neo4j_connect".to_string(),
                 params: vec![Ty::Str, Ty::Str, Ty::Str],
                 ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(neo4j_connect_call),
             },
             PluginBuiltin {
                 name: "neo4j_run".to_string(),
                 params: vec![Ty::I64, Ty::Str],
                 ret: Ty::Str,
+                effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(neo4j_run_call),
             },
             PluginBuiltin {
                 name: "neo4j_close".to_string(),
                 params: vec![Ty::I64],
                 ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(neo4j_close_call),
             },
         ]

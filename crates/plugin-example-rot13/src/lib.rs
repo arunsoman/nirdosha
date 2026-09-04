@@ -27,6 +27,9 @@ impl NirdoshaPlugin for Rot13Plugin {
             name: "rot13".to_string(),
             params: vec![Ty::Str],
             ret: Ty::Str,
+            // A pure string transform -- no I/O, no RNG, nothing
+            // concurrent, no network. The empty set (rfcs/0003-plugin-abi-v2.md).
+            effects: Default::default(),
             call: Arc::new(rot13_call),
         }]
     }

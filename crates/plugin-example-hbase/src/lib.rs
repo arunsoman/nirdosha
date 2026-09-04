@@ -21,7 +21,7 @@
 
 use hbase_thrift::hbase::{ColumnDescriptor, HbaseSyncClient, THbaseSyncClient};
 use hbase_thrift::MutationBuilder;
-use nirdosha::ast::Ty;
+use nirdosha::ast::{Effect, Ty};
 use nirdosha::interpreter::{RuntimeError, Value};
 use nirdosha::plugin::{NirdoshaPlugin, PluginBuiltin};
 use nirdosha::token::Span;
@@ -53,30 +53,35 @@ impl NirdoshaPlugin for HbasePlugin {
                 name: "hbase_connect".to_string(),
                 params: vec![Ty::Str, Ty::I64],
                 ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(hbase_connect_call),
             },
             PluginBuiltin {
                 name: "hbase_create_table".to_string(),
                 params: vec![Ty::I64, Ty::Str, Ty::Str],
                 ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(hbase_create_table_call),
             },
             PluginBuiltin {
                 name: "hbase_put".to_string(),
                 params: vec![Ty::I64, Ty::Str, Ty::Str, Ty::Str, Ty::Str, Ty::Str],
                 ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(hbase_put_call),
             },
             PluginBuiltin {
                 name: "hbase_get".to_string(),
                 params: vec![Ty::I64, Ty::Str, Ty::Str, Ty::Str, Ty::Str],
                 ret: Ty::Str,
+                effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(hbase_get_call),
             },
             PluginBuiltin {
                 name: "hbase_close".to_string(),
                 params: vec![Ty::I64],
                 ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(hbase_close_call),
             },
         ]

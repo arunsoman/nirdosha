@@ -20,9 +20,10 @@
 //! parallel toy example invented separately from what a real
 //! third-party plugin author would write.
 
-use crate::ast::Ty;
+use crate::ast::{Effect, Ty};
 use crate::interpreter::{RuntimeError, Value};
 use crate::token::Span;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// The signature + implementation of one new builtin a plugin crate
@@ -42,6 +43,19 @@ pub struct PluginBuiltin {
     pub name: String,
     pub params: Vec<Ty>,
     pub ret: Ty,
+    /// Which of `ast::Effect`'s four tags (`Rng`/`Io`/`Concurrent`/
+    /// `Network`) this builtin's `call` produces — the empty set for a
+    /// pure function like `rot13`. **rfcs/0003-plugin-abi-v2.md**: this
+    /// field exists to close a real, previously-live unsoundness —
+    /// before it, `effects.rs`'s `Expr::Call` arm attributed *zero*
+    /// effect tags to any plugin builtin (it matched neither
+    /// `is_builtin` nor a known user function), so a plugin doing real
+    /// network I/O could be called from an `effect(pure)`-declared
+    /// function and typecheck clean. Never invent a new tag here — a
+    /// plugin effect is always a new *producer* of one of the four
+    /// existing kinds, never a fifth kind (see `effects.rs`'s own
+    /// module doc on why the set is deliberately closed).
+    pub effects: BTreeSet<Effect>,
     pub call: PluginFn,
 }
 
@@ -76,4 +90,12 @@ pub(crate) fn signatures(plugins: &[PluginBuiltin]) -> std::collections::HashMap
 
 pub(crate) fn implementations(plugins: &[PluginBuiltin]) -> std::collections::HashMap<String, PluginFn> {
     plugins.iter().map(|p| (p.name.clone(), p.call.clone())).collect()
+}
+
+/// Same shape/purpose as `signatures`/`implementations` above, for
+/// `effects.rs::infer_effects_with_plugins` (rfcs/0003-plugin-abi-v2.md):
+/// the one flat map it needs to attribute a plugin call's real effects
+/// instead of silently attributing none.
+pub(crate) fn effect_map(plugins: &[PluginBuiltin]) -> std::collections::HashMap<String, BTreeSet<Effect>> {
+    plugins.iter().map(|p| (p.name.clone(), p.effects.clone())).collect()
 }

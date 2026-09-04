@@ -49,5 +49,15 @@ dist = ["z3/vendored"]
 # silently make every distributed `nirdosha` binary wrap i64 overflow
 # instead of erroring -- directly contradicting the project's overflow-
 # safety guarantees. Keep this on in release builds.
+#
+# DEAD as of 2026-09-05 -- kept only as documentation of *why*, not as
+# the effective setting. Cargo profiles are workspace-level only; once
+# this crate became a workspace member (this table predates that), the
+# root `Cargo.toml` is the one place that actually applies. See the
+# root `Cargo.toml`'s own copy of this comment/setting for the real one
+# — found via `cargo test --release`'s own "profiles for the non root
+# package will be ignored" warning, present on every build since,
+# finally traced to a real failure (`concurrency.rs`'s
+# `a_panic_inside_a_spawned_function_surfaces_as_thread_panicked`).
 [profile.release]
 overflow-checks = true

@@ -5,11 +5,13 @@
 //! identifier text inside the parens, same treatment `transact`'s slot
 //! names already get.
 
-use nirdosha::ast::{Effect, TypeRegistry};
+use nirdosha::ast::{Effect, Ty, TypeRegistry};
 use nirdosha::effects::infer_effects;
+use nirdosha::interpreter::{RuntimeError, Value};
 use nirdosha::parser::Parser;
-use nirdosha::token::Lexer;
-use nirdosha::typeck::{typecheck, TypeErrorKind};
+use nirdosha::plugin::PluginBuiltin;
+use nirdosha::token::{Lexer, Span};
+use nirdosha::typeck::{typecheck, typecheck_with_plugins, TypeErrorKind};
 
 fn parse_ok(src: &str) -> nirdosha::ast::Program {
     let toks = Lexer::new(src).tokenize().expect("lex should succeed");
@@ -365,4 +367,60 @@ fn an_unknown_effect_name_is_a_parse_error() {
     .tokenize()
     .expect("lex should succeed");
     Parser::new(toks).parse_program().expect_err("an unrecognized effect name must be a parse error");
+}
+
+// ---- plugin builtins (rfcs/0003-plugin-abi-v2.md) --------------------------
+//
+// Before `PluginBuiltin.effects` existed, `effects.rs`'s `Expr::Call` arm
+// matched neither `is_builtin` (a plugin name is deliberately kept out of
+// `ast::BUILTIN_NAMES`) nor a known user function for a plugin call, so it
+// silently contributed the empty set — a real, live unsoundness: a plugin
+// doing real network I/O, called from an `effect(pure)`-declared function,
+// typechecked clean. These tests are the regression proof that declaring
+// `effects: [Effect::Network].into_iter().collect()` on a `PluginBuiltin`
+// now participates in effect checking exactly like a real builtin would.
+
+/// A trivial plugin builtin declaring `Effect::Network` — stands in for
+/// this repo's real network-backed plugins (`crates/plugin-example-
+/// {mysql,activemq,cassandra,neo4j,hbase}`) without this test needing an
+/// actual external dependency.
+fn fake_network_plugin() -> PluginBuiltin {
+    PluginBuiltin {
+        name: "fake_network_call".to_string(),
+        params: vec![],
+        ret: Ty::I64,
+        effects: [Effect::Network].into_iter().collect(),
+        call: std::sync::Arc::new(|_args: &[Value], _span: Span| -> Result<Value, RuntimeError> { Ok(Value::Int(1)) }),
+    }
+}
+
+#[test]
+fn a_pure_declared_function_calling_a_network_effect_plugin_is_now_a_type_error() {
+    let program = parse_ok(
+        r#"
+        fn main() -> i64 effect(pure) {
+            return fake_network_call()
+        }
+    "#,
+    );
+    let plugins = [fake_network_plugin()];
+    let err = typecheck_with_plugins(&program, &plugins)
+        .expect_err("a plugin's declared network effect must be checked, not silently dropped");
+    assert_eq!(
+        err.into_iter().next().unwrap().kind,
+        TypeErrorKind::EffectNotDeclared { fn_name: "main".to_string(), missing: Effect::Network }
+    );
+}
+
+#[test]
+fn declaring_the_matching_effect_for_a_plugin_call_typechecks_cleanly() {
+    let program = parse_ok(
+        r#"
+        fn main() -> i64 effect(network) {
+            return fake_network_call()
+        }
+    "#,
+    );
+    let plugins = [fake_network_plugin()];
+    typecheck_with_plugins(&program, &plugins).expect("network effect declared and matches the plugin's own -- should typecheck");
 }

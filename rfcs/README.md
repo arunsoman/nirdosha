@@ -42,6 +42,7 @@ with none of this, which is the concrete gap it closes.
 |---|---|---|---|
 | [0001](./0001-package-manifest-format.md) | Package manifest format (Cargo-based package manager) | draft | *unassigned* |
 | [0002](./0002-editor-tooling-lsp-tree-sitter.md) | Editor/tooling ecosystem: tree-sitter grammar + minimal LSP | draft | *unassigned* |
+| [0003](./0003-plugin-abi-v2.md) | Plugin ABI v2 — effect declarations, async/sync policy, versioning | draft | *unassigned* |
 
 ## What doesn't need an RFC
 

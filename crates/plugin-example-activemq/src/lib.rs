@@ -12,7 +12,7 @@
 
 mod stomp;
 
-use nirdosha::ast::Ty;
+use nirdosha::ast::{Effect, Ty};
 use nirdosha::interpreter::{RuntimeError, Value};
 use nirdosha::plugin::{NirdoshaPlugin, PluginBuiltin};
 use nirdosha::token::Span;
@@ -37,24 +37,28 @@ impl NirdoshaPlugin for ActiveMqPlugin {
                 name: "activemq_connect".to_string(),
                 params: vec![Ty::Str],
                 ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(activemq_connect_call),
             },
             PluginBuiltin {
                 name: "activemq_send".to_string(),
                 params: vec![Ty::I64, Ty::Str, Ty::Str],
                 ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(activemq_send_call),
             },
             PluginBuiltin {
                 name: "activemq_receive".to_string(),
                 params: vec![Ty::I64, Ty::Str, Ty::I64],
                 ret: Ty::Str,
+                effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(activemq_receive_call),
             },
             PluginBuiltin {
                 name: "activemq_close".to_string(),
                 params: vec![Ty::I64],
                 ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(activemq_close_call),
             },
         ]

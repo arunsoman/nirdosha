@@ -60,6 +60,24 @@ pub struct FnEffects {
 }
 
 pub fn infer_effects(program: &Program, registry: &TypeRegistry) -> HashMap<String, FnEffects> {
+    infer_effects_with_plugins(program, registry, &HashMap::new())
+}
+
+/// Same as [`infer_effects`], plus a plugin builtin's own declared
+/// effects (`plugin::effect_map`, keyed by builtin name) —
+/// rfcs/0003-plugin-abi-v2.md: without this, a plugin call in
+/// `walk_expr`'s `Expr::Call` arm matched neither `is_builtin` nor a
+/// known user function and silently contributed the empty set, a real
+/// unsoundness once any plugin does more than `rot13`'s pure string
+/// transform. `infer_effects` itself keeps its exact existing
+/// signature/behavior (an empty `plugin_effects` map) — every one of
+/// its 20 existing call sites across `main.rs`/`serve.rs`/
+/// `interpreter.rs`/tests is untouched by this addition.
+pub fn infer_effects_with_plugins(
+    program: &Program,
+    registry: &TypeRegistry,
+    plugin_effects: &HashMap<String, EffectSet>,
+) -> HashMap<String, FnEffects> {
     let mut known: HashMap<String, EffectSet> =
         program.fns.iter().map(|f| (f.name.clone(), EffectSet::new())).collect();
 
@@ -72,7 +90,7 @@ pub fn infer_effects(program: &Program, registry: &TypeRegistry) -> HashMap<Stri
                 scopes.define(&p.name, p.ty.clone());
             }
             let mut acc = known[&f.name].clone();
-            walk_stmts(&f.body.stmts, &mut scopes, &known, registry, &mut acc);
+            walk_stmts(&f.body.stmts, &mut scopes, &known, plugin_effects, registry, &mut acc);
             if acc != known[&f.name] {
                 known.insert(f.name.clone(), acc);
                 changed = true;
@@ -114,38 +132,38 @@ impl Scopes {
     }
 }
 
-fn walk_stmts(stmts: &[Stmt], scopes: &mut Scopes, known: &HashMap<String, EffectSet>, registry: &TypeRegistry, acc: &mut EffectSet) {
+fn walk_stmts(stmts: &[Stmt], scopes: &mut Scopes, known: &HashMap<String, EffectSet>, plugin_effects: &HashMap<String, EffectSet>, registry: &TypeRegistry, acc: &mut EffectSet) {
     for s in stmts {
-        walk_stmt(s, scopes, known, registry, acc);
+        walk_stmt(s, scopes, known, plugin_effects, registry, acc);
     }
 }
 
-fn walk_block(stmts: &[Stmt], scopes: &mut Scopes, known: &HashMap<String, EffectSet>, registry: &TypeRegistry, acc: &mut EffectSet) {
+fn walk_block(stmts: &[Stmt], scopes: &mut Scopes, known: &HashMap<String, EffectSet>, plugin_effects: &HashMap<String, EffectSet>, registry: &TypeRegistry, acc: &mut EffectSet) {
     scopes.push();
-    walk_stmts(stmts, scopes, known, registry, acc);
+    walk_stmts(stmts, scopes, known, plugin_effects, registry, acc);
     scopes.pop();
 }
 
-fn walk_stmt(stmt: &Stmt, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, registry: &TypeRegistry, acc: &mut EffectSet) {
+fn walk_stmt(stmt: &Stmt, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, plugin_effects: &HashMap<String, EffectSet>, registry: &TypeRegistry, acc: &mut EffectSet) {
     match stmt {
         Stmt::Let { name, ty, value, .. } => {
-            walk_expr(value, scopes, known, registry, acc);
+            walk_expr(value, scopes, known, plugin_effects, registry, acc);
             scopes.define(name, ty.clone());
         }
-        Stmt::Return { value: Some(e), .. } => walk_expr(e, scopes, known, registry, acc),
+        Stmt::Return { value: Some(e), .. } => walk_expr(e, scopes, known, plugin_effects, registry, acc),
         Stmt::Return { value: None, .. } => {}
         Stmt::While { cond, body, .. } => {
-            walk_expr(cond, scopes, known, registry, acc);
-            walk_block(&body.stmts, scopes, known, registry, acc);
+            walk_expr(cond, scopes, known, plugin_effects, registry, acc);
+            walk_block(&body.stmts, scopes, known, plugin_effects, registry, acc);
         }
-        Stmt::Expr(e) => walk_expr(e, scopes, known, registry, acc),
+        Stmt::Expr(e) => walk_expr(e, scopes, known, plugin_effects, registry, acc),
         // `audited` only suppresses codegen's Tier-1/2 guard *emission* —
         // what the code inside actually does, and therefore its effects,
         // is completely unaffected.
         Stmt::Audited { body, .. } => {
             scopes.push();
             for s in body {
-                walk_stmt(s, scopes, known, registry, acc);
+                walk_stmt(s, scopes, known, plugin_effects, registry, acc);
             }
             scopes.pop();
         }
@@ -269,25 +287,35 @@ fn db_connect_effect(args: &[Expr]) -> EffectSet {
     s
 }
 
-fn walk_expr(e: &Expr, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, registry: &TypeRegistry, acc: &mut EffectSet) {
+fn walk_expr(e: &Expr, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, plugin_effects: &HashMap<String, EffectSet>, registry: &TypeRegistry, acc: &mut EffectSet) {
     match e {
         Expr::Int(_, _) | Expr::Float(_, _) | Expr::Bool(_, _) | Expr::Str(_, _) | Expr::Ident(_, _) | Expr::Chan(_) => {}
         Expr::Unary(_, inner, _) | Expr::Box(inner, _) | Expr::Deref(inner, _) | Expr::Ref(inner, _) => {
-            walk_expr(inner, scopes, known, registry, acc);
+            walk_expr(inner, scopes, known, plugin_effects, registry, acc);
         }
         Expr::Binary(_, l, r, _) => {
-            walk_expr(l, scopes, known, registry, acc);
-            walk_expr(r, scopes, known, registry, acc);
+            walk_expr(l, scopes, known, plugin_effects, registry, acc);
+            walk_expr(r, scopes, known, plugin_effects, registry, acc);
         }
-        Expr::Assign(_, rhs, _) => walk_expr(rhs, scopes, known, registry, acc),
+        Expr::Assign(_, rhs, _) => walk_expr(rhs, scopes, known, plugin_effects, registry, acc),
         Expr::Call(name, args, _) => {
             for a in args {
-                walk_expr(a, scopes, known, registry, acc);
+                walk_expr(a, scopes, known, plugin_effects, registry, acc);
             }
             if name == "db_connect" {
                 acc.extend(db_connect_effect(args));
             } else if is_builtin(name) {
                 acc.extend(builtin_effect(name));
+            } else if let Some(fx) = plugin_effects.get(name) {
+                // rfcs/0003-plugin-abi-v2.md: a plugin builtin's name is
+                // deliberately never in `ast::BUILTIN_NAMES` (`plugin.rs`'s
+                // own doc comment) and isn't a `known` user function
+                // either, so before this arm existed a plugin call fell
+                // through to the `known.get`/`Ty::Fn` branches below and
+                // matched neither -- contributing the empty set
+                // unconditionally, a real unsoundness the moment any
+                // plugin does more than a pure string transform.
+                acc.extend(fx.iter().copied());
             } else if let Some(callee) = known.get(name) {
                 acc.extend(callee.iter().copied());
             } else if matches!(scopes.get(name), Some(Ty::Fn(..))) {
@@ -317,18 +345,18 @@ fn walk_expr(e: &Expr, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, 
             }
         }
         Expr::If { cond, then_block, else_block, .. } => {
-            walk_expr(cond, scopes, known, registry, acc);
-            walk_block(&then_block.stmts, scopes, known, registry, acc);
+            walk_expr(cond, scopes, known, plugin_effects, registry, acc);
+            walk_block(&then_block.stmts, scopes, known, plugin_effects, registry, acc);
             match else_block.as_deref() {
-                Some(ElseBranch::Block(b)) => walk_block(&b.stmts, scopes, known, registry, acc),
-                Some(ElseBranch::If(e2)) => walk_expr(e2, scopes, known, registry, acc),
+                Some(ElseBranch::Block(b)) => walk_block(&b.stmts, scopes, known, plugin_effects, registry, acc),
+                Some(ElseBranch::If(e2)) => walk_expr(e2, scopes, known, plugin_effects, registry, acc),
                 None => {}
             }
         }
         Expr::Spawn(name, args, _) => {
             acc.insert(Effect::Concurrent);
             for a in args {
-                walk_expr(a, scopes, known, registry, acc);
+                walk_expr(a, scopes, known, plugin_effects, registry, acc);
             }
             if let Some(callee) = known.get(name) {
                 acc.extend(callee.iter().copied());
@@ -347,10 +375,10 @@ fn walk_expr(e: &Expr, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, 
         // above now handles this directly (any call through a local
         // `Ty::Fn` binding conservatively unions every function's
         // inferred effects), so this arm only needs to walk `proof`.
-        Expr::Acquire(_, proof, _) => walk_expr(proof, scopes, known, registry, acc),
+        Expr::Acquire(_, proof, _) => walk_expr(proof, scopes, known, plugin_effects, registry, acc),
         Expr::Join(inner, _) => {
             acc.insert(Effect::Concurrent);
-            walk_expr(inner, scopes, known, registry, acc);
+            walk_expr(inner, scopes, known, plugin_effects, registry, acc);
         }
         Expr::Send(target, value, _) => {
             match local_ty(target, scopes) {
@@ -365,8 +393,8 @@ fn walk_expr(e: &Expr, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, 
                 }
                 _ => {}
             }
-            walk_expr(target, scopes, known, registry, acc);
-            walk_expr(value, scopes, known, registry, acc);
+            walk_expr(target, scopes, known, plugin_effects, registry, acc);
+            walk_expr(value, scopes, known, plugin_effects, registry, acc);
         }
         Expr::Recv(target, _) => {
             match local_ty(target, scopes) {
@@ -381,12 +409,12 @@ fn walk_expr(e: &Expr, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, 
                 }
                 _ => {}
             }
-            walk_expr(target, scopes, known, registry, acc);
+            walk_expr(target, scopes, known, plugin_effects, registry, acc);
         }
         Expr::SpawnSandbox(name, args, _) => {
             acc.insert(Effect::Concurrent);
             for a in args {
-                walk_expr(a, scopes, known, registry, acc);
+                walk_expr(a, scopes, known, plugin_effects, registry, acc);
             }
             if let Some(callee) = known.get(name) {
                 acc.extend(callee.iter().copied());
@@ -405,35 +433,35 @@ fn walk_expr(e: &Expr, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, 
                 }
                 _ => {}
             }
-            walk_expr(inner, scopes, known, registry, acc);
+            walk_expr(inner, scopes, known, plugin_effects, registry, acc);
         }
         Expr::Connect(host, port, _) => {
             acc.insert(Effect::Network);
-            walk_expr(host, scopes, known, registry, acc);
-            walk_expr(port, scopes, known, registry, acc);
+            walk_expr(host, scopes, known, plugin_effects, registry, acc);
+            walk_expr(port, scopes, known, plugin_effects, registry, acc);
         }
         Expr::Listen(port, _) => {
             acc.insert(Effect::Network);
-            walk_expr(port, scopes, known, registry, acc);
+            walk_expr(port, scopes, known, plugin_effects, registry, acc);
         }
         Expr::Accept(listener, _) => {
             acc.insert(Effect::Network);
-            walk_expr(listener, scopes, known, registry, acc);
+            walk_expr(listener, scopes, known, plugin_effects, registry, acc);
         }
         Expr::Open(path, mode, _) => {
             acc.insert(Effect::Io);
-            walk_expr(path, scopes, known, registry, acc);
-            walk_expr(mode, scopes, known, registry, acc);
+            walk_expr(path, scopes, known, plugin_effects, registry, acc);
+            walk_expr(mode, scopes, known, plugin_effects, registry, acc);
         }
         Expr::Index(base, indices, _) => {
-            walk_expr(base, scopes, known, registry, acc);
+            walk_expr(base, scopes, known, plugin_effects, registry, acc);
             for idx in indices {
-                walk_expr(idx, scopes, known, registry, acc);
+                walk_expr(idx, scopes, known, plugin_effects, registry, acc);
             }
         }
         Expr::ArrayLit(elements, _) => {
             for e in elements {
-                walk_expr(e, scopes, known, registry, acc);
+                walk_expr(e, scopes, known, plugin_effects, registry, acc);
             }
         }
         // Every slot is restricted to a named user-function call
@@ -449,7 +477,7 @@ fn walk_expr(e: &Expr, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, 
                 .chain(log.iter());
             for slot in slots {
                 for a in &slot.args {
-                    walk_expr(a, scopes, known, registry, acc);
+                    walk_expr(a, scopes, known, plugin_effects, registry, acc);
                 }
                 if let Some(callee) = known.get(&slot.name) {
                     acc.extend(callee.iter().copied());
@@ -458,7 +486,7 @@ fn walk_expr(e: &Expr, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, 
         }
         // Reading a field has no effect of its own -- just recurse into
         // the base, same treatment `Expr::Deref` already gets.
-        Expr::FieldAccess(base, _, _) => walk_expr(base, scopes, known, registry, acc),
+        Expr::FieldAccess(base, _, _) => walk_expr(base, scopes, known, plugin_effects, registry, acc),
         // A `match` itself has no effect -- the scrutinee and every arm's
         // body are walked for their own effects, in a fresh scope with
         // that arm's payload bindings defined at their *real* declared
@@ -468,7 +496,7 @@ fn walk_expr(e: &Expr, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, 
         // `local_ty`'s `Ident` lookup the same way a `let`-bound name
         // already is, or that effect would silently go undetected.
         Expr::Match { scrutinee, arms, .. } => {
-            walk_expr(scrutinee, scopes, known, registry, acc);
+            walk_expr(scrutinee, scopes, known, plugin_effects, registry, acc);
             for arm in arms {
                 scopes.push();
                 if let Some((_, variant)) = registry.find_variant(&arm.variant) {
@@ -476,7 +504,7 @@ fn walk_expr(e: &Expr, scopes: &mut Scopes, known: &HashMap<String, EffectSet>, 
                         scopes.define(name, ty.clone());
                     }
                 }
-                walk_expr(&arm.body, scopes, known, registry, acc);
+                walk_expr(&arm.body, scopes, known, plugin_effects, registry, acc);
                 scopes.pop();
             }
         }

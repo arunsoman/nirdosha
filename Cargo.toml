@@ -15,3 +15,29 @@ members = [
     "crates/plugin-example-hbase",
     "crates/plugin-examples",
 ]
+
+# Real, pre-existing gap found while running the full suite in release
+# mode (2026-09-05): `crates/compiler/Cargo.toml` has carried its own
+# `[profile.release] overflow-checks = true` since before this was a
+# Cargo workspace (see that file's own comment on why: Rust's i64
+# overflow panic is Nirdosha's only runtime overflow guard, and
+# Cargo's default release profile disables it, silently making every
+# distributed binary wrap instead of erroring -- directly contradicting
+# the project's overflow-safety guarantees). Cargo profiles are
+# workspace-level only -- a member crate's own `[profile.*]` table is
+# silently ignored once it's part of a workspace ("profiles for the
+# non root package will be ignored" is cargo's own warning, present on
+# every build since whichever commit first turned this into a
+# workspace). That means overflow-checks has been OFF in every real
+# release build since this repo became a workspace, unnoticed until
+# `concurrency.rs`'s `a_panic_inside_a_spawned_function_surfaces_as_
+# thread_panicked` test failed under `cargo test --release` at the
+# workspace root -- the first time anyone appears to have run the
+# release-profile suite from here rather than always building via
+# `crates/compiler`'s own now-silently-ignored profile table. Fixed by
+# duplicating the setting at the one place Cargo actually honors it;
+# `crates/compiler/Cargo.toml`'s own copy is now dead and kept there
+# only as documentation of the *reason*, not as the effective setting.
+[profile.release]
+overflow-checks = true
+

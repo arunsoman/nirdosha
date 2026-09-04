@@ -14,7 +14,7 @@
 //! success — CQL doesn't report affected-row counts the way SQL does),
 //! `cassandra_close(handle: i64) -> i64`.
 
-use nirdosha::ast::Ty;
+use nirdosha::ast::{Effect, Ty};
 use nirdosha::interpreter::{RuntimeError, Value};
 use nirdosha::plugin::{NirdoshaPlugin, PluginBuiltin};
 use nirdosha::token::Span;
@@ -40,24 +40,28 @@ impl NirdoshaPlugin for CassandraPlugin {
                 name: "cassandra_connect".to_string(),
                 params: vec![Ty::Str],
                 ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(cassandra_connect_call),
             },
             PluginBuiltin {
                 name: "cassandra_query".to_string(),
                 params: vec![Ty::I64, Ty::Str],
                 ret: Ty::Str,
+                effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(cassandra_query_call),
             },
             PluginBuiltin {
                 name: "cassandra_execute".to_string(),
                 params: vec![Ty::I64, Ty::Str],
                 ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(cassandra_execute_call),
             },
             PluginBuiltin {
                 name: "cassandra_close".to_string(),
                 params: vec![Ty::I64],
                 ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(cassandra_close_call),
             },
         ]
