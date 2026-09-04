@@ -1,4 +1,4 @@
-// `file`/`open` -- PROTOLANG_PORT.md's "Locked design 2" file I/O port.
+// `file`/`open` -- docs/PROTOLANG_PORT.md's "Locked design 2" file I/O port.
 //
 // `send`/`recv`/`stop` are reused verbatim from `tcp`/`sandbox`, exactly
 // the way `tcp` itself reused them from `chan` -- no new I/O keywords,

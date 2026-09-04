@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/compiler",
+    "crates/grammar_check",
+    "crates/grammar_export",
+    "crates/bench",
+    "crates/presence-gateway",
+]

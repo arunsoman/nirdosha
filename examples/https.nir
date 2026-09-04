@@ -3,11 +3,11 @@
 // TlsConnector::new()'s defaults verify the certificate chain and
 // hostname against the platform's trust store -- a vetted library
 // binding doing the security-critical work, not hand-rolled crypto
-// (PROTOLANG_PORT.md's std_io §12 stance).
+// (docs/PROTOLANG_PORT.md's std_io §12 stance).
 //
 // Talks to a real external host -- there's no offline way to test a
 // successful HTTPS handshake against a self-signed certificate the
-// client would actually trust (compiler/tests/https.rs's own module doc
+// client would actually trust (crates/compiler/tests/https.rs's own module doc
 // explains why, and tests the handshake/verification path a different,
 // fully self-contained way instead). This file is illustrative, not
 // something CI runs -- the same "documented as needing an external

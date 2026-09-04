@@ -1,5 +1,5 @@
 # Kustomize alternative to deploy/helm/nirdosha for an operator who
-# prefers plain manifests over templating (KUBERNETES.md P3: "Helm
+# prefers plain manifests over templating (docs/KUBERNETES.md P3: "Helm
 # chart / Kustomize overlay"). `nirdosha-sqlite.yaml` is a static
 # render of the Helm chart's own defaults (ServiceAccount + Service +
 # single-replica StatefulSet + PVC, local SQLite, no auth/ingress) — the

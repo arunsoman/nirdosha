@@ -4,7 +4,7 @@
 // `sandbox` handle. `stop` terminates it (killing it if still running)
 // and yields its OS exit code.
 //
-// This first layer (SANDBOXING.md) has no typed IPC yet -- a sandboxed
+// This first layer (docs/SANDBOXING.md) has no typed IPC yet -- a sandboxed
 // function's return value never reaches the caller, only its exit status
 // does, so `worker` must declare `-> unit` and take only plain scalar
 // parameters (an integer type or `bool`); typeck.rs rejects anything else

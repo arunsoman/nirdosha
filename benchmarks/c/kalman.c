@@ -1,7 +1,7 @@
 #include <math.h>
 #include <stdio.h>
 
-// Direct translation of compiler/src/interpreter.rs's kf_predict/kf_update
+// Direct translation of crates/compiler/src/interpreter.rs's kf_predict/kf_update
 // and matrix_inv (Gauss-Jordan with partial pivoting) -- same algorithm,
 // same operation order, as the Nirdosha interpreter uses, so results are
 // bit-for-bit comparable (not just "close," the way Julia's LAPACK-backed

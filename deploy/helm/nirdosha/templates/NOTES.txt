@@ -7,7 +7,7 @@ Check rollout status:
   kubectl rollout status statefulset/{{ include "nirdosha.fullname" . }} -n {{ .Release.Namespace }}
   {{- end }}
 
-Probe the health/readiness routes (see KUBERNETES.md's "Health &
+Probe the health/readiness routes (see docs/KUBERNETES.md's "Health &
 lifecycle" row) from inside the cluster:
   kubectl exec -n {{ .Release.Namespace }} {{ include "nirdosha.fullname" . }}-0 -- wget -qO- http://localhost:8080/healthz
 
@@ -36,12 +36,12 @@ sidecar is deployed alongside nirdosha, reachable at
   ws://{{ include "nirdosha.fullname" . }}:{{ .Values.presence.gateway.port }}/ws
 from inside the cluster (port-forward or Ingress it the same way as the
 main http port if browsers need to reach it directly). See
-presence-gateway/README.md for the client protocol.
+crates/presence-gateway/README.md for the client protocol.
 {{- else }}
 
 NOTE: presence.enabled=false — notify() will always silently take the
 offline (send_email) path; nothing terminates a live browser WebSocket
 connection. Set presence.enabled=true (with auth.enabled=true and
-presence.redis.host set) to enable real-time push. See ROADMAP.md Track
-A5 / WORKFLOW.md's presence-bridge section.
+presence.redis.host set) to enable real-time push. See docs/ROADMAP.md Track
+A5 / docs/WORKFLOW.md's presence-bridge section.
 {{- end }}

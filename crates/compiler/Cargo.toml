@@ -1,0 +1,53 @@
+[package]
+name = "nirdosha"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+z3 = "0.20.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+native-tls = "0.2"
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+ring = "0.17"
+rusqlite = { version = "0.31", features = ["bundled"] }
+redis = "0.27"
+tiny_http = "0.12"
+flate2 = "1"
+postgres = "0.19"
+postgres-native-tls = "0.5"
+regex = "1.13.1"
+rust_decimal = "1"
+# Connection pooling (crates/compiler/src/pool.rs) -- r2d2 is the generic
+# pool/Manager machinery, kept generic on purpose so any future pooled
+# resource (not just db_connect's two backends) gets it for free; r2d2_
+# sqlite/r2d2_postgres are the two Manager impls this layer needs today.
+# r2d2_sqlite pinned to 0.24, NOT the latest 0.35, to match this crate's
+# existing rusqlite = "0.31" pin (0.35 requires rusqlite ^0.40 -- a real
+# version conflict on the shared `sqlite3` native link target, confirmed
+# via crates.io's own index metadata, not guessed).
+r2d2 = "0.8"
+r2d2_sqlite = { version = "0.24", default-features = false, features = ["bundled"] }
+r2d2_postgres = "0.18"
+signal-hook = { version = "0.4", default-features = false }
+
+# `dist`: statically vendors Z3 (compiles it from source via `z3-src`)
+# instead of dynamically linking the system `libz3` — same pattern as
+# rusqlite's `bundled` feature above. Only used for release/CI binaries
+# (see .github/workflows/release.yml); local dev builds keep using
+# system z3 via pkg-config since the vendored build is much slower.
+[features]
+dist = ["z3/vendored"]
+
+# Rust's own integer-overflow panic is `nirdosha`'s only runtime guard
+# for i64 arithmetic (there's no dynamic `OutOfRange` check for it, see
+# `scalar_binop`/`eval_binary` in src/interpreter.rs) -- `spawn`/`join`
+# catches that panic via `catch_unwind` and reports `ThreadPanicked`.
+# Cargo's default release profile disables overflow checks, which would
+# silently make every distributed `nirdosha` binary wrap i64 overflow
+# instead of erroring -- directly contradicting the project's overflow-
+# safety guarantees. Keep this on in release builds.
+[profile.release]
+overflow-checks = true

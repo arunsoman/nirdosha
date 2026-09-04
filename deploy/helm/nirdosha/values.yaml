@@ -1,8 +1,8 @@
-# Default values for the nirdosha chart — see KUBERNETES.md for the
+# Default values for the nirdosha chart — see docs/KUBERNETES.md for the
 # compliance matrix every default below traces back to.
 
 image:
-  # Unpublished as of this chart's first version — KUBERNETES.md P0's
+  # Unpublished as of this chart's first version — docs/KUBERNETES.md P0's
   # first item. Build+push it from the repo root Dockerfile, or point
   # this at your own derived image (base image + your .nir source
   # COPY'd in, same shape `plugins/deploy_targets/kubernetes.py`'s
@@ -15,12 +15,12 @@ nameOverride: ""
 fullnameOverride: ""
 
 # The single .nir entrypoint this release serves. Required — there is no
-# sensible default (KUBERNETES.md: one process, one file per `serve`
+# sensible default (docs/KUBERNETES.md: one process, one file per `serve`
 # invocation).
 entrypointFile: "app.nir"
 
 # `.nir` has no runtime env-var read (`db_connect(...)` is a literal
-# compiled into the source itself, KUBERNETES.md's "State, data &
+# compiled into the source itself, docs/KUBERNETES.md's "State, data &
 # horizontal scaling" row) — replicas > 1 is refused by this chart's own
 # templates (see statefulset/deployment .tpl logic) unless
 # db.mode=postgres, matching `kubernetes.py::render_manifests`'s own
@@ -61,16 +61,16 @@ auth:
   audience: ""
 
 # `--presence-token-file`/`--otel-token-file` — Secret-mounted, never a
-# bare CLI value (KUBERNETES.md's "Secrets sourced from files, not bare
+# bare CLI value (docs/KUBERNETES.md's "Secrets sourced from files, not bare
 # CLI values" row; this same compliance change added the -file flags).
 #
 # Setting `presence.enabled: true` alone used to be a silent trap: it
 # wired `--presence-token-file` onto the `nirdosha` container so
 # `notify()`'s presence routes stopped 404ing, but nothing in this chart
-# ever deployed the WebSocket gateway (`presence-gateway/`, repo root)
+# ever deployed the WebSocket gateway (`crates/presence-gateway/`)
 # those routes exist *for* — `identity_presence` would still never gain
 # an "online" row, so `notify()` still always silently took the offline
-# path, just with no error anywhere to say so (ROADMAP.md Track A5's own
+# path, just with no error anywhere to say so (docs/ROADMAP.md Track A5's own
 # "this doesn't error, it just never does the push-it-live half of its
 # job" framing, reproduced one layer up in this chart). `presence.enabled`
 # now deploys the gateway as a sidecar in the same Pod (`_pod.tpl`) —
@@ -97,7 +97,7 @@ presence:
     # `ws://<service>:<gatewayPort>/ws`.
     port: 8090
   # Redis is where `notify()`'s live-push events actually flow
-  # (`nirdosha:push:<subject>`, WORKFLOW.md's presence-bridge section) —
+  # (`nirdosha:push:<subject>`, docs/WORKFLOW.md's presence-bridge section) —
   # a separate, already-running Redis this chart does not deploy for you
   # (the same "bring your own Postgres" posture `db.postgresSecretName`
   # already takes for `db.mode=postgres`). Required when `presence.enabled`.
@@ -118,7 +118,7 @@ resources:
     cpu: "1"
     memory: 512Mi
 
-# KUBERNETES.md's "Security posture" row / P3's "Pod Security
+# docs/KUBERNETES.md's "Security posture" row / P3's "Pod Security
 # 'restricted' profile" item.
 securityContext:
   runAsNonRoot: true

@@ -19,10 +19,10 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            compiler/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('compiler/Cargo.lock') }}
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
       - name: Build
-        working-directory: compiler
+        working-directory: crates/compiler
         run: cargo build --release
 
   # Windows didn't get a CI job of its own until now — the release
@@ -32,7 +32,7 @@ jobs:
   # in `interpreter.rs`'s sandbox-channel transport — Unix-only in std,
   # so it doesn't even exist on the `windows` target; the `tcp`/
   # `tcp_listener` runtime's own `RawFd`→`RawSocket` port was already
-  # correct). See ROADMAP.md A7. Fixed by giving that transport a real
+  # correct). See docs/ROADMAP.md A7. Fixed by giving that transport a real
   # `#[cfg(windows)]` leg (a loopback TCP socket, since std doesn't wrap
   # `AF_UNIX` for Windows) instead of leaving Windows uncompilable — this
   # job is what actually proves the fix, and what would have caught the
@@ -52,13 +52,13 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            compiler/target
-          key: windows-cargo-${{ hashFiles('compiler/Cargo.lock') }}
+            target
+          key: windows-cargo-${{ hashFiles('Cargo.lock') }}
       - name: Build (Z3 vendored, no system libz3 dependency)
-        working-directory: compiler
+        working-directory: crates/compiler
         run: cargo build --release --features dist
       - name: Run the tcp / sandbox-channel integration tests
-        working-directory: compiler
+        working-directory: crates/compiler
         run: cargo test --release --features dist --test tcp --test sandbox --test sandbox_channels --test channels
       - name: Run the compiled (native-codegen) tcp/tcp_listener tests
         # These are the ones that actually exercise runtime_kernels.rs's
@@ -67,5 +67,5 @@ jobs:
         # not just the interpreter. Filtered out of the rest of
         # `codegen.rs`'s ~140 tests to keep this job fast; nothing else
         # in that file touches the platform-conditional socket code.
-        working-directory: compiler
+        working-directory: crates/compiler
         run: cargo test --release --features dist --test codegen -- compiled_connect compiled_listen compiled_recv connecting_to_a_closed_port_traps_at_runtime tcp_client_example

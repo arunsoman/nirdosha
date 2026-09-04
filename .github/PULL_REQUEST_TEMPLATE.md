@@ -10,7 +10,7 @@ Closes #
 
 - [ ] `cargo test` passes locally (`cd compiler && cargo test`)
 - [ ] Docs updated in this same PR if behavior changed
-      (`LANGUAGE.md`/`GRAMMAR.md`/`ROADMAP.md`/`PUBLIC_ROADMAP.md`, as
+      (`docs/LANGUAGE.md`/`docs/GRAMMAR.md`/`docs/ROADMAP.md`/`docs/PUBLIC_ROADMAP.md`, as
       applicable) — this project treats docs as load-bearing, not
       deferred cleanup
 - [ ] New behavior has a test, or an explanation of why it doesn't need one

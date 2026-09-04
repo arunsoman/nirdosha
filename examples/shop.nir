@@ -10,7 +10,7 @@
 // row lookups, the cart-checkout loop) lives in `X_inner`'s plain
 // function body -- a `block`, which supports a full `stmt*` -- never
 // inside a `match` arm, since `match_arm ::= ... "=>" expr` only ever
-// accepts a single `expr` (`GRAMMAR.md`'s `match_expr` production), not
+// accepts a single `expr` (`docs/GRAMMAR.md`'s `match_expr` production), not
 // a `block`. Every branch that reaches a `stop(conn)` produces its
 // result immediately afterward with no further `conn` use on that path
 // -- confirmed empirically (same discipline `store.nir`'s header notes:

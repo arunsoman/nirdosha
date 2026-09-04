@@ -18,7 +18,7 @@
 // `"system_admin"`, `"corporate_seller"`, `"corporate_buyer"`,
 // `"bank_ops"`, `"compliance_officer"`, `"channel_partner"` -- or
 // anything else, which becomes `"customer"`. Nirdosha `str` has no
-// concatenation or parsing (LANGUAGE.md §2), so there's no way to turn
+// concatenation or parsing (docs/LANGUAGE.md §2), so there's no way to turn
 // an arbitrary free-text role list into JSON claims dynamically;
 // picking between a fixed set of literal, pre-written claims payloads
 // via `==` is what's actually expressible. A real IdP obviously
@@ -36,7 +36,7 @@
 // `login`'s own doc comment below for the exact per-persona arrays.
 //
 // `issued_at` is a fixed literal, not a real clock reading -- Nirdosha
-// has no wall-clock builtin (deliberate: LANGUAGE.md §9's determinism
+// has no wall-clock builtin (deliberate: docs/LANGUAGE.md §9's determinism
 // stance), so tokens are minted with a generous fixed ttl instead of
 // expiring realistically. Fine for a local mock; would need a real
 // clock source to not be.
