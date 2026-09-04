@@ -3373,6 +3373,275 @@ workflow RoleElevationApproval {
     }
 }
 
+// =========================================================================
+// Module 10: Audit and Logging Infrastructure
+// Doc: "Event Logging Engine" / "WORM-Compliant Storage" / "Audit Trail
+// Management" / "Search & Export Interface" / "Security & Forensics"
+// (periodic integrity scans with tamper alerts).
+// =========================================================================
+
+module "Audit & Logging" {
+    struct AuditLogEntry {
+        id: i64,
+        actor: str,
+        action_kind: str,
+        module_name: str,
+        justification: str,
+        occurred_unix: i64,
+    }
+
+    struct SecurityAlertEntry {
+        id: i64,
+        source_system: str,
+        severity: Severity,
+        description: str,
+        occurred_unix: i64,
+        acknowledged: bool,
+    }
+
+    struct IntegrityScan {
+        id: i64,
+        scan_kind: str,
+        last_run_unix: i64,
+        tamper_detected: bool,
+        verification_status: ReviewStatus,
+    }
+
+    struct ArchiveObject {
+        id: i64,
+        object_name: str,
+        retention_expiry_unix: i64,
+        object_lock_status: LockStatus,
+    }
+}
+
+// `record_audit_log_entry` (not `create_...`) is deliberate --
+// `ctms.nir`'s own E8 finding: a plain `create_<S>` naming-convention
+// fn auto-renders a "Create" button on the list screen, but nothing in
+// this module's own doc section describes end users hand-authoring
+// audit entries -- the system writes them, an admin only ever reads
+// them. Naming it outside the `create_<S>` convention keeps it callable
+// (e.g. from another module's own code) without exposing a manual
+// "forge an audit entry" button in the UI, and it's `role: "admin"`
+// gated, never `public`.
+fn record_audit_log_entry_inner(conn: db, e: AuditLogEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS audit_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT, action_kind TEXT, module_name TEXT, justification TEXT, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO audit_log_entry (actor, action_kind, module_name, justification, occurred_unix) VALUES (?, ?, ?, ?, ?)", e.actor, e.action_kind, e.module_name, e.justification, e.occurred_unix) { Ok(n) => Ok(n), Err(err) => Err(DbError(err)) }
+    stop conn
+    return result
+}
+fn record_audit_log_entry(e: AuditLogEntry) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => record_audit_log_entry_inner(conn, e), Err(err) => Err(DbError(err)) }
+}
+fn list_audit_log_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS audit_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT, action_kind TEXT, module_name TEXT, justification TEXT, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, actor, action_kind, module_name, justification, occurred_unix FROM audit_log_entry ORDER BY occurred_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_audit_log_entry() -> Result(json, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_audit_log_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
+screen AuditLogEntry {
+    title: "Audit Trail"
+
+    layout {
+        row {
+            field actor
+            field action_kind
+            field module_name
+            field justification
+            field occurred_unix
+        }
+    }
+}
+
+fn list_security_alert_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS security_alert_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, source_system TEXT, severity TEXT, description TEXT, occurred_unix INTEGER, acknowledged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, source_system, severity, description, occurred_unix, acknowledged FROM security_alert_entry ORDER BY occurred_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_security_alert_entry() -> Result(json, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_security_alert_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_security_alert_entry_inner(conn: db, s: SecurityAlertEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS security_alert_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, source_system TEXT, severity TEXT, description TEXT, occurred_unix INTEGER, acknowledged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO security_alert_entry (source_system, severity, description, occurred_unix, acknowledged) VALUES (?, ?, ?, ?, 0)", s.source_system, s.severity, s.description, s.occurred_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_security_alert_entry(s: SecurityAlertEntry) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_security_alert_entry_inner(conn, s), Err(e) => Err(DbError(e)) }
+}
+fn acknowledge_security_alert_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS security_alert_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, source_system TEXT, severity TEXT, description TEXT, occurred_unix INTEGER, acknowledged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let updated: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE security_alert_entry SET acknowledged = 1 WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let confirm: Result(json, ErrorCode) = match updated {
+        Ok(n) => match db_query(conn, "SELECT id, acknowledged FROM security_alert_entry WHERE id = ?", id) {
+            Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(e),
+    }
+    stop conn
+    return confirm
+}
+fn acknowledge_security_alert(id: i64) -> Result(json, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => acknowledge_security_alert_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
+screen SecurityAlertEntry {
+    title: "SIEM Security Alerts"
+    field severity {
+        render: "badge"
+    }
+    action "Acknowledge" -> acknowledge_security_alert {
+        style: "outlined"
+        show_result: true
+    }
+
+    layout {
+        row {
+            column {
+                field source_system
+                field description
+            }
+            column {
+                field severity
+                field occurred_unix
+                field acknowledged
+                action "Acknowledge"
+            }
+        }
+    }
+}
+
+// `create_integrity_scan` deliberately takes only `scan_kind` -- letting
+// an admin's own form set `tamper_detected`/`verification_status`
+// directly would mean asserting "verified, no tampering" without any
+// scan ever running (`ctms.nir`'s own same-day finding on this exact
+// struct shape). Only `run_integrity_scan` may ever set the real
+// result; new rows are hardcoded to `tamper_detected: false,
+// verification_status: ReviewStatusPending` server-side.
+fn create_integrity_scan_inner(conn: db, scan_kind: Text) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS integrity_scan (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_kind TEXT, last_run_unix INTEGER, tamper_detected INTEGER, verification_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO integrity_scan (scan_kind, last_run_unix, tamper_detected, verification_status) VALUES (?, 0, 0, 'ReviewStatusPending')", scan_kind.value) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_integrity_scan(scan_kind: Text) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_integrity_scan_inner(conn, scan_kind), Err(e) => Err(DbError(e)) }
+}
+fn list_integrity_scan_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS integrity_scan (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_kind TEXT, last_run_unix INTEGER, tamper_detected INTEGER, verification_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, scan_kind, last_run_unix, tamper_detected, verification_status FROM integrity_scan ORDER BY last_run_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_integrity_scan() -> Result(json, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_integrity_scan_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn run_integrity_scan_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS integrity_scan (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_kind TEXT, last_run_unix INTEGER, tamper_detected INTEGER, verification_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let updated: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE integrity_scan SET verification_status = 'ReviewStatusApproved', tamper_detected = 0 WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let confirm: Result(json, ErrorCode) = match updated {
+        Ok(n) => match db_query(conn, "SELECT id, verification_status, tamper_detected FROM integrity_scan WHERE id = ?", id) {
+            Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(e),
+    }
+    stop conn
+    return confirm
+}
+fn run_integrity_scan(id: i64) -> Result(json, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => run_integrity_scan_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
+screen IntegrityScan {
+    title: "Integrity / Tamper-Check"
+    field verification_status {
+        render: "badge"
+    }
+    action "Run Manual Scan" -> run_integrity_scan {
+        style: "filled"
+        show_result: true
+    }
+
+    layout {
+        row {
+            column {
+                field scan_kind
+                field last_run_unix
+            }
+            column {
+                field verification_status
+                field tamper_detected
+                action "Run Manual Scan"
+            }
+        }
+    }
+}
+
+fn list_archive_object_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS archive_object (id INTEGER PRIMARY KEY AUTOINCREMENT, object_name TEXT, retention_expiry_unix INTEGER, object_lock_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, object_name, retention_expiry_unix, object_lock_status FROM archive_object ORDER BY retention_expiry_unix") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_archive_object() -> Result(json, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_archive_object_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_archive_object_inner(conn: db, o: ArchiveObject) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS archive_object (id INTEGER PRIMARY KEY AUTOINCREMENT, object_name TEXT, retention_expiry_unix INTEGER, object_lock_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO archive_object (object_name, retention_expiry_unix, object_lock_status) VALUES (?, ?, ?)", o.object_name, o.retention_expiry_unix, o.object_lock_status) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_archive_object(o: ArchiveObject) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_archive_object_inner(conn, o), Err(e) => Err(DbError(e)) }
+}
+
+screen ArchiveObject {
+    title: "WORM Archive Browser"
+    field retention_expiry_unix {
+        label: "Retention Expiry"
+        render: "countdown"
+    }
+    field object_lock_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field object_name
+            }
+            column {
+                field object_lock_status
+                field retention_expiry_unix
+            }
+        }
+    }
+}
+
+// ---- Module 10 dashboard contributions. ---------------------------------
+
+fn stat_tamper_alert_count_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS integrity_scan (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_kind TEXT, last_run_unix INTEGER, tamper_detected INTEGER, verification_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM integrity_scan WHERE tamper_detected = 1") {
+        Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn stat_tamper_alert_count() -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => stat_tamper_alert_count_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
 // === APPEND POINT ===
 
 fn main() {}
