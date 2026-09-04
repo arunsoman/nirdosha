@@ -23,6 +23,113 @@ enum ErrorCode {
     DbError(str),
 }
 
+// ---- Closed-vocabulary status/severity enums, Track F4 Phase A's
+// `field { render: "badge" }` (`docs/LANGUAGE.md` SS18). Every variant is
+// prefixed with its own enum's name -- this language's enum variants
+// share one flat global namespace (no `EnumName::Variant` qualifier
+// exists at all), the same collision-avoidance convention
+// `examples/trade-finance/trade_finance.nir` already established
+// (`EntityType`/`AuditAction`/etc.), not invented here. Several of
+// these enums are deliberately reused across more than one struct field
+// below where the real-world vocabulary is genuinely the same concept
+// (e.g. `Severity` for every risk-tier-shaped field, `KycReviewStatus`
+// for both a wallet's own KYC submission and a master entity's KYC
+// state) rather than minting a near-duplicate enum per field.
+enum MatterStatus {
+    MatterStatusOpen,
+    MatterStatusInProgress,
+    MatterStatusEscalated,
+    MatterStatusResolved,
+    MatterStatusClosed,
+}
+enum Severity {
+    SeverityLow,
+    SeverityMedium,
+    SeverityHigh,
+    SeverityCritical,
+}
+enum ConnectionStatus {
+    ConnectionStatusConnected,
+    ConnectionStatusDisconnected,
+    ConnectionStatusError,
+}
+enum AlertStatus {
+    AlertStatusOpen,
+    AlertStatusDismissed,
+    AlertStatusEscalated,
+}
+enum ReferralStatus {
+    ReferralStatusPending,
+    ReferralStatusAccepted,
+    ReferralStatusDeclined,
+}
+enum SignatureStatus {
+    SignatureStatusValid,
+    SignatureStatusInvalid,
+    SignatureStatusPending,
+}
+enum RegReportStatus {
+    RegReportStatusDraft,
+    RegReportStatusPendingReview,
+    RegReportStatusApproved,
+    RegReportStatusFiled,
+}
+enum TransmissionStatus {
+    TransmissionStatusPending,
+    TransmissionStatusTransmitted,
+    TransmissionStatusFailed,
+}
+enum FlagStatus {
+    FlagStatusOpen,
+    FlagStatusUnderReview,
+    FlagStatusCleared,
+}
+enum HoldStatus {
+    HoldStatusActive,
+    HoldStatusReleased,
+    HoldStatusExpired,
+}
+enum ValidationStatus {
+    ValidationStatusPending,
+    ValidationStatusPassed,
+    ValidationStatusFailed,
+}
+enum SanctionsHitStatus {
+    SanctionsHitStatusUnderReview,
+    SanctionsHitStatusConfirmed,
+    SanctionsHitStatusFalsePositive,
+}
+enum ActionTaken {
+    ActionTakenAllowed,
+    ActionTakenChallenged,
+    ActionTakenBlocked,
+}
+enum VerificationStatus {
+    VerificationStatusPending,
+    VerificationStatusVerified,
+    VerificationStatusTamperDetected,
+}
+enum LockStatus {
+    LockStatusUnlocked,
+    LockStatusLocked,
+    LockStatusLegalHold,
+}
+enum ServiceHealthStatus {
+    ServiceHealthStatusHealthy,
+    ServiceHealthStatusDegraded,
+    ServiceHealthStatusDown,
+}
+enum KycReviewStatus {
+    KycReviewStatusPending,
+    KycReviewStatusApproved,
+    KycReviewStatusRejected,
+}
+enum FederatedStage {
+    FederatedStageSubmitted,
+    FederatedStageInReview,
+    FederatedStageCompleted,
+}
+
 struct Text {
     value: str,
 }
@@ -30,7 +137,7 @@ struct Text {
 struct Matter {
     id: i64,
     subject_name: str,
-    status: str,
+    status: MatterStatus,
     risk_score: i64,
     // Track E3's `field { render: "countdown" }` -- a unix-seconds SLA
     // deadline, rendered as a live "23m left"/"OVERDUE" chip on the
@@ -174,6 +281,15 @@ fn delete_matter(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
 // already use (`docs/LANGUAGE.md` SS11c/SS3).
 // Decision Panel / Case Export -- Track E4 preview-shaped actions on the
 // Matter Queue screen itself, alongside its Track E3 SLA countdown.
+// `resolution` stays free-text (a Decision Panel is a human typing a
+// resolution note, not picking from `MatterStatus`'s own closed
+// vocabulary) and writes straight into the `status` column via raw SQL,
+// bypassing `MatterStatus` entirely -- a real, disclosed gap: a value
+// that isn't one of `MatterStatus`'s own variant names still renders
+// (the `"badge"` widget colors by hashing whatever string it's given),
+// just not as one of the five real declared states. Left as-is rather
+// than forcing this panel into a fixed enum-of-outcomes it was never
+// designed around.
 fn record_matter_decision_inner(conn: db, id: i64, resolution: Text, justification: Text) -> Result(json, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
     let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE matter SET status = ? WHERE id = ?", resolution.value, id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
@@ -213,6 +329,9 @@ fn export_matter_dossier(id: i64) -> Result(json, ErrorCode) requires(role: "inv
 
 screen Matter {
     title: "Matter Queue"
+    field status {
+        render: "badge"
+    }
     field sla_deadline_unix {
         label: "SLA"
         render: "countdown"
@@ -220,6 +339,25 @@ screen Matter {
     action "Export Dossier" -> export_matter_dossier {
         style: "outlined"
         show_result: true
+    }
+
+    layout {
+        row {
+            column {
+                group "Matter" {
+                    field subject_name
+                    field status
+                    field risk_score
+                }
+            }
+            column {
+                group "SLA" {
+                    field sla_deadline_unix
+                }
+                divider {}
+                action "Export Dossier"
+            }
+        }
     }
 }
 
@@ -469,7 +607,7 @@ fn stat_open_matters_inner(conn: db) -> Result(i64, ErrorCode) {
         Ok(n) => n,
         Err(e) => -1,
     }
-    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM matter WHERE status = 'open'") {
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM matter WHERE status = 'MatterStatusOpen'") {
         Ok(rows) => match json_array_get(rows, 0) {
             Ok(row) => match json_get_i64(row, "value") {
                 Ok(n) => Ok(n),
@@ -532,7 +670,7 @@ fn stat_cases_nearing_sla_breach_inner(conn: db) -> Result(i64, ErrorCode) {
     }
     let result: Result(i64, ErrorCode) = match db_query(
         conn,
-        "SELECT COUNT(*) AS value FROM matter WHERE status = 'open' AND (sla_deadline_unix - strftime('%s','now')) BETWEEN 0 AND 3600"
+        "SELECT COUNT(*) AS value FROM matter WHERE status = 'MatterStatusOpen' AND (sla_deadline_unix - strftime('%s','now')) BETWEEN 0 AND 3600"
     ) {
         Ok(rows) => match json_array_get(rows, 0) {
             Ok(row) => match json_get_i64(row, "value") {
@@ -750,6 +888,21 @@ screen CompliancePolicy {
         style: "outlined"
         show_result: true
     }
+
+    layout {
+        row {
+            column {
+                group "Policy" {
+                    field name
+                    field threshold_cents
+                    field active
+                }
+            }
+            column {
+                action "Simulate"
+            }
+        }
+    }
 }
 
 dashboard {
@@ -874,7 +1027,7 @@ struct MatterEscalation {
     matter_id: i64,
     reason: str,
     target: str,
-    referral_status: str,
+    referral_status: ReferralStatus,
     regulator_response: str,
 }
 
@@ -908,6 +1061,31 @@ fn update_matter_escalation(e: MatterEscalation) -> Result(i64, ErrorCode) requi
 
 screen MatterEscalation {
     title: "Escalation & Regulatory Referral"
+    field matter_id {
+        render: "searchable_select"
+        source: Matter
+    }
+    field referral_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Escalation" {
+                    field matter_id
+                    field reason
+                    field target
+                }
+            }
+            column {
+                group "Referral" {
+                    field referral_status
+                    field regulator_response
+                }
+            }
+        }
+    }
 }
 
 // Case Linking / Entity Graph -- Track E2 visual.
@@ -995,7 +1173,7 @@ screen SlaRoutingRule {
 // one program-wide `dashboard { }` block below.
 fn stat_resolved_matter_count_inner(conn: db) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
-    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM matter WHERE status = 'resolved'") {
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM matter WHERE status = 'MatterStatusResolved'") {
         Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
         Err(e) => Err(DbError(e)),
     }
@@ -1033,7 +1211,7 @@ module "Data Ingestion" {
         name: str,
         source_type: str,
         format: str,
-        connection_status: str,
+        connection_status: ConnectionStatus,
         last_ingestion_unix: i64,
         active: bool,
     }
@@ -1124,9 +1302,33 @@ fn test_data_source_connection(id: i64) -> Result(json, ErrorCode) requires(role
 
 screen DataSource {
     title: "Source Connector Registry"
+    field connection_status {
+        render: "badge"
+    }
     action "Test Connection" -> test_data_source_connection {
         style: "outlined"
         show_result: true
+    }
+
+    layout {
+        row {
+            column {
+                group "Source" {
+                    field name
+                    field source_type
+                    field format
+                }
+            }
+            column {
+                group "Status" {
+                    field connection_status
+                    field last_ingestion_unix
+                    field active
+                }
+                divider {}
+                action "Test Connection"
+            }
+        }
     }
 }
 
@@ -1320,9 +1522,9 @@ module "Fraud Detection" {
         transaction_ref: str,
         risk_score: i64,
         triggering_rule: str,
-        severity: str,
+        severity: Severity,
         detected_unix: i64,
-        status: str,
+        status: AlertStatus,
     }
 
     struct AlertSignal {
@@ -1453,6 +1655,35 @@ fn list_similar_alerts_for_alert_inner(conn: db, alert_id: i64) -> Result(json, 
 }
 fn list_similar_alerts_for_alert(alert_id: i64) -> Result(json, ErrorCode) requires(role: "fraud_analyst") {
     return match db_connect("ctms.db") { Ok(conn) => list_similar_alerts_for_alert_inner(conn, alert_id), Err(e) => Err(DbError(e)) }
+}
+
+screen Alert {
+    title: "Suspicious-Transaction Alert Queue"
+    field severity {
+        render: "badge"
+    }
+    field status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Alert" {
+                    field transaction_ref
+                    field triggering_rule
+                    field risk_score
+                }
+            }
+            column {
+                group "Triage" {
+                    field severity
+                    field status
+                    field detected_unix
+                }
+            }
+        }
+    }
 }
 
 workspace AlertRiskBreakdown {
@@ -1679,7 +1910,7 @@ screen WatchlistEntry {
 
 fn stat_open_alert_count_inner(conn: db) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS alert (id INTEGER PRIMARY KEY AUTOINCREMENT, transaction_ref TEXT, risk_score INTEGER, triggering_rule TEXT, severity TEXT, detected_unix INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
-    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM alert WHERE status = 'Open'") {
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM alert WHERE status = 'AlertStatusOpen'") {
         Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
         Err(e) => Err(DbError(e)),
     }
