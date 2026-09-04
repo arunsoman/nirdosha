@@ -3642,6 +3642,360 @@ fn stat_tamper_alert_count() -> Result(i64, ErrorCode) requires(role: "admin") {
     return match db_connect("ctms_pro.db") { Ok(conn) => stat_tamper_alert_count_inner(conn), Err(e) => Err(DbError(e)) }
 }
 
-// === APPEND POINT ===
+// =========================================================================
+// Cross-cutting: Entity 360 (Master Entity Profile), the doc's own
+// "Related alerts and cases" / "graph views" / "risk chain graph"
+// language from the Investigation Workspace and layering-through-shell-
+// accounts use case, generalized into one composite entity view.
+// =========================================================================
 
-fn main() {}
+struct MasterEntity {
+    id: i64,
+    entity_name: str,
+    entity_type: str,
+    kyc_status: ReviewStatus,
+    risk_score: i64,
+    flagged: bool,
+}
+
+fn list_master_entity_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS master_entity (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_name TEXT, entity_type TEXT, kyc_status TEXT, risk_score INTEGER, flagged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, entity_name, entity_type, kyc_status, risk_score, flagged FROM master_entity ORDER BY risk_score DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_master_entity() -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_master_entity_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn get_master_entity_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS master_entity (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_name TEXT, entity_type TEXT, kyc_status TEXT, risk_score INTEGER, flagged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let row: Result(json, ErrorCode) = match db_query(conn, "SELECT id, entity_name, entity_type, kyc_status, risk_score, flagged FROM master_entity WHERE id = ?", id) {
+        Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return row
+}
+fn get_master_entity(id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => get_master_entity_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+fn create_master_entity_inner(conn: db, m: MasterEntity) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS master_entity (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_name TEXT, entity_type TEXT, kyc_status TEXT, risk_score INTEGER, flagged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO master_entity (entity_name, entity_type, kyc_status, risk_score, flagged) VALUES (?, ?, ?, ?, ?)", m.entity_name, m.entity_type, m.kyc_status, m.risk_score, m.flagged) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_master_entity(m: MasterEntity) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_master_entity_inner(conn, m), Err(e) => Err(DbError(e)) }
+}
+fn update_master_entity_inner(conn: db, m: MasterEntity) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS master_entity (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_name TEXT, entity_type TEXT, kyc_status TEXT, risk_score INTEGER, flagged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE master_entity SET entity_name = ?, entity_type = ?, kyc_status = ?, risk_score = ?, flagged = ? WHERE id = ?", m.entity_name, m.entity_type, m.kyc_status, m.risk_score, m.flagged, m.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_master_entity(m: MasterEntity) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => update_master_entity_inner(conn, m), Err(e) => Err(DbError(e)) }
+}
+
+screen MasterEntity {
+    title: "Master Entity Registry"
+    field kyc_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Entity" {
+                    field entity_name
+                    field entity_type
+                }
+            }
+            column {
+                group "Risk" {
+                    field kyc_status
+                    field risk_score
+                    field flagged
+                }
+            }
+        }
+    }
+}
+
+struct EntityCaseLink {
+    id: i64,
+    entity_id: i64,
+    investigation_id: i64,
+    case_status: CaseStatus,
+}
+
+fn list_entity_case_link_for_entity_inner(conn: db, entity_id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS entity_case_link (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_id INTEGER, investigation_id INTEGER, case_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, investigation_id, case_status FROM entity_case_link WHERE entity_id = ? ORDER BY id DESC", entity_id) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_entity_case_link_for_entity(entity_id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_entity_case_link_for_entity_inner(conn, entity_id), Err(e) => Err(DbError(e)) }
+}
+fn link_entity_to_case_inner(conn: db, entity_id: i64, investigation_id: i64) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS entity_case_link (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_id INTEGER, investigation_id INTEGER, case_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO entity_case_link (entity_id, investigation_id, case_status) VALUES (?, ?, 'CaseStatusOpen')", entity_id, investigation_id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn link_entity_to_case(entity_id: i64, investigation_id: i64) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => link_entity_to_case_inner(conn, entity_id, investigation_id), Err(e) => Err(DbError(e)) }
+}
+
+struct RiskScoreHistoryEntry {
+    id: i64,
+    entity_id: i64,
+    score: i64,
+    recorded_unix: i64,
+}
+
+fn list_risk_score_history_entry_for_entity_inner(conn: db, entity_id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS risk_score_history_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_id INTEGER, score INTEGER, recorded_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT recorded_unix AS ts, (CAST(score AS TEXT) || ' risk') AS label FROM risk_score_history_entry WHERE entity_id = ? ORDER BY recorded_unix", entity_id) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_risk_score_history_entry_for_entity(entity_id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_risk_score_history_entry_for_entity_inner(conn, entity_id), Err(e) => Err(DbError(e)) }
+}
+
+struct EntityLink {
+    id: i64,
+    source_entity_id: i64,
+    target_entity_id: i64,
+    link_reason: str,
+}
+
+fn create_entity_link_inner(conn: db, l: EntityLink) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS entity_link (id INTEGER PRIMARY KEY AUTOINCREMENT, source_entity_id INTEGER, target_entity_id INTEGER, link_reason TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO entity_link (source_entity_id, target_entity_id, link_reason) VALUES (?, ?, ?)", l.source_entity_id, l.target_entity_id, l.link_reason) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_entity_link(l: EntityLink) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_entity_link_inner(conn, l), Err(e) => Err(DbError(e)) }
+}
+// `panel { source: fn }` scopes the graph to one entity's own
+// neighborhood via a 3-subquery self-join, rather than returning the
+// whole unscoped graph the way a dashboard-level `graph_*` visual does
+// (`ctms.nir`'s own `PanelSourceWrongShape` finding on this exact
+// shape -- must take exactly one `i64` param).
+fn graph_entity_links_inner(conn: db, entity_id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS entity_link (id INTEGER PRIMARY KEY AUTOINCREMENT, source_entity_id INTEGER, target_entity_id INTEGER, link_reason TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let c2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS master_entity (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_name TEXT, entity_type TEXT, kyc_status TEXT, risk_score INTEGER, flagged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(json, ErrorCode) = match db_query(
+        conn,
+        "SELECT json_object('nodes', (SELECT json_group_array(json_object('id', id, 'label', entity_name, 'risk', risk_score)) FROM master_entity WHERE id = ? OR id IN (SELECT target_entity_id FROM entity_link WHERE source_entity_id = ?) OR id IN (SELECT source_entity_id FROM entity_link WHERE target_entity_id = ?)), 'edges', (SELECT json_group_array(json_object('source', source_entity_id, 'target', target_entity_id, 'weight', 1)) FROM entity_link WHERE source_entity_id = ? OR target_entity_id = ?)) AS value",
+        entity_id, entity_id, entity_id, entity_id, entity_id
+    ) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") {
+                Ok(s) => match json_parse(s) { Ok(v) => Ok(v), Err(e) => Err(DbError(e)) },
+                Err(e) => Err(DbError(e)),
+            },
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn graph_entity_links(entity_id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => graph_entity_links_inner(conn, entity_id), Err(e) => Err(DbError(e)) }
+}
+
+workspace EntityProfile {
+    title: "Entity 360"
+    subject: MasterEntity
+
+    panel "Alerts & Cases" {
+        source: list_entity_case_link_for_entity
+        action "Link to Case" -> link_entity_to_case {
+            style: "outlined"
+        }
+    }
+    panel "Risk Score Trend" {
+        source: list_risk_score_history_entry_for_entity
+        render: "timeline"
+    }
+    panel "Linked Entities" {
+        source: graph_entity_links
+        render: "graph"
+    }
+}
+
+// =========================================================================
+// Cross-cutting: Exchange / Partner FI Portal.
+// Doc: "Exchange/Partner FI ... Submits wallet KYC, receives inter-bank
+// alerts, participates in federated compliance workflows."
+// =========================================================================
+
+struct WalletKycSubmission {
+    id: i64,
+    exchange_name: str,
+    wallet_address: str,
+    kyc_document_ref: str,
+    review_status: ReviewStatus,
+    submitted_unix: i64,
+}
+
+fn list_wallet_kyc_submission_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet_kyc_submission (id INTEGER PRIMARY KEY AUTOINCREMENT, exchange_name TEXT, wallet_address TEXT, kyc_document_ref TEXT, review_status TEXT, submitted_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, exchange_name, wallet_address, kyc_document_ref, review_status, submitted_unix FROM wallet_kyc_submission ORDER BY submitted_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_wallet_kyc_submission() -> Result(json, ErrorCode) requires(role: "exchange_partner") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_wallet_kyc_submission_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn get_wallet_kyc_submission_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet_kyc_submission (id INTEGER PRIMARY KEY AUTOINCREMENT, exchange_name TEXT, wallet_address TEXT, kyc_document_ref TEXT, review_status TEXT, submitted_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let row: Result(json, ErrorCode) = match db_query(conn, "SELECT id, exchange_name, wallet_address, kyc_document_ref, review_status, submitted_unix FROM wallet_kyc_submission WHERE id = ?", id) {
+        Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return row
+}
+fn get_wallet_kyc_submission(id: i64) -> Result(json, ErrorCode) requires(role: "exchange_partner") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => get_wallet_kyc_submission_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+fn create_wallet_kyc_submission_inner(conn: db, w: WalletKycSubmission) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet_kyc_submission (id INTEGER PRIMARY KEY AUTOINCREMENT, exchange_name TEXT, wallet_address TEXT, kyc_document_ref TEXT, review_status TEXT, submitted_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO wallet_kyc_submission (exchange_name, wallet_address, kyc_document_ref, review_status, submitted_unix) VALUES (?, ?, ?, 'ReviewStatusPending', ?)", w.exchange_name, w.wallet_address, w.kyc_document_ref, w.submitted_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_wallet_kyc_submission(w: WalletKycSubmission) -> Result(i64, ErrorCode) requires(role: "exchange_partner") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_wallet_kyc_submission_inner(conn, w), Err(e) => Err(DbError(e)) }
+}
+
+screen WalletKycSubmission {
+    title: "Wallet KYC Submission Queue"
+    field review_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Submission" {
+                    field exchange_name
+                    field wallet_address
+                    field kyc_document_ref
+                }
+            }
+            column {
+                group "Review" {
+                    field review_status
+                    field submitted_unix
+                }
+            }
+        }
+    }
+}
+
+struct InterBankAlert {
+    id: i64,
+    submission_id: i64,
+    from_institution: str,
+    alert_message: str,
+    occurred_unix: i64,
+    acknowledged: bool,
+}
+
+fn list_inter_bank_alert_for_submission_inner(conn: db, submission_id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS inter_bank_alert (id INTEGER PRIMARY KEY AUTOINCREMENT, submission_id INTEGER, from_institution TEXT, alert_message TEXT, occurred_unix INTEGER, acknowledged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, from_institution, alert_message, occurred_unix, acknowledged FROM inter_bank_alert WHERE submission_id = ? ORDER BY occurred_unix DESC", submission_id) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_inter_bank_alert_for_submission(submission_id: i64) -> Result(json, ErrorCode) requires(role: "exchange_partner") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_inter_bank_alert_for_submission_inner(conn, submission_id), Err(e) => Err(DbError(e)) }
+}
+fn acknowledge_inter_bank_alert_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS inter_bank_alert (id INTEGER PRIMARY KEY AUTOINCREMENT, submission_id INTEGER, from_institution TEXT, alert_message TEXT, occurred_unix INTEGER, acknowledged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE inter_bank_alert SET acknowledged = 1 WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn acknowledge_inter_bank_alert(id: i64) -> Result(i64, ErrorCode) requires(role: "exchange_partner") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => acknowledge_inter_bank_alert_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
+// Workspace-panel-only, same shape as `ctms.nir`'s own `Transaction`/
+// `MatterNote` under `CaseInvestigation` -- no standalone `list_/
+// create_` pair, only ever browsed scoped to one submission.
+fn list_federated_workflow_status_entry_for_submission_inner(conn: db, submission_id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS federated_workflow_status_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, submission_id INTEGER, stage TEXT, updated_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, stage, updated_unix FROM federated_workflow_status_entry WHERE submission_id = ? ORDER BY updated_unix DESC", submission_id) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_federated_workflow_status_entry_for_submission(submission_id: i64) -> Result(json, ErrorCode) requires(role: "exchange_partner") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_federated_workflow_status_entry_for_submission_inner(conn, submission_id), Err(e) => Err(DbError(e)) }
+}
+
+workspace ExchangePartnerPortal {
+    title: "Exchange / Partner FI Portal"
+    subject: WalletKycSubmission
+
+    panel "Inter-Bank Alerts" {
+        source: list_inter_bank_alert_for_submission
+        action "Acknowledge" -> acknowledge_inter_bank_alert {
+            style: "outlined"
+        }
+    }
+    panel "Federated Workflow Status" {
+        source: list_federated_workflow_status_entry_for_submission
+        render: "timeline"
+    }
+}
+
+// =========================================================================
+// The one program-wide `dashboard{}` block (parser-enforced: exactly
+// one per program). Every module's own "role home" folds in here with
+// grouped tiles/visuals instead of a separate dashboard per module.
+// =========================================================================
+
+dashboard {
+    tile "Active Sources" -> stat_active_source_count
+    tile "Unreviewed Ingestion Errors" -> stat_unreviewed_ingestion_error_count
+    tile "Open Alerts" -> stat_open_alert_count
+    tile "Open Investigations" -> stat_open_investigation_count
+    tile "Nearing SLA Breach" -> stat_investigation_nearing_sla_breach
+    tile "Shared Data Volume" -> stat_shared_volume_count
+    tile "Open Compliance Flags" -> stat_open_compliance_flag_count
+    tile "Active Legal Holds" -> stat_active_legal_hold_count
+    tile "Sanctioned Wallets" -> stat_sanctioned_wallet_count
+    tile "Blocked RTFDS Attempts" -> stat_blocked_attempt_count
+    tile "Tamper Alerts" -> stat_tamper_alert_count
+
+    // `chart_<name>() -> json` fns (Ingestion Volume by Source, Alert
+    // Volume by Severity, Entity Risk Ranking) need no `visual{}`
+    // declaration at all -- the `chart_` naming convention alone lands
+    // them on the dashboard as an inline-SVG bar chart automatically.
+    visual "Wallet Clusters" -> graph_wallet_clusters {
+        render: "graph"
+    }
+    visual "Transaction Geography" -> heatmap_transaction_geo {
+        render: "heatmap"
+    }
+    visual "Case Linking / Entity Graph" -> graph_case_links {
+        render: "graph"
+    }
+}
+
+// `main` is never invoked meaningfully by `nirdosha serve` (GET / =
+// UI, POST /api/<fn> = the real entrypoints above) -- `requires(public)`
+// here is a deliberate, honest "yes, anyone, no token" rather than the
+// implicit-and-unreviewed default the compiler would otherwise warn
+// about.
+fn main() requires(public) {}
