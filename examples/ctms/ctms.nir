@@ -139,6 +139,18 @@ enum DownloadStatus {
     DownloadStatusReady,
     DownloadStatusFailed,
 }
+// The exact 8 `requires(role: "...")` values this file's own `fn`s
+// already check against -- grounded in that list, not invented.
+enum UserRole {
+    UserRoleAdmin,
+    UserRoleComplianceOfficer,
+    UserRoleExchangePartner,
+    UserRoleFraudAnalyst,
+    UserRoleIngestionAdmin,
+    UserRoleInvestigator,
+    UserRoleRegulator,
+    UserRoleSupervisor,
+}
 
 struct Text {
     value: str,
@@ -3090,8 +3102,8 @@ module "RTFDS" {
         user_ref: str,
         device_ref: str,
         ip_address: str,
-        risk_tier: str,
-        action_taken: str,
+        risk_tier: Severity,
+        action_taken: ActionTaken,
         occurred_unix: i64,
     }
 
@@ -3153,6 +3165,32 @@ fn override_rtfds_action(id: i64, new_action: Text) -> Result(json, ErrorCode) r
 // gap in today's `screen` action shape, not silently routed around.
 screen RtfdsEvent {
     title: "Session/Fraud Alert Queue"
+    field risk_tier {
+        render: "badge"
+    }
+    field action_taken {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Event" {
+                    field event_type
+                    field user_ref
+                    field device_ref
+                    field ip_address
+                }
+            }
+            column {
+                group "Disposition" {
+                    field risk_tier
+                    field action_taken
+                    field occurred_unix
+                }
+            }
+        }
+    }
 }
 
 fn create_device_link_inner(conn: db, l: DeviceLink) -> Result(i64, ErrorCode) {
@@ -3194,7 +3232,7 @@ screen DeviceLink {
 
 fn stat_blocked_attempt_count_inner(conn: db) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS rtfds_event (id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, user_ref TEXT, device_ref TEXT, ip_address TEXT, risk_tier TEXT, action_taken TEXT, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
-    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM rtfds_event WHERE action_taken = 'blocked'") {
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM rtfds_event WHERE action_taken = 'ActionTakenBlocked'") {
         Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
         Err(e) => Err(DbError(e)),
     }
@@ -3225,7 +3263,7 @@ module "IAM" {
     struct AppUser {
         id: i64,
         username: str,
-        role_name: str,
+        role_name: UserRole,
         department: str,
         active: bool,
     }
@@ -3299,6 +3337,22 @@ fn delete_app_user(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
 
 screen AppUser {
     title: "User & Role Management"
+    field role_name {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field username
+                field department
+            }
+            column {
+                field role_name
+                field active
+            }
+        }
+    }
 }
 
 fn list_identity_provider_config_inner(conn: db) -> Result(json, ErrorCode) {
