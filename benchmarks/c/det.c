@@ -2,7 +2,7 @@
 #include <stdio.h>
 
 // Gaussian elimination with partial pivoting -- the exact algorithm
-// compiler/src/interpreter.rs's matrix_det() uses, translated directly,
+// crates/compiler/src/interpreter.rs's matrix_det() uses, translated directly,
 // so results are bit-for-bit comparable with Nirdosha (not just
 // "close," the way Julia's LAPACK-based det() is).
 double det4(double a[16]) {

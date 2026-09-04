@@ -1,7 +1,7 @@
 // A real shipment-tracking app, served with `nirdosha serve
 // examples/measure_shipment.nir --port 8081 --db measure_shipment.db`.
 //
-// Demonstrates `LANGUAGE.md` §6d's `dec128`/`UnitCode`/`Measure` end to
+// Demonstrates `docs/LANGUAGE.md` §6d's `dec128`/`UnitCode`/`Measure` end to
 // end. As of 2026-08-27 all three are real **prelude** types, built into
 // every `.nir` program automatically (no more pasting the starter
 // `UnitCode` list into each file that needs it -- see
@@ -101,7 +101,7 @@ fn delete_shipment(id: i64) -> Result(i64, ErrorCode) requires(public) {
 
 // ---- the actual point of this demo --------------------------------------
 
-// `LANGUAGE.md` §6d's `add_measure`, as a real endpoint returning a real
+// `docs/LANGUAGE.md` §6d's `add_measure`, as a real endpoint returning a real
 // prelude `Measure` value -- `POST /api/combine_shipments` with
 // `{"a": {...}, "b": {...}}`.
 fn combine_shipments(a: Shipment, b: Shipment) -> Result(Measure, ErrorCode) requires(public) {
@@ -111,7 +111,7 @@ fn combine_shipments(a: Shipment, b: Shipment) -> Result(Measure, ErrorCode) req
     return Ok(Measure(a.quantity + b.quantity, a.unit_code))
 }
 
-// `LANGUAGE.md` §6d's `ucum_code`, verbatim, as a real endpoint --
+// `docs/LANGUAGE.md` §6d's `ucum_code`, verbatim, as a real endpoint --
 // `POST /api/ucum_code_of` with `{"unit_code": "Kilogram"}` returns
 // `{"ok": {"value": "kg"}}`.
 fn ucum_code_of(unit_code: UnitCode) -> Text requires(public) {

@@ -702,7 +702,7 @@ module "Module 2: Corporate & Counterparty Onboarding (KYC/KYB)" {
 
 // Categorical, human-chosen at onboarding (never system-computed) --
 // a real zero-payload enum, per the language's new categorical-field
-// support (LANGUAGE.md SS12's sibling `module` note; see
+// support (docs/LANGUAGE.md SS12's sibling `module` note; see
 // `interpreter.rs::sql_bind_params`/`serve.rs::decode_enum_value` for
 // the round-trip fix that makes this possible at all). `emit-ui` renders
 // it as a searchable dropdown, options in this declaration order.
@@ -921,11 +921,11 @@ fn check_credit_hold(counterparty_id: i64, amount_cents: i64) -> bool {
 // ---- financial statements: real ratio computation ------------------
 //
 // `Ty::I64`/`Ty::F64` have no conversion operator between them
-// (LANGUAGE.md §3), so ratios are computed and stored as basis points
+// (docs/LANGUAGE.md §3), so ratios are computed and stored as basis points
 // (i64 * 10000 / i64) throughout, the same convention
 // `examples/rev-assurence/rev_assurance.nir`'s `stat_leakage_rate_bps`
 // already established -- real division, guarded against a zero
-// divisor (`LANGUAGE.md` §4: int division traps on zero).
+// divisor (`docs/LANGUAGE.md` §4: int division traps on zero).
 
 struct FinancialStatement {
     id: i64,
@@ -994,10 +994,10 @@ fn create_financial_statement(fs: FinancialStatement) -> Result(i64, ErrorCode) 
 
 }
 
-// `screen`/`dashboard` blocks stay top-level-only (LANGUAGE.md's `module`
+// `screen`/`dashboard` blocks stay top-level-only (docs/LANGUAGE.md's `module`
 // section) -- deliberately outside every `module { ... }` block, not a
 // business-organizational choice. This is the one worked example of
-// field-level RBAC in this app (LANGUAGE.md's `screen`/`dashboard`
+// field-level RBAC in this app (docs/LANGUAGE.md's `screen`/`dashboard`
 // section): `risk_rating` is compliance-sensitive, so only
 // `compliance_officer`/`bank_ops` can see it at all (every other role
 // `list_counterparty`'s own `trade_party` gate admits -- `corporate_
@@ -2292,7 +2292,7 @@ module "Module 5: Invoice Discounting & Supply Chain Finance" {
 // liquidity. Double-discounting prevention is a real SQL exact-match
 // query on (invoice_number, tax_id, supplier_code, face_value_cents) --
 // zero false negatives by construction (todo.md's own description);
-// Nirdosha has no i64->str cast (LANGUAGE.md §3), so the amount
+// Nirdosha has no i64->str cast (docs/LANGUAGE.md §3), so the amount
 // participates directly in the SQL match rather than folding it into a
 // sha256_hex-built composite key the way Module 1's audit chain hashes
 // its (all-str) fields -- same real guarantee, no Redis-backed hash index
@@ -2429,7 +2429,7 @@ fn create_invoice(inv: Invoice) -> Result(i64, ErrorCode) {
 // `[MOCK]` -- stands in for a live SOFR/EURIBOR benchmark feed; kept as
 // basis points (i64), not `f64`, so it composes with every other rate in
 // this file without an int<->float cast Nirdosha doesn't have
-// (LANGUAGE.md §3) -- same convention as `required_eyes_for_amount` and
+// (docs/LANGUAGE.md §3) -- same convention as `required_eyes_for_amount` and
 // every other `_bps` field in this build.
 fn mock_benchmark_rate_bps() -> i64 {
     return 525
@@ -3200,7 +3200,7 @@ fn accrue_daily_interest() -> i64 {
 
 // ---- `[MOCK]` FX -- stands in for a live SOFR-style benchmark or FX
 // feed; fixed illustrative cross-rates, bps-scaled (x10000) so the
-// result stays an exact i64 (no int<->float cast, LANGUAGE.md §3).
+// result stays an exact i64 (no int<->float cast, docs/LANGUAGE.md §3).
 // Written as a nested `match` rather than `==` pairs -- both work
 // (`interpreter.rs::eval_binary` now has a `Value::Enum` arm), `match`
 // just reads better for a full currency-pair lookup table than a long
@@ -3528,7 +3528,7 @@ fn list_virtual_iban() -> Result(json, ErrorCode) requires(role: "bank_ops") {
 // Provisioning is Maker-Checker per the doc's table -- plain callable
 // here, same disclosed per-module scoping as every earlier module's
 // non-marquee actions. `iban_number` is caller-supplied rather than
-// generated: Nirdosha has no string concatenation (LANGUAGE.md §2), so
+// generated: Nirdosha has no string concatenation (docs/LANGUAGE.md §2), so
 // there is no way to compose e.g. a country-code prefix with a freshly
 // minted numeric id into one string internally.
 fn create_virtual_iban_inner(conn: db, buyer_counterparty_id: i64, seller_counterparty_id: i64, iban_number: Text, partner_bank_note: Text) -> Result(i64, ErrorCode) {
@@ -3670,7 +3670,7 @@ module "Module 9: Integration, Analytics & External Reporting" {
 // called out as high-risk). `mock_basel_extract`/`mock_aml_export` return
 // a real *computed* SQL aggregate (`Result(i64, ErrorCode)`, not a literal
 // stub) rather than a hand-built JSON blob: Nirdosha has no i64->str
-// cast (LANGUAGE.md §3), so a dynamic number can never be spliced into a
+// cast (docs/LANGUAGE.md §3), so a dynamic number can never be spliced into a
 // JSON string literal -- the same constraint every other module in this
 // file works around by returning a plain number or persisting to a
 // `list_`-able table instead.

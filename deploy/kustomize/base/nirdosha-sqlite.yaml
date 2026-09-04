@@ -103,7 +103,7 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
           readinessProbe:
-            # Doubles as the startup probe (KUBERNETES.md: "same route as
+            # Doubles as the startup probe (docs/KUBERNETES.md: "same route as
             # readiness, with a longer failureThreshold, works as a startup
             # probe") -- a generous budget for schema migration + crash
             # replay to finish before the Pod is ever marked NotReady long

@@ -62,11 +62,11 @@ echo
 echo "================================================================"
 echo "Build"
 echo "================================================================"
-if [ ! -x "$REPO_ROOT/compiler/target/release/nirdosha" ]; then
+if [ ! -x "$REPO_ROOT/crates/compiler/target/release/nirdosha" ]; then
     echo "Building nirdosha --release (not found)..."
     (cd "$REPO_ROOT/compiler" && cargo build --release)
 fi
-NIRDOSHA_BIN="$REPO_ROOT/compiler/target/release/nirdosha"
+NIRDOSHA_BIN="$REPO_ROOT/crates/compiler/target/release/nirdosha"
 echo "nirdosha binary: $NIRDOSHA_BIN"
 echo
 

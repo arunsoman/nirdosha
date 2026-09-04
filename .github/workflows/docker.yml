@@ -1,10 +1,10 @@
 name: docker
 
-# Publishes ghcr.io/protobox/nirdosha-runtime — KUBERNETES.md's P0 item
+# Publishes ghcr.io/protobox/nirdosha-runtime — docs/KUBERNETES.md's P0 item
 # ("no published nirdosha binary/base image exists yet"), and protobox's
 # plugins/languages/nirdosha.py's own `docker_image` field, which already
 # names this target — plus ghcr.io/protobox/nirdosha-presence-gateway
-# (`presence-gateway/`, ROADMAP.md Track A5's own image, added
+# (`crates/presence-gateway/`, docs/ROADMAP.md Track A5's own image, added
 # 2026-08-28: the two images share this one workflow, matrixed, rather
 # than a second near-duplicate file, since every step past "which
 # Dockerfile/image name" is identical). Separate from release.yml (which
@@ -22,7 +22,7 @@ name: docker
 #
 # Signed (cosign, keyless via GitHub OIDC — no key material to manage or
 # leak) and SBOM'd (syft, attached as an attestation) on every publish,
-# for both images — KUBERNETES.md's "SBOM / image signing (Sigstore,
+# for both images — docs/KUBERNETES.md's "SBOM / image signing (Sigstore,
 # SLSA)" row.
 
 on:
@@ -43,7 +43,7 @@ jobs:
       # One image's build failing shouldn't cancel the other's -- they're
       # independent artifacts with independent consumers (protobox's own
       # nirdosha.py names only the runtime image; presence-gateway is an
-      # optional, separately-opted-into sidecar, ROADMAP.md A5).
+      # optional, separately-opted-into sidecar, docs/ROADMAP.md A5).
       fail-fast: false
       matrix:
         include:
@@ -53,7 +53,7 @@ jobs:
             sbom_file: nirdosha-runtime.sbom.spdx.json
           - name: presence-gateway
             image: ghcr.io/protobox/nirdosha-presence-gateway
-            dockerfile: presence-gateway/Dockerfile
+            dockerfile: crates/presence-gateway/Dockerfile
             sbom_file: nirdosha-presence-gateway.sbom.spdx.json
     steps:
       - uses: actions/checkout@v4
@@ -88,10 +88,10 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           # Both Dockerfiles need the repo root as their build context —
-          # `presence-gateway/Dockerfile` also `COPY`s `compiler/`'s
-          # manifest for its `[dev-dependencies]` path resolution (that
-          # Dockerfile's own doc comment), not just `presence-gateway/`
-          # itself.
+          # `crates/presence-gateway/Dockerfile` also `COPY`s
+          # `crates/compiler/`'s manifest for its `[dev-dependencies]`
+          # path resolution (that Dockerfile's own doc comment), not just
+          # `crates/presence-gateway/` itself.
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64,linux/arm64

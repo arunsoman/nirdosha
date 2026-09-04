@@ -141,7 +141,7 @@ fn delete_product(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
 // fixed +10 rather than taking a quantity param, because a declared
 // custom action's client-side handler currently sends only the row's id
 // (mirrors `delete_product`'s own single-param call), the same v1 limit
-// `compiler/UI_DSL_TODO.md` tracks for a future multi-param action form.
+// `crates/compiler/UI_DSL_TODO.md` tracks for a future multi-param action form.
 fn restock_product_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
     let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price_cents INTEGER, stock INTEGER)") {
         Ok(n) => n,
@@ -166,7 +166,7 @@ fn restock_product(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
 // of the plain struct/CRUD-naming inference above -- everything not
 // mentioned here (the `create`/`update`/`delete` slots, the `id`/
 // `price_cents`/`stock` fields) still comes from inference unchanged.
-// See LANGUAGE.md's "screen / dashboard" section and GRAMMAR.md's
+// See docs/LANGUAGE.md's "screen / dashboard" section and docs/GRAMMAR.md's
 // `screen_decl` production for the full syntax.
 screen Product {
     title: "Catalog"

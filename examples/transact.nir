@@ -1,4 +1,4 @@
-// `transact { ... }` -- TRANSACT.md's durable-effect construct.
+// `transact { ... }` -- docs/TRANSACT.md's durable-effect construct.
 //
 // Full protocol: precheck?, network, verify, commit, compensate?, log? --
 //
@@ -31,7 +31,7 @@
 // reconciliation run again later) to keep retrying.
 //
 // `transact` is an *expression* (not a statement) that produces `bool` --
-// the same "block-value convention `if` already uses" TRANSACT.md names
+// the same "block-value convention `if` already uses" docs/TRANSACT.md names
 // explicitly, which is why `return transact { ... }` below works exactly
 // like `return if c {..} else {..}` already does.
 
@@ -80,7 +80,7 @@ fn checkout(amount: i64) -> bool {
 }
 
 // A `transact` with no `precheck`/`compensate`/`log` slot at all -- all
-// three are optional (TRANSACT.md's grammar), and `verify == false` with
+// three are optional (docs/TRANSACT.md's grammar), and `verify == false` with
 // no `compensate` present still yields `false`, it just has nothing to
 // run on the way there.
 fn minimal(amount: i64) -> bool {

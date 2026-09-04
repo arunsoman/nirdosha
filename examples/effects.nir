@@ -1,4 +1,4 @@
-// `effect(...)` -- PROTOLANG_PORT.md's "Locked design 1", goal.md's
+// `effect(...)` -- docs/PROTOLANG_PORT.md's "Locked design 1", docs/goal.md's
 // "Effects" synthesis layer (rows 4, 9). Fully inferred by default (no
 // annotation, no notational cost); a declared annotation is checked
 // against what the body actually does -- an effect the body performs but

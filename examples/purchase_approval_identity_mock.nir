@@ -1,5 +1,5 @@
 // A mock identity provider for the `examples/purchase_approval.nir` demo
-// (`ROADMAP.md` Track A item A13) -- same recipe `examples/
+// (`docs/ROADMAP.md` Track A item A13) -- same recipe `examples/
 // identity_mock.nir`'s own doc comment documents in full: `POST
 // /api/login {"subject":"...","role":"..."}` mints a real signed token
 // via `mock_issue_token` against a fixed, published JWKS; the token then

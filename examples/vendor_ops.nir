@@ -5,7 +5,7 @@
 // (`risk_score` is admin-only -- an `analyst` login sees it redacted to
 // null, not just hidden by convention), a role-gated custom action
 // (`Approve` on a payout), and a real dashboard tile + chart. Themed via
-// `--theme examples/vendor_ops_theme.json` (see LANGUAGE.md SS11b).
+// `--theme examples/vendor_ops_theme.json` (see docs/LANGUAGE.md SS11b).
 //
 // Serve it (from the repo root -- `db_connect("vendor_ops.db")` below is
 // a relative path, so it must match `--db`'s own relative path exactly,

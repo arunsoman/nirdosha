@@ -1,4 +1,4 @@
-// A worked example for `workflow { ... }` (WORKFLOW.md): a minimal KYC
+// A worked example for `workflow { ... }` (docs/WORKFLOW.md): a minimal KYC
 // onboarding pipeline. Demonstrates:
 //   - a `data` block and `data.<field>` implicit bindings
 //   - `on_entry` notification actions (`notify`, `send_email`)
@@ -14,10 +14,10 @@
 // own `submit_kyc_application`/`review_kyc_application` wrappers). Not
 // runnable end-to-end without a real webhook endpoint behind
 // `EmailProviderConfig` and (for the online/push path) a Redis instance —
-// see WORKFLOW.md's "Deliberate non-goals" for exactly what's real today
+// see docs/WORKFLOW.md's "Deliberate non-goals" for exactly what's real today
 // versus what needs an operator's own infrastructure.
 
-// LANGUAGE.md §6b's carrier-struct convention: free text that has to
+// docs/LANGUAGE.md §6b's carrier-struct convention: free text that has to
 // cross a function boundary (every wrapper `fn` below is a real
 // `program.fns` entry, so a bare `str` parameter is rejected).
 struct Text {
@@ -26,11 +26,11 @@ struct Text {
 
 // The "communication control" — an ordinary, admin-editable struct.
 // `nirdosha serve --db` migrates this into `email_provider_config`
-// automatically (LANGUAGE.md §13); an admin fills in `host`/`port`/
+// automatically (docs/LANGUAGE.md §13); an admin fills in `host`/`port`/
 // `path`/`api_key`/`from_address` through the free CRUD screen this
-// struct already gets (LANGUAGE.md §11) and flips `active` once real
+// struct already gets (docs/LANGUAGE.md §11) and flips `active` once real
 // values are in place. `send_email`/`notify` read the first `active = 1`
-// row of this exact table at send time (WORKFLOW.md).
+// row of this exact table at send time (docs/WORKFLOW.md).
 struct EmailProviderConfig {
     id: i64,
     active: bool,
@@ -198,7 +198,7 @@ workflow KycOnboarding {
     }
 
     state UnderReview {
-        // `WORKFLOW.md`'s "state ownership + a generated queue UI"
+        // `docs/WORKFLOW.md`'s "state ownership + a generated queue UI"
         // section: `owner` matches `notify_compliance_review_needed`'s
         // own notification target below exactly (they usually do, though
         // nothing forces it — see that section's `owner`/`on_entry`
@@ -233,7 +233,7 @@ workflow KycOnboarding {
 // over its `_inner` helper: a caller shouldn't have to know the exact
 // synthesized name/shape to use this workflow.
 // `start_kyc_onboarding`'s leading `identity: Option(VerifiedIdentity)`
-// param (`WORKFLOW.md`'s "who submitted this" section) is `None()` here
+// param (`docs/WORKFLOW.md`'s "who submitted this" section) is `None()` here
 // deliberately, not a shortcut: a brand-new applicant doing KYC has no
 // account yet, so there's genuinely no identity to record as
 // `started_by_subject` — the legitimate anonymous-intake case that
@@ -244,7 +244,7 @@ fn submit_kyc_application(applicant_subject: Text, risk_score: i64) -> Result(i6
 }
 
 // `identity` is a real, disclosed breaking-change param
-// (`WORKFLOW.md`'s "state ownership" section) — `advance_kyc_onboarding`
+// (`docs/WORKFLOW.md`'s "state ownership" section) — `advance_kyc_onboarding`
 // now checks it against `UnderReview`'s own `owner: role(...)` above, so
 // this wrapper has to take one to pass through (`nirdosha serve` injects
 // it from the caller's bearer token automatically; see `serve.rs::dispatch`).

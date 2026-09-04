@@ -1,4 +1,4 @@
-// Live demo for `ROADMAP.md` Track A item A13 / `WORKFLOW.md`'s "State
+// Live demo for `docs/ROADMAP.md` Track A item A13 / `docs/WORKFLOW.md`'s "State
 // ownership + a generated queue UI" section: a purchase order needs
 // sequential sign-off from three different roles, in order, before it's
 // approved -- a plain multi-level approval chain (contrast the six-eyes
@@ -17,7 +17,7 @@
 // see `scratch/` for a worked login flow). `submit_purchase_order`
 // requires a real, signed-in `employee` -- unlike `kyc_onboarding.nir`'s
 // deliberately anonymous public intake, "who submitted this" is exactly
-// what this demo wants to show off (`WORKFLOW.md`'s "who submitted
+// what this demo wants to show off (`docs/WORKFLOW.md`'s "who submitted
 // this" section): the requester's own `identity.subject` is recorded as
 // `data.requester_subject` *and* durably as `workflow_instance.
 // started_by_subject`, so they can later pull up their own request's
@@ -34,7 +34,7 @@
 // on exactly the requests waiting on *them* -- and lets the original
 // requester see exactly their own, read-only, with a full audit trail.
 
-// `LANGUAGE.md` §6b's carrier-struct convention: free text crossing a
+// `docs/LANGUAGE.md` §6b's carrier-struct convention: free text crossing a
 // real `fn` boundary can't be a bare `str` (`submit_purchase_order`
 // below is a real, user-facing `program.fns` entry, not a workflow-
 // lowering-synthesized one, so it isn't exempt the way `data { ... }`'s

@@ -4,18 +4,18 @@
 grammar change, no `typeck.rs`/`ui_gen.rs`/`serve.rs` change, no `.nir`
 code landed anywhere in this repo as of this writing. This is step 2 of
 the CTMS forcing-function initiative — `examples/ctms/SCREENS.md` (step 1,
-left untouched by this doc, same `PUBLIC_ROADMAP.md`/`ROADMAP.md`
+left untouched by this doc, same `docs/PUBLIC_ROADMAP.md`/`docs/ROADMAP.md`
 scannable-summary-vs-full-detail split) inventoried all 89 screens a real
 CTMS needs; this doc takes every "hard" screen shape from that inventory
 and asks, concretely, what Nirdosha's `screen`/`dashboard`/`module` DSL
-(`LANGUAGE.md` §11/§12, `compiler/src/ui_gen.rs`,
-`compiler/src/ui_gen_template.html`) would need to grow in order to
+(`docs/LANGUAGE.md` §11/§12, `crates/compiler/src/ui_gen.rs`,
+`crates/compiler/src/ui_gen_template.html`) would need to grow in order to
 generate it — not a wishlist, a specific proposal per construct, at the
-same level of detail `MOBILE.md` uses for its own not-yet-built
+same level of detail `docs/MOBILE.md` uses for its own not-yet-built
 constructs (problem framing, grammar-shaped syntax, what it lowers to,
 a worked example, open questions). A human reviews this design — and
-cross-checks any grammar delta against `grammar_check/`'s independent
-LALR parser and the `compiler/nirdosha.gbnf` export — before any of it is
+cross-checks any grammar delta against `crates/grammar_check/`'s independent
+LALR parser and the `crates/compiler/nirdosha.gbnf` export — before any of it is
 built.
 
 ## The finding that matters
@@ -30,8 +30,8 @@ screens (13) are already fully expressible with today's `struct` +
 "simulate before apply" is just a custom `action` calling an ordinary fn.
 Section 6 below proves this with two worked examples, precisely so this
 doc doesn't inflate the language surface for screens that don't need it —
-the same restraint `MOBILE.md`'s own "already reusable, unchanged" table
-takes, and the same instinct `AGENTS.md`/`LANGUAGE.md`'s existing
+the same restraint `docs/MOBILE.md`'s own "already reusable, unchanged" table
+takes, and the same instinct `AGENTS.md`/`docs/LANGUAGE.md`'s existing
 minimalism (one chart type, one animation vocabulary, a fixed seven-kind
 form-control set) already commits to.
 
@@ -80,7 +80,7 @@ its actions are that one struct's CRUD functions plus declared
 one screen, all scoped to one case instance* — there is no single struct
 whose fields are "a case's transactions plus its alerts plus its notes."
 Faking this with `module "Investigation" { ... }` groups screens in the
-nav sidebar (`LANGUAGE.md` §12) but still renders them as separate pages,
+nav sidebar (`docs/LANGUAGE.md` §12) but still renders them as separate pages,
 not one composed view a Supervisor can read at a glance. This is a real
 gap, not an under-used existing feature.
 
@@ -107,7 +107,7 @@ workspace CaseInvestigation {
 ```
 
 **Grammar** (mirrors `screen_decl`/`action_decl` almost exactly — see
-`GRAMMAR.md`'s existing `screen_decl ::= "screen" ident "{" screen_item*
+`docs/GRAMMAR.md`'s existing `screen_decl ::= "screen" ident "{" screen_item*
 "}"` production for the pattern this follows):
 
 ```ebnf
@@ -124,10 +124,10 @@ panel_item     ::= action_decl | kv_entry
 `workspace` is a new fully-reserved top-level keyword (dispatched on the
 first token exactly like `screen`/`dashboard`/`module`/`workflow`
 already are — confirmed zero collisions: `workspace` and `panel` are
-unused as identifiers anywhere in `compiler/src/*.rs` or
+unused as identifiers anywhere in `crates/compiler/src/*.rs` or
 `examples/*.nir` today). `panel` is a **contextual** keyword, the same
 "keyword only within this one leading position" treatment `field`/
-`action`/`tile`/`chart` already get (`GRAMMAR.md`'s own note on this):
+`action`/`tile`/`chart` already get (`docs/GRAMMAR.md`'s own note on this):
 disambiguated from a `kv_entry` the same way `action_decl` already is —
 `panel_decl`'s second token is always a `string`, `kv_entry`'s second
 token is always `:`, so the two-token dispatch is unambiguous, no
@@ -177,7 +177,7 @@ logic there at all. Motion: the workspace root gets `screen-enter`
 exactly like any other screen; each panel card gets the existing `.card`
 styling and, where it holds a list, the same `row-enter`/`--stagger-ms`
 per-row entrance every other table already has — no new animation
-vocabulary, reusing `LANGUAGE.md` §11b's fixed four-keyframe set as-is.
+vocabulary, reusing `docs/LANGUAGE.md` §11b's fixed four-keyframe set as-is.
 
 **`serve.rs`**: **nothing.** Every panel's `source` fn and every panel
 action are ordinary `.nir` functions already exposed at `POST /api/<fn>`
@@ -262,7 +262,7 @@ ordinary CRUD building blocks.
   in depth here.
 - **Nested workspaces / panel-of-panels.** Deliberately excluded, same
   "single-level only" discipline `module` and `transact` slots already
-  enforce (`GRAMMAR.md`'s note on `module_decl`) — a panel's `render`
+  enforce (`docs/GRAMMAR.md`'s note on `module_decl`) — a panel's `render`
   can select a richer visualization (§2) but never another `workspace`.
 - **Does a panel need its own pagination?** `dispatch_table_query`'s
   page/sort/search machinery is scoped to a whole struct's table, not an
@@ -286,7 +286,7 @@ panels for several more.**
 ### Is this really new?
 
 Yes for the visualization itself (today's `dashboard` has exactly one
-chart kind — an inline-SVG bar chart, `LANGUAGE.md` §11's own listed
+chart kind — an inline-SVG bar chart, `docs/LANGUAGE.md` §11's own listed
 "deliberate non-goal": "no line/scatter/heatmap/treemap/geo/3D"). But the
 *grammar* delta is small and deliberately reuses the existing
 `dashboard_item`/`kv_entry` shape rather than inventing a parallel
@@ -532,7 +532,7 @@ several already-CRUD-shaped config-as-data screens from `SCREENS.md`.**
 
 Barely — it's the smallest extension in this document, one boolean key
 on an already-existing construct. Today's declared `action "<label>" ->
-<fn> { style, confirm }` (`LANGUAGE.md` §11) calls `fn` and, per
+<fn> { style, confirm }` (`docs/LANGUAGE.md` §11) calls `fn` and, per
 `ui_gen_template.html`'s existing convention, just refreshes the row/list
 on success — there's no way today to *show the caller what the fn
 returned*. A "Simulate" action's entire value is its return value (e.g.
@@ -628,7 +628,7 @@ progress stepper instead of a bare state-name label.
 ### Is this really new?
 
 No — everything the render needs is **already parsed**. A `workflow`
-block (`LANGUAGE.md` §14, `WORKFLOW.md`) already declares its `state`s
+block (`docs/LANGUAGE.md` §14, `docs/WORKFLOW.md`) already declares its `state`s
 in order, and `workflow_lower.rs` already synthesizes
 `list_<workflow>_pending_for_me`, whose per-row response already
 includes `state`/`state_label` (`ui_gen.rs`'s `WorkflowQueue`, `236`).
@@ -735,8 +735,8 @@ fourth new construct.
 
 Naming these now so nobody reading this doc mistakes a screen shape from
 `SCREENS.md` for something silently promised — same "disclosed gap, not
-silently dropped" discipline `MOBILE.md`'s own "Rich profile" section and
-`WORKFLOW.md`'s presence-bridge section already practice.
+silently dropped" discipline `docs/MOBILE.md`'s own "Rich profile" section and
+`docs/WORKFLOW.md`'s presence-bridge section already practice.
 
 - **Ad-hoc Query Builder (Module 5's Self-Service Query Interface) — not
   designed at all in this doc.** Nirdosha deliberately has zero string
@@ -764,7 +764,7 @@ silently dropped" discipline `MOBILE.md`'s own "Rich profile" section and
 - **No file/document upload anywhere in this doc** — Evidence
   Management's panel (§1) can list and link evidence *metadata* (a row
   per document: filename, hash, uploader, tag), never the file bytes
-  themselves. This is the exact same gap `MOBILE.md`'s own `D3` names
+  themselves. This is the exact same gap `docs/MOBILE.md`'s own `D3` names
   and defers: **no file/blob/attachment type exists anywhere in
   Nirdosha today** (confirmed absent, not merely unrendered — there is
   no `Vector`/`Matrix`-style fixed-shape collection that fits either;
@@ -784,7 +784,7 @@ silently dropped" discipline `MOBILE.md`'s own "Rich profile" section and
 - **No real-time push beyond §3's client-side countdown.** Every
   workspace panel, graph, and heatmap in this doc is fetched on
   navigation (or on a manual refresh action), never subscribed to. The
-  `presence-gateway` (`ROADMAP.md` Track A5, `[DONE]`) already exists and
+  `presence-gateway` (`docs/ROADMAP.md` Track A5, `[DONE]`) already exists and
   already relays `workflow`'s `notify()` to a live WebSocket for a
   connected browser — nothing in this doc wires any of the new
   constructs above to it. A live-updating Alert Queue or a

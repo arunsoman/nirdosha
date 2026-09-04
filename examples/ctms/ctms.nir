@@ -1,5 +1,5 @@
 // CTMS -- Track E1 proof-of-concept for `workspace`/`panel`
-// (`ROADMAP.md` Track E1, `examples/ctms/UI_CONSTRUCTS.md` SS1). This is
+// (`docs/ROADMAP.md` Track E1, `examples/ctms/UI_CONSTRUCTS.md` SS1). This is
 // deliberately NOT the full CTMS rebuild -- that's Track E6, blocked on
 // E1-E5 all landing. This file exists to prove the Investigation
 // Workspace worked example for real: a `Matter` (an investigative case
@@ -34,7 +34,7 @@ struct Matter {
     risk_score: i64,
     // Track E3's `field { render: "countdown" }` -- a unix-seconds SLA
     // deadline, rendered as a live "23m left"/"OVERDUE" chip on the
-    // Matter Queue instead of a raw integer (`LANGUAGE.md` SS11c/SS3).
+    // Matter Queue instead of a raw integer (`docs/LANGUAGE.md` SS11c/SS3).
     sla_deadline_unix: i64,
 }
 
@@ -171,7 +171,7 @@ fn delete_matter(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
 // Track E3 -- the Matter Queue's live SLA countdown. No grammar change:
 // `field { render: "countdown" }` is an ordinary `kv_entry` inside the
 // same `field <name> { ... }` block `label`/`pattern`/`min`/`max`
-// already use (`LANGUAGE.md` SS11c/SS3).
+// already use (`docs/LANGUAGE.md` SS11c/SS3).
 // Decision Panel / Case Export -- Track E4 preview-shaped actions on the
 // Matter Queue screen itself, alongside its Track E3 SLA countdown.
 fn record_matter_decision_inner(conn: db, id: i64, resolution: Text, justification: Text) -> Result(json, ErrorCode) {
@@ -196,7 +196,7 @@ fn record_matter_decision(id: i64, resolution: Text, justification: Text) -> Res
 fn export_matter_dossier_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
     // A real dossier would bundle a signed PDF/CSV/JSON artifact --
-    // Nirdosha has no file/blob type yet (`MOBILE.md`'s D3 already names
+    // Nirdosha has no file/blob type yet (`docs/MOBILE.md`'s D3 already names
     // this same gap). This returns the JSON summary a real one would be
     // built from, honestly short of the real deliverable, not silently
     // pretending to produce one.
@@ -257,11 +257,11 @@ fn create_transaction(t: Transaction) -> Result(i64, ErrorCode) requires(role: "
 }
 
 // The Investigation Workspace's "Transactions" panel source -- shaped
-// as `{ts, label}[]` (Track E2's timeline contract, `LANGUAGE.md`
+// as `{ts, label}[]` (Track E2's timeline contract, `docs/LANGUAGE.md`
 // SS11c) rather than raw columns, since this fn's only consumer is that
 // one `panel { render: "timeline" }`. Exactly one `i64` param,
 // `Result(json, _)` return -- `typeck.rs::check_workspace`'s required
-// shape (LANGUAGE.md SS15). `||`/`CAST` below are ordinary SQL, executed
+// shape (docs/LANGUAGE.md SS15). `||`/`CAST` below are ordinary SQL, executed
 // server-side by SQLite -- Nirdosha's own expression grammar still has
 // no `str` concatenation operator at all (`UI_CONSTRUCTS.md` SS7's own
 // disclosed limit); this sidesteps it by pushing the formatting into the
@@ -315,7 +315,7 @@ fn list_matter_note(matter_id: i64) -> Result(json, ErrorCode) requires(role: "i
 
 // `author`/`body` both stay `Text`, never a bare `str` -- the
 // enum-favoring-`str`-ban applies at *every* user fn's call boundary,
-// including a private `_inner` helper (LANGUAGE.md SS6b) -- only
+// including a private `_inner` helper (docs/LANGUAGE.md SS6b) -- only
 // builtins (`db_execute` etc.) are exempt.
 fn add_matter_note_inner(conn: db, matter_id: i64, author: Text, body: Text) -> Result(i64, ErrorCode) {
     let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter_note (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, author TEXT, body TEXT)") {
@@ -331,7 +331,7 @@ fn add_matter_note_inner(conn: db, matter_id: i64, author: Text, body: Text) -> 
 }
 
 // `author` is hardcoded here since real subject identity plumbing into
-// a panel action's own params is future work, same as `WORKFLOW.md`'s
+// a panel action's own params is future work, same as `docs/WORKFLOW.md`'s
 // disclosed "comment not yet threaded into on_entry/on_exit" gap.
 fn add_matter_note(matter_id: i64, body: Text) -> Result(i64, ErrorCode) requires(role: "investigator") {
     return match db_connect("ctms.db") {
@@ -520,7 +520,7 @@ fn stat_high_risk_wallet_count() -> Result(i64, ErrorCode) requires(public) {
 // (`UI_CONSTRUCTS.md` SS3's own "Open questions": "just an ordinary
 // stat_<name>() -> i64 counting function -- no render involvement at
 // all"). `strftime('%s','now')` is SQLite's own clock, not Nirdosha's --
-// this language has no wall-clock builtin at all (`LANGUAGE.md` SS9's
+// this language has no wall-clock builtin at all (`docs/LANGUAGE.md` SS9's
 // deliberate no-wall-clock determinism stance), the same way this file
 // already leans on SQL's own `||`/`json_object` for what Nirdosha's own
 // expression grammar can't do, pushed into the query text rather than
@@ -555,7 +555,7 @@ fn stat_cases_nearing_sla_breach() -> Result(i64, ErrorCode) requires(public) {
 }
 
 // `render: "graph"`'s required `{"nodes":[...], "edges":[...]}` envelope
-// (`LANGUAGE.md` SS11c) is built entirely in SQL -- SQLite's own bundled
+// (`docs/LANGUAGE.md` SS11c) is built entirely in SQL -- SQLite's own bundled
 // `json_object`/`json_group_array` functions -- since Nirdosha itself has
 // no builtin to combine two `db_query` results into one nested JSON
 // object. The one `db_query` call returns a single row whose one column
@@ -771,7 +771,7 @@ dashboard {
 
 // ---- Track E5: the Case Workflow/Stage Tracker (Module 3) -------------
 // `UI_CONSTRUCTS.md` SS5's own worked example, built for real: no syntax
-// beyond what `WORKFLOW.md` already supports -- the stepper is purely a
+// beyond what `docs/WORKFLOW.md` already supports -- the stepper is purely a
 // rendering upgrade on top of this declared `state` order.
 workflow CaseLifecycle {
     data {
@@ -1020,7 +1020,7 @@ fn chart_matters_by_status() -> Result(json, ErrorCode) requires(public) {
 // `examples/ctms/SCREENS.md`'s 89-screen inventory, built against the
 // actual construct each needs (E1-E5), not a stub. Structs are grouped
 // under `module "<Module Name>" { ... }` purely for nav grouping
-// (LANGUAGE.md SS12) -- fns/screens/dashboard/workspace stay top-level,
+// (docs/LANGUAGE.md SS12) -- fns/screens/dashboard/workspace stay top-level,
 // since `module` bodies may only hold `fn`/`struct`/`enum` (parser.rs's
 // own "screen/dashboard blocks must be declared at top level" rule).
 // =========================================================================
@@ -3053,14 +3053,31 @@ fn get_audit_log_entry_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
 fn get_audit_log_entry(id: i64) -> Result(json, ErrorCode) requires(public) {
     return match db_connect("ctms.db") { Ok(conn) => get_audit_log_entry_inner(conn, id), Err(e) => Err(DbError(e)) }
 }
-fn create_audit_log_entry_inner(conn: db, a: AuditLogEntry) -> Result(i64, ErrorCode) {
+// Deliberately named `record_` here, not `create_` -- an audit trail is
+// meant to be an append-only side effect of *other* modules' actions
+// (`create_matter`, `update_wallet`, and so on each ought to call this
+// as they run), never something a human fills into a form. `create_`
+// would trip `ui_gen`'s naming-convention inference (`build_screens`,
+// `ui_gen.rs`) and render a manual "Add" button + form on the "Audit
+// Search & Export" screen -- exactly the CRUD-that-shouldn't-exist this
+// was flagged for (SCREENS.md's own Module 10 row lists this screen's
+// actions as "Search, export ..., verify integrity" only, no create).
+// Gated to `admin` (was `requires(public)` -- a real bug: literally
+// anyone, unauthenticated, could POST a fabricated entry -- actor,
+// justification, timestamp, legal-hold reference all attacker-chosen --
+// straight into what's supposed to be the tamper-evident record of who
+// did what; every sibling struct in this same module, e.g.
+// `create_security_alert_entry`/`create_integrity_scan` below, already
+// requires `role: "admin"` for its own writes -- this one just hadn't
+// been brought in line).
+fn record_audit_log_entry_inner(conn: db, a: AuditLogEntry) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS audit_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT, action_kind TEXT, module_name TEXT, justification TEXT, occurred_unix INTEGER, legal_hold_ref INTEGER)") { Ok(n) => n, Err(e) => -1 }
     let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO audit_log_entry (actor, action_kind, module_name, justification, occurred_unix, legal_hold_ref) VALUES (?, ?, ?, ?, ?, ?)", a.actor, a.action_kind, a.module_name, a.justification, a.occurred_unix, a.legal_hold_ref) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
     stop conn
     return result
 }
-fn create_audit_log_entry(a: AuditLogEntry) -> Result(i64, ErrorCode) requires(public) {
-    return match db_connect("ctms.db") { Ok(conn) => create_audit_log_entry_inner(conn, a), Err(e) => Err(DbError(e)) }
+fn record_audit_log_entry(a: AuditLogEntry) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms.db") { Ok(conn) => record_audit_log_entry_inner(conn, a), Err(e) => Err(DbError(e)) }
 }
 // "export signed bundles" -- Track E4 preview action; a real signed
 // PDF/CSV/JSON bundle needs a file/blob type Nirdosha doesn't have yet
@@ -3130,14 +3147,32 @@ fn list_integrity_scan_inner(conn: db) -> Result(json, ErrorCode) {
 fn list_integrity_scan() -> Result(json, ErrorCode) requires(public) {
     return match db_connect("ctms.db") { Ok(conn) => list_integrity_scan_inner(conn), Err(e) => Err(DbError(e)) }
 }
-fn create_integrity_scan_inner(conn: db, s: IntegrityScan) -> Result(i64, ErrorCode) {
+// Deliberately takes just `scan_kind`, not the whole `IntegrityScan`
+// struct -- the naming convention only requires `create_<snake>` to
+// exist and be gated, not that its param be the struct itself
+// (`ui_gen.rs::build_action` renders whatever params the fn actually
+// declares). Registering a new integrity-check job is legitimate admin
+// work (`SCREENS.md`'s own "Integrity-scan history" implies new scan
+// kinds get added over time); *declaring its result* is not -- that's
+// exactly what `tamper_detected`/`verification_status` are, and per
+// `SCREENS.md`'s Module 10 row this screen's only actions are "Run
+// manual scan, view tamper detail," never a raw create-with-any-values
+// form. The old signature let an admin's own form submission simply
+// assert "verified, no tampering" for a scan that never ran -- worse
+// than clutter, a way to fake the one thing this screen exists to
+// prove. New rows now always start `tamper_detected: false,
+// verification_status: "pending"` -- untrue until `run_integrity_scan`
+// (below) actually sets it, the same "only the real check may assert
+// the result" principle the audit-log fix just applied to
+// `record_audit_log_entry`.
+fn create_integrity_scan_inner(conn: db, scan_kind: Text) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS integrity_scan (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_kind TEXT, last_run_unix INTEGER, tamper_detected INTEGER, verification_status TEXT)") { Ok(n) => n, Err(e) => -1 }
-    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO integrity_scan (scan_kind, last_run_unix, tamper_detected, verification_status) VALUES (?, ?, ?, ?)", s.scan_kind, s.last_run_unix, s.tamper_detected, s.verification_status) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO integrity_scan (scan_kind, last_run_unix, tamper_detected, verification_status) VALUES (?, 0, 0, 'pending')", scan_kind.value) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
     stop conn
     return result
 }
-fn create_integrity_scan(s: IntegrityScan) -> Result(i64, ErrorCode) requires(role: "admin") {
-    return match db_connect("ctms.db") { Ok(conn) => create_integrity_scan_inner(conn, s), Err(e) => Err(DbError(e)) }
+fn create_integrity_scan(scan_kind: Text) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms.db") { Ok(conn) => create_integrity_scan_inner(conn, scan_kind), Err(e) => Err(DbError(e)) }
 }
 fn run_integrity_scan_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS integrity_scan (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_kind TEXT, last_run_unix INTEGER, tamper_detected INTEGER, verification_status TEXT)") { Ok(n) => n, Err(e) => -1 }

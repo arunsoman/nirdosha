@@ -5,9 +5,9 @@ instructions, Windsurf, Cline, and the paste-anywhere prompt). Most of
 those platforms don't support file includes, so the body below is
 duplicated into each with platform-specific wrapping — if you're fixing
 a factual error, fix it here first, then propagate to the others.
-Source of truth for everything below: LANGUAGE.md and GRAMMAR.md in the
+Source of truth for everything below: docs/LANGUAGE.md and docs/GRAMMAR.md in the
 main Nirdosha repo (https://github.com/arunsoman/nirdosha). If those
-docs and this file ever disagree, LANGUAGE.md/GRAMMAR.md win.
+docs and this file ever disagree, docs/LANGUAGE.md/docs/GRAMMAR.md win.
 -->
 
 # Writing Nirdosha (`.nir`) code
@@ -598,7 +598,7 @@ fn main() {
 Naming `list_<struct>`/`create_<struct>`/`update_<struct>`/
 `delete_<struct>` functions like this is also what `nirdosha emit-ui`/
 `nirdosha serve` use to auto-generate a full CRUD web UI with zero
-extra syntax — see the `screen`/`dashboard` DSL in `LANGUAGE.md` §11 if
+extra syntax — see the `screen`/`dashboard` DSL in `docs/LANGUAGE.md` §11 if
 you need to customize that generated UI (custom labels, field
 validation, role-gated visibility, dashboard tiles/charts).
 
@@ -613,7 +613,7 @@ checked live, per instance, not statically — and `nirdosha serve`/
 `emit-ui` generate a "Workflows" queue screen from it automatically
 (each role sees only what's waiting on them, plus a "my requests" tab
 for whoever started an instance and an audit-trail "history" view), no
-extra syntax needed. See `WORKFLOW.md` for the full construct.
+extra syntax needed. See `docs/WORKFLOW.md` for the full construct.
 
 ## How to verify what you wrote
 
@@ -652,7 +652,7 @@ run through the real compiler.
 
 ## Where to go deeper
 
-Full type/builtin reference: `LANGUAGE.md`. Full EBNF grammar:
-`GRAMMAR.md`. `workflow`/state-ownership construct: `WORKFLOW.md`.
+Full type/builtin reference: `docs/LANGUAGE.md`. Full EBNF grammar:
+`docs/GRAMMAR.md`. `workflow`/state-ownership construct: `docs/WORKFLOW.md`.
 Worked examples: `examples/*.nir` in the main repo
 (https://github.com/arunsoman/nirdosha).

@@ -1,6 +1,6 @@
 // Exercises: `spawn`, `join`, and `thread <T>`. `spawn f(args)` runs `f`
 // concurrently (a real OS thread in this first implementation -- see
-// PHASE0.md) and immediately returns a `thread T` handle, where `T` is
+// docs/PHASE0.md) and immediately returns a `thread T` handle, where `T` is
 // `f`'s return type. `join h` blocks until that computation finishes and
 // consumes the handle, producing its `T`-typed result.
 //
