@@ -15,11 +15,12 @@ ring = "0.17"
 rusqlite = { version = "0.31", features = ["bundled"] }
 redis = "0.27"
 tiny_http = "0.12"
+flate2 = "1"
 postgres = "0.19"
 postgres-native-tls = "0.5"
 regex = "1.13.1"
 rust_decimal = "1"
-# Connection pooling (compiler/src/pool.rs) -- r2d2 is the generic
+# Connection pooling (crates/compiler/src/pool.rs) -- r2d2 is the generic
 # pool/Manager machinery, kept generic on purpose so any future pooled
 # resource (not just db_connect's two backends) gets it for free; r2d2_
 # sqlite/r2d2_postgres are the two Manager impls this layer needs today.

@@ -138,6 +138,83 @@ fn header(name: &str, value: &str) -> tiny_http::Header {
     tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("header name/value are plain ASCII here")
 }
 
+/// Below this, gzip's own framing overhead (~20 bytes) plus the CPU cost
+/// of compressing at all routinely outweighs the saving -- most `/api/*`
+/// JSON responses (a handful of bytes to a few hundred) are already
+/// smaller than that. `GET /`'s `ui_gen`-derived HTML (100s of KB) is the
+/// case this actually exists for.
+const COMPRESSION_THRESHOLD_BYTES: usize = 512;
+
+fn accepts_gzip(request: &tiny_http::Request) -> bool {
+    request
+        .headers()
+        .iter()
+        .any(|h| h.field.as_str().as_str().eq_ignore_ascii_case("Accept-Encoding") && h.value.as_str().to_ascii_lowercase().contains("gzip"))
+}
+
+fn gzip_compress(body: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(body).expect("writing into an in-memory Vec<u8> cannot fail");
+    encoder.finish().expect("finishing an in-memory gzip stream cannot fail")
+}
+
+/// Single response-sending path for every route in `run`'s dispatch loop
+/// below, replacing what used to be ~17 separate inline `Response::
+/// from_string(...).with_header(...)` call sites (one per route) --
+/// consolidated so the two "reduce per-request bytes on the wire" levers
+/// live in exactly one place instead of needing to be re-added at each
+/// site: gzip-compresses the body whenever the client advertises
+/// `Accept-Encoding: gzip` and the payload clears
+/// `COMPRESSION_THRESHOLD_BYTES` (`Vary: Accept-Encoding` always
+/// accompanies it, so a shared cache in front of this never serves the
+/// wrong encoding to a client that didn't ask for it), and always applies
+/// CORS + records the status in `metrics`. `extra_headers` carries
+/// anything route-specific (`Location` on a redirect, `ETag`/
+/// `Cache-Control` on `GET /`) that doesn't fit the common
+/// status/content-type/body shape.
+fn send_response(
+    request: tiny_http::Request,
+    metrics: &Metrics,
+    request_started_at: Instant,
+    status: u16,
+    content_type: Option<&str>,
+    body: String,
+    extra_headers: Vec<tiny_http::Header>,
+) {
+    let use_gzip = body.len() >= COMPRESSION_THRESHOLD_BYTES && accepts_gzip(&request);
+    let bytes: Vec<u8> = if use_gzip { gzip_compress(body.as_bytes()) } else { body.into_bytes() };
+    let mut resp = tiny_http::Response::from_data(bytes).with_status_code(status);
+    if let Some(ct) = content_type {
+        resp.add_header(header("Content-Type", ct));
+    }
+    if use_gzip {
+        resp.add_header(header("Content-Encoding", "gzip"));
+    }
+    resp.add_header(header("Vary", "Accept-Encoding"));
+    for h in cors_headers() {
+        resp.add_header(h);
+    }
+    for h in extra_headers {
+        resp.add_header(h);
+    }
+    let _ = request.respond(resp);
+    metrics.record(status, request_started_at.elapsed());
+}
+
+/// Weak validator for `GET /`'s `ui_gen`-derived HTML -- not a security
+/// hash (`DefaultHasher` is not cryptographic), just a cheap change
+/// detector so a client that already has the current bytes (the common
+/// case: the same generated UI on every page load/refresh until the
+/// server is restarted or `--theme` hot-reloads) gets a bodyless `304`
+/// instead of re-downloading the whole page.
+fn compute_etag(body: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hasher);
+    format!("\"{:x}\"", hasher.finish())
+}
+
 /// Maximum request body size accepted by either `POST` route. `tiny_http`
 /// already buffers the whole body; this cap prevents a single huge request
 /// from exhausting the server's memory.
@@ -579,26 +656,19 @@ pub fn run(
 
         if method == tiny_http::Method::Get && url == "/healthz" {
             // Liveness: answers the instant the listener is bound, no
-            // dependency check -- `KUBERNETES.md`'s own stated contract
+            // dependency check -- `docs/KUBERNETES.md`'s own stated contract
             // ("no dependency check needed for liveness specifically").
             // By the time this loop can even run, migration + crash
             // replay (both above, before `Server::http` binds at all)
             // have already succeeded, so there is nothing further to
             // verify here.
-            let mut resp = tiny_http::Response::from_string(r#"{"status":"ok"}"#)
-                .with_status_code(200)
-                .with_header(header("Content-Type", "application/json"));
-            for h in cors_headers() {
-                resp.add_header(h);
-            }
-            let _ = request.respond(resp);
-            metrics.record(200, request_started_at.elapsed());
+            send_response(request, &metrics, request_started_at, 200, Some("application/json"), r#"{"status":"ok"}"#.to_string(), vec![]);
             continue;
         }
 
         if method == tiny_http::Method::Get && url == "/readyz" {
             // Readiness (and, with a longer `failureThreshold`, a startup
-            // probe -- `KUBERNETES.md`'s own note that these can share a
+            // probe -- `docs/KUBERNETES.md`'s own note that these can share a
             // route): unlike `/healthz`, this genuinely checks the one
             // thing that can go degraded *after* a successful startup --
             // the `--db`-backed table/role-cache connection, if one was
@@ -617,35 +687,17 @@ pub fn run(
             };
             let status = if ready { 200 } else { 503 };
             let body = serde_json::json!({"status": if ready {"ready"} else {"not_ready"}, "detail": detail}).to_string();
-            let mut resp =
-                tiny_http::Response::from_string(body).with_status_code(status).with_header(header("Content-Type", "application/json"));
-            for h in cors_headers() {
-                resp.add_header(h);
-            }
-            let _ = request.respond(resp);
-            metrics.record(status, request_started_at.elapsed());
+            send_response(request, &metrics, request_started_at, status, Some("application/json"), body, vec![]);
             continue;
         }
 
         if method == tiny_http::Method::Get && url == "/metrics" {
-            let mut resp = tiny_http::Response::from_string(metrics.render())
-                .with_status_code(200)
-                .with_header(header("Content-Type", "text/plain; version=0.0.4"));
-            for h in cors_headers() {
-                resp.add_header(h);
-            }
-            let _ = request.respond(resp);
-            metrics.record(200, request_started_at.elapsed());
+            send_response(request, &metrics, request_started_at, 200, Some("text/plain; version=0.0.4"), metrics.render(), vec![]);
             continue;
         }
 
         if method == tiny_http::Method::Options {
-            let mut resp = tiny_http::Response::from_string("").with_status_code(204);
-            for h in cors_headers() {
-                resp.add_header(h);
-            }
-            let _ = request.respond(resp);
-            metrics.record(204, request_started_at.elapsed());
+            send_response(request, &metrics, request_started_at, 204, None, String::new(), vec![]);
             continue;
         }
 
@@ -657,13 +709,28 @@ pub fn run(
                 }
                 _ => ui_html.clone(),
             };
-            let mut resp = tiny_http::Response::from_string(html)
-                .with_header(header("Content-Type", "text/html; charset=utf-8"));
-            for h in cors_headers() {
-                resp.add_header(h);
+            // `ETag`/`If-None-Match`: this HTML is static between
+            // requests (byte-for-byte the same `ui_html`, or the same
+            // `theme_cache` entry until its TTL next refreshes it above),
+            // so a client re-requesting it -- a page refresh, or the same
+            // tab reopened -- gets a bodyless `304` instead of
+            // re-downloading the whole page. `Cache-Control: no-cache`
+            // (not `max-age`) so the browser always revalidates rather
+            // than risking a stale page after a `--theme` hot-reload or
+            // server restart -- correctness first, the 304 round-trip
+            // still saves the actual page weight either way.
+            let etag = compute_etag(&html);
+            let if_none_match = request
+                .headers()
+                .iter()
+                .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("If-None-Match"))
+                .map(|h| h.value.as_str().to_string());
+            let cache_headers = vec![header("ETag", &etag), header("Cache-Control", "no-cache")];
+            if if_none_match.as_deref() == Some(etag.as_str()) {
+                send_response(request, &metrics, request_started_at, 304, None, String::new(), cache_headers);
+            } else {
+                send_response(request, &metrics, request_started_at, 200, Some("text/html; charset=utf-8"), html, cache_headers);
             }
-            let _ = request.respond(resp);
-            metrics.record(200, request_started_at.elapsed());
             continue;
         }
 
@@ -702,14 +769,7 @@ pub fn run(
                 Ok(None) => (401, json_err("not signed in")),
                 Err(status_body) => status_body,
             };
-            let mut resp = tiny_http::Response::from_string(payload)
-                .with_status_code(status)
-                .with_header(header("Content-Type", "application/json"));
-            for h in cors_headers() {
-                resp.add_header(h);
-            }
-            let _ = request.respond(resp);
-            metrics.record(status, request_started_at.elapsed());
+            send_response(request, &metrics, request_started_at, status, Some("application/json"), payload, vec![]);
             continue;
         }
 
@@ -728,29 +788,21 @@ pub fn run(
                     url_encode_component(&state),
                     url_encode_component(&code_challenge),
                 );
-                let mut resp = tiny_http::Response::from_string("").with_status_code(302).with_header(header("Location", &redirect_url));
-                for h in cors_headers() {
-                    resp.add_header(h);
-                }
-                let _ = request.respond(resp);
-                metrics.record(302, request_started_at.elapsed());
+                send_response(request, &metrics, request_started_at, 302, None, String::new(), vec![header("Location", &redirect_url)]);
                 continue;
             }
             if method == tiny_http::Method::Get && url.starts_with("/auth/callback") {
                 let query = url.splitn(2, '?').nth(1).unwrap_or("");
                 let params = parse_query_string(query);
                 let (status, body_or_redirect) = handle_oidc_callback(&params, cfg, &pkce_store, auth.as_ref().as_ref());
-                let mut resp = match body_or_redirect {
-                    OidcCallbackOutcome::Redirect(location) => tiny_http::Response::from_string("").with_status_code(status).with_header(header("Location", &location)),
-                    OidcCallbackOutcome::Error(msg) => tiny_http::Response::from_string(json_err(&msg))
-                        .with_status_code(status)
-                        .with_header(header("Content-Type", "application/json")),
+                match body_or_redirect {
+                    OidcCallbackOutcome::Redirect(location) => {
+                        send_response(request, &metrics, request_started_at, status, None, String::new(), vec![header("Location", &location)])
+                    }
+                    OidcCallbackOutcome::Error(msg) => {
+                        send_response(request, &metrics, request_started_at, status, Some("application/json"), json_err(&msg), vec![])
+                    }
                 };
-                for h in cors_headers() {
-                    resp.add_header(h);
-                }
-                let _ = request.respond(resp);
-                metrics.record(status, request_started_at.elapsed());
                 continue;
             }
         }
@@ -761,12 +813,7 @@ pub fn run(
                     Ok(b) => b,
                     Err(status_body) => {
                         let status = status_body.0;
-                        let mut resp = tiny_http::Response::from_string(status_body.1).with_status_code(status);
-                        for h in cors_headers() {
-                            resp.add_header(h);
-                        }
-                        let _ = request.respond(resp);
-                        metrics.record(status, request_started_at.elapsed());
+                        send_response(request, &metrics, request_started_at, status, None, status_body.1, vec![]);
                         continue;
                     }
                 };
@@ -790,14 +837,7 @@ pub fn run(
                     },
                     None => (404, json_err("no --db was passed to `nirdosha serve`; the generic table-query route is disabled")),
                 };
-                let mut resp = tiny_http::Response::from_string(payload)
-                    .with_status_code(status)
-                    .with_header(header("Content-Type", "application/json"));
-                for h in cors_headers() {
-                    resp.add_header(h);
-                }
-                let _ = request.respond(resp);
-                metrics.record(status, request_started_at.elapsed());
+                send_response(request, &metrics, request_started_at, status, Some("application/json"), payload, vec![]);
                 continue;
             }
             if demo_mode && url == "/api/_demo_login" {
@@ -805,24 +845,12 @@ pub fn run(
                     Ok(b) => b,
                     Err(status_body) => {
                         let status = status_body.0;
-                        let mut resp = tiny_http::Response::from_string(status_body.1).with_status_code(status);
-                        for h in cors_headers() {
-                            resp.add_header(h);
-                        }
-                        let _ = request.respond(resp);
-                        metrics.record(status, request_started_at.elapsed());
+                        send_response(request, &metrics, request_started_at, status, None, status_body.1, vec![]);
                         continue;
                     }
                 };
                 let (status, payload) = handle_demo_login(&body, auth.as_ref().as_ref());
-                let mut resp = tiny_http::Response::from_string(payload)
-                    .with_status_code(status)
-                    .with_header(header("Content-Type", "application/json"));
-                for h in cors_headers() {
-                    resp.add_header(h);
-                }
-                let _ = request.respond(resp);
-                metrics.record(status, request_started_at.elapsed());
+                send_response(request, &metrics, request_started_at, status, Some("application/json"), payload, vec![]);
                 continue;
             }
             if url == "/api/_presence_connect" || url == "/api/_presence_disconnect" {
@@ -831,12 +859,7 @@ pub fn run(
                     Ok(b) => b,
                     Err(status_body) => {
                         let status = status_body.0;
-                        let mut resp = tiny_http::Response::from_string(status_body.1).with_status_code(status);
-                        for h in cors_headers() {
-                            resp.add_header(h);
-                        }
-                        let _ = request.respond(resp);
-                        metrics.record(status, request_started_at.elapsed());
+                        send_response(request, &metrics, request_started_at, status, None, status_body.1, vec![]);
                         continue;
                     }
                 };
@@ -847,14 +870,7 @@ pub fn run(
                     .map(|h| h.value.as_str().to_string());
                 let (status, payload) =
                     handle_presence(&body, auth_header.as_deref(), presence_token.as_ref().as_ref(), &workflow_log_path, online);
-                let mut resp = tiny_http::Response::from_string(payload)
-                    .with_status_code(status)
-                    .with_header(header("Content-Type", "application/json"));
-                for h in cors_headers() {
-                    resp.add_header(h);
-                }
-                let _ = request.respond(resp);
-                metrics.record(status, request_started_at.elapsed());
+                send_response(request, &metrics, request_started_at, status, Some("application/json"), payload, vec![]);
                 continue;
             }
             if let Some(fn_name) = url.strip_prefix("/api/") {
@@ -862,12 +878,7 @@ pub fn run(
                     Ok(b) => b,
                     Err(status_body) => {
                         let status = status_body.0;
-                        let mut resp = tiny_http::Response::from_string(status_body.1).with_status_code(status);
-                        for h in cors_headers() {
-                            resp.add_header(h);
-                        }
-                        let _ = request.respond(resp);
-                        metrics.record(status, request_started_at.elapsed());
+                        send_response(request, &metrics, request_started_at, status, None, status_body.1, vec![]);
                         continue;
                     }
                 };
@@ -908,24 +919,12 @@ pub fn run(
                     Ok(result) => result,
                     Err(_) => (500, json_err(&format!("`{fn_name}` panicked while handling this request"))),
                 };
-                let mut resp = tiny_http::Response::from_string(payload)
-                    .with_status_code(status)
-                    .with_header(header("Content-Type", "application/json"));
-                for h in cors_headers() {
-                    resp.add_header(h);
-                }
-                let _ = request.respond(resp);
-                metrics.record(status, request_started_at.elapsed());
+                send_response(request, &metrics, request_started_at, status, Some("application/json"), payload, vec![]);
                 continue;
             }
         }
 
-        let mut resp = tiny_http::Response::from_string(r#"{"err":"not found"}"#).with_status_code(404);
-        for h in cors_headers() {
-            resp.add_header(h);
-        }
-        let _ = request.respond(resp);
-        metrics.record(404, request_started_at.elapsed());
+        send_response(request, &metrics, request_started_at, 404, None, r#"{"err":"not found"}"#.to_string(), vec![]);
     }
     log_lifecycle("info", "server stopped accepting requests, exiting cleanly");
     Ok(())
