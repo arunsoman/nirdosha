@@ -499,6 +499,49 @@ messages.
       cycle rejected, a box-indirected self-reference still compiles and
       emits IR); full suite green.
 
+- `[DONE]` **2026-09-03 — `nirdosha serve`: reduce per-request bytes on
+  the wire (gzip + `ETag`/304), across every served `.nir` app, not just
+  one.** Prompted directly (`nirdosha` chat, 2026-09-03) after starting
+  `examples/ctms/ctms.nir` and noticing `GET /` shipped its full
+  `ui_gen`-derived HTML (432,866 bytes for CTMS specifically) with no
+  compression and no cache validation at all — every page load/refresh
+  re-transferred the whole thing, unconditionally. Investigated first
+  whether "tokens" meant the JWT bearer token itself: it doesn't need
+  shrinking (a demo-mode token is already a plain ~221-char three-field
+  JWT, and `/api/*` JSON responses are already small — an empty
+  `list_matter` is 9 bytes) — the real, measurable waste was `serve.rs`
+  never compressing or cache-validating any response at all.
+  Consolidated all ~17 previously-inline `Response::from_string(...)
+  .with_header(...)` call sites in `run`'s dispatch loop (`/healthz`,
+  `/readyz`, `/metrics`, `OPTIONS`, `GET /`, `/api/_whoami`,
+  `/auth/login`/`/auth/callback`, `/_nirdosha/table/*`,
+  `/api/_demo_login`, `/api/_presence_connect`/`_disconnect`, every
+  `/api/<fn>`, the 404 fallback) into one `send_response` helper, so both
+  levers below live in exactly one place instead of needing to be
+  re-added per route:
+  - **gzip**, applied when the client sends `Accept-Encoding: gzip` and
+    the body clears a 512-byte floor (below that, gzip's own framing
+    overhead routinely makes small JSON responses *larger*, not
+    smaller) — new `flate2` dependency (`crates/compiler/Cargo.toml`), in-memory
+    `GzEncoder`, `Vary: Accept-Encoding` always set alongside it. Verified
+    live against the running CTMS server: 432,866 bytes uncompressed →
+    58,604 bytes gzipped (~86% smaller) for the same page.
+  - **`ETag`/`If-None-Match` on `GET /`** — a `DefaultHasher` digest of
+    the generated HTML (a change detector, not a security hash) plus
+    `Cache-Control: no-cache` (always revalidates, never risks serving a
+    stale page after a `--theme` hot-reload or restart); a client that
+    already has the current bytes gets a bodyless `304` instead of
+    re-downloading the page. Verified live: re-requesting `/` with the
+    prior response's `ETag` in `If-None-Match` returns `304`.
+  Two response bodies (the body-read-failure early-returns, and the 404
+  fallback) deliberately kept their pre-existing "no `Content-Type`
+  header at all" behavior rather than silently changing it while
+  passing through the new shared helper — out of scope for what was
+  asked, a latent inconsistency to fix separately if it matters.
+  Full `cargo test --test serve` (24 tests) green, no route's behavior
+  changed for a client that doesn't send `Accept-Encoding`/
+  `If-None-Match` — this is additive.
+
 - `[OPEN]` **A16. `json` onto real LLVM codegen — scoped, not started.**
   Requested directly (`nirdosha` chat, 2026-08-27). Structurally a
   different problem than `dec128`'s own outstanding codegen gap
