@@ -43,6 +43,19 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install system Z3 (see workflow header)
         run: brew install z3
+      - name: Install and start Redis (mq_connect/mq_publish/mq_consume tests)
+        # tests/mq.rs's own header comment: needs a real Redis at
+        # 127.0.0.1:6379, no auth. Unlike Postgres's own integration
+        # tests (#[ignore]d, opt-in via NIRDOSHA_TEST_POSTGRES_URL),
+        # mq.rs's tests run unconditionally -- this job is the first CI
+        # job that ever runs the full `cargo test --release` (see this
+        # workflow's own build-macos header comment), which is what
+        # surfaced the gap: without this step, every mq.rs test fails
+        # with "Connection refused" instead of exercising real behavior.
+        run: |
+          brew install redis
+          brew services start redis
+          for i in $(seq 1 10); do redis-cli ping && break; sleep 1; done
       - name: Cache cargo registry and build artifacts
         uses: actions/cache@v4
         with:
