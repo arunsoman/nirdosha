@@ -22,7 +22,7 @@ write access below is broader than that.
 | GitHub | Areas ([`AREAS.md`](./AREAS.md)) | Write access granted | Status |
 |---|---|---|---|
 | [@lekshmideepu](https://github.com/lekshmideepu) | *unassigned* | yes | not yet active — no commits/reviews on record yet |
-| [@maheshmindlabs](https://github.com/maheshmindlabs) | *unassigned* | yes | active on Helm chart maintainership ([`deploy/helm/nirdosha/Chart.yaml`](./deploy/helm/nirdosha/Chart.yaml)); 1 commit on record |
+| [@maheshmindlabs](https://github.com/maheshmindlabs) | *unassigned* | yes | active — Helm chart maintainership ([`deploy/helm/nirdosha/Chart.yaml`](./deploy/helm/nirdosha/Chart.yaml)), Track G ecosystem-gap docs/example, and the 2026-09-04 adoption-barrier fixes (CI/bench/compiler-diagnostics + docs/positioning); 4 commits on record (`git log --author=maheshmindlabs --oneline`) |
 | [@arulrajan123](https://github.com/arulrajan123) | *unassigned* | yes | not yet active — no commits/reviews on record yet |
 | [@Baskarrajcodeflow](https://github.com/Baskarrajcodeflow) | *unassigned* | yes | not yet active — no commits/reviews on record yet |
 

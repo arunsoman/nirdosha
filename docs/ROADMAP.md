@@ -1158,6 +1158,19 @@ of Track B has landed.*
   `z3-src = "416"` — upgrading requires either a new `z3` crate release
   or a `[patch]` override, not just a version bump in this repo's own
   `Cargo.toml`).
+
+  **2026-09-04 — the separate CI-verification gap closed, vendoring gap
+  still open.** Until now macOS was only ever actually built by
+  `release.yml`, triggered by a `v*` tag — a regular push/PR to `main`
+  could break the macOS build and nothing would notice until release
+  time (unlike Linux/Windows, both covered by `build.yml` on every
+  push/PR). New `build-macos` job in `.github/workflows/build.yml`
+  mirrors `release.yml`'s already-proven macOS leg exactly (`brew
+  install z3`, system Z3 not vendored, `macos-14`), runs `cargo build
+  --release` + `cargo test --release`. This doesn't touch the vendoring
+  question above — the macOS build still needs `brew install z3` — it
+  only means a regression in the macOS build path now gets caught on
+  the next push instead of at the next tagged release.
 - `[OPEN]` **A9. Business-rule parameters (thresholds, boundary
   operators, currency) have no elicitation or config-store path.**
   Found via `examples/trade-finance/trade_finance.nir`'s
@@ -2802,13 +2815,18 @@ sequencing in `docs/ECOSYSTEM.md`; this entry only tracks status.*
   already-cross-checked LALR(1) grammar, not hand-authored separately),
   then a minimal diagnostics-first LSP, then a VS Code extension,
   formatter last (no canonical style decided yet to format toward).
-- `[OPEN]` **G3. Independent LLM validation.** `crates/bench/`
-  (pass@1 + self-repair, 23 tasks) is real but has only ever run
-  against mock models per this file's own standards table — the
-  flagship "an LLM can write Nirdosha" claim is unverified by the
-  project's own evidence. `docs/ECOSYSTEM.md` §G3: wire one real model
-  into the existing harness, run the existing tasks once, publish real
-  numbers.
+- `[PARTIAL]` **G3. Independent LLM validation.** `crates/bench/`
+  (pass@1 + self-repair, 23 tasks) is real; `real_model::RealModel`
+  (`--mode real`) is a real `Model` against any OpenAI-compatible
+  `/chat/completions` endpoint (DeepSeek, Kimi/Moonshot, GLM/Zhipu — base
+  URL/key/model name are env vars, not hardcoded to one provider), with
+  its request-building and response-parsing covered by real unit tests.
+  Still true: it has never actually run against a live provider (no API
+  key set in this project's dev/CI environment) — the flagship "an LLM
+  can write Nirdosha" claim is still unverified by the project's own
+  evidence. What's left of `docs/ECOSYSTEM.md` §G3's ask: set a real key
+  for one of the three providers, run `--mode real` against the existing
+  23 tasks, publish real pass@1/self-repair numbers.
 - **G4. Production/ops ecosystem — no new item, stays Track A.** The
   outside critique's items here (durability, deployment, OTLP,
   versioning policy, Windows/macOS verification) map directly onto

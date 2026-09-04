@@ -23,12 +23,17 @@ cargo run -- serve <file.nir> --port 8080     # run as a real HTTP service
 
 ## Facts that will cost you real time to rediscover — read these once
 
-- **No `::` token exists anywhere in the lexer.** Enum variants are
-  flat, unqualified calls — `Some(5)`, `None()`, `Circle(r)` in a
-  `match` arm — never `EnumName::Variant`. Writing the Rust-style
-  qualified form is a hard parse error, not a style issue. A
+- **`::` is real syntax, not a parse error — this changed 2026-09-03
+  (Track F, F2).** Enum variants are still flat calls with no implicit
+  qualification (`Some(5)`, `None()`, `Circle(r)` in a `match` arm), but
+  `EnumName::Variant`/`EnumName::Variant(...)` now also parses and
+  typechecks for *any* enum, namespaced or not (`parser::
+  parse_qualified_name`, `ast::TypeRegistry::find_variant`) — it's
+  accepted disambiguation sugar, never required. `Mod::Name` is
+  *required*, not optional, for anything declared inside a real
+  `module Ident { ... }` block — see `docs/LANGUAGE.md` §17. A
   zero-payload variant still needs `()` at the call site (`None()`,
-  not bare `None`).
+  not bare `None`) whether written qualified or bare.
 - **`str` cannot be a user `fn`'s parameter or return type**, checked
   recursively through `Result`/`Option`/generics/`box`/`&`/`thread`/
   `chan`/`Vector`/`Matrix`/`fn` types (`TypeErrorKind::

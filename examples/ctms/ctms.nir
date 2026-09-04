@@ -23,6 +23,135 @@ enum ErrorCode {
     DbError(str),
 }
 
+// ---- Closed-vocabulary status/severity enums, Track F4 Phase A's
+// `field { render: "badge" }` (`docs/LANGUAGE.md` SS18). Every variant is
+// prefixed with its own enum's name -- this language's enum variants
+// share one flat global namespace (no `EnumName::Variant` qualifier
+// exists at all), the same collision-avoidance convention
+// `examples/trade-finance/trade_finance.nir` already established
+// (`EntityType`/`AuditAction`/etc.), not invented here. Several of
+// these enums are deliberately reused across more than one struct field
+// below where the real-world vocabulary is genuinely the same concept
+// (e.g. `Severity` for every risk-tier-shaped field, `KycReviewStatus`
+// for both a wallet's own KYC submission and a master entity's KYC
+// state) rather than minting a near-duplicate enum per field.
+enum MatterStatus {
+    MatterStatusOpen,
+    MatterStatusInProgress,
+    MatterStatusEscalated,
+    MatterStatusResolved,
+    MatterStatusClosed,
+}
+enum Severity {
+    SeverityLow,
+    SeverityMedium,
+    SeverityHigh,
+    SeverityCritical,
+}
+enum ConnectionStatus {
+    ConnectionStatusConnected,
+    ConnectionStatusDisconnected,
+    ConnectionStatusError,
+}
+enum AlertStatus {
+    AlertStatusOpen,
+    AlertStatusDismissed,
+    AlertStatusEscalated,
+}
+enum ReferralStatus {
+    ReferralStatusPending,
+    ReferralStatusAccepted,
+    ReferralStatusDeclined,
+}
+enum SignatureStatus {
+    SignatureStatusValid,
+    SignatureStatusInvalid,
+    SignatureStatusPending,
+}
+enum RegReportStatus {
+    RegReportStatusDraft,
+    RegReportStatusPendingReview,
+    RegReportStatusApproved,
+    RegReportStatusFiled,
+}
+enum TransmissionStatus {
+    TransmissionStatusPending,
+    TransmissionStatusTransmitted,
+    TransmissionStatusFailed,
+}
+enum FlagStatus {
+    FlagStatusOpen,
+    FlagStatusUnderReview,
+    FlagStatusCleared,
+}
+enum HoldStatus {
+    HoldStatusActive,
+    HoldStatusReleased,
+    HoldStatusExpired,
+}
+enum ValidationStatus {
+    ValidationStatusPending,
+    ValidationStatusPassed,
+    ValidationStatusFailed,
+}
+enum SanctionsHitStatus {
+    SanctionsHitStatusUnderReview,
+    SanctionsHitStatusConfirmed,
+    SanctionsHitStatusFalsePositive,
+}
+enum ActionTaken {
+    ActionTakenAllowed,
+    ActionTakenChallenged,
+    ActionTakenBlocked,
+}
+enum VerificationStatus {
+    VerificationStatusPending,
+    VerificationStatusVerified,
+    VerificationStatusTamperDetected,
+}
+enum LockStatus {
+    LockStatusUnlocked,
+    LockStatusLocked,
+    LockStatusLegalHold,
+}
+enum ServiceHealthStatus {
+    ServiceHealthStatusHealthy,
+    ServiceHealthStatusDegraded,
+    ServiceHealthStatusDown,
+}
+enum KycReviewStatus {
+    KycReviewStatusPending,
+    KycReviewStatusApproved,
+    KycReviewStatusRejected,
+}
+enum FederatedStage {
+    FederatedStageSubmitted,
+    FederatedStageInReview,
+    FederatedStageCompleted,
+}
+enum ResponseStatus {
+    ResponseStatusPending,
+    ResponseStatusInProgress,
+    ResponseStatusResolved,
+}
+enum DownloadStatus {
+    DownloadStatusPending,
+    DownloadStatusReady,
+    DownloadStatusFailed,
+}
+// The exact 8 `requires(role: "...")` values this file's own `fn`s
+// already check against -- grounded in that list, not invented.
+enum UserRole {
+    UserRoleAdmin,
+    UserRoleComplianceOfficer,
+    UserRoleExchangePartner,
+    UserRoleFraudAnalyst,
+    UserRoleIngestionAdmin,
+    UserRoleInvestigator,
+    UserRoleRegulator,
+    UserRoleSupervisor,
+}
+
 struct Text {
     value: str,
 }
@@ -30,7 +159,7 @@ struct Text {
 struct Matter {
     id: i64,
     subject_name: str,
-    status: str,
+    status: MatterStatus,
     risk_score: i64,
     // Track E3's `field { render: "countdown" }` -- a unix-seconds SLA
     // deadline, rendered as a live "23m left"/"OVERDUE" chip on the
@@ -174,6 +303,15 @@ fn delete_matter(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
 // already use (`docs/LANGUAGE.md` SS11c/SS3).
 // Decision Panel / Case Export -- Track E4 preview-shaped actions on the
 // Matter Queue screen itself, alongside its Track E3 SLA countdown.
+// `resolution` stays free-text (a Decision Panel is a human typing a
+// resolution note, not picking from `MatterStatus`'s own closed
+// vocabulary) and writes straight into the `status` column via raw SQL,
+// bypassing `MatterStatus` entirely -- a real, disclosed gap: a value
+// that isn't one of `MatterStatus`'s own variant names still renders
+// (the `"badge"` widget colors by hashing whatever string it's given),
+// just not as one of the five real declared states. Left as-is rather
+// than forcing this panel into a fixed enum-of-outcomes it was never
+// designed around.
 fn record_matter_decision_inner(conn: db, id: i64, resolution: Text, justification: Text) -> Result(json, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
     let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE matter SET status = ? WHERE id = ?", resolution.value, id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
@@ -213,6 +351,9 @@ fn export_matter_dossier(id: i64) -> Result(json, ErrorCode) requires(role: "inv
 
 screen Matter {
     title: "Matter Queue"
+    field status {
+        render: "badge"
+    }
     field sla_deadline_unix {
         label: "SLA"
         render: "countdown"
@@ -220,6 +361,25 @@ screen Matter {
     action "Export Dossier" -> export_matter_dossier {
         style: "outlined"
         show_result: true
+    }
+
+    layout {
+        row {
+            column {
+                group "Matter" {
+                    field subject_name
+                    field status
+                    field risk_score
+                }
+            }
+            column {
+                group "SLA" {
+                    field sla_deadline_unix
+                }
+                divider {}
+                action "Export Dossier"
+            }
+        }
     }
 }
 
@@ -469,7 +629,7 @@ fn stat_open_matters_inner(conn: db) -> Result(i64, ErrorCode) {
         Ok(n) => n,
         Err(e) => -1,
     }
-    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM matter WHERE status = 'open'") {
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM matter WHERE status = 'MatterStatusOpen'") {
         Ok(rows) => match json_array_get(rows, 0) {
             Ok(row) => match json_get_i64(row, "value") {
                 Ok(n) => Ok(n),
@@ -532,7 +692,7 @@ fn stat_cases_nearing_sla_breach_inner(conn: db) -> Result(i64, ErrorCode) {
     }
     let result: Result(i64, ErrorCode) = match db_query(
         conn,
-        "SELECT COUNT(*) AS value FROM matter WHERE status = 'open' AND (sla_deadline_unix - strftime('%s','now')) BETWEEN 0 AND 3600"
+        "SELECT COUNT(*) AS value FROM matter WHERE status = 'MatterStatusOpen' AND (sla_deadline_unix - strftime('%s','now')) BETWEEN 0 AND 3600"
     ) {
         Ok(rows) => match json_array_get(rows, 0) {
             Ok(row) => match json_get_i64(row, "value") {
@@ -750,6 +910,21 @@ screen CompliancePolicy {
         style: "outlined"
         show_result: true
     }
+
+    layout {
+        row {
+            column {
+                group "Policy" {
+                    field name
+                    field threshold_cents
+                    field active
+                }
+            }
+            column {
+                action "Simulate"
+            }
+        }
+    }
 }
 
 dashboard {
@@ -874,7 +1049,7 @@ struct MatterEscalation {
     matter_id: i64,
     reason: str,
     target: str,
-    referral_status: str,
+    referral_status: ReferralStatus,
     regulator_response: str,
 }
 
@@ -908,6 +1083,31 @@ fn update_matter_escalation(e: MatterEscalation) -> Result(i64, ErrorCode) requi
 
 screen MatterEscalation {
     title: "Escalation & Regulatory Referral"
+    field matter_id {
+        render: "searchable_select"
+        source: Matter
+    }
+    field referral_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Escalation" {
+                    field matter_id
+                    field reason
+                    field target
+                }
+            }
+            column {
+                group "Referral" {
+                    field referral_status
+                    field regulator_response
+                }
+            }
+        }
+    }
 }
 
 // Case Linking / Entity Graph -- Track E2 visual.
@@ -953,7 +1153,7 @@ fn graph_case_links() -> Result(json, ErrorCode) requires(role: "investigator") 
 // SLA / Workload Routing Config.
 struct SlaRoutingRule {
     id: i64,
-    severity_tier: str,
+    severity_tier: Severity,
     sla_minutes: i64,
     jurisdiction_scope: str,
     skillset_required: str,
@@ -989,13 +1189,29 @@ fn update_sla_routing_rule(r: SlaRoutingRule) -> Result(i64, ErrorCode) requires
 
 screen SlaRoutingRule {
     title: "SLA / Workload Routing Config"
+    field severity_tier {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field severity_tier
+                field sla_minutes
+            }
+            column {
+                field jurisdiction_scope
+                field skillset_required
+            }
+        }
+    }
 }
 
 // Case Analytics Dashboard tiles + Case Linking graph, folded into the
 // one program-wide `dashboard { }` block below.
 fn stat_resolved_matter_count_inner(conn: db) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
-    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM matter WHERE status = 'resolved'") {
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM matter WHERE status = 'MatterStatusResolved'") {
         Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
         Err(e) => Err(DbError(e)),
     }
@@ -1033,7 +1249,7 @@ module "Data Ingestion" {
         name: str,
         source_type: str,
         format: str,
-        connection_status: str,
+        connection_status: ConnectionStatus,
         last_ingestion_unix: i64,
         active: bool,
     }
@@ -1124,9 +1340,33 @@ fn test_data_source_connection(id: i64) -> Result(json, ErrorCode) requires(role
 
 screen DataSource {
     title: "Source Connector Registry"
+    field connection_status {
+        render: "badge"
+    }
     action "Test Connection" -> test_data_source_connection {
         style: "outlined"
         show_result: true
+    }
+
+    layout {
+        row {
+            column {
+                group "Source" {
+                    field name
+                    field source_type
+                    field format
+                }
+            }
+            column {
+                group "Status" {
+                    field connection_status
+                    field last_ingestion_unix
+                    field active
+                }
+                divider {}
+                action "Test Connection"
+            }
+        }
     }
 }
 
@@ -1320,9 +1560,9 @@ module "Fraud Detection" {
         transaction_ref: str,
         risk_score: i64,
         triggering_rule: str,
-        severity: str,
+        severity: Severity,
         detected_unix: i64,
-        status: str,
+        status: AlertStatus,
     }
 
     struct AlertSignal {
@@ -1453,6 +1693,35 @@ fn list_similar_alerts_for_alert_inner(conn: db, alert_id: i64) -> Result(json, 
 }
 fn list_similar_alerts_for_alert(alert_id: i64) -> Result(json, ErrorCode) requires(role: "fraud_analyst") {
     return match db_connect("ctms.db") { Ok(conn) => list_similar_alerts_for_alert_inner(conn, alert_id), Err(e) => Err(DbError(e)) }
+}
+
+screen Alert {
+    title: "Suspicious-Transaction Alert Queue"
+    field severity {
+        render: "badge"
+    }
+    field status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Alert" {
+                    field transaction_ref
+                    field triggering_rule
+                    field risk_score
+                }
+            }
+            column {
+                group "Triage" {
+                    field severity
+                    field status
+                    field detected_unix
+                }
+            }
+        }
+    }
 }
 
 workspace AlertRiskBreakdown {
@@ -1679,7 +1948,7 @@ screen WatchlistEntry {
 
 fn stat_open_alert_count_inner(conn: db) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS alert (id INTEGER PRIMARY KEY AUTOINCREMENT, transaction_ref TEXT, risk_score INTEGER, triggering_rule TEXT, severity TEXT, detected_unix INTEGER, status TEXT)") { Ok(n) => n, Err(e) => -1 }
-    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM alert WHERE status = 'Open'") {
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM alert WHERE status = 'AlertStatusOpen'") {
         Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
         Err(e) => Err(DbError(e)),
     }
@@ -1708,7 +1977,7 @@ module "Data Exchange" {
         what: str,
         destination: str,
         occurred_unix: i64,
-        signature_status: str,
+        signature_status: SignatureStatus,
     }
 
     struct AbacPolicy {
@@ -1736,17 +2005,17 @@ module "Data Exchange" {
         id: i64,
         report_type: str,
         jurisdiction: str,
-        status: str,
+        status: RegReportStatus,
         due_unix: i64,
-        transmission_status: str,
+        transmission_status: TransmissionStatus,
     }
 
     struct AccessViolationEntry {
         id: i64,
         violation_type: str,
         affected_subject: str,
-        severity: str,
-        response_status: str,
+        severity: Severity,
+        response_status: ResponseStatus,
         occurred_unix: i64,
     }
 
@@ -1754,7 +2023,7 @@ module "Data Exchange" {
         id: i64,
         export_name: str,
         format: str,
-        download_status: str,
+        download_status: DownloadStatus,
         generated_unix: i64,
     }
 }
@@ -1780,6 +2049,27 @@ fn create_data_sharing_log_entry(e: DataSharingLogEntry) -> Result(i64, ErrorCod
 
 screen DataSharingLogEntry {
     title: "Secure Data Sharing Log"
+    field signature_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Exchange" {
+                    field who
+                    field what
+                    field destination
+                }
+            }
+            column {
+                group "Verification" {
+                    field signature_status
+                    field occurred_unix
+                }
+            }
+        }
+    }
 }
 
 fn list_abac_policy_inner(conn: db) -> Result(json, ErrorCode) {
@@ -1914,7 +2204,7 @@ fn update_regulatory_report(r: RegulatoryReport) -> Result(i64, ErrorCode) requi
 }
 fn transmit_regulatory_report_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS regulatory_report (id INTEGER PRIMARY KEY AUTOINCREMENT, report_type TEXT, jurisdiction TEXT, status TEXT, due_unix INTEGER, transmission_status TEXT)") { Ok(n) => n, Err(e) => -1 }
-    let updated: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE regulatory_report SET transmission_status = 'transmitted' WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let updated: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE regulatory_report SET transmission_status = 'TransmissionStatusTransmitted' WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
     let result: Result(json, ErrorCode) = match updated {
         Ok(n) => match db_query(conn, "SELECT id, transmission_status FROM regulatory_report WHERE id = ?", id) {
             Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
@@ -1931,9 +2221,35 @@ fn transmit_regulatory_report(id: i64) -> Result(json, ErrorCode) requires(role:
 
 screen RegulatoryReport {
     title: "Regulatory Reporting Queue"
+    field status {
+        render: "badge"
+    }
+    field transmission_status {
+        render: "badge"
+    }
     action "Generate/Transmit" -> transmit_regulatory_report {
         style: "filled"
         show_result: true
+    }
+
+    layout {
+        row {
+            column {
+                group "Report" {
+                    field report_type
+                    field jurisdiction
+                    field due_unix
+                }
+            }
+            column {
+                group "Status" {
+                    field status
+                    field transmission_status
+                }
+                divider {}
+                action "Generate/Transmit"
+            }
+        }
     }
 }
 
@@ -1967,6 +2283,30 @@ fn update_access_violation_entry(v: AccessViolationEntry) -> Result(i64, ErrorCo
 
 screen AccessViolationEntry {
     title: "Access Violation / Breach Monitor"
+    field severity {
+        render: "badge"
+    }
+    field response_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Violation" {
+                    field violation_type
+                    field affected_subject
+                    field occurred_unix
+                }
+            }
+            column {
+                group "Response" {
+                    field severity
+                    field response_status
+                }
+            }
+        }
+    }
 }
 
 fn list_regulator_export_inner(conn: db) -> Result(json, ErrorCode) {
@@ -1990,6 +2330,22 @@ fn create_regulator_export(r: RegulatorExport) -> Result(i64, ErrorCode) require
 
 screen RegulatorExport {
     title: "Regulator/Partner Portal"
+    field download_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field export_name
+                field format
+            }
+            column {
+                field download_status
+                field generated_unix
+            }
+        }
+    }
 }
 
 fn stat_shared_volume_count_inner(conn: db) -> Result(i64, ErrorCode) {
@@ -2177,9 +2533,9 @@ module "Compliance" {
         rule_matched: str,
         entity_ref: str,
         threshold_value: i64,
-        severity: str,
+        severity: Severity,
         flagged_unix: i64,
-        status: str,
+        status: FlagStatus,
     }
 
     struct ComplianceReportTemplate {
@@ -2194,7 +2550,7 @@ module "Compliance" {
         id: i64,
         matter_id: i64,
         applied_by: str,
-        status: str,
+        status: HoldStatus,
         expiry_unix: i64,
     }
 
@@ -2237,6 +2593,31 @@ fn update_compliance_flag_entry(f: ComplianceFlagEntry) -> Result(i64, ErrorCode
 
 screen ComplianceFlagEntry {
     title: "Compliance Flag Queue"
+    field severity {
+        render: "badge"
+    }
+    field status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Flag" {
+                    field rule_matched
+                    field entity_ref
+                    field threshold_value
+                }
+            }
+            column {
+                group "Disposition" {
+                    field severity
+                    field status
+                    field flagged_unix
+                }
+            }
+        }
+    }
 }
 
 fn list_compliance_report_template_inner(conn: db) -> Result(json, ErrorCode) {
@@ -2301,6 +2682,26 @@ fn update_legal_hold(h: LegalHold) -> Result(i64, ErrorCode) requires(role: "com
 
 screen LegalHold {
     title: "Legal Hold Management"
+    field matter_id {
+        render: "searchable_select"
+        source: Matter
+    }
+    field status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field matter_id
+                field applied_by
+            }
+            column {
+                field status
+                field expiry_unix
+            }
+        }
+    }
 }
 
 fn list_filing_deadline_inner(conn: db) -> Result(json, ErrorCode) {
@@ -2367,7 +2768,7 @@ module "Crypto Risk" {
         mcc_code: str,
         amount_cents: i64,
         occurred_unix: i64,
-        risk_priority: str,
+        risk_priority: Severity,
     }
 
     struct MerchantEntry {
@@ -2381,7 +2782,7 @@ module "Crypto Risk" {
         id: i64,
         wallet_address: str,
         counterparty_info: str,
-        validation_status: str,
+        validation_status: ValidationStatus,
         checked_unix: i64,
     }
 
@@ -2397,13 +2798,13 @@ module "Crypto Risk" {
         wallet_address: str,
         list_source: str,
         match_confidence: i64,
-        status: str,
+        status: SanctionsHitStatus,
     }
 
     struct CryptoLegalHold {
         id: i64,
         wallet_address: str,
-        status: str,
+        status: HoldStatus,
         applied_unix: i64,
     }
 }
@@ -2453,9 +2854,33 @@ fn simulate_card_crypto_detection(id: i64) -> Result(json, ErrorCode) requires(r
 
 screen CardCryptoTxn {
     title: "Fiat-Crypto Correlation"
+    field risk_priority {
+        render: "badge"
+    }
     action "Run Detection Simulation" -> simulate_card_crypto_detection {
         style: "outlined"
         show_result: true
+    }
+
+    layout {
+        row {
+            column {
+                group "Transaction" {
+                    field card_ref
+                    field merchant_name
+                    field mcc_code
+                    field amount_cents
+                }
+            }
+            column {
+                group "Risk" {
+                    field risk_priority
+                    field occurred_unix
+                }
+                divider {}
+                action "Run Detection Simulation"
+            }
+        }
     }
 }
 
@@ -2520,6 +2945,22 @@ fn update_travel_rule_check(t: TravelRuleCheck) -> Result(i64, ErrorCode) requir
 
 screen TravelRuleCheck {
     title: "Travel Rule Compliance"
+    field validation_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field wallet_address
+                field counterparty_info
+            }
+            column {
+                field validation_status
+                field checked_unix
+            }
+        }
+    }
 }
 
 fn list_crypto_compliance_report_inner(conn: db) -> Result(json, ErrorCode) {
@@ -2575,6 +3016,22 @@ fn update_wallet_sanctions_hit(h: WalletSanctionsHit) -> Result(i64, ErrorCode) 
 
 screen WalletSanctionsHit {
     title: "Wallet Sanctions Screening Queue"
+    field status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field wallet_address
+                field list_source
+            }
+            column {
+                field match_confidence
+                field status
+            }
+        }
+    }
 }
 
 fn list_crypto_legal_hold_inner(conn: db) -> Result(json, ErrorCode) {
@@ -2598,6 +3055,17 @@ fn create_crypto_legal_hold(h: CryptoLegalHold) -> Result(i64, ErrorCode) requir
 
 screen CryptoLegalHold {
     title: "Crypto Legal Hold"
+    field status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            field wallet_address
+            field status
+            field applied_unix
+        }
+    }
 }
 
 fn stat_sanctioned_wallet_count_inner(conn: db) -> Result(i64, ErrorCode) {
@@ -2634,8 +3102,8 @@ module "RTFDS" {
         user_ref: str,
         device_ref: str,
         ip_address: str,
-        risk_tier: str,
-        action_taken: str,
+        risk_tier: Severity,
+        action_taken: ActionTaken,
         occurred_unix: i64,
     }
 
@@ -2697,6 +3165,32 @@ fn override_rtfds_action(id: i64, new_action: Text) -> Result(json, ErrorCode) r
 // gap in today's `screen` action shape, not silently routed around.
 screen RtfdsEvent {
     title: "Session/Fraud Alert Queue"
+    field risk_tier {
+        render: "badge"
+    }
+    field action_taken {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Event" {
+                    field event_type
+                    field user_ref
+                    field device_ref
+                    field ip_address
+                }
+            }
+            column {
+                group "Disposition" {
+                    field risk_tier
+                    field action_taken
+                    field occurred_unix
+                }
+            }
+        }
+    }
 }
 
 fn create_device_link_inner(conn: db, l: DeviceLink) -> Result(i64, ErrorCode) {
@@ -2738,7 +3232,7 @@ screen DeviceLink {
 
 fn stat_blocked_attempt_count_inner(conn: db) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS rtfds_event (id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, user_ref TEXT, device_ref TEXT, ip_address TEXT, risk_tier TEXT, action_taken TEXT, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
-    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM rtfds_event WHERE action_taken = 'blocked'") {
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM rtfds_event WHERE action_taken = 'ActionTakenBlocked'") {
         Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
         Err(e) => Err(DbError(e)),
     }
@@ -2769,7 +3263,7 @@ module "IAM" {
     struct AppUser {
         id: i64,
         username: str,
-        role_name: str,
+        role_name: UserRole,
         department: str,
         active: bool,
     }
@@ -2843,6 +3337,22 @@ fn delete_app_user(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
 
 screen AppUser {
     title: "User & Role Management"
+    field role_name {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field username
+                field department
+            }
+            column {
+                field role_name
+                field active
+            }
+        }
+    }
 }
 
 fn list_identity_provider_config_inner(conn: db) -> Result(json, ErrorCode) {
@@ -3021,14 +3531,14 @@ module "Audit" {
         scan_kind: str,
         last_run_unix: i64,
         tamper_detected: bool,
-        verification_status: str,
+        verification_status: VerificationStatus,
     }
 
     struct ArchiveObject {
         id: i64,
         object_name: str,
         retention_expiry_unix: i64,
-        object_lock_status: str,
+        object_lock_status: LockStatus,
     }
 }
 
@@ -3167,7 +3677,7 @@ fn list_integrity_scan() -> Result(json, ErrorCode) requires(public) {
 // `record_audit_log_entry`.
 fn create_integrity_scan_inner(conn: db, scan_kind: Text) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS integrity_scan (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_kind TEXT, last_run_unix INTEGER, tamper_detected INTEGER, verification_status TEXT)") { Ok(n) => n, Err(e) => -1 }
-    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO integrity_scan (scan_kind, last_run_unix, tamper_detected, verification_status) VALUES (?, 0, 0, 'pending')", scan_kind.value) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO integrity_scan (scan_kind, last_run_unix, tamper_detected, verification_status) VALUES (?, 0, 0, 'VerificationStatusPending')", scan_kind.value) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
     stop conn
     return result
 }
@@ -3176,7 +3686,7 @@ fn create_integrity_scan(scan_kind: Text) -> Result(i64, ErrorCode) requires(rol
 }
 fn run_integrity_scan_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS integrity_scan (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_kind TEXT, last_run_unix INTEGER, tamper_detected INTEGER, verification_status TEXT)") { Ok(n) => n, Err(e) => -1 }
-    let updated: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE integrity_scan SET verification_status = 'verified', tamper_detected = 0 WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let updated: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE integrity_scan SET verification_status = 'VerificationStatusVerified', tamper_detected = 0 WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
     let result: Result(json, ErrorCode) = match updated {
         Ok(n) => match db_query(conn, "SELECT id, verification_status, tamper_detected FROM integrity_scan WHERE id = ?", id) {
             Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
@@ -3193,9 +3703,26 @@ fn run_integrity_scan(id: i64) -> Result(json, ErrorCode) requires(role: "admin"
 
 screen IntegrityScan {
     title: "Integrity / Tamper-Check"
+    field verification_status {
+        render: "badge"
+    }
     action "Run Manual Scan" -> run_integrity_scan {
         style: "filled"
         show_result: true
+    }
+
+    layout {
+        row {
+            column {
+                field scan_kind
+                field last_run_unix
+            }
+            column {
+                field verification_status
+                field tamper_detected
+                action "Run Manual Scan"
+            }
+        }
     }
 }
 
@@ -3223,6 +3750,21 @@ screen ArchiveObject {
     field retention_expiry_unix {
         label: "Retention Expiry"
         render: "countdown"
+    }
+    field object_lock_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field object_name
+            }
+            column {
+                field object_lock_status
+                field retention_expiry_unix
+            }
+        }
     }
 }
 
@@ -3294,7 +3836,7 @@ module "Cross-Cutting" {
     struct ServiceHealthEntry {
         id: i64,
         service_name: str,
-        status: str,
+        status: ServiceHealthStatus,
         error_rate_pct: i64,
         kafka_lag_ms: i64,
         checked_unix: i64,
@@ -3304,7 +3846,7 @@ module "Cross-Cutting" {
         id: i64,
         entity_name: str,
         entity_type: str,
-        kyc_status: str,
+        kyc_status: KycReviewStatus,
         risk_score: i64,
         flagged: bool,
     }
@@ -3343,7 +3885,7 @@ module "Cross-Cutting" {
         exchange_name: str,
         wallet_address: str,
         kyc_document_ref: str,
-        review_status: str,
+        review_status: KycReviewStatus,
         submitted_unix: i64,
     }
 
@@ -3541,7 +4083,7 @@ fn update_service_health_entry(s: ServiceHealthEntry) -> Result(i64, ErrorCode) 
 }
 fn stat_unhealthy_service_count_inner(conn: db) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS service_health_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, service_name TEXT, status TEXT, error_rate_pct INTEGER, kafka_lag_ms INTEGER, checked_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
-    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM service_health_entry WHERE status != 'healthy'") {
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM service_health_entry WHERE status != 'ServiceHealthStatusHealthy'") {
         Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
         Err(e) => Err(DbError(e)),
     }
@@ -3554,6 +4096,23 @@ fn stat_unhealthy_service_count() -> Result(i64, ErrorCode) requires(public) {
 
 screen ServiceHealthEntry {
     title: "System Health / Observability"
+    field status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field service_name
+                field status
+            }
+            column {
+                field error_rate_pct
+                field kafka_lag_ms
+                field checked_unix
+            }
+        }
+    }
 }
 
 // -- Entity 360 / Master Entity Profile --------------------------------------
@@ -3664,6 +4223,31 @@ fn graph_entity_links(entity_id: i64) -> Result(json, ErrorCode) requires(role: 
     return match db_connect("ctms.db") { Ok(conn) => graph_entity_links_inner(conn, entity_id), Err(e) => Err(DbError(e)) }
 }
 
+screen MasterEntity {
+    title: "Master Entity Registry"
+    field kyc_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Entity" {
+                    field entity_name
+                    field entity_type
+                }
+            }
+            column {
+                group "Risk" {
+                    field kyc_status
+                    field risk_score
+                    field flagged
+                }
+            }
+        }
+    }
+}
+
 workspace EntityProfile {
     title: "Entity 360"
     subject: MasterEntity
@@ -3711,7 +4295,7 @@ fn list_wallet_kyc_submission() -> Result(json, ErrorCode) requires(public) {
 }
 fn create_wallet_kyc_submission_inner(conn: db, w: WalletKycSubmission) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS wallet_kyc_submission (id INTEGER PRIMARY KEY AUTOINCREMENT, exchange_name TEXT, wallet_address TEXT, kyc_document_ref TEXT, review_status TEXT, submitted_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
-    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO wallet_kyc_submission (exchange_name, wallet_address, kyc_document_ref, review_status, submitted_unix) VALUES (?, ?, ?, 'pending', ?)", w.exchange_name, w.wallet_address, w.kyc_document_ref, w.submitted_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO wallet_kyc_submission (exchange_name, wallet_address, kyc_document_ref, review_status, submitted_unix) VALUES (?, ?, ?, 'KycReviewStatusPending', ?)", w.exchange_name, w.wallet_address, w.kyc_document_ref, w.submitted_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
     stop conn
     return result
 }
@@ -3746,6 +4330,31 @@ fn list_federated_workflow_status_entry_for_submission_inner(conn: db, submissio
 }
 fn list_federated_workflow_status_entry_for_submission(submission_id: i64) -> Result(json, ErrorCode) requires(role: "exchange_partner") {
     return match db_connect("ctms.db") { Ok(conn) => list_federated_workflow_status_entry_for_submission_inner(conn, submission_id), Err(e) => Err(DbError(e)) }
+}
+
+screen WalletKycSubmission {
+    title: "Wallet KYC Submission Queue"
+    field review_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Submission" {
+                    field exchange_name
+                    field wallet_address
+                    field kyc_document_ref
+                }
+            }
+            column {
+                group "Review" {
+                    field review_status
+                    field submitted_unix
+                }
+            }
+        }
+    }
 }
 
 workspace ExchangePartnerPortal {
