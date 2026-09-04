@@ -2754,6 +2754,58 @@ duplicate the reasoning.*
 
 ---
 
+## Track G — Developer/production ecosystem (`docs/ECOSYSTEM.md`)
+
+*Discussion-only spec, written 2026-09-04 from an outside read of the
+repo: the compiler core is unusually well documented, but adoption
+infrastructure around it is thin. Full analysis, open questions, and
+sequencing in `docs/ECOSYSTEM.md`; this entry only tracks status.*
+
+- `[OPEN]` **G1. Package/stdlib economy via Cargo.** No `.nir`
+  package manager/registry today — distribution is prebuilt CLI
+  releases only, and `Cargo.toml` is the compiler's own build
+  manifest, not a `.nir` package system. `docs/ECOSYSTEM.md` §G1 works
+  through the concrete proposal ("use Cargo/crates.io itself") in
+  depth: splits it into Kind A (native builtin-extension crates —
+  Cargo already sufficient, just needs a plugin-trait + metadata
+  convention) and Kind B (pure-`.nir`-source library crates — needs F2's
+  resolver taught to fetch them), with a staged plan and real open
+  questions (native-plugin sandboxing, two overlapping version
+  resolvers, whether crates.io is even the right home for Kind B).
+- `[OPEN]` **G2. Editor/tooling ecosystem.** No LSP, no tree-sitter
+  grammar, no formatter, no debugger (`cie`, a related repo, already
+  documents this gap from the outside — Nirdosha handled via AST dump
+  for lack of either). `docs/ECOSYSTEM.md` §G2: tree-sitter grammar
+  first (derived from/checked against `crates/grammar_check/`'s
+  already-cross-checked LALR(1) grammar, not hand-authored separately),
+  then a minimal diagnostics-first LSP, then a VS Code extension,
+  formatter last (no canonical style decided yet to format toward).
+- `[OPEN]` **G3. Independent LLM validation.** `crates/bench/`
+  (pass@1 + self-repair, 23 tasks) is real but has only ever run
+  against mock models per this file's own standards table — the
+  flagship "an LLM can write Nirdosha" claim is unverified by the
+  project's own evidence. `docs/ECOSYSTEM.md` §G3: wire one real model
+  into the existing harness, run the existing tasks once, publish real
+  numbers.
+- **G4. Production/ops ecosystem — no new item, stays Track A.** The
+  outside critique's items here (durability, deployment, OTLP,
+  versioning policy, Windows/macOS verification) map directly onto
+  A1–A4 above, which already track real status for each. See
+  `docs/ECOSYSTEM.md` §G4 for the explicit mapping — deliberately not
+  duplicated as new tracked items here.
+- `[OPEN]` **G5. Community/governance depth.** Solo-maintained today
+  (GitHub contributor graph: `arunsoman` only, 94 contributions) — no
+  RFC process, no bus-factor resilience. `docs/ECOSYSTEM.md` §G5: an
+  RFC-lite process for breaking changes in `CONTRIBUTING.md` (same
+  root cause as A4's versioning-policy gap), plus turning
+  `deploy/helm/nirdosha/Chart.yaml`'s `maintainers:` entries
+  (`lekshmideepu`, `maheshmindlabs`, added 2026-09-04) into real GitHub
+  collaborator access and branch protection — flagged here, not done
+  here; granting real repo access is a maintainer-only action for the
+  repo owner, not a side effect of a design doc.
+
+---
+
 ## Suggested near-term order
 
 Given "critical apps soon": the security review, the systematic
