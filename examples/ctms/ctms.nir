@@ -3053,14 +3053,31 @@ fn get_audit_log_entry_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
 fn get_audit_log_entry(id: i64) -> Result(json, ErrorCode) requires(public) {
     return match db_connect("ctms.db") { Ok(conn) => get_audit_log_entry_inner(conn, id), Err(e) => Err(DbError(e)) }
 }
-fn create_audit_log_entry_inner(conn: db, a: AuditLogEntry) -> Result(i64, ErrorCode) {
+// Deliberately named `record_` here, not `create_` -- an audit trail is
+// meant to be an append-only side effect of *other* modules' actions
+// (`create_matter`, `update_wallet`, and so on each ought to call this
+// as they run), never something a human fills into a form. `create_`
+// would trip `ui_gen`'s naming-convention inference (`build_screens`,
+// `ui_gen.rs`) and render a manual "Add" button + form on the "Audit
+// Search & Export" screen -- exactly the CRUD-that-shouldn't-exist this
+// was flagged for (SCREENS.md's own Module 10 row lists this screen's
+// actions as "Search, export ..., verify integrity" only, no create).
+// Gated to `admin` (was `requires(public)` -- a real bug: literally
+// anyone, unauthenticated, could POST a fabricated entry -- actor,
+// justification, timestamp, legal-hold reference all attacker-chosen --
+// straight into what's supposed to be the tamper-evident record of who
+// did what; every sibling struct in this same module, e.g.
+// `create_security_alert_entry`/`create_integrity_scan` below, already
+// requires `role: "admin"` for its own writes -- this one just hadn't
+// been brought in line).
+fn record_audit_log_entry_inner(conn: db, a: AuditLogEntry) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS audit_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT, action_kind TEXT, module_name TEXT, justification TEXT, occurred_unix INTEGER, legal_hold_ref INTEGER)") { Ok(n) => n, Err(e) => -1 }
     let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO audit_log_entry (actor, action_kind, module_name, justification, occurred_unix, legal_hold_ref) VALUES (?, ?, ?, ?, ?, ?)", a.actor, a.action_kind, a.module_name, a.justification, a.occurred_unix, a.legal_hold_ref) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
     stop conn
     return result
 }
-fn create_audit_log_entry(a: AuditLogEntry) -> Result(i64, ErrorCode) requires(public) {
-    return match db_connect("ctms.db") { Ok(conn) => create_audit_log_entry_inner(conn, a), Err(e) => Err(DbError(e)) }
+fn record_audit_log_entry(a: AuditLogEntry) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms.db") { Ok(conn) => record_audit_log_entry_inner(conn, a), Err(e) => Err(DbError(e)) }
 }
 // "export signed bundles" -- Track E4 preview action; a real signed
 // PDF/CSV/JSON bundle needs a file/blob type Nirdosha doesn't have yet
@@ -3130,14 +3147,32 @@ fn list_integrity_scan_inner(conn: db) -> Result(json, ErrorCode) {
 fn list_integrity_scan() -> Result(json, ErrorCode) requires(public) {
     return match db_connect("ctms.db") { Ok(conn) => list_integrity_scan_inner(conn), Err(e) => Err(DbError(e)) }
 }
-fn create_integrity_scan_inner(conn: db, s: IntegrityScan) -> Result(i64, ErrorCode) {
+// Deliberately takes just `scan_kind`, not the whole `IntegrityScan`
+// struct -- the naming convention only requires `create_<snake>` to
+// exist and be gated, not that its param be the struct itself
+// (`ui_gen.rs::build_action` renders whatever params the fn actually
+// declares). Registering a new integrity-check job is legitimate admin
+// work (`SCREENS.md`'s own "Integrity-scan history" implies new scan
+// kinds get added over time); *declaring its result* is not -- that's
+// exactly what `tamper_detected`/`verification_status` are, and per
+// `SCREENS.md`'s Module 10 row this screen's only actions are "Run
+// manual scan, view tamper detail," never a raw create-with-any-values
+// form. The old signature let an admin's own form submission simply
+// assert "verified, no tampering" for a scan that never ran -- worse
+// than clutter, a way to fake the one thing this screen exists to
+// prove. New rows now always start `tamper_detected: false,
+// verification_status: "pending"` -- untrue until `run_integrity_scan`
+// (below) actually sets it, the same "only the real check may assert
+// the result" principle the audit-log fix just applied to
+// `record_audit_log_entry`.
+fn create_integrity_scan_inner(conn: db, scan_kind: Text) -> Result(i64, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS integrity_scan (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_kind TEXT, last_run_unix INTEGER, tamper_detected INTEGER, verification_status TEXT)") { Ok(n) => n, Err(e) => -1 }
-    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO integrity_scan (scan_kind, last_run_unix, tamper_detected, verification_status) VALUES (?, ?, ?, ?)", s.scan_kind, s.last_run_unix, s.tamper_detected, s.verification_status) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO integrity_scan (scan_kind, last_run_unix, tamper_detected, verification_status) VALUES (?, 0, 0, 'pending')", scan_kind.value) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
     stop conn
     return result
 }
-fn create_integrity_scan(s: IntegrityScan) -> Result(i64, ErrorCode) requires(role: "admin") {
-    return match db_connect("ctms.db") { Ok(conn) => create_integrity_scan_inner(conn, s), Err(e) => Err(DbError(e)) }
+fn create_integrity_scan(scan_kind: Text) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms.db") { Ok(conn) => create_integrity_scan_inner(conn, scan_kind), Err(e) => Err(DbError(e)) }
 }
 fn run_integrity_scan_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS integrity_scan (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_kind TEXT, last_run_unix INTEGER, tamper_detected INTEGER, verification_status TEXT)") { Ok(n) => n, Err(e) => -1 }
