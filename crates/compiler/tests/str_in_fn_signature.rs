@@ -36,6 +36,56 @@ fn a_str_parameter_is_rejected() {
 }
 
 #[test]
+fn a_str_parameter_error_message_is_self_teaching() {
+    // The error text itself must name the exact fix (real `enum` for
+    // categorical data, `struct Text { value: str }` for free text),
+    // not just point at the problem — so a reader never has to already
+    // know `docs/LANGUAGE.md` §6b to recover from hitting this.
+    let program = parse(
+        r#"
+        fn greet(name: str) -> unit {
+            print(name)
+        }
+        fn main() -> unit {}
+        "#,
+    );
+    let errs = typecheck(&program).expect_err("a str parameter must be rejected");
+    let msg = errs
+        .iter()
+        .find(|e| matches!(&e.kind, TypeErrorKind::StrInFnSignature { fn_name, param_name: Some(p) } if fn_name == "greet" && p == "name"))
+        .expect("StrInFnSignature error for `greet`'s `name` param")
+        .to_string();
+    assert!(msg.contains("can't cross a function boundary"), "message was: {msg}");
+    assert!(msg.contains("enum Status { Pending, Approved }"), "message was: {msg}");
+    assert!(msg.contains("name: Status"), "message was: {msg}");
+    assert!(msg.contains("struct Text { value: str }"), "message was: {msg}");
+    assert!(msg.contains("name: Text"), "message was: {msg}");
+    assert!(msg.contains("name.value"), "message was: {msg}");
+}
+
+#[test]
+fn a_str_return_type_error_message_is_self_teaching() {
+    let program = parse(
+        r#"
+        fn label() -> str {
+            return "hi"
+        }
+        fn main() -> unit {}
+        "#,
+    );
+    let errs = typecheck(&program).expect_err("a str return type must be rejected");
+    let msg = errs
+        .iter()
+        .find(|e| matches!(&e.kind, TypeErrorKind::StrInFnSignature { fn_name, param_name: None } if fn_name == "label"))
+        .expect("StrInFnSignature error for `label`'s return type")
+        .to_string();
+    assert!(msg.contains("can't cross a function boundary"), "message was: {msg}");
+    assert!(msg.contains("struct Text { value: str }"), "message was: {msg}");
+    assert!(msg.contains("-> Text"), "message was: {msg}");
+    assert!(msg.contains("Text(the_string)"), "message was: {msg}");
+}
+
+#[test]
 fn a_str_return_type_is_rejected() {
     let program = parse(
         r#"

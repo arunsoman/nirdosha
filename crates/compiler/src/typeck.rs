@@ -922,14 +922,19 @@ impl std::fmt::Display for TypeError {
             TypeErrorKind::StrInFnSignature { fn_name, param_name: Some(param_name) } => write!(
                 f,
                 "{line}:{col}: `fn {fn_name}`'s parameter `{param_name}` is (or contains) `str` — \
-                 `str` can't cross a function boundary; use an `enum` for categorical data or a \
-                 carrier struct (e.g. `Text`) for free text"
+                 `str` can't cross a function boundary. Fix: if `{param_name}` is a closed set of \
+                 values (a status, a currency code, a decision), replace `{param_name}: str` with a \
+                 real `enum`, e.g. `enum Status {{ Pending, Approved }}` then `{param_name}: Status`. \
+                 If it's genuine free text, wrap it: `struct Text {{ value: str }}` then \
+                 `{param_name}: Text`, and read `{param_name}.value` inside the body"
             ),
             TypeErrorKind::StrInFnSignature { fn_name, param_name: None } => write!(
                 f,
                 "{line}:{col}: `fn {fn_name}`'s return type is (or contains) `str` — \
-                 `str` can't cross a function boundary; use an `enum` for categorical data or a \
-                 carrier struct (e.g. `Text`) for free text"
+                 `str` can't cross a function boundary. Fix: if the result is a closed set of \
+                 outcomes, return a real `enum` instead of `str`. If it's genuine free text, wrap \
+                 it: `struct Text {{ value: str }}`, change the signature to `-> Text`, and return \
+                 `Text(the_string)` instead of the bare `str`"
             ),
             TypeErrorKind::WorkflowEventArgMustBeEnum { fn_name, found } => write!(
                 f,

@@ -9,12 +9,17 @@
 //! loop, and the re-prompt-with-diagnostics mechanism (docs/goal.md row 9's
 //! actual payoff: a failing attempt's structured `Diagnostic` JSON,
 //! from `nirdosha::run_diagnostic`, is what a real re-prompt would feed
-//! back to a model) -- not a real model integration. `Model` is a small
-//! trait; the two implementations here (`MockModel`, `SelfRepairMockModel`)
-//! exist only to prove the loop itself works end to end (4.5.5's
-//! verification bullet), not to claim anything about real model
-//! behavior. A real integration implements `Model::generate` with an
-//! actual API call and drops in wherever `--mode` selects one below.
+//! back to a model). `Model` is a small trait; `MockModel` and
+//! `SelfRepairMockModel` exist only to prove the loop itself works end
+//! to end (4.5.5's verification bullet) against no live model at all.
+//! `real_model::RealModel` is a real integration: an HTTP client for any
+//! OpenAI-compatible `/chat/completions` endpoint (DeepSeek, Kimi/
+//! Moonshot, GLM/Zhipu -- configurable via `NIRDOSHA_BENCH_API_BASE`/
+//! `_API_KEY`/`_MODEL`, see `real_model`'s module doc), selected with
+//! `--mode real`. It has not been run against a live provider in this
+//! development environment -- no API key is set here -- but its request
+//! building and response parsing are covered by real unit tests
+//! (`real_model::tests`) that don't need one.
 //!
 //! **Scoring is against `run()`'s return *value*, not printed stdout.**
 //! `print`'s builtin writes straight to the process's real stdout
@@ -31,6 +36,9 @@ use std::collections::HashSet;
 
 use serde::Deserialize;
 use serde_json::Value as Json;
+
+pub mod real_model;
+pub use real_model::RealModel;
 
 #[derive(Deserialize, Clone)]
 pub struct Task {

@@ -1,0 +1,54 @@
+name: welcome
+
+# Greets a first-time issue/PR author with something more useful than
+# silence — the "no one else is here, why bother" cold-start feeling a
+# new visitor gets isn't fixed by GOVERNANCE.md/MAINTAINERS.md/AREAS.md
+# existing, only by a real human-shaped response actually showing up on
+# their thread. `actions/first-interaction` decides "first" the same
+# way GitHub does (paginates issues/PRs by the sender and checks none
+# have a lower number) and only fires on the true first issue or PR, so
+# this never spams a returning contributor.
+#
+# `pull_request_target` (not `pull_request`) is deliberate: a first-time
+# PR is, by definition, almost always from a fork, and the default
+# GITHUB_TOKEN on a fork's `pull_request` event is read-only regardless
+# of the `permissions:` block below, so it couldn't post a comment at
+# all. `pull_request_target` runs with the base repo's token instead —
+# safe here because this job never checks out the PR head or runs any
+# of its code, it only reads event metadata and posts a fixed string.
+
+on:
+  issues:
+    types: [opened]
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  greet:
+    name: Welcome first-time contributors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/first-interaction@v3.1.0
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          issue_message: |
+            Thanks for opening your first issue here — glad you tried Nirdosha.
+
+            A couple of pointers while you wait:
+            - The ["Before you contribute"](https://github.com/arunsoman/nirdosha/blob/main/CONTRIBUTING.md#before-you-contribute) section of `CONTRIBUTING.md` covers checking the [Public Roadmap](https://github.com/arunsoman/nirdosha/blob/main/docs/PUBLIC_ROADMAP.md) for related work already scoped.
+            - This is a small team, but there's a **48-hour triage SLA** on every new issue (see `CONTRIBUTING.md`'s "Response time" section) — a real person will respond, even if it's just "seen, will look."
+
+            You've been tagged `first-time contributor` so it's easy to spot. Thanks again.
+          pr_message: |
+            Thanks for the PR — your first one here, welcome.
+
+            A couple of pointers while it's in the queue:
+            - The ["Before you contribute"](https://github.com/arunsoman/nirdosha/blob/main/CONTRIBUTING.md#before-you-contribute) section of `CONTRIBUTING.md` covers what we look for before review (an issue discussed first for anything non-trivial, minimal/focused diffs, docs updated in the same PR).
+            - [`AREAS.md`](https://github.com/arunsoman/nirdosha/blob/main/AREAS.md) lists who owns the subsystem you touched, so you know who's likely to review.
+            - **48-hour triage SLA** applies here too (`CONTRIBUTING.md`'s "Response time" section) — expect a first response, not necessarily a merge, within that window.
+
+            You've been tagged `first-time contributor` so it's easy to spot. Thanks again.
