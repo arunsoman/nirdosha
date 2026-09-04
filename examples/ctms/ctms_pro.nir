@@ -3003,6 +3003,127 @@ fn stat_sanctioned_wallet_count() -> Result(i64, ErrorCode) requires(role: "comp
     return match db_connect("ctms_pro.db") { Ok(conn) => stat_sanctioned_wallet_count_inner(conn), Err(e) => Err(DbError(e)) }
 }
 
+// =========================================================================
+// Module 8: Real-Time Fraud Detection Management System (RTFDS)
+// Doc: a module distinct from Module 2's own Detection Engine -- this
+// one operates on session/device telemetry, not transaction payloads.
+// "Alert and Action Framework": "Risk-tiered alerts: High (immediate
+// block), Medium (2FA challenge), Low (logging only)".
+// =========================================================================
+
+module "RTFDS" {
+    struct RtfdsEvent {
+        id: i64,
+        event_type: str,
+        user_ref: str,
+        device_ref: str,
+        ip_address: str,
+        risk_tier: Severity,
+        action_taken: ActionTaken,
+        occurred_unix: i64,
+    }
+
+    struct DeviceLink {
+        id: i64,
+        device_ref: str,
+        linked_account_ref: str,
+        linked_ip: str,
+    }
+}
+
+fn list_rtfds_event_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS rtfds_event (id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, user_ref TEXT, device_ref TEXT, ip_address TEXT, risk_tier TEXT, action_taken TEXT, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, event_type, user_ref, device_ref, ip_address, risk_tier, action_taken, occurred_unix FROM rtfds_event ORDER BY occurred_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_rtfds_event() -> Result(json, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_rtfds_event_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_rtfds_event_inner(conn: db, e: RtfdsEvent) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS rtfds_event (id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, user_ref TEXT, device_ref TEXT, ip_address TEXT, risk_tier TEXT, action_taken TEXT, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO rtfds_event (event_type, user_ref, device_ref, ip_address, risk_tier, action_taken, occurred_unix) VALUES (?, ?, ?, ?, ?, ?, ?)", e.event_type, e.user_ref, e.device_ref, e.ip_address, e.risk_tier, e.action_taken, e.occurred_unix) { Ok(n) => Ok(n), Err(err) => Err(DbError(err)) }
+    stop conn
+    return result
+}
+fn create_rtfds_event(e: RtfdsEvent) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_rtfds_event_inner(conn, e), Err(err) => Err(DbError(err)) }
+}
+
+screen RtfdsEvent {
+    title: "Session/Fraud Alert Queue"
+    field risk_tier {
+        render: "badge"
+    }
+    field action_taken {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Event" {
+                    field event_type
+                    field user_ref
+                    field device_ref
+                    field ip_address
+                }
+            }
+            column {
+                group "Disposition" {
+                    field risk_tier
+                    field action_taken
+                    field occurred_unix
+                }
+            }
+        }
+    }
+}
+
+fn create_device_link_inner(conn: db, l: DeviceLink) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS device_link (id INTEGER PRIMARY KEY AUTOINCREMENT, device_ref TEXT, linked_account_ref TEXT, linked_ip TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO device_link (device_ref, linked_account_ref, linked_ip) VALUES (?, ?, ?)", l.device_ref, l.linked_account_ref, l.linked_ip) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_device_link(l: DeviceLink) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_device_link_inner(conn, l), Err(e) => Err(DbError(e)) }
+}
+fn list_device_link_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS device_link (id INTEGER PRIMARY KEY AUTOINCREMENT, device_ref TEXT, linked_account_ref TEXT, linked_ip TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, device_ref, linked_account_ref, linked_ip FROM device_link ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_device_link() -> Result(json, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_device_link_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
+screen DeviceLink {
+    title: "Device / Account Linkage"
+
+    layout {
+        row {
+            field device_ref
+            field linked_account_ref
+            field linked_ip
+        }
+    }
+}
+
+fn stat_blocked_attempt_count_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS rtfds_event (id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, user_ref TEXT, device_ref TEXT, ip_address TEXT, risk_tier TEXT, action_taken TEXT, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM rtfds_event WHERE action_taken = 'ActionTakenBlocked'") {
+        Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn stat_blocked_attempt_count() -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => stat_blocked_attempt_count_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
 // === APPEND POINT ===
 
 fn main() {}
