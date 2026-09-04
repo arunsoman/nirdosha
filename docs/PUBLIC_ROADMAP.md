@@ -77,9 +77,10 @@ Status tags: `[DONE]` (verified — tests pass or run end-to-end),
   (`crates/compiler/nirdosha.gbnf`)
 - [DONE] Structured `Diagnostic` JSON on every error (`--format=json`)
 - [DONE] `emit-ast`/`validate_fragment` for typed AST/fragment tooling
-- [PARTIAL] `crates/bench/` pass@1 + self-repair-rate harness — scaffold and
-  corpus exist, ships with mock models today; real LLM wiring is
-  separate work
+- [PARTIAL] `crates/bench/` pass@1 + self-repair-rate harness — scaffold,
+  corpus, and a real `Model` (`--mode real`, any OpenAI-compatible
+  `/chat/completions` endpoint) all exist; not yet run against a live
+  provider for lack of an API key in this environment
 
 ---
 

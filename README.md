@@ -4,8 +4,9 @@
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Wiki](https://img.shields.io/badge/docs-wiki-blue)](https://github.com/arunsoman/nirdosha/wiki)
 [![Contributing](https://img.shields.io/badge/CONTRIBUTING-read-blue)](./CONTRIBUTING.md)
+[![Governance](https://img.shields.io/badge/GOVERNANCE-read-blue)](./GOVERNANCE.md)
 [![Roadmap](https://img.shields.io/badge/ROADMAP-view-purple)](./docs/PUBLIC_ROADMAP.md)
-[![Maintainers](https://img.shields.io/badge/maintainers-3-green)](./deploy/helm/nirdosha/Chart.yaml)
+[![Maintainers](https://img.shields.io/badge/maintainers-5-green)](./MAINTAINERS.md)
 [![Sponsor](https://img.shields.io/badge/%E2%9D%A4-Sponsor-ea4aaa)](https://github.com/sponsors/arunsoman)
 
 > **A systems language designed for LLMs to write, with a grammar so
@@ -14,10 +15,10 @@
 > the pitch, they're the proof that a language built for an AI agent to
 > write unsupervised can also be trusted to run.
 
-Status: active research prototype. The compiler is a real, runnable Rust
-crate (`crates/compiler/`); many safety properties are *proven* today and some are
-*aspirational* (called out honestly in the [wiki](https://github.com/arunsoman/nirdosha/wiki/Honest-Scope-and-Roadmap)).
-Source files use the `.nir` extension.
+Status: a real, runnable Rust compiler (`crates/compiler/`) under
+active development — many safety properties are *proven* today, and
+where one is still *aspirational* the [wiki](https://github.com/arunsoman/nirdosha/wiki/Honest-Scope-and-Roadmap)
+says so plainly. Source files use the `.nir` extension.
 
 ```nirdosha
 fn secret(n: i64) -> i64 requires(role: "admin") {
@@ -68,25 +69,55 @@ wiki pages.
 
 ## Current focus / how to help
 
-Solo-maintained research project — small, high-context contributions
-matter more than volume. Right now:
+Small team, high-context contributions matter more than volume — see
+[`MAINTAINERS.md`](./MAINTAINERS.md) for who has write access and how
+active each is. Right now:
 
 - **Track B (full compilation)** — native codegen only covers the
   numeric/control-flow subset; `db`/`json`/`http`/`mq`/identity/
-  `transact`/concurrency are interpreter-only. First gap to close:
+  `transact`/concurrency are interpreter-only *(fully functional
+  today — the `vendor_ops.nir` demo above combines all four live;
+  Track B is a latency/throughput project, not a capability gap, see
+  [ROADMAP](./docs/PUBLIC_ROADMAP.md))*. First gap to close:
   `transact` → `db`/`json`.
 - **LLM eval harness** — [`crates/bench/`](./crates/bench) has a real pass@1 +
-  self-repair-rate scaffold but ships with mock models; wiring it to
-  DeepSeek/Kimi/GLM would make the LLM-writability claims independently
-  checkable.
-- **Windows / macOS verification** — the compiled `tcp`/`tcp_listener`
-  runtime has never run on a real Windows machine; macOS binaries link
-  system Z3 because `z3-src` doesn't build against current AppleClang.
+  self-repair-rate scaffold, and now a real `Model` too:
+  `real_model::RealModel` (`--mode real`) talks to any OpenAI-compatible
+  `/chat/completions` endpoint (DeepSeek, Kimi/Moonshot, GLM/Zhipu — set
+  `NIRDOSHA_BENCH_API_BASE`/`_API_KEY`/`_MODEL`). Its request-building and
+  response-parsing are unit-tested, but it hasn't been run against a live
+  provider yet — no API key is set in this project's dev/CI environment.
+  Running it for real against one or more of the three providers, and
+  reporting the resulting pass@1/self-repair numbers, is the actual gap
+  left to close.
+- **macOS verification** — release binaries link system Z3 because
+  `z3-src` doesn't build against current AppleClang ([ADR
+  0001](./docs/adr/0001-vendor-z3-except-macos.md), tracked as
+  [issue #5](https://github.com/arunsoman/nirdosha/issues/5)) — that part
+  is still open. What's now closed: macOS gets CI verification on every
+  push/PR, not just at release time. `build-macos` in
+  [`.github/workflows/build.yml`](./.github/workflows/build.yml) mirrors
+  release.yml's proven `brew install z3` + system-Z3 build on a real
+  `macos-14` runner. Windows is CI-verified too: `build-windows` in the
+  same file builds and runs the `tcp`/`sandbox`/`sandbox_channels`/
+  `channels` suite plus the compiled-native-codegen TCP tests on a real
+  `windows-latest` runner on every push/PR (see [ROADMAP
+  A7](./docs/PUBLIC_ROADMAP.md)).
 
 Full list with status tags: [`docs/PUBLIC_ROADMAP.md`](./docs/PUBLIC_ROADMAP.md).
 Issues are labeled `good first issue` / `help wanted` / `compiler` /
-`llm` / `infra` / `docs`. Pick one, comment before starting on anything
-non-trivial — see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+`llm` / `infra` / `documentation` (full set: [`.github/labels.yml`](./.github/labels.yml)).
+Pick one, comment before starting on anything non-trivial — see
+[`CONTRIBUTING.md`](./CONTRIBUTING.md). [`AREAS.md`](./AREAS.md) lists
+who owns which subsystem; a cross-cutting or breaking change goes
+through the [RFC process](./rfcs/README.md) first — see
+[`GOVERNANCE.md`](./GOVERNANCE.md). Your first issue or PR here won't
+land in silence: [`welcome.yml`](./.github/workflows/welcome.yml) posts
+a real, specific reply (not boilerplate) and
+[`label-first-contribution.yml`](./.github/workflows/label-first-contribution.yml)
+tags it `first-time contributor` so it's visible at a glance — it
+doesn't solve cold-start on its own, but it's a real signal in place of
+nothing.
 
 | If you care about | Try | 
 |---|---|
@@ -107,8 +138,32 @@ process and a language primitive, not a bolted-on Docker wrapper; there is
 no mutex in the language, so an agent literally cannot generate a
 lock-ordering deadlock. It isn't trying to be a better Rust — see the
 [wiki](https://github.com/arunsoman/nirdosha/wiki) for the full case,
-including where the design is still a research bet, not a finished
-product.
+including where the design is still evolving, not a finished product.
+
+## Who this is for — and who it isn't
+
+**This is for you if:**
+- You're building an agent (or agent framework) that writes and runs
+  backend code with no human reviewing it before it executes, and you
+  need the *language* to make bug classes unrepresentable rather than
+  catching them in review.
+- You want to try the constrained-decoding / self-repair mechanism on a
+  real compiler today, not a whitepaper — the GBNF grammar,
+  `--format=json` diagnostics, and `crates/bench/` all run now.
+- You're fine filing issues against a fast-moving pre-1.0 project, not
+  pulling a finished 1.0 into a production stack.
+
+**This isn't for you if:**
+- You want a general-purpose systems language for humans to write —
+  that's Rust, and Rust is the honest answer (see the FAQ below).
+- You need `db`/`json`/`http`/`mq`/concurrency compiled to native code
+  today — those run now in the interpreter (see the vendor_ops.nir demo
+  above), but aren't native-compiled until Track B lands (see
+  [ROADMAP](./docs/PUBLIC_ROADMAP.md)).
+- You need something production-ready this quarter — nothing here
+  claims that.
+
+Full picture: [Who It's For](https://github.com/arunsoman/nirdosha/wiki/Who-Its-For) in the wiki.
 
 ## Nirdosha vs. Rust, Go, Mojo — the one-line version
 
@@ -134,21 +189,65 @@ lines, each by an LLM with no prior Nirdosha exposure. See
 [LLM Integration](https://github.com/arunsoman/nirdosha/wiki/LLM-Integration)
 for the full mechanism and evidence.
 
-**Install and run it yourself:**
+**Install and run it yourself — no compiler needed, prebuilt binaries are
+published on every [release](https://github.com/arunsoman/nirdosha/releases):**
 
 ```sh
-# macOS / Linux
+git clone https://github.com/arunsoman/nirdosha.git && cd nirdosha
+
+# macOS / Linux — installer script, auto-detects your platform
 curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/arunsoman/nirdosha/main/scripts/install.sh | sh
 
-git clone https://github.com/arunsoman/nirdosha.git && cd nirdosha
 nirdosha examples/hello.nir
 nirdosha serve examples/store.nir --port 8080   # CRUD API from a struct
 ```
+
+Prefer not to pipe a script into `sh`? Download the binary straight from
+the release instead — `.../releases/latest/download/<asset>` always
+resolves to the newest release, so this stays correct with no version
+number to update. Run this from inside the `nirdosha` clone from above:
+
+```sh
+# Linux x86_64
+curl -fsSL https://github.com/arunsoman/nirdosha/releases/latest/download/nirdosha-x86_64-unknown-linux-gnu.tar.gz | tar xz
+
+# macOS, Apple Silicon
+curl -fsSL https://github.com/arunsoman/nirdosha/releases/latest/download/nirdosha-aarch64-apple-darwin.tar.gz | tar xz
+
+./nirdosha examples/hello.nir
+```
+
+These two targets are what's currently published; Windows and Intel
+Mac binaries aren't up yet (build from source below in the meantime) —
+the [releases page](https://github.com/arunsoman/nirdosha/releases/latest)
+has the current full asset list.
 
 Full install (Windows, building from source, toolchain requirements),
 scaffolding a new project, and generating a UI: see
 [Getting Started](https://github.com/arunsoman/nirdosha/wiki/Getting-Started)
 in the wiki.
+
+### Before you write your own program
+
+The example above runs as-is, but these four things will trip up your
+*first original line* — they're parse/type errors, not style nits:
+
+- **Enum variants are calls, always with `()`.** `Some(5)`, `None()`,
+  `Circle(r)` — a zero-payload variant still needs the parens.
+  `Color::Red` also works (optional disambiguation sugar), but a bare
+  variant name never takes the place of a call.
+- **`str` can't be a function's parameter or return type.** Use an
+  `enum` for categorical data, or `struct Text { value: str }` to pass
+  free text.
+- **No string concatenation or formatting.** A `str` value only ever
+  comes from a source literal or a builtin (`json_get_str`,
+  `db_query`, ...) — there's no `+` or format string to build one at
+  runtime.
+- **No statement separators.** The parser always extends the current
+  expression across a newline — `return x` then `-y` on the next line
+  parses as `return (x - y)`, not two statements.
+
+Full rationale and the complete list: [`AGENTS.md`](./AGENTS.md).
 
 ## 📚 Documentation lives in the wiki
 
@@ -172,8 +271,9 @@ the LLM-integration mechanism with evidence — lives in the
 
 ## FAQ (short version)
 
-**Is it production-ready?** No — active research prototype. See
-[Honest Scope & Roadmap](https://github.com/arunsoman/nirdosha/wiki/Honest-Scope-and-Roadmap).
+**Is it production-ready?** Not yet — it's under active development,
+with real guarantees proven today and the rest tracked openly, not
+hand-waved. See [Honest Scope & Roadmap](https://github.com/arunsoman/nirdosha/wiki/Honest-Scope-and-Roadmap).
 
 **Why not just use Rust?** Rust already solves memory safety for teams
 that can invest in its learning curve. Nirdosha targets a narrower
