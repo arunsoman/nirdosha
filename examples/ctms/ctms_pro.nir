@@ -1853,6 +1853,338 @@ fn stat_shared_volume_count() -> Result(i64, ErrorCode) requires(role: "complian
     return match db_connect("ctms_pro.db") { Ok(conn) => stat_shared_volume_count_inner(conn), Err(e) => Err(DbError(e)) }
 }
 
+// =========================================================================
+// Module 5: Advanced Analytics, Reporting, and BI
+// Doc: "Dashboard and Visualization Layer" (alert volumes, entity risk
+// rankings, case aging/SLA trends, geo heatmaps), "Reporting Engine"
+// (SAR/CTR/regulatory audit reports), "Access and Audit Layer".
+// =========================================================================
+
+module "Analytics & BI" {
+    struct RegulatoryReport {
+        id: i64,
+        report_type: str,
+        jurisdiction: str,
+        status: ReportStatus,
+        due_unix: i64,
+        transmission_status: SignatureStatus,
+    }
+
+    struct AccessViolationEntry {
+        id: i64,
+        violation_type: str,
+        affected_subject: str,
+        severity: Severity,
+        response_status: ReviewStatus,
+        occurred_unix: i64,
+    }
+
+    struct RegulatorExport {
+        id: i64,
+        export_name: str,
+        format: SourceFormat,
+        download_status: ReviewStatus,
+        generated_unix: i64,
+    }
+
+    struct AnalyticsReportSchedule {
+        id: i64,
+        template_name: str,
+        schedule_kind: str,
+        dispatch_channel: str,
+        last_dispatched_unix: i64,
+    }
+
+    struct DriftAlert {
+        id: i64,
+        entity_ref: str,
+        drift_score: i64,
+        acknowledged: bool,
+        detected_unix: i64,
+    }
+
+    struct AnalyticsAccessLogEntry {
+        id: i64,
+        accessed_by: str,
+        asset_name: str,
+        accessed_unix: i64,
+        action_kind: str,
+    }
+}
+
+// ---- RegulatoryReport: the Regulatory Reporting Queue. -----------------
+
+fn list_regulatory_report_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS regulatory_report (id INTEGER PRIMARY KEY AUTOINCREMENT, report_type TEXT, jurisdiction TEXT, status TEXT, due_unix INTEGER, transmission_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, report_type, jurisdiction, status, due_unix, transmission_status FROM regulatory_report ORDER BY due_unix") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_regulatory_report() -> Result(json, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_regulatory_report_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_regulatory_report_inner(conn: db, r: RegulatoryReport) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS regulatory_report (id INTEGER PRIMARY KEY AUTOINCREMENT, report_type TEXT, jurisdiction TEXT, status TEXT, due_unix INTEGER, transmission_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO regulatory_report (report_type, jurisdiction, status, due_unix, transmission_status) VALUES (?, ?, ?, ?, ?)", r.report_type, r.jurisdiction, r.status, r.due_unix, r.transmission_status) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_regulatory_report(r: RegulatoryReport) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_regulatory_report_inner(conn, r), Err(e) => Err(DbError(e)) }
+}
+fn transmit_regulatory_report_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS regulatory_report (id INTEGER PRIMARY KEY AUTOINCREMENT, report_type TEXT, jurisdiction TEXT, status TEXT, due_unix INTEGER, transmission_status TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let updated: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE regulatory_report SET status = 'ReportStatusFiled', transmission_status = 'SignatureStatusValid' WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let confirm: Result(json, ErrorCode) = match updated {
+        Ok(n) => match db_query(conn, "SELECT id, status, transmission_status FROM regulatory_report WHERE id = ?", id) {
+            Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(e),
+    }
+    stop conn
+    return confirm
+}
+fn transmit_regulatory_report(id: i64) -> Result(json, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => transmit_regulatory_report_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
+screen RegulatoryReport {
+    title: "Regulatory Reporting Queue"
+    field status {
+        render: "badge"
+    }
+    field transmission_status {
+        render: "badge"
+    }
+    action "Generate/Transmit" -> transmit_regulatory_report {
+        style: "filled"
+        show_result: true
+    }
+
+    layout {
+        row {
+            column {
+                field report_type
+                field jurisdiction
+                field due_unix
+            }
+            column {
+                field status
+                field transmission_status
+                action "Generate/Transmit"
+            }
+        }
+    }
+}
+
+// ---- AccessViolationEntry: breach/violation monitor. -------------------
+
+fn list_access_violation_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS access_violation_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, violation_type TEXT, affected_subject TEXT, severity TEXT, response_status TEXT, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, violation_type, affected_subject, severity, response_status, occurred_unix FROM access_violation_entry ORDER BY occurred_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_access_violation_entry() -> Result(json, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_access_violation_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_access_violation_entry_inner(conn: db, v: AccessViolationEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS access_violation_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, violation_type TEXT, affected_subject TEXT, severity TEXT, response_status TEXT, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO access_violation_entry (violation_type, affected_subject, severity, response_status, occurred_unix) VALUES (?, ?, ?, ?, ?)", v.violation_type, v.affected_subject, v.severity, v.response_status, v.occurred_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_access_violation_entry(v: AccessViolationEntry) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_access_violation_entry_inner(conn, v), Err(e) => Err(DbError(e)) }
+}
+
+screen AccessViolationEntry {
+    title: "Access Violation / Breach Monitor"
+    field severity {
+        render: "badge"
+    }
+    field response_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field violation_type
+                field affected_subject
+                field occurred_unix
+            }
+            column {
+                field severity
+                field response_status
+            }
+        }
+    }
+}
+
+// ---- RegulatorExport: export bundles for the regulator/partner. ------
+
+fn list_regulator_export_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS regulator_export (id INTEGER PRIMARY KEY AUTOINCREMENT, export_name TEXT, format TEXT, download_status TEXT, generated_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, export_name, format, download_status, generated_unix FROM regulator_export ORDER BY generated_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_regulator_export() -> Result(json, ErrorCode) requires(role: "regulator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_regulator_export_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_regulator_export_inner(conn: db, e: RegulatorExport) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS regulator_export (id INTEGER PRIMARY KEY AUTOINCREMENT, export_name TEXT, format TEXT, download_status TEXT, generated_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO regulator_export (export_name, format, download_status, generated_unix) VALUES (?, ?, ?, ?)", e.export_name, e.format, e.download_status, e.generated_unix) { Ok(n) => Ok(n), Err(err) => Err(DbError(err)) }
+    stop conn
+    return result
+}
+fn create_regulator_export(e: RegulatorExport) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_regulator_export_inner(conn, e), Err(err) => Err(DbError(err)) }
+}
+
+screen RegulatorExport {
+    title: "Regulator/Partner Export Portal"
+    field format {
+        render: "badge"
+    }
+    field download_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            field export_name
+            field format
+            field download_status
+            field generated_unix
+        }
+    }
+}
+
+// ---- AnalyticsReportSchedule / DriftAlert / AnalyticsAccessLogEntry. -
+
+fn list_analytics_report_schedule_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS analytics_report_schedule (id INTEGER PRIMARY KEY AUTOINCREMENT, template_name TEXT, schedule_kind TEXT, dispatch_channel TEXT, last_dispatched_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, template_name, schedule_kind, dispatch_channel, last_dispatched_unix FROM analytics_report_schedule ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_analytics_report_schedule() -> Result(json, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_analytics_report_schedule_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_analytics_report_schedule_inner(conn: db, s: AnalyticsReportSchedule) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS analytics_report_schedule (id INTEGER PRIMARY KEY AUTOINCREMENT, template_name TEXT, schedule_kind TEXT, dispatch_channel TEXT, last_dispatched_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO analytics_report_schedule (template_name, schedule_kind, dispatch_channel, last_dispatched_unix) VALUES (?, ?, ?, ?)", s.template_name, s.schedule_kind, s.dispatch_channel, s.last_dispatched_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_analytics_report_schedule(s: AnalyticsReportSchedule) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_analytics_report_schedule_inner(conn, s), Err(e) => Err(DbError(e)) }
+}
+
+screen AnalyticsReportSchedule {
+    title: "Report Scheduling"
+
+    layout {
+        row {
+            field template_name
+            field schedule_kind
+            field dispatch_channel
+            field last_dispatched_unix
+        }
+    }
+}
+
+fn list_drift_alert_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS drift_alert (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_ref TEXT, drift_score INTEGER, acknowledged INTEGER, detected_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, entity_ref, drift_score, acknowledged, detected_unix FROM drift_alert ORDER BY detected_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_drift_alert() -> Result(json, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_drift_alert_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_drift_alert_inner(conn: db, d: DriftAlert) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS drift_alert (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_ref TEXT, drift_score INTEGER, acknowledged INTEGER, detected_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO drift_alert (entity_ref, drift_score, acknowledged, detected_unix) VALUES (?, ?, ?, ?)", d.entity_ref, d.drift_score, d.acknowledged, d.detected_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_drift_alert(d: DriftAlert) -> Result(i64, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_drift_alert_inner(conn, d), Err(e) => Err(DbError(e)) }
+}
+
+screen DriftAlert {
+    title: "Model/Metric Drift Alerts"
+
+    layout {
+        row {
+            field entity_ref
+            field drift_score
+            field acknowledged
+            field detected_unix
+        }
+    }
+}
+
+fn list_analytics_access_log_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS analytics_access_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, accessed_by TEXT, asset_name TEXT, accessed_unix INTEGER, action_kind TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, accessed_by, asset_name, accessed_unix, action_kind FROM analytics_access_log_entry ORDER BY accessed_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_analytics_access_log_entry() -> Result(json, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_analytics_access_log_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_analytics_access_log_entry_inner(conn: db, l: AnalyticsAccessLogEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS analytics_access_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, accessed_by TEXT, asset_name TEXT, accessed_unix INTEGER, action_kind TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO analytics_access_log_entry (accessed_by, asset_name, accessed_unix, action_kind) VALUES (?, ?, ?, ?)", l.accessed_by, l.asset_name, l.accessed_unix, l.action_kind) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_analytics_access_log_entry(l: AnalyticsAccessLogEntry) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_analytics_access_log_entry_inner(conn, l), Err(e) => Err(DbError(e)) }
+}
+
+screen AnalyticsAccessLogEntry {
+    title: "Analytics Access Log"
+
+    layout {
+        row {
+            field accessed_by
+            field asset_name
+            field action_kind
+            field accessed_unix
+        }
+    }
+}
+
+// ---- Module 5 dashboard contributions: geo heatmap + entity risk chart.
+
+// `render: "heatmap"`'s `[{"lat","lng","weight","label"?}]` contract --
+// one point per investigation transaction (Module 3), weighted by amount.
+fn heatmap_transaction_geo_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS investigation_transaction (id INTEGER PRIMARY KEY AUTOINCREMENT, investigation_id INTEGER, amount_cents INTEGER, geo_country TEXT, created_unix INTEGER, geo_lat REAL, geo_lng REAL)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT geo_lat AS lat, geo_lng AS lng, amount_cents AS weight, geo_country AS label FROM investigation_transaction") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn heatmap_transaction_geo() -> Result(json, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => heatmap_transaction_geo_inner(conn), Err(e) => Err(DbError(e)) }
+}
+// "Entity risk rankings" -- doc's own dashboard widget name, verbatim.
+fn chart_entity_risk_ranking_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS behavioural_profile (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_ref TEXT, baseline_txn_count INTEGER, deviation_score INTEGER, flagged INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(json, ErrorCode) = match db_query(conn, "SELECT entity_ref AS label, deviation_score AS value FROM behavioural_profile ORDER BY deviation_score DESC LIMIT 10") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn chart_entity_risk_ranking() -> Result(json, ErrorCode) requires(role: "fraud_analyst") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => chart_entity_risk_ranking_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
 // === APPEND POINT ===
 
 fn main() {}
