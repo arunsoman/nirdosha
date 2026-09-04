@@ -2195,8 +2195,8 @@ fn free_port() -> u16 {
 #[test]
 fn compiled_connect_send_recv_stop_round_trips_real_bytes() {
     use std::io::{Read, Write};
-    let port = free_port();
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut buf = [0u8; 1024];
@@ -2225,8 +2225,8 @@ fn compiled_connect_send_recv_stop_round_trips_real_bytes() {
 #[test]
 fn compiled_recv_payload_matches_interpreter_byte_for_byte() {
     use std::io::{Read, Write};
-    let port = free_port();
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut buf = [0u8; 1024];

@@ -41,8 +41,8 @@ fn free_port() -> u16 {
 
 #[test]
 fn a_connected_client_can_send_and_receive_real_bytes() {
-    let port = free_port();
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut buf = [0u8; 1024];

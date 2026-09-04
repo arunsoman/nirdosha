@@ -881,8 +881,8 @@ fn replay_leaves_a_still_failing_network_at_pending_for_the_next_attempt() {
 /// end to end rather than just asserted.
 #[test]
 fn network_slot_talks_to_a_real_separate_process_over_tcp() {
-    let port = free_port();
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
     let received_txn_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
     let received_clone = Arc::clone(&received_txn_ids);
     let server = std::thread::spawn(move || {

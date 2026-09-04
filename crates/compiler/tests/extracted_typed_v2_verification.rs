@@ -6,6 +6,17 @@
 //! workflows and both of its `routing_fn`s are checked for real here,
 //! not just read — this is the actual answer to "does this extraction
 //! meet expectations," not a visual skim.
+//!
+//! `scratch/extracted_typed_v2.json` is a local fixture, **not** checked
+//! into git (`scratch/` is in `.gitignore`) — it's the output of a
+//! one-off LLM extraction pass, not something this repo's own tooling
+//! regenerates. Every `#[test]` below is `#[ignore]`d for that reason
+//! (same convention `postgres.rs`'s `NIRDOSHA_TEST_POSTGRES_URL`-gated
+//! tests use for "needs a local resource the test suite can't assume
+//! exists"): a plain `cargo test` never touches this file, so its
+//! absence can't break a clean checkout or CI. Anyone who still has the
+//! fixture locally can run it directly: `cargo test --release --test
+//! extracted_typed_v2_verification -- --ignored`.
 
 use std::collections::HashMap;
 
@@ -17,10 +28,21 @@ use nirdosha::token::Lexer;
 use nirdosha::typeck::typecheck_optional_main;
 use nirdosha::workflow_conformance::check_workflow_conformance;
 
-const EXTRACTED_JSON: &str = include_str!("../../../scratch/extracted_typed_v2.json");
-
+/// Read at test-run time, not compiled in via `include_str!` — the
+/// fixture is gitignored and won't exist on a clean checkout/CI runner,
+/// and `include_str!` would fail the whole *build* (every test in this
+/// binary, including ones that don't need this file) rather than just
+/// this one, ignored test.
 fn load_extraction() -> ExtractionFile {
-    serde_json::from_str(EXTRACTED_JSON).expect("scratch/extracted_typed_v2.json should match extraction_schema::ExtractionFile")
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scratch/extracted_typed_v2.json");
+    let json = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "couldn't read {path}: {e} -- this is a local-only fixture (scratch/ is gitignored, \
+             not shipped with the repo); only run this test with it present, via \
+             `cargo test --release --test extracted_typed_v2_verification -- --ignored`"
+        )
+    });
+    serde_json::from_str(&json).expect("scratch/extracted_typed_v2.json should match extraction_schema::ExtractionFile")
 }
 
 fn build_program(src: &str) -> nirdosha::ast::Program {
@@ -203,6 +225,7 @@ fn assert_conforms(nir: &str, file: &ExtractionFile, id: &str) {
     assert!(report.is_exact_match(), "{id}: conformance mismatches: {:#?}", report.mismatches);
 }
 
+#[ignore = "needs local scratch/extracted_typed_v2.json, not checked into git"]
 #[test]
 fn all_six_v2_workflows_match_their_real_nir_verbatim() {
     let file = load_extraction();
@@ -214,6 +237,7 @@ fn all_six_v2_workflows_match_their_real_nir_verbatim() {
     assert_conforms(WALLET_SETTLEMENT_NIR, &file, "WF-COMM-001");
 }
 
+#[ignore = "needs local scratch/extracted_typed_v2.json, not checked into git"]
 #[test]
 fn trade_payment_approval_routing_fn_is_proved_against_v2() {
     let file = load_extraction();
@@ -231,6 +255,7 @@ fn trade_payment_approval_routing_fn_is_proved_against_v2() {
 /// type in Nirdosha). Confirms `contract_check.rs` handles a multi-
 /// parameter arithmetic contract, not just the single-param case
 /// `extracted_typed_v1_verification.rs` already covered.
+#[ignore = "needs local scratch/extracted_typed_v2.json, not checked into git"]
 #[test]
 fn batch_payment_approval_routing_fn_is_proved_against_v2() {
     let file = load_extraction();
@@ -244,6 +269,7 @@ fn batch_payment_approval_routing_fn_is_proved_against_v2() {
 /// Same threshold-unbound case as v1, re-confirmed against the fresh
 /// extraction — `high_value_threshold` still isn't one of
 /// `required_eyes_for_amount`'s real parameters.
+#[ignore = "needs local scratch/extracted_typed_v2.json, not checked into git"]
 #[test]
 fn trade_payment_approval_routing_fn_is_unbound_without_a_threshold_binding() {
     let file = load_extraction();
@@ -257,6 +283,7 @@ fn trade_payment_approval_routing_fn_is_unbound_without_a_threshold_binding() {
 /// demonstrate: `required_role` (a literal token, not
 /// `required_permission`'s prose), `implements` (bound to a real
 /// function), and `input_fields` (typed, form-renderable).
+#[ignore = "needs local scratch/extracted_typed_v2.json, not checked into git"]
 #[test]
 fn user_story_ui_fields_are_populated_and_well_formed() {
     let file = load_extraction();
@@ -290,6 +317,7 @@ fn user_story_ui_fields_are_populated_and_well_formed() {
 /// State-ownership fields: `owner_role`/`required_decisions` should
 /// correctly distinguish Maker-Checker (1 other decider) from six-eyes
 /// (2 distinct ones) from a no-owner automatic state.
+#[ignore = "needs local scratch/extracted_typed_v2.json, not checked into git"]
 #[test]
 fn state_ownership_fields_distinguish_maker_checker_from_six_eyes() {
     let file = load_extraction();

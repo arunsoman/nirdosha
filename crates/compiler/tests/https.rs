@@ -123,8 +123,8 @@ fn https_get_rejects_an_untrusted_self_signed_certificate() {
     };
     let identity = native_tls::Identity::from_pkcs12(&pkcs12, "testpass").expect("test cert should load");
 
-    let port = free_port();
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
     let server = serve_one_tls(listener, identity);
 
     let src = format!(
@@ -150,8 +150,8 @@ fn https_get_rejects_an_untrusted_self_signed_certificate() {
 fn https_against_a_plain_tcp_peer_is_a_recoverable_err() {
     // A listener that accepts and immediately closes -- speaks no TLS at
     // all. The handshake must fail cleanly, not hang or panic.
-    let port = free_port();
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {
         let _ = listener.accept();
     });

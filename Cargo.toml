@@ -8,3 +8,25 @@ members = [
     "crates/presence-gateway",
     "crates/plugin-example-rot13",
 ]
+
+# Rust's own integer-overflow panic is `nirdosha`'s only runtime guard for
+# i64 arithmetic (there's no dynamic `OutOfRange` check for it, see
+# `scalar_binop`/`eval_binary` in crates/compiler/src/interpreter.rs) --
+# `spawn`/`join` catches that panic via `catch_unwind` and reports
+# `ThreadPanicked`. Cargo's default release profile disables overflow
+# checks, which would silently make every distributed `nirdosha` binary
+# wrap i64 overflow instead of erroring -- directly contradicting the
+# project's overflow-safety guarantees. Keep this on in release builds.
+#
+# Must live HERE, at the workspace root -- Cargo only honors `[profile.*]`
+# from the root manifest, silently ignoring the same section in a member
+# crate's own Cargo.toml (with a build-time warning, easy to miss). This
+# setting used to live in crates/compiler/Cargo.toml, back when that file
+# was itself the workspace root; the `crates/`/`docs/` reorg moved it under
+# a real workspace without moving this section along with it, silently
+# turning overflow-checks off in every `--release` build since -- caught by
+# `tests/concurrency.rs::a_panic_inside_a_spawned_function_surfaces_as_
+# thread_panicked` failing in `--release` (it passed in plain `cargo test`,
+# which defaults to debug-mode overflow panics regardless of this setting).
+[profile.release]
+overflow-checks = true
