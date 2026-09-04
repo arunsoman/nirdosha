@@ -2761,7 +2761,7 @@ repo: the compiler core is unusually well documented, but adoption
 infrastructure around it is thin. Full analysis, open questions, and
 sequencing in `docs/ECOSYSTEM.md`; this entry only tracks status.*
 
-- `[OPEN]` **G1. Package/stdlib economy via Cargo.** No `.nir`
+- `[PARTIAL]` **G1. Package/stdlib economy via Cargo.** No `.nir`
   package manager/registry today — distribution is prebuilt CLI
   releases only, and `Cargo.toml` is the compiler's own build
   manifest, not a `.nir` package system. `docs/ECOSYSTEM.md` §G1 works
@@ -2772,6 +2772,28 @@ sequencing in `docs/ECOSYSTEM.md`; this entry only tracks status.*
   resolver taught to fetch them), with a staged plan and real open
   questions (native-plugin sandboxing, two overlapping version
   resolvers, whether crates.io is even the right home for Kind B).
+
+  **2026-09-04 — Stage 1 (Kind A) built and verified.**
+  `crates/compiler/src/plugin.rs`'s `NirdoshaPlugin` trait, real
+  additive hooks in `typeck.rs`/`interpreter.rs` (every existing call
+  site that used to gate on `ast::is_builtin` alone now also checks a
+  registered plugin table — nothing already-shipped changed behavior),
+  a new `lib.rs::run_with_plugins` entrypoint, and one real reference
+  plugin crate (`crates/plugin-example-rot13/`, a `[package.metadata.
+  nirdosha]`-annotated crate contributing `rot13(s: str) -> str`) with
+  a real `.nir`-source end-to-end test suite (6/6 passing — call
+  resolution, correct return value, wrong-arity and wrong-type calls
+  both caught as real type errors, correct "unresolvable" with no
+  plugin registered). Full existing suite reverified unaffected
+  (`cargo test -p nirdosha --no-fail-fast`, every target green except
+  `tests/mq.rs`'s pre-existing Redis-dependent failures, unrelated to
+  this change). Still genuinely open, per `docs/ECOSYSTEM.md` §G1's own
+  disclosed gap: `serve`/`emit-ui`/`emit-llvm` don't see plugins yet
+  (interpreter path only); no `Cargo.toml`-driven auto-discovery (a
+  project calls `run_with_plugins` from its own small entrypoint, the
+  standard `nirdosha` CLI doesn't find a declared plugin dependency on
+  its own yet); the native-code-sandboxing open question is still just
+  that, open. Stage 2 (Kind B, pure-`.nir`-source crates) not started.
 - `[OPEN]` **G2. Editor/tooling ecosystem.** No LSP, no tree-sitter
   grammar, no formatter, no debugger (`cie`, a related repo, already
   documents this gap from the outside — Nirdosha handled via AST dump

@@ -207,6 +207,7 @@ pub fn error_kind_name(kind: &crate::interpreter::ErrorKind) -> &'static str {
         WorkflowActionPending { .. } => "WorkflowActionPending",
         Deadlock { .. } => "Deadlock",
         ContractViolation { .. } => "ContractViolation",
+        PluginError { .. } => "PluginError",
     }
 }
 
