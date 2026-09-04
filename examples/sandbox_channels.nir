@@ -1,5 +1,5 @@
 // Exercises: `sandbox`/`stop` combined with `chan`/`send`/`recv` --
-// SANDBOXING.md's layer 2, a real cross-process transport for the same
+// docs/SANDBOXING.md's layer 2, a real cross-process transport for the same
 // `chan T` primitive examples/channels.nir already demonstrates
 // in-process. A `chan`-typed argument to `sandbox worker(c)` gives the
 // spawned OS process a genuine, live communication channel with the

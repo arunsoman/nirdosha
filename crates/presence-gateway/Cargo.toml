@@ -1,0 +1,47 @@
+[package]
+name = "nirdosha-presence-gateway"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Deliberately NOT `nirdosha = { path = "../compiler" }` as a real
+# dependency (unlike `bench`/`grammar_check`, which use the compiler as a
+# library) -- this is meant to be the "small standalone service" docs/WORKFLOW.md
+# §"notify presence bridge" and docs/ROADMAP.md's A5 both describe, deployed as
+# its own lightweight container/sidecar next to `nirdosha serve`, not a
+# second copy of the whole interpreter (z3, postgres, rusqlite, the full
+# `dist`-feature vendored-Z3 build). It talks to `nirdosha serve` only over
+# the network, the same arm's-length relationship an external WS gateway
+# has in production. `nirdosha` IS pulled in under `[dev-dependencies]`
+# below, purely so tests can start a real `nirdosha serve` in-process and
+# mint real tokens with `mock_issue_token` -- "verify against the real
+# thing, not a hand-rolled stand-in" (this repo's own testing discipline,
+# `tests/mq.rs`'s doc comment) without that cost ever reaching the shipped
+# binary.
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync", "io-util"] }
+tokio-tungstenite = "0.28"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# `tokio-comp`, not the default sync client -- every Redis call this
+# service makes (the per-connection `SUBSCRIBE`) has to share the same
+# async runtime as the WebSocket I/O and the `_presence_connect`/
+# `_disconnect` HTTP calls; a blocking Redis call on a Tokio worker thread
+# would stall every other connection multiplexed onto it.
+redis = { version = "0.32", default-features = false, features = ["tokio-comp"] }
+# `rustls-tls`, not the default `default-tls` (system OpenSSL): keeps the
+# runtime image dependency-free of a system TLS library, same reasoning
+# `dbconn.rs`'s Postgres-TLS path and this repo's own release binaries
+# already apply elsewhere.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+jsonwebtoken = "9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+http = "1"
+base64 = "0.22"
+
+[dev-dependencies]
+nirdosha = { path = "../compiler" }
+
+[[bin]]
+name = "nirdosha-presence-gateway"
+path = "src/main.rs"

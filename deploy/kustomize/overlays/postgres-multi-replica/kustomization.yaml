@@ -7,7 +7,7 @@
 # for the Helm chart's `--set db.mode=postgres --set replicaCount=N
 # --set db.postgresSecretName=...` invocation. You must create the
 # `nirdosha-postgres` Secret (transact-log-url/workflow-log-url keys)
-# yourself before applying this — see KUBERNETES.md's P1 remediation
+# yourself before applying this — see docs/KUBERNETES.md's P1 remediation
 # item.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization

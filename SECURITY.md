@@ -37,7 +37,7 @@ boundary in a real deployment:
 - `serve.rs` — the HTTP/auth boundary: token validation
   (`oidc_validate_token`), role/claim gate enforcement, field-level
   RBAC redaction, request-size/rate limits
-- `sandbox`/`stop` — real OS-process isolation (`SANDBOXING.md`)
+- `sandbox`/`stop` — real OS-process isolation (`docs/SANDBOXING.md`)
 - `ownership.rs`/`typeck.rs` — the static guarantees the whole project
   is built around; a real counterexample to "the type checker accepts
   it, therefore it's memory/race-safe" is a serious finding
@@ -54,5 +54,5 @@ locally-run `nirdosha serve` instance with no authentication configured
 
 This project is pre-1.0 and does not yet have a formal support-window
 policy — see Track A ("Compatibility/versioning policy") in
-[`PUBLIC_ROADMAP.md`](./PUBLIC_ROADMAP.md). Until that lands, the only
+[`docs/PUBLIC_ROADMAP.md`](./docs/PUBLIC_ROADMAP.md). Until that lands, the only
 supported version is the latest commit on `main`.

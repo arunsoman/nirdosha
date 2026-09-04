@@ -1,5 +1,5 @@
 // CTMS -- Track E1 proof-of-concept for `workspace`/`panel`
-// (`ROADMAP.md` Track E1, `examples/ctms/UI_CONSTRUCTS.md` SS1). This is
+// (`docs/ROADMAP.md` Track E1, `examples/ctms/UI_CONSTRUCTS.md` SS1). This is
 // deliberately NOT the full CTMS rebuild -- that's Track E6, blocked on
 // E1-E5 all landing. This file exists to prove the Investigation
 // Workspace worked example for real: a `Matter` (an investigative case
@@ -34,7 +34,7 @@ struct Matter {
     risk_score: i64,
     // Track E3's `field { render: "countdown" }` -- a unix-seconds SLA
     // deadline, rendered as a live "23m left"/"OVERDUE" chip on the
-    // Matter Queue instead of a raw integer (`LANGUAGE.md` SS11c/SS3).
+    // Matter Queue instead of a raw integer (`docs/LANGUAGE.md` SS11c/SS3).
     sla_deadline_unix: i64,
 }
 
@@ -171,7 +171,7 @@ fn delete_matter(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
 // Track E3 -- the Matter Queue's live SLA countdown. No grammar change:
 // `field { render: "countdown" }` is an ordinary `kv_entry` inside the
 // same `field <name> { ... }` block `label`/`pattern`/`min`/`max`
-// already use (`LANGUAGE.md` SS11c/SS3).
+// already use (`docs/LANGUAGE.md` SS11c/SS3).
 // Decision Panel / Case Export -- Track E4 preview-shaped actions on the
 // Matter Queue screen itself, alongside its Track E3 SLA countdown.
 fn record_matter_decision_inner(conn: db, id: i64, resolution: Text, justification: Text) -> Result(json, ErrorCode) {
@@ -196,7 +196,7 @@ fn record_matter_decision(id: i64, resolution: Text, justification: Text) -> Res
 fn export_matter_dossier_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, risk_score INTEGER, sla_deadline_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
     // A real dossier would bundle a signed PDF/CSV/JSON artifact --
-    // Nirdosha has no file/blob type yet (`MOBILE.md`'s D3 already names
+    // Nirdosha has no file/blob type yet (`docs/MOBILE.md`'s D3 already names
     // this same gap). This returns the JSON summary a real one would be
     // built from, honestly short of the real deliverable, not silently
     // pretending to produce one.
@@ -315,7 +315,7 @@ fn list_matter_note(matter_id: i64) -> Result(json, ErrorCode) requires(role: "i
 
 // `author`/`body` both stay `Text`, never a bare `str` -- the
 // enum-favoring-`str`-ban applies at *every* user fn's call boundary,
-// including a private `_inner` helper (LANGUAGE.md SS6b) -- only
+// including a private `_inner` helper (docs/LANGUAGE.md SS6b) -- only
 // builtins (`db_execute` etc.) are exempt.
 fn add_matter_note_inner(conn: db, matter_id: i64, author: Text, body: Text) -> Result(i64, ErrorCode) {
     let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS matter_note (id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER, author TEXT, body TEXT)") {
@@ -331,7 +331,7 @@ fn add_matter_note_inner(conn: db, matter_id: i64, author: Text, body: Text) -> 
 }
 
 // `author` is hardcoded here since real subject identity plumbing into
-// a panel action's own params is future work, same as `WORKFLOW.md`'s
+// a panel action's own params is future work, same as `docs/WORKFLOW.md`'s
 // disclosed "comment not yet threaded into on_entry/on_exit" gap.
 fn add_matter_note(matter_id: i64, body: Text) -> Result(i64, ErrorCode) requires(role: "investigator") {
     return match db_connect("ctms.db") {
@@ -520,7 +520,7 @@ fn stat_high_risk_wallet_count() -> Result(i64, ErrorCode) requires(public) {
 // (`UI_CONSTRUCTS.md` SS3's own "Open questions": "just an ordinary
 // stat_<name>() -> i64 counting function -- no render involvement at
 // all"). `strftime('%s','now')` is SQLite's own clock, not Nirdosha's --
-// this language has no wall-clock builtin at all (`LANGUAGE.md` SS9's
+// this language has no wall-clock builtin at all (`docs/LANGUAGE.md` SS9's
 // deliberate no-wall-clock determinism stance), the same way this file
 // already leans on SQL's own `||`/`json_object` for what Nirdosha's own
 // expression grammar can't do, pushed into the query text rather than
@@ -555,7 +555,7 @@ fn stat_cases_nearing_sla_breach() -> Result(i64, ErrorCode) requires(public) {
 }
 
 // `render: "graph"`'s required `{"nodes":[...], "edges":[...]}` envelope
-// (`LANGUAGE.md` SS11c) is built entirely in SQL -- SQLite's own bundled
+// (`docs/LANGUAGE.md` SS11c) is built entirely in SQL -- SQLite's own bundled
 // `json_object`/`json_group_array` functions -- since Nirdosha itself has
 // no builtin to combine two `db_query` results into one nested JSON
 // object. The one `db_query` call returns a single row whose one column
@@ -771,7 +771,7 @@ dashboard {
 
 // ---- Track E5: the Case Workflow/Stage Tracker (Module 3) -------------
 // `UI_CONSTRUCTS.md` SS5's own worked example, built for real: no syntax
-// beyond what `WORKFLOW.md` already supports -- the stepper is purely a
+// beyond what `docs/WORKFLOW.md` already supports -- the stepper is purely a
 // rendering upgrade on top of this declared `state` order.
 workflow CaseLifecycle {
     data {
@@ -1020,7 +1020,7 @@ fn chart_matters_by_status() -> Result(json, ErrorCode) requires(public) {
 // `examples/ctms/SCREENS.md`'s 89-screen inventory, built against the
 // actual construct each needs (E1-E5), not a stub. Structs are grouped
 // under `module "<Module Name>" { ... }` purely for nav grouping
-// (LANGUAGE.md SS12) -- fns/screens/dashboard/workspace stay top-level,
+// (docs/LANGUAGE.md SS12) -- fns/screens/dashboard/workspace stay top-level,
 // since `module` bodies may only hold `fn`/`struct`/`enum` (parser.rs's
 // own "screen/dashboard blocks must be declared at top level" rule).
 // =========================================================================

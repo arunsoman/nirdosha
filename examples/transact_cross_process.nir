@@ -1,4 +1,4 @@
-// `transact`'s Layer 5 (TRANSACT.md): a slot's named function using a
+// `transact`'s Layer 5 (docs/TRANSACT.md): a slot's named function using a
 // real cross-process effect internally -- `connect`/`tcp`'s `send`/`recv`
 // here, `sandbox`/`db_connect` equally legal, since the restriction is
 // only "one named `Expr::Call`," never "no side effects inside it." No

@@ -39,7 +39,7 @@ durability log.
 */ -}}
 {{- define "nirdosha.validateReplicaMode" -}}
 {{- if and (gt (.Values.replicaCount | int) 1) (ne .Values.db.mode "postgres") -}}
-{{- fail "replicaCount > 1 requires db.mode=postgres (see KUBERNETES.md's P1 remediation item) -- one replica per independent SQLite durability log is a correctness bug, not a scaling config" -}}
+{{- fail "replicaCount > 1 requires db.mode=postgres (see docs/KUBERNETES.md's P1 remediation item) -- one replica per independent SQLite durability log is a correctness bug, not a scaling config" -}}
 {{- end -}}
 {{- if and (eq .Values.db.mode "postgres") (not .Values.db.postgresSecretName) -}}
 {{- fail "db.mode=postgres requires db.postgresSecretName (a Secret with transact-log-url/workflow-log-url keys)" -}}
@@ -48,7 +48,7 @@ durability log.
 
 {{- /*
 `presence.enabled` deploys the presence-gateway sidecar
-(`presence-gateway/`, repo root) -- it independently verifies every
+(`crates/presence-gateway/`) -- it independently verifies every
 WebSocket client's identity token, so it needs the same JWKS/issuer/
 audience the main container validates against, and a real Redis to
 subscribe to (`notify()`'s live-push transport). Both fail fast at

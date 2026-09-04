@@ -2,7 +2,7 @@
 
 **Update, 21 Aug 2026**: `Vector`/`Matrix` — the whole dense-linear-algebra
 feature set pulled from Julia — is now a **compiled** feature
-(`goal.md` §9 item 1; see `LANGUAGE.md` §7/§10, updated to match). The
+(`docs/goal.md` §9 item 1; see `docs/LANGUAGE.md` §7/§10, updated to match). The
 numbers below are the re-run, compiled-vs-compiled results. The original
 interpreted numbers are kept further down as the "before" state — the
 whole point of compiling it was to see this delta, not to discard the
@@ -20,7 +20,7 @@ codegen phases, and the fair external baseline differs for each:
   because it exposes a real, honest tradeoff — see below.
 - **Group B — everything else** (scalar arithmetic, control flow, recursion:
   `fib`, `floatloop`): Nirdosha (**compiled**, `nirdosha build`) vs. **C**,
-  the natural baseline for a language whose stated goal (`goal.md` row 5) is
+  the natural baseline for a language whose stated goal (`docs/goal.md` row 5) is
   hardware-native speed with no runtime.
 
 ## Methodology
@@ -62,7 +62,7 @@ bit-identical across all three languages before any time was trusted
 
 **Decisive win over Julia on all four now** — the 2-2 split in the
 interpreted-era numbers below is gone once compiled, exactly what
-compiling `Vector`/`Matrix` was expected to buy (`goal.md` §9).
+compiling `Vector`/`Matrix` was expected to buy (`docs/goal.md` §9).
 
 **The honest asterisk**: Nirdosha loses to hand-specialized C on `det` and
 `kalman`, and wins on `matmul`/`dot` by more than a compiled-vs-compiled
@@ -88,7 +88,7 @@ it for `matmul`/`dot` — noted as follow-up, not done here.
 ### Before compiling (historical — interpreted Nirdosha vs. Julia)
 
 Kept for the record; this was the whole reason Vector/Matrix codegen
-(`goal.md` §9 item 1) got prioritized.
+(`docs/goal.md` §9 item 1) got prioritized.
 
 | Benchmark | Julia (JIT native) | Nirdosha (interpreted) | Ratio |
 |---|---:|---:|---:|
@@ -116,7 +116,7 @@ for C since Nirdosha's backend is `clang`.
 
 At `-O2`, Nirdosha-compiled is within **1.4×** of `gcc -O2` on `fib` and
 essentially tied with both C compilers on `floatloop` (0.436 s vs. 0.443/
-0.435 s — noise-level). This is the comparison `goal.md` row 5 actually
+0.435 s — noise-level). This is the comparison `docs/goal.md` row 5 actually
 cares about, and it lands where a thin LLVM-backed AOT compiler should:
 close to hand-written C, an order of magnitude ahead of Julia on cold-start
 + short-lived-process workloads, and roughly what `clang -O2` alone gets on
@@ -144,7 +144,7 @@ flagged, not silently omitted.
   C — that's a different, also-valid question ("steady-state throughput"
   rather than "one-shot run cost") that this suite doesn't answer.
 - **Group A is now compiled vs. compiled**, as of the `Vector`/`Matrix`
-  codegen work landing (`goal.md` §9 item 1) — no longer the
+  codegen work landing (`docs/goal.md` §9 item 1) — no longer the
   interpreter-vs-JIT caveat the original run carried.
 - **4×4/8-element problem sizes still favor Nirdosha's hand-rolled
   algorithm choice over Julia's BLAS dispatch** — not a general "Nirdosha

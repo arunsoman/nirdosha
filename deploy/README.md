@@ -1,7 +1,7 @@
 # Deploying nirdosha to Kubernetes
 
-Three ways in, all rendering the same shape (see `../KUBERNETES.md` for
-the compliance matrix these implement and `../KUBERNETES_ADVANTAGE.md`
+Three ways in, all rendering the same shape (see `../docs/KUBERNETES.md` for
+the compliance matrix these implement and `../docs/KUBERNETES_ADVANTAGE.md`
 for the case for nirdosha over a classic two-tier stack on k8s):
 
 1. **Helm chart** (`helm/nirdosha/`) — for a human operator, templated,
@@ -22,7 +22,7 @@ for the case for nirdosha over a classic two-tier stack on k8s):
    `COPY`s in just that project's `.nir` source) before applying.
 
 All three need the base runtime image published first — see the repo
-root `Dockerfile` and `KUBERNETES.md`'s P0 remediation item
+root `Dockerfile` and `docs/KUBERNETES.md`'s P0 remediation item
 ("Publish `ghcr.io/protobox/nirdosha-runtime`"). Build it locally for
 testing with:
 
@@ -34,7 +34,7 @@ docker build -t ghcr.io/protobox/nirdosha-runtime:latest .
 
 `.nir` has no runtime env-var read — a program's `db_connect(...)`
 literal, and which durability-log backend it uses, are both decided at
-*generation* time, not deploy time (`KUBERNETES.md`'s "State, data &
+*generation* time, not deploy time (`docs/KUBERNETES.md`'s "State, data &
 horizontal scaling" section). That's why replica count isn't just a
 number in these manifests:
 
@@ -49,4 +49,4 @@ number in these manifests:
   SQLite durability log. The `--db`-backed generic table browser
   (`/_nirdosha/table/<name>`) has no Postgres option yet — either don't
   use `--db` in a multi-replica deployment, or wait for that gap to
-  close upstream (tracked in `KUBERNETES.md`).
+  close upstream (tracked in `docs/KUBERNETES.md`).

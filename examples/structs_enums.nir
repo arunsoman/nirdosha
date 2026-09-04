@@ -1,4 +1,4 @@
-// Row 11 (`nirdosha_row11_amendment.md`) -- struct/enum/match. Layer 1:
+// Row 11 (`docs/nirdosha_row11_amendment.md`) -- struct/enum/match. Layer 1:
 // fixed concrete fields, no generics yet (that's layer 6). Construction is
 // an ordinary call, field access is `expr.field`, and `match` destructures
 // a closed, exhaustively-checked set of variants.
