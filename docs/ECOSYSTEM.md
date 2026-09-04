@@ -332,9 +332,10 @@ the two highest-leverage, lowest-risk starting points — both are
 additive (nothing existing has to change), both have a concrete first
 artifact (one reference plugin; one grammar file checked against
 `crates/grammar_check/`), and both are the kind of thing a new
-contributor could plausibly pick up — which itself starts chipping
-away at G5. G3 (wire a real model into the existing bench harness) is
-similarly small and fast, and closes a gap the project's own docs
-already admit to. G4 stays inside Track A. G5's process piece
-(RFC-lite in `CONTRIBUTING.md`) is cheap to write; the access-granting
-half needs the repo owner, not more design.
+contributor could plausibly pick up — which itself now has somewhere
+real to land, per G5's `rfcs/`. G3 (wire a real model into the
+existing bench harness) is similarly small and fast, and closes a gap
+the project's own docs already admit to. G4 stays inside Track A. G5
+itself is `[DONE]` (see above) — what's left there is activation
+(named maintainers actually using their access), not more design or
+process.
