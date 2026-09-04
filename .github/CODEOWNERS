@@ -1,0 +1,26 @@
+# Mechanical mirror of ../AREAS.md — GitHub review-routing only.
+# Update both files in the same PR when an area's owner changes.
+# `require_code_owner_reviews` is currently OFF in branch protection
+# (see ../GOVERNANCE.md#branch-protection): with a bus factor this low,
+# a hard CODEOWNERS-only gate would block merges nobody but the Owner
+# could clear. This file still drives GitHub's automatic
+# reviewer-suggestion UI even with the hard requirement off.
+
+*                                       @arunsoman
+
+/crates/compiler/src/plugin.rs         @arunsoman
+/crates/plugin-example-rot13/          @arunsoman
+/crates/grammar_check/                 @arunsoman
+/crates/grammar_export/                @arunsoman
+/crates/bench/                         @arunsoman
+/crates/presence-gateway/              @arunsoman
+
+/deploy/                               @arunsoman @lekshmideepu @maheshmindlabs
+/Dockerfile                            @arunsoman
+/.github/workflows/                    @arunsoman
+
+/GOVERNANCE.md                         @arunsoman
+/MAINTAINERS.md                        @arunsoman
+/AREAS.md                              @arunsoman
+/rfcs/                                 @arunsoman
+/docs/adr/                             @arunsoman

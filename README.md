@@ -4,8 +4,9 @@
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Wiki](https://img.shields.io/badge/docs-wiki-blue)](https://github.com/arunsoman/nirdosha/wiki)
 [![Contributing](https://img.shields.io/badge/CONTRIBUTING-read-blue)](./CONTRIBUTING.md)
+[![Governance](https://img.shields.io/badge/GOVERNANCE-read-blue)](./GOVERNANCE.md)
 [![Roadmap](https://img.shields.io/badge/ROADMAP-view-purple)](./docs/PUBLIC_ROADMAP.md)
-[![Maintainers](https://img.shields.io/badge/maintainers-3-green)](./deploy/helm/nirdosha/Chart.yaml)
+[![Maintainers](https://img.shields.io/badge/maintainers-5-green)](./MAINTAINERS.md)
 [![Sponsor](https://img.shields.io/badge/%E2%9D%A4-Sponsor-ea4aaa)](https://github.com/sponsors/arunsoman)
 
 > **A systems language designed for LLMs to write, with a grammar so
@@ -85,8 +86,12 @@ matter more than volume. Right now:
 
 Full list with status tags: [`docs/PUBLIC_ROADMAP.md`](./docs/PUBLIC_ROADMAP.md).
 Issues are labeled `good first issue` / `help wanted` / `compiler` /
-`llm` / `infra` / `docs`. Pick one, comment before starting on anything
-non-trivial — see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+`llm` / `infra` / `documentation` (full set: [`.github/labels.yml`](./.github/labels.yml)).
+Pick one, comment before starting on anything non-trivial — see
+[`CONTRIBUTING.md`](./CONTRIBUTING.md). [`AREAS.md`](./AREAS.md) lists
+who owns which subsystem; a cross-cutting or breaking change goes
+through the [RFC process](./rfcs/README.md) first — see
+[`GOVERNANCE.md`](./GOVERNANCE.md).
 
 | If you care about | Try | 
 |---|---|
