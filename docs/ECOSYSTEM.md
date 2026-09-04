@@ -121,6 +121,46 @@ crates.io-hosted `.nir`-source-only crate needs:
    Define the plugin trait + metadata convention; re-package one
    existing real builtin as the reference/example plugin to prove the
    shape works end-to-end before asking any third party to build one.
+
+   **2026-09-04 — built and verified.** `crates/compiler/src/plugin.rs`:
+   `NirdoshaPlugin` trait + `PluginBuiltin`/`PluginFn`, plus real hook
+   points (additive, no existing call site's behavior changed) in
+   `typeck.rs` (`Checker::plugins`, `typecheck_with_plugins`,
+   `is_builtin_or_plugin` at all five sites that used to gate on
+   `ast::is_builtin` alone: registration-time shadow checks, spawn/
+   `transact`-slot rejection, `infer_call`'s own dispatch,
+   `infer_acquire`) and `interpreter.rs` (`Interpreter::plugins`,
+   `with_plugins`, a dispatch arm in `Expr::Call`, propagated to every
+   spawned child `Interpreter` the same way `tracer`/`sandbox_exe`
+   already are) and a new `lib.rs::run_with_plugins` entrypoint. A new
+   `ErrorKind::PluginError` variant gives a plugin builtin a real,
+   spanned failure path (and `observability.rs`'s exhaustive
+   `error_kind_name` match — a new variant is a compile error there by
+   design — got its required arm).
+
+   `crates/plugin-example-rot13/` is the one real reference plugin: a
+   `[package.metadata.nirdosha]`-annotated crate contributing
+   `rot13(s: str) -> str`, depending on `nirdosha` the same way a real
+   third-party crate would. `tests/end_to_end.rs` runs real `.nir`
+   source through the actual pipeline and checks: the call resolves and
+   returns the right value; wrong arity and wrong argument type are
+   both caught as real *type* errors (not runtime panics); and with no
+   plugin registered, `rot13` is correctly unresolvable. `cargo test -p
+   nirdosha-plugin-rot13`: 6/6 passing. Full existing suite reverified
+   unaffected: `cargo test -p nirdosha --no-fail-fast` — every target
+   green except `tests/mq.rs`'s 2 tests, which fail identically without
+   this change too (`Connection refused` — they need a real local Redis,
+   an environment gap, not a regression).
+
+   **What Stage 1 does *not* cover, honestly disclosed:** `serve`/
+   `emit-ui`/`emit-llvm` never see `plugins` — only the plain-interpreter
+   `run_with_plugins` path does (real future work, not silently implied).
+   There's no `Cargo.toml`-driven auto-discovery yet — a project wanting
+   a plugin writes a small custom entrypoint calling `run_with_plugins`
+   itself, rather than the standard `nirdosha` CLI finding it
+   automatically; that auto-discovery layer, and the security/sandboxing
+   open question below, are what's left before this is safe to hand to
+   a real third party.
 2. **Stage 2 — Kind B.** Only after Stage 1 is real and F2 itself has
    had more mileage; needs the resolver work above plus a decision (see
    open questions) on whether crates.io is even the right home for

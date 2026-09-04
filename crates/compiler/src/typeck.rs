@@ -1047,6 +1047,17 @@ pub struct Checker<'a> {
     /// doc comment, so no "which module is currently being checked"
     /// state is needed for resolution, only for this one gate.
     current_ns: Option<String>,
+    /// `docs/ROADMAP.md` Track G, G1 / `docs/ECOSYSTEM.md` §G1's Stage 1:
+    /// name -> (declared param types, declared return type) for every
+    /// builtin a plugin crate contributed (`plugin::signatures`), empty
+    /// for every ordinary `typecheck`/`typecheck_optional_main` caller.
+    /// Consulted everywhere `ast::is_builtin` already is (see
+    /// `is_builtin_or_plugin`) so a plugin builtin is indistinguishable
+    /// from a real one to every existing check — can't be spawned, can't
+    /// be a `transact` slot, can't be shadowed by a `fn`/`struct`/enum
+    /// variant — and by `infer_builtin_call`'s own early-return, which is
+    /// the one place the actual signature gets used.
+    plugins: HashMap<String, (Vec<Ty>, Ty)>,
 }
 
 /// Type-check a whole program. `Ok(())` means every function body is well
@@ -1055,7 +1066,17 @@ pub struct Checker<'a> {
 /// rejects. Requires a zero-arg `fn main()` — the entrypoint every
 /// `run`/`build`/`emit-llvm` caller is about to execute.
 pub fn typecheck(program: &Program) -> Result<(), Vec<TypeError>> {
-    typecheck_impl(program, true)
+    typecheck_impl(program, true, &HashMap::new())
+}
+
+/// Same as `typecheck`, plus a plugin crate's declared builtin
+/// signatures (`docs/ROADMAP.md` Track G, G1 / `docs/ECOSYSTEM.md` §G1's
+/// Stage 1) — `plugin::signatures(plugins)`'s shape, so every call to a
+/// plugin builtin is checked exactly like a call to a real one:
+/// resolvable, right arity, right argument/return types, and unusable in
+/// a `spawn`/`transact` slot or as a `fn`/`struct`/variant name.
+pub fn typecheck_with_plugins(program: &Program, plugins: &[crate::plugin::PluginBuiltin]) -> Result<(), Vec<TypeError>> {
+    typecheck_impl(program, true, &crate::plugin::signatures(plugins))
 }
 
 /// Same checks as `typecheck`, but does not require a `fn main()`. For
@@ -1070,7 +1091,7 @@ pub fn typecheck(program: &Program) -> Result<(), Vec<TypeError>> {
 /// `main`), so requiring one here would make every such program
 /// permanently unservable.
 pub fn typecheck_optional_main(program: &Program) -> Result<(), Vec<TypeError>> {
-    typecheck_impl(program, false)
+    typecheck_impl(program, false, &HashMap::new())
 }
 
 /// A non-fatal diagnostic — unlike `TypeError`, this never blocks
@@ -1279,9 +1300,20 @@ pub fn collect_role_claim_strings(program: &Program) -> (Vec<String>, Vec<(Strin
     (roles.into_iter().collect(), claims.into_iter().collect())
 }
 
-fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeError>> {
+fn typecheck_impl(
+    program: &Program,
+    require_main: bool,
+    plugins: &HashMap<String, (Vec<Ty>, Ty)>,
+) -> Result<(), Vec<TypeError>> {
     let registry = TypeRegistry::build(program);
-    let mut c = Checker { sigs: HashMap::new(), errors: Vec::new(), registry, silent: false, current_ns: None };
+    let mut c = Checker {
+        sigs: HashMap::new(),
+        errors: Vec::new(),
+        registry,
+        silent: false,
+        current_ns: None,
+        plugins: plugins.clone(),
+    };
 
     // ---- Row 11: register struct/enum type names + their constructors --
     // Two independent namespaces, per `docs/nirdosha_row11_amendment.md` §3.1-
@@ -1312,7 +1344,7 @@ fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeE
         if type_names.insert(key.clone(), s.span).is_some() {
             c.error(TypeErrorKind::DuplicateType(s.name.clone()), s.span);
         }
-        if (s.ns.is_none() && is_builtin(&s.name)) || callable_names.contains_key(&key) {
+        if (s.ns.is_none() && (is_builtin(&s.name) || c.plugins.contains_key(&s.name))) || callable_names.contains_key(&key) {
             c.error(TypeErrorKind::DuplicateConstructor(s.name.clone()), s.span);
         } else {
             callable_names.insert(key, s.span);
@@ -1350,7 +1382,7 @@ fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeE
             // variants (exactly the bug this fixes), not catch a real
             // one.
             if e.ns.is_none() {
-                if is_builtin(&v.name) || callable_names.contains_key(v.name.as_str()) {
+                if is_builtin(&v.name) || c.plugins.contains_key(&v.name) || callable_names.contains_key(v.name.as_str()) {
                     c.error(TypeErrorKind::DuplicateConstructor(v.name.clone()), v.span);
                 } else {
                     callable_names.insert(v.name.clone(), v.span);
@@ -1382,7 +1414,7 @@ fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeE
 
     for f in &program.fns {
         let key = scope_key(f.ns.as_deref(), &f.name);
-        if f.ns.is_none() && is_builtin(&f.name) {
+        if f.ns.is_none() && (is_builtin(&f.name) || c.plugins.contains_key(&f.name)) {
             c.error(TypeErrorKind::FnNameShadowsBuiltin(f.name.clone()), f.span);
             continue;
         }
@@ -2824,7 +2856,7 @@ impl<'a> Checker<'a> {
         scopes: &mut Scopes,
         span: Span,
     ) -> Ty {
-        if is_builtin(name) {
+        if self.is_builtin_or_plugin(name) {
             self.error(TypeErrorKind::CannotSpawnBuiltin { name: name.to_string() }, span);
             for a in args {
                 self.infer(a, expected_ret, scopes);
@@ -2865,7 +2897,7 @@ impl<'a> Checker<'a> {
     /// here, at the type level, rather than left for the interpreter to
     /// fail on.
     fn infer_spawn(&mut self, name: &str, args: &[Expr], expected_ret: &Ty, scopes: &mut Scopes, span: Span) -> Ty {
-        if is_builtin(name) {
+        if self.is_builtin_or_plugin(name) {
             self.error(TypeErrorKind::CannotSpawnBuiltin { name: name.to_string() }, span);
             for a in args {
                 self.infer(a, expected_ret, scopes); // still check the args for their own errors
@@ -2969,7 +3001,7 @@ impl<'a> Checker<'a> {
     /// example in `docs/TRANSACT.md` needs a builtin in a slot; every slot
     /// names a real, user-authored business operation.
     fn infer_transact_slot(&mut self, slot: &TransactSlot, expected_ret: &Ty, scopes: &mut Scopes) -> Ty {
-        if is_builtin(&slot.name) {
+        if self.is_builtin_or_plugin(&slot.name) {
             self.error(TypeErrorKind::CannotUseBuiltinInTransact { name: slot.name.clone() }, slot.span);
             for a in &slot.args {
                 self.infer(a, expected_ret, scopes);
@@ -3057,7 +3089,7 @@ impl<'a> Checker<'a> {
             }
             return *ret;
         }
-        if is_builtin(name) {
+        if self.is_builtin_or_plugin(name) {
             return self.infer_builtin_call(name, args, expected_ret, scopes, span);
         }
         // Row 11: "construction is an ordinary call, not a new literal
@@ -3158,7 +3190,7 @@ impl<'a> Checker<'a> {
     /// `RoleView`'s `role` field is an ordinary runtime string, the same
     /// reason `check_role` itself is runtime-checked.
     fn infer_acquire(&mut self, name: &str, proof: &Expr, expected_ret: &Ty, scopes: &mut Scopes, span: Span) -> Ty {
-        if is_builtin(name) || self.registry.is_struct(name) || self.registry.find_variant(name).is_some() {
+        if self.is_builtin_or_plugin(name) || self.registry.is_struct(name) || self.registry.find_variant(name).is_some() {
             self.error(TypeErrorKind::UnknownFn(name.to_string()), span);
             self.infer(proof, expected_ret, scopes);
             return Ty::Error;
@@ -3600,6 +3632,16 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `docs/ROADMAP.md` Track G, G1: a plugin builtin (`self.plugins`) is
+    /// a real builtin for every purpose `ast::is_builtin` alone used to
+    /// gate — can't be spawned, can't be a `transact` slot, can't be
+    /// shadowed, and resolves through `infer_builtin_call` exactly like
+    /// one of `ast::BUILTIN_NAMES`. Every one of the (now five) call
+    /// sites that used to ask `is_builtin(name)` alone asks this instead.
+    fn is_builtin_or_plugin(&self, name: &str) -> bool {
+        is_builtin(name) || self.plugins.contains_key(name)
+    }
+
     /// Every builtin's shape rule, dispatched by name — `is_builtin`
     /// (ast.rs) is the shared membership check; the actual per-builtin
     /// logic lives here (and `interpreter.rs`'s `Expr::Call` arm has its
@@ -3608,6 +3650,30 @@ impl<'a> Checker<'a> {
     /// `zeros`/`ones`/`identity` need to fix their result's static shape
     /// — see `ast.rs::BUILTIN_NAMES`'s doc comment.
     fn infer_builtin_call(&mut self, name: &str, args: &[Expr], expected_ret: &Ty, scopes: &mut Scopes, span: Span) -> Ty {
+        // `docs/ECOSYSTEM.md` §G1's Stage 1: a plugin builtin's signature is
+        // declared data (`self.plugins`), not a hand-written match arm —
+        // checked positionally against `params`, same as `self.check`
+        // already does for e.g. the workflow builtins' fixed-shape
+        // arguments below. Checked before `print`'s special case and the
+        // giant `match` so a plugin can never accidentally collide with
+        // either (`typecheck_with_plugins`'s registration-time guards
+        // already prove no plugin name equals a real builtin's name).
+        if let Some((params, ret)) = self.plugins.get(name).cloned() {
+            if args.len() != params.len() {
+                for a in args {
+                    self.infer(a, expected_ret, scopes);
+                }
+                self.error(
+                    TypeErrorKind::ArityMismatch { fn_name: name.to_string(), want: params.len(), got: args.len() },
+                    span,
+                );
+                return Ty::Error;
+            }
+            for (a, want) in args.iter().zip(params.iter()) {
+                self.check(a, want, expected_ret, scopes);
+            }
+            return ret;
+        }
         // `print` accepts any number of arguments of any type -- every
         // argument is still inferred, for its own diagnostics, but
         // nothing here constrains what it can be.
@@ -4840,7 +4906,14 @@ pub fn validate_fragment(json: &str, expected_ty: &Ty, env: &FragmentEnv) -> Res
         })]
     })?;
 
-    let mut checker = Checker { sigs: HashMap::new(), errors: Vec::new(), registry: TypeRegistry::empty(), silent: false, current_ns: None };
+    let mut checker = Checker {
+        sigs: HashMap::new(),
+        errors: Vec::new(),
+        registry: TypeRegistry::empty(),
+        silent: false,
+        current_ns: None,
+        plugins: HashMap::new(),
+    };
     let mut scopes = Scopes::new();
     for (name, ty) in &env.0 {
         scopes.define(name, ty.clone());
