@@ -3969,7 +3969,19 @@ pub enum WorkflowReplayOutcome {
 
 impl Interpreter {
     pub fn new(program: Arc<Program>, source: Arc<str>) -> Self {
-        let fn_index = program.fns.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect();
+        // Keyed by `ast::scope_key(f.ns, &f.name)`, not the bare `f.name`
+        // (`docs/ROADMAP.md` Track F, F2) — identical to `f.name.clone()` for
+        // every `ns: None` fn (everything before F2), so this changes
+        // nothing for any program with no real `module Ident { ... }`
+        // block. `Expr::Call`'s own callee string is *always* already
+        // the exact canonical form (bare or `Mod::Name`, verbatim as
+        // written — `typeck.rs` never rewrites the AST), so a plain
+        // lookup by that string against this same canonical key is all
+        // that's ever needed; see `ast::scope_key`'s doc comment for why
+        // no "which module is this call currently inside" context is
+        // needed here either.
+        let fn_index =
+            program.fns.iter().enumerate().map(|(i, f)| (crate::ast::scope_key(f.ns.as_deref(), &f.name), i)).collect();
         Interpreter {
             program,
             fn_index,
@@ -4303,16 +4315,34 @@ impl Interpreter {
     /// thread call path ever looks a struct up by name the way a
     /// function is).
     fn find_struct(&self, name: &str) -> Option<&StructDecl> {
-        self.program.structs.iter().find(|s| s.name == name)
+        self.program.structs.iter().find(|s| crate::ast::scope_key(s.ns.as_deref(), &s.name) == name)
     }
 
     /// `(owning EnumDecl, the variant itself)` for a variant name —
     /// mirrors `ast::TypeRegistry::find_variant`'s flat-namespace lookup,
     /// just over `&self.program` directly instead of a registry (this
     /// file has no `TypeRegistry` of its own to build; `typeck.rs`
-    /// already proved every name it evaluates resolves).
+    /// already proved every name it evaluates resolves). `name` is
+    /// either bare (`"SAR"` — matched only among `ns: None` enums,
+    /// identical to every pre-F2 program's exact behavior) or qualified
+    /// (`"CurrencyCode::SAR"` / `"Mod::ReportType::SAR"` — the owning
+    /// enum's own `scope_key` up to the last `::`, the variant's bare
+    /// name after it), exactly mirroring `ast::TypeRegistry::
+    /// find_variant`'s own two-branch resolution (`docs/ROADMAP.md` Track F,
+    /// F2).
     fn find_variant(&self, name: &str) -> Option<(&EnumDecl, &Variant)> {
-        self.program.enums.iter().find_map(|e| e.variants.iter().find(|v| v.name == name).map(|v| (e, v)))
+        match name.rsplit_once("::") {
+            Some((enum_ref, short)) => {
+                let e = self.program.enums.iter().find(|e| crate::ast::scope_key(e.ns.as_deref(), &e.name) == enum_ref)?;
+                e.variants.iter().find(|v| v.name == short).map(|v| (e, v))
+            }
+            None => self
+                .program
+                .enums
+                .iter()
+                .filter(|e| e.ns.is_none())
+                .find_map(|e| e.variants.iter().find(|v| v.name == name).map(|v| (e, v))),
+        }
     }
 
     /// Row 11 layer 6 (generics) — walks `decl_ty` (a variant's own
@@ -5556,8 +5586,15 @@ impl Interpreter {
             (Value::Enum(name, variant, payload), Ty::Named(want_name, want_args))
                 if name.as_ref() == want_name.as_str() =>
             {
+                // `variant` (the *value's* own tag) is always bare —
+                // `name` is already its owning enum's canonical key
+                // (matches `want_name` by this arm's own guard), so
+                // qualifying with it here finds a namespaced enum's
+                // variant too, the same way `Expr::Match`'s own arm
+                // above does (`docs/ROADMAP.md` Track F, F2).
+                let qualified = format!("{name}::{variant}");
                 let (enum_decl, v) = self
-                    .find_variant(variant)
+                    .find_variant(&qualified)
                     .expect("typeck.rs already proved this variant name is declared");
                 let subst = zip_type_params(&enum_decl.type_params, want_args);
                 for (val, want) in payload.iter().zip(v.payload.iter()) {
@@ -5763,13 +5800,36 @@ impl Interpreter {
                     }
                     return Ok(Value::Struct(Arc::from(name.as_str()), Arc::from(vals)));
                 }
-                if let Some((enum_decl, _)) = self.find_variant(name) {
-                    let enum_name: Arc<str> = Arc::from(enum_decl.name.as_str());
+                if let Some((enum_decl, variant)) = self.find_variant(name) {
+                    // The runtime `Value::Enum` tag has to be the
+                    // owning enum's *canonical* key (`ast::scope_key`),
+                    // not its bare `enum_decl.name` — the two only
+                    // differ for a namespaced enum (`docs/ROADMAP.md` Track
+                    // F, F2), but `check`/`infer_ty_of_value`-style
+                    // comparisons against an expected `Ty::Named` (e.g.
+                    // `let r: Mine::ReportType = ...`) always compare
+                    // against the qualified form typeck already
+                    // resolved, so tagging with the bare name here
+                    // would make every namespaced-enum value fail its
+                    // own type check at runtime. The *variant* tag,
+                    // similarly, has to be `variant.name` (always bare
+                    // — a `Variant` has no `ns` of its own, only its
+                    // owning enum does), never the raw `name` this
+                    // `Expr::Call` was written with — that's the
+                    // *reference's* own spelling (`"SAR"` bare, or
+                    // `"Mine::ReportType::SAR"` qualified), and every
+                    // other place a `Value::Enum`'s variant tag is
+                    // compared (`Expr::Match`'s own arm below,
+                    // `identity_subject`'s `"Some"`/`"None"` checks,
+                    // `Result`'s `"Ok"`/`"Err"` checks) assumes the bare
+                    // form unconditionally.
+                    let enum_name: Arc<str> = Arc::from(crate::ast::scope_key(enum_decl.ns.as_deref(), &enum_decl.name).as_str());
+                    let variant_name: Arc<str> = Arc::from(variant.name.as_str());
                     let mut vals = Vec::with_capacity(arg_exprs.len());
                     for a in arg_exprs {
                         vals.push(self.eval_expr(a, env)?);
                     }
-                    return Ok(Value::Enum(enum_name, Arc::from(name.as_str()), Arc::from(vals)));
+                    return Ok(Value::Enum(enum_name, variant_name, Arc::from(vals)));
                 }
                 let mut vals = Vec::with_capacity(arg_exprs.len());
                 for a in arg_exprs {
@@ -6849,16 +6909,33 @@ impl Interpreter {
                     let _ = span;
                     return result;
                 }
-                let Value::Enum(_, variant, payload) = &sv else {
+                let Value::Enum(enum_tag, variant, payload) = &sv else {
                     unreachable!("typeck.rs already proved this is an enum, got {}", sv.ty_name())
                 };
+                // `Value::Enum`'s own variant tag is always bare
+                // (`variant.name`, never `ns`-qualified — see its
+                // construction in `Expr::Call`'s own arm above), but a
+                // `match` arm's `variant` string is whatever the source
+                // literally wrote — bare for an ordinary enum, or
+                // qualified (`"Mine::ReportType::SAR"`) for a
+                // namespaced one's (`parser::parse_qualified_name`,
+                // `docs/ROADMAP.md` Track F, F2) — so only the text *after*
+                // the last `::`, if any, is ever compared against it.
                 let arm = arms
                     .iter()
-                    .find(|a| a.variant.as_str() == variant.as_ref())
+                    .find(|a| a.variant.rsplit_once("::").map_or(a.variant.as_str(), |(_, v)| v) == variant.as_ref())
                     .expect("typeck.rs already proved every match is exhaustive");
-                let (enum_decl, decl_variant) = self
-                    .find_variant(variant)
-                    .expect("typeck.rs already proved this variant name is declared");
+                // Looked up by the scrutinee's own already-canonical
+                // enum tag + bare variant name (`"Mine::ReportType::
+                // SAR"`), not by `variant` alone — a bare `find_variant`
+                // lookup only ever searches non-namespaced enums
+                // (`ast::TypeRegistry::find_variant`'s own doc comment),
+                // so it would never find a namespaced enum's own
+                // variant even though `enum_tag` already unambiguously
+                // names which enum this value really is.
+                let qualified = format!("{enum_tag}::{variant}");
+                let (enum_decl, decl_variant) =
+                    self.find_variant(&qualified).expect("typeck.rs already proved this variant name is declared");
                 env.push();
                 // Bound with the variant's real declared payload type
                 // (not a placeholder) -- a binding is an ordinary local

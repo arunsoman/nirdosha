@@ -236,13 +236,21 @@ pub enum TypeErrorKind {
     /// A struct's own name (as its constructor) or an enum variant's name
     /// collides with a function name, a builtin, or another constructor —
     /// every constructor lives in one flat callable namespace
-    /// (`nirdosha_row11_amendment.md` §3.2).
+    /// (`docs/nirdosha_row11_amendment.md` §3.2).
     DuplicateConstructor(String),
     /// Two fields of the same `struct` share a name.
     DuplicateField { struct_name: String, field: String },
     /// A bare `ident` in type position (a `let`/param/return/field/
     /// payload type) didn't resolve to any declared `struct`/`enum`.
     UnknownType(String),
+    /// A qualified (`Mod::Name`) reference resolved to a real,
+    /// namespaced declaration, but that declaration isn't `pub` and the
+    /// referencing site is outside its own `ns` (`docs/ROADMAP.md` Track F,
+    /// F2 piece 2). Never fires for a bare (unqualified) reference —
+    /// those can only ever resolve to a non-namespaced declaration in
+    /// the first place (`ast::scope_key`'s doc comment), which is
+    /// always effectively `pub`.
+    PrivateItem(String),
     /// `expr.field` where `expr`'s type isn't a declared `struct`.
     NotAStruct { found: Ty },
     /// `expr.field` on a real struct type, but `field` isn't one of its
@@ -678,6 +686,9 @@ impl std::fmt::Display for TypeError {
                 "{line}:{col}: `{struct_name}` declares field `{field}` more than once"
             ),
             TypeErrorKind::UnknownType(n) => write!(f, "{line}:{col}: unknown type `{n}`"),
+            TypeErrorKind::PrivateItem(n) => {
+                write!(f, "{line}:{col}: `{n}` is private to its own module — mark it `pub` to reference it from outside")
+            }
             TypeErrorKind::NotAStruct { found } => write!(
                 f,
                 "{line}:{col}: `.` needs a struct type, found `{}`",
@@ -948,6 +959,13 @@ struct FnSig {
     /// value-references, `acquire`) can enforce the gate without a
     /// second lookup table.
     requires: Option<Requirement>,
+    /// Mirrors `ast::FnDecl::ns`/`exported` — carried here too, same
+    /// reasoning as `requires` above: `infer_call`'s fn-call path needs
+    /// `check_visibility`'s inputs right where it already has `sig` in
+    /// hand, with no second lookup back into `program.fns` (`Checker`
+    /// only ever borrows a `TypeRegistry`, not the whole `&Program`).
+    ns: Option<String>,
+    exported: bool,
 }
 
 /// A lexical scope stack from declared name to declared `Ty` — the static
@@ -985,6 +1003,21 @@ pub struct Checker<'a> {
     /// actually reports them. Mirrors `ownership.rs`'s identically-named,
     /// identically-purposed field.
     silent: bool,
+    /// The `ns` of whatever struct/enum/fn declaration is currently
+    /// being checked (the registration loop / `check_fn`'s own callers
+    /// set this right before validating that one declaration's fields/
+    /// payload/params/return/body) — `None` outside a real `module
+    /// Ident { ... }` block, exactly as most of this program is
+    /// (`docs/ROADMAP.md` Track F, F2). The *only* thing this is used for:
+    /// deciding whether a qualified reference that resolved to a
+    /// private (`exported: false`) namespaced item is a legal
+    /// same-module self-reference or an illegal cross-module one — see
+    /// `check_visibility`. Never affects *resolution* itself (which
+    /// namespaced item, if any, a name refers to) — only bare vs.
+    /// qualified spelling ever affects that, per `ast::scope_key`'s
+    /// doc comment, so no "which module is currently being checked"
+    /// state is needed for resolution, only for this one gate.
+    current_ns: Option<String>,
 }
 
 /// Type-check a whole program. `Ok(())` means every function body is well
@@ -1219,26 +1252,41 @@ pub fn collect_role_claim_strings(program: &Program) -> (Vec<String>, Vec<(Strin
 
 fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeError>> {
     let registry = TypeRegistry::build(program);
-    let mut c = Checker { sigs: HashMap::new(), errors: Vec::new(), registry, silent: false };
+    let mut c = Checker { sigs: HashMap::new(), errors: Vec::new(), registry, silent: false, current_ns: None };
 
     // ---- Row 11: register struct/enum type names + their constructors --
-    // Two independent namespaces, per `nirdosha_row11_amendment.md` §3.1-
+    // Two independent namespaces, per `docs/nirdosha_row11_amendment.md` §3.1-
     // 3.2: `type_names` (struct/enum names, used in type position) and
     // `callable_names` (struct names *as constructors*, enum variant
     // names, function names, builtin names — anything `Expr::Call` can
     // name). A struct's name lives in both; an enum's own name lives only
     // in the first (only its variants are callable).
-    let mut type_names: HashMap<&str, Span> = HashMap::new();
-    let mut callable_names: HashMap<&str, Span> = HashMap::new();
+    //
+    // Keyed by `ast::scope_key(decl.ns, &decl.name)` (`docs/ROADMAP.md` Track
+    // F, F2), not the bare name — a top-level/prelude/legacy-`module`-
+    // string declaration (`ns: None`) keys exactly as it always did
+    // (`scope_key` is the identity function there), so every duplicate-
+    // detection rule below is byte-for-byte unchanged for any program
+    // that declares no real (`module Ident { }`) namespace. Two
+    // declarations sharing a bare name but different `ns` now key
+    // differently and no longer collide — the direct fix for the
+    // documented `struct Pair` (vs. the prelude's own) and enum-variant
+    // (`CurrencyCode::SAR`) collisions; see `scope_key`'s own doc
+    // comment for why a namespaced item is then reachable only via its
+    // qualified form, never bare, with zero new resolution-context
+    // tracking needed anywhere.
+    let mut type_names: HashMap<String, Span> = HashMap::new();
+    let mut callable_names: HashMap<String, Span> = HashMap::new();
 
     for s in &program.structs {
-        if type_names.insert(s.name.as_str(), s.span).is_some() {
+        let key = scope_key(s.ns.as_deref(), &s.name);
+        if type_names.insert(key.clone(), s.span).is_some() {
             c.error(TypeErrorKind::DuplicateType(s.name.clone()), s.span);
         }
-        if is_builtin(&s.name) || callable_names.contains_key(s.name.as_str()) {
+        if (s.ns.is_none() && is_builtin(&s.name)) || callable_names.contains_key(&key) {
             c.error(TypeErrorKind::DuplicateConstructor(s.name.clone()), s.span);
         } else {
-            callable_names.insert(s.name.as_str(), s.span);
+            callable_names.insert(key, s.span);
         }
         c.check_duplicate_type_params(&s.type_params, s.span);
         let mut field_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -1252,7 +1300,8 @@ fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeE
         }
     }
     for e in &program.enums {
-        if type_names.insert(e.name.as_str(), e.span).is_some() {
+        let key = scope_key(e.ns.as_deref(), &e.name);
+        if type_names.insert(key.clone(), e.span).is_some() {
             c.error(TypeErrorKind::DuplicateType(e.name.clone()), e.span);
         }
         c.check_duplicate_type_params(&e.type_params, e.span);
@@ -1262,10 +1311,21 @@ fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeE
                 c.error(TypeErrorKind::DuplicateConstructor(v.name.clone()), v.span);
                 continue;
             }
-            if is_builtin(&v.name) || callable_names.contains_key(v.name.as_str()) {
-                c.error(TypeErrorKind::DuplicateConstructor(v.name.clone()), v.span);
-            } else {
-                callable_names.insert(v.name.as_str(), v.span);
+            // A namespaced enum's variants are reachable only via
+            // explicit qualification (`Enum::Variant`/`Mod::Enum::
+            // Variant` — `ast::TypeRegistry::find_variant`), never a
+            // bare call, so they never actually share the flat
+            // `callable_names` bare-call namespace with anything —
+            // registering them there would only manufacture false
+            // collisions between two unrelated modules' same-named
+            // variants (exactly the bug this fixes), not catch a real
+            // one.
+            if e.ns.is_none() {
+                if is_builtin(&v.name) || callable_names.contains_key(v.name.as_str()) {
+                    c.error(TypeErrorKind::DuplicateConstructor(v.name.clone()), v.span);
+                } else {
+                    callable_names.insert(v.name.clone(), v.span);
+                }
             }
         }
     }
@@ -1276,44 +1336,52 @@ fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeE
     // declaration's own `type_params` are in scope for its own fields/
     // payloads (layer 6, generics), nowhere else.
     for s in &program.structs {
+        c.current_ns = s.ns.clone();
         for field in &s.fields {
             c.validate_ty(&field.ty, s.span, &s.type_params);
         }
     }
     for e in &program.enums {
+        c.current_ns = e.ns.clone();
         for v in &e.variants {
             for t in &v.payload {
                 c.validate_ty(t, v.span, &e.type_params);
             }
         }
     }
+    c.current_ns = None;
 
     for f in &program.fns {
-        if is_builtin(&f.name) {
+        let key = scope_key(f.ns.as_deref(), &f.name);
+        if f.ns.is_none() && is_builtin(&f.name) {
             c.error(TypeErrorKind::FnNameShadowsBuiltin(f.name.clone()), f.span);
             continue;
         }
-        if c.sigs.contains_key(&f.name) {
+        if c.sigs.contains_key(&key) {
             c.error(TypeErrorKind::DuplicateFn(f.name.clone()), f.span);
             continue;
         }
-        if callable_names.contains_key(f.name.as_str()) {
+        if callable_names.contains_key(&key) {
             c.error(TypeErrorKind::DuplicateConstructor(f.name.clone()), f.span);
             continue;
         }
+        c.current_ns = f.ns.clone();
         // Functions have no type-parameter list of their own
-        // (`nirdosha_row11_amendment.md` §2.2/§3.3 scopes generics to
+        // (`docs/nirdosha_row11_amendment.md` §2.2/§3.3 scopes generics to
         // struct/enum declarations only) — empty scope.
         for p in &f.params {
             c.validate_ty(&p.ty, f.span, &[]);
         }
         c.validate_ty(&f.ret, f.span, &[]);
+        c.current_ns = None;
         c.sigs.insert(
-            f.name.clone(),
+            key,
             FnSig {
                 params: f.params.iter().map(|p| p.ty.clone()).collect(),
                 ret: f.ret.clone(),
                 requires: f.requires.clone(),
+                ns: f.ns.clone(),
+                exported: f.exported,
             },
         );
     }
@@ -1865,6 +1933,25 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `owner_ns: Some(ns)` means the struct/enum/fn this name resolved
+    /// to is a real namespaced declaration (only ever true when `name`
+    /// was itself qualified — `ast::scope_key`'s doc comment) — `pub`/
+    /// F2 piece 2. `None` (bare reference, or a resolved item outside
+    /// any real namespace) is always visible, no check needed. A
+    /// namespaced item that isn't `exported` is visible only from
+    /// inside its own `ns` (`self.current_ns`) — a sibling declaration
+    /// referencing it *still* has to spell it out qualified (`Mod::
+    /// Name`), per `scope_key`'s "no bare access to a namespaced item,
+    /// even from within its own module" rule, but that qualified
+    /// self-reference is always legal regardless of `exported`.
+    fn check_visibility(&mut self, name: &str, owner_ns: Option<&str>, exported: bool, span: Span) {
+        if let Some(owner_ns) = owner_ns {
+            if !exported && self.current_ns.as_deref() != Some(owner_ns) {
+                self.error(TypeErrorKind::PrivateItem(name.to_string()), span);
+            }
+        }
+    }
+
     /// Recursively checks every `Ty::Named` leaf inside `ty` resolves —
     /// either to one of `in_scope_params` (the enclosing struct/enum
     /// declaration's own type-parameter names, empty everywhere else —
@@ -1896,10 +1983,12 @@ impl<'a> Checker<'a> {
                     }
                     return;
                 }
-                let want_arity = if let Some(p) = self.registry.struct_type_params(name) {
-                    Some(p.len())
+                let (want_arity, owner) = if let Some(s) = self.registry.struct_decl(name) {
+                    (Some(s.type_params.len()), Some((s.ns.as_deref(), s.exported)))
+                } else if let Some(e) = self.registry.enum_decl(name) {
+                    (Some(e.type_params.len()), Some((e.ns.as_deref(), e.exported)))
                 } else {
-                    self.registry.enum_type_params(name).map(|p| p.len())
+                    (None, None)
                 };
                 match want_arity {
                     None => self.error(TypeErrorKind::UnknownType(name.clone()), span),
@@ -1910,6 +1999,9 @@ impl<'a> Checker<'a> {
                         );
                     }
                     Some(_) => {}
+                }
+                if let Some((owner_ns, exported)) = owner {
+                    self.check_visibility(name, owner_ns, exported, span);
                 }
             }
             Ty::Box(inner) | Ty::Ref(inner) | Ty::Thread(inner) | Ty::Channel(inner) => {
@@ -1927,6 +2019,13 @@ impl<'a> Checker<'a> {
     }
 
     fn check_fn(&mut self, f: &FnDecl) {
+        // Set for the whole body check, not just the registration
+        // loop's own params/return-type validation — `check_visibility`
+        // needs to know "am I inside `f`'s own module" for every
+        // qualified reference `f`'s *body* makes too (a call, a `let`
+        // annotation, a struct/variant construction), not only the ones
+        // in its signature (`docs/ROADMAP.md` Track F, F2 piece 2).
+        self.current_ns = f.ns.clone();
         // "Enum favoring": `str` may not be, or contain, a parameter or
         // return type of a user-defined function — see
         // `TypeErrorKind::StrInFnSignature`'s doc comment for the full
@@ -1954,9 +2053,10 @@ impl<'a> Checker<'a> {
         if f.ret != Ty::Unit && !definitely_returns(&f.body.stmts) {
             self.error(TypeErrorKind::NotAllPathsReturn { fn_name: f.name.clone() }, f.span);
         }
+        self.current_ns = None;
     }
 
-    /// `WorkflowDecl`'s own rules (`WORKFLOW.md`): every non-terminal
+    /// `WorkflowDecl`'s own rules (`docs/WORKFLOW.md`): every non-terminal
     /// `state` has a way out, every transition target exists, no
     /// ambiguous event dispatch — and, crucially, every `on_entry`/
     /// `on_exit` action call is *really* type-checked, not just
@@ -2811,11 +2911,16 @@ impl<'a> Checker<'a> {
                 }
                 return Ty::Error;
             }
+            if let Some(s) = self.registry.struct_decl(name) {
+                self.check_visibility(name, s.ns.as_deref(), s.exported, span);
+            }
             return self.infer_struct_construction(name, args, expected, expected_ret, scopes, span);
         }
         if let Some((enum_name, variant)) = self.registry.find_variant(name) {
-            let enum_name = enum_name.to_string();
             let variant = variant.clone();
+            if let Some(e) = self.registry.enum_decl(&enum_name) {
+                self.check_visibility(name, e.ns.as_deref(), e.exported, span);
+            }
             return self.infer_variant_construction(&enum_name, &variant, args, expected, expected_ret, scopes, span);
         }
         let Some(sig) = self.sigs.get(name) else {
@@ -2825,21 +2930,30 @@ impl<'a> Checker<'a> {
             }
             return Ty::Error;
         };
+        // Everything needed out of `sig` is cloned up front, right here
+        // — `sig` borrows `self.sigs` (unlike `self.registry`'s own
+        // `'a`-lifetime-decoupled accessors above), so it has to stop
+        // being read before the first `&mut self` call below
+        // (`check_visibility`/`error`) or the borrow checker rejects it.
+        let sig_ns = sig.ns.clone();
+        let sig_exported = sig.exported;
+        let requires = sig.requires.clone();
+        let params = sig.params.clone();
+        let ret = sig.ret.clone();
+        self.check_visibility(name, sig_ns.as_deref(), sig_exported, span);
         // A `requires`-gated function has no direct-call path at all —
         // `acquire` (`infer_acquire`) is the only place that's allowed to
         // resolve this name against `sigs`. Still type-checks the
         // arguments (so a bad call reports its own errors too, not just
         // this one), same "don't cascade, but don't go silent either"
         // pattern `UnknownFn`'s branch above already follows.
-        if let Some(requirement) = sig.requires.clone() {
+        if let Some(requirement) = requires {
             self.error(TypeErrorKind::PrivilegedFnNotAcquired { name: name.to_string(), requirement }, span);
             for a in args {
                 self.infer(a, expected_ret, scopes);
             }
             return Ty::Error;
         }
-        let params = sig.params.clone();
-        let ret = sig.ret.clone();
         if params.len() != args.len() {
             self.error(
                 TypeErrorKind::ArityMismatch { fn_name: name.to_string(), want: params.len(), got: args.len() },
@@ -3108,7 +3222,7 @@ impl<'a> Checker<'a> {
             } else {
                 match &enum_name {
                     Some(en) => match self.registry.find_variant(&arm.variant) {
-                        Some((owner, v)) if owner == en => {
+                        Some((owner, v)) if &owner == en => {
                             v.payload.iter().map(|t| substitute_ty(t, &enum_subst)).collect()
                         }
                         _ => {
@@ -3123,7 +3237,14 @@ impl<'a> Checker<'a> {
                 }
             };
 
-            if arm.pattern.is_none() && !seen.insert(arm.variant.clone()) {
+            // `seen`/the exhaustiveness check below both compare against
+            // `ast::TypeRegistry::enum_variants`'s own bare `v.name`s —
+            // `arm.variant` may itself be qualified (`"Mine::ReportType
+            // ::SAR"`, `docs/ROADMAP.md` Track F, F2's qualified match-arm
+            // grammar), so only the text after its last `::`, if any,
+            // is ever recorded/compared.
+            let bare_variant = arm.variant.rsplit_once("::").map_or(arm.variant.as_str(), |(_, v)| v).to_string();
+            if arm.pattern.is_none() && !seen.insert(bare_variant) {
                 self.error(TypeErrorKind::DuplicateMatchArm { variant: arm.variant.clone() }, arm.span);
             }
             if payload.len() != arm.bindings.len() {
@@ -4546,7 +4667,7 @@ pub fn validate_fragment(json: &str, expected_ty: &Ty, env: &FragmentEnv) -> Res
         })]
     })?;
 
-    let mut checker = Checker { sigs: HashMap::new(), errors: Vec::new(), registry: TypeRegistry::empty(), silent: false };
+    let mut checker = Checker { sigs: HashMap::new(), errors: Vec::new(), registry: TypeRegistry::empty(), silent: false, current_ns: None };
     let mut scopes = Scopes::new();
     for (name, ty) in &env.0 {
         scopes.define(name, ty.clone());

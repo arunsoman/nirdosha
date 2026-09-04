@@ -145,6 +145,18 @@ pub enum Tok {
     /// "keyword only within one specific syntactic slot" treatment
     /// `screen`'s own `field`/`action`/`paginate` already get.
     Validate,
+    /// `pub` — marks a declaration inside a real (identifier-named)
+    /// `module Ident { ... }` block visible outside that module
+    /// (`docs/ROADMAP.md` Track F, F2; `docs/NEXT_GEN.md` §F2). Meaningless
+    /// (accepted, no effect) on a top-level or legacy string-named
+    /// `module "Display Name" { ... }` declaration — those are always
+    /// effectively public already, unchanged from before this existed.
+    Pub,
+    /// `use "relative/path.nir"` — a leading-only top-level item that
+    /// imports another file's `pub` real-namespace declarations
+    /// (`docs/ROADMAP.md` Track F, F2 piece 3). Only legal in the leading
+    /// run at the very start of a program, before any other item.
+    Use,
     /// `Vector`/`Matrix` in *type* position (`Vector(f64, 3)`) — deliberately
     /// capitalized, distinct from the lowercase `TypeName` scalars, matching
     /// the surface syntax the unified plan's architecture table already
@@ -189,6 +201,12 @@ pub enum Tok {
     Amp,
     DotStar,  // .*
     DotSlash, // ./
+    /// `::` — qualified-name path separator (`Mod::Name`). Lexed as one
+    /// token, not two `Colon`s, so `expr : Type` (an eventual annotation
+    /// slot, none exists today) and `Mod::Name` can never be confused
+    /// downstream — see `Lexer::tokenize`'s two-char dispatch, which
+    /// checks this before falling back to a single `Colon`.
+    ColonColon,
 
     Eof,
 }
@@ -412,6 +430,8 @@ impl<'a> Lexer<'a> {
                     "state" => Tok::State,
                     "workspace" => Tok::Workspace,
                     "validate" => Tok::Validate,
+                    "pub" => Tok::Pub,
+                    "use" => Tok::Use,
                     "Vector" => Tok::VectorKw,
                     "Matrix" => Tok::MatrixKw,
                     "true" => Tok::True,
@@ -436,6 +456,7 @@ impl<'a> Lexer<'a> {
                 (b'|', Some(b'|')) => (Tok::OrOr, 2),
                 (b'.', Some(b'*')) => (Tok::DotStar, 2),
                 (b'.', Some(b'/')) => (Tok::DotSlash, 2),
+                (b':', Some(b':')) => (Tok::ColonColon, 2),
                 _ => {
                     let single = match c {
                         b'(' => Tok::LParen,

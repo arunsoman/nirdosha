@@ -591,6 +591,31 @@ pub struct StructDecl {
     /// global namespace, `module` adds no scoping at all. See
     /// `parser.rs::parse_module_decl`'s doc comment for the full design.
     pub module: Option<String>,
+    /// `Some("Ident")` when declared inside a real, identifier-named
+    /// `module Ident { ... }` block (`docs/ROADMAP.md` Track F, F2;
+    /// `docs/NEXT_GEN.md` §F2) — a genuine namespace, unlike `module`'s
+    /// legacy string-literal display-name meaning above. `None` for
+    /// every top-level/prelude/legacy-`module`-string declaration —
+    /// unaffected, since this field didn't exist before F2. A
+    /// namespaced declaration's own bare `name` is deliberately left
+    /// unmangled (still just `"Pair"`, not `"MyMod::Pair"`) — every
+    /// pre-existing consumer that reads `.name` directly (`ui_gen.rs`,
+    /// `serve.rs`, `codegen.rs`, `contract_check.rs`) is unaffected by
+    /// F2 exactly because of this; only `ast::scope_key`-keyed lookups
+    /// (`TypeRegistry`, `typeck.rs`'s registration maps) know about
+    /// `ns` at all. See `ast::scope_key`'s doc comment for the full
+    /// resolution rule this enables.
+    pub ns: Option<String>,
+    /// `pub` — `true` when this declaration is reachable from outside
+    /// its own `ns` via an explicit `Ident::Ident` qualified reference
+    /// (`docs/ROADMAP.md` Track F, F2 piece 2). Always `true` for a
+    /// top-level/prelude/legacy-`module`-string declaration (`ns:
+    /// None`) — visibility only has teeth inside a real namespace, and
+    /// every such declaration was already unconditionally visible
+    /// before this field existed. Meaningless in isolation from `ns`;
+    /// checked only where a qualified (`ns: Some(_)`) lookup succeeds
+    /// — see `typeck.rs::Checker::current_ns` and its use.
+    pub exported: bool,
 }
 
 /// One `enum` variant — `Some(T)`, `None`, `Circle(f64)`. `payload` is
@@ -620,12 +645,16 @@ pub struct EnumDecl {
     pub span: Span,
     /// Same meaning as `StructDecl::module` — see its doc comment.
     pub module: Option<String>,
+    /// Same meaning as `StructDecl::ns` — see its doc comment.
+    pub ns: Option<String>,
+    /// Same meaning as `StructDecl::exported` — see its doc comment.
+    pub exported: bool,
 }
 
-/// `Recipient`/`WorkflowActionError` — `WORKFLOW.md`'s prelude enums for
+/// `Recipient`/`WorkflowActionError` — `docs/WORKFLOW.md`'s prelude enums for
 /// the `send_email`/`send_sms`/`send_push`/`notify` builtins. `str`
 /// payloads on these variants are the documented, precedented exemption
-/// (`LANGUAGE.md` §6b: "an enum variant may itself carry a `str` payload
+/// (`docs/LANGUAGE.md` §6b: "an enum variant may itself carry a `str` payload
 /// ... the check only inspects a `fn`'s own declared parameter/return
 /// type expression") — a bare `Ty::Named("Recipient", [])` has nothing
 /// for `Ty::contains_str` to recurse into, so this needs no `Text`
@@ -659,6 +688,8 @@ pub fn prelude_enums() -> Vec<EnumDecl> {
             ],
             span,
             module: None,
+            ns: None,
+            exported: true,
         },
         EnumDecl {
             name: "Result".to_string(),
@@ -669,10 +700,12 @@ pub fn prelude_enums() -> Vec<EnumDecl> {
             ],
             span,
             module: None,
+            ns: None,
+            exported: true,
         },
-        // WORKFLOW.md: `send_email`/`send_sms`/`send_push`/`notify`'s `to`
+        // docs/WORKFLOW.md: `send_email`/`send_sms`/`send_push`/`notify`'s `to`
         // parameter. `str` payloads are the documented enum-variant
-        // exemption from the fn-boundary str ban (LANGUAGE.md §6b) — see
+        // exemption from the fn-boundary str ban (docs/LANGUAGE.md §6b) — see
         // the doc comment just above `prelude_enums`.
         EnumDecl {
             name: "Recipient".to_string(),
@@ -683,8 +716,10 @@ pub fn prelude_enums() -> Vec<EnumDecl> {
             ],
             span,
             module: None,
+            ns: None,
+            exported: true,
         },
-        // WORKFLOW.md: the shared error type for every workflow-action
+        // docs/WORKFLOW.md: the shared error type for every workflow-action
         // builtin and every desugared `start_*`/`advance_*`/`*_via_link`
         // function's `Result(_, WorkflowActionError)` return type.
         EnumDecl {
@@ -710,8 +745,10 @@ pub fn prelude_enums() -> Vec<EnumDecl> {
             ],
             span,
             module: None,
+            ns: None,
+            exported: true,
         },
-        // 2026-08-27: `LANGUAGE.md` §6c's `CurrencyCode` promoted from a
+        // 2026-08-27: `docs/LANGUAGE.md` §6c's `CurrencyCode` promoted from a
         // documented per-program convention (paste this enum into your
         // own file) to a real prelude type, injected here the same way
         // `Option`/`Result` already are -- no more re-pasting ISO 4217
@@ -785,6 +822,8 @@ fn zero_payload_enum(name: &str, variants: &[&str], span: Span) -> EnumDecl {
         variants: variants.iter().map(|v| Variant { name: v.to_string(), payload: vec![], span }).collect(),
         span,
         module: None,
+        ns: None,
+        exported: true,
     }
 }
 
@@ -808,6 +847,8 @@ pub fn prelude_structs() -> Vec<StructDecl> {
             ],
             span,
             module: None,
+            ns: None,
+            exported: true,
         },
         // Row 12: first-class identity consumption. VerifiedIdentity is the
         // common abstraction produced by protocol adapters; it is freely
@@ -826,6 +867,8 @@ pub fn prelude_structs() -> Vec<StructDecl> {
             ],
             span,
             module: None,
+            ns: None,
+            exported: true,
         },
         StructDecl {
             name: "RoleView".to_string(),
@@ -833,6 +876,8 @@ pub fn prelude_structs() -> Vec<StructDecl> {
             fields: vec![Field { name: "role".to_string(), ty: Ty::Str }],
             span,
             module: None,
+            ns: None,
+            exported: true,
         },
         StructDecl {
             name: "ClaimView".to_string(),
@@ -840,6 +885,8 @@ pub fn prelude_structs() -> Vec<StructDecl> {
             fields: vec![Field { name: "value".to_string(), ty: Ty::Str }],
             span,
             module: None,
+            ns: None,
+            exported: true,
         },
         // Row 12 continued: application session and refresh-token lifecycle.
         // ApplicationSession is separate from VerifiedIdentity and manages
@@ -857,6 +904,8 @@ pub fn prelude_structs() -> Vec<StructDecl> {
             ],
             span,
             module: None,
+            ns: None,
+            exported: true,
         },
         // RefreshTokenHandle is affine (box i64 field) — represents a
         // runtime-managed refresh token slot.
@@ -869,6 +918,8 @@ pub fn prelude_structs() -> Vec<StructDecl> {
             ],
             span,
             module: None,
+            ns: None,
+            exported: true,
         },
         // Generic pair for returning two values together (used by refresh
         // token exchange).
@@ -881,8 +932,10 @@ pub fn prelude_structs() -> Vec<StructDecl> {
             ],
             span,
             module: None,
+            ns: None,
+            exported: true,
         },
-        // 2026-08-27: `LANGUAGE.md` §6c's `Money`, promoted from a
+        // 2026-08-27: `docs/LANGUAGE.md` §6c's `Money`, promoted from a
         // documented convention to a real prelude type -- same mechanism,
         // same motivation as `CurrencyCode`'s own promotion just above in
         // `prelude_enums`. Mixing currencies is still not a *compile-time*
@@ -902,8 +955,10 @@ pub fn prelude_structs() -> Vec<StructDecl> {
             ],
             span,
             module: None,
+            ns: None,
+            exported: true,
         },
-        // `LANGUAGE.md` §6d's `Measure`, same promotion, same reasoning.
+        // `docs/LANGUAGE.md` §6d's `Measure`, same promotion, same reasoning.
         // Field is `unit_code`, not `unit` -- `unit` lexes as
         // `Tok::TypeName("unit")` (`Ty::Unit`'s own keyword, `token.rs`'s
         // `TYPE_NAMES`) regardless of position, so `m.unit` would be a
@@ -920,11 +975,13 @@ pub fn prelude_structs() -> Vec<StructDecl> {
             ],
             span,
             module: None,
+            ns: None,
+            exported: true,
         },
     ]
 }
 
-/// `goal.md`'s "Effects" synthesis layer (row 4, 9) — `PROTOLANG_PORT.md`'s
+/// `docs/goal.md`'s "Effects" synthesis layer (row 4, 9) — `docs/PROTOLANG_PORT.md`'s
 /// "Locked design 1". A Koka-style **set**, not ProtoLang's own total
 /// order (`pure < mutates < io < network`): Nirdosha's real effectful
 /// builtins don't nest the way that lattice assumes (`network` isn't a
@@ -1015,6 +1072,10 @@ pub struct FnDecl {
     pub explicit_public: bool,
     /// Same meaning as `StructDecl::module` — see its doc comment.
     pub module: Option<String>,
+    /// Same meaning as `StructDecl::ns` — see its doc comment.
+    pub ns: Option<String>,
+    /// Same meaning as `StructDecl::exported` — see its doc comment.
+    pub exported: bool,
 }
 
 /// What `acquire` (`Expr::Acquire`) demands proof of before a `requires`-
@@ -1729,15 +1790,57 @@ pub struct WorkspaceDecl {
 /// DuplicateType`/`DuplicateConstructor`) — this just answers "what
 /// fields does this struct have" / "what payload does this variant
 /// carry."
+/// The canonical lookup key every namespace-aware registration map
+/// (`TypeRegistry`, `typeck.rs`'s `type_names`/`callable_names`/`sigs`)
+/// keys a declaration by (`docs/ROADMAP.md` Track F, F2; `docs/NEXT_GEN.md` §F2).
+/// `None` synthesizes to the declaration's own bare `name` — today's
+/// exact key, for every declaration that predates F2 (`ns` is always
+/// `None` for those). `Some(ns)` synthesizes to `"ns::name"`, which is
+/// *exactly* what an explicit qualified reference looks like once
+/// parsed (`parser::parse_qualified_name` joins `IDENT ("::" IDENT)*`
+/// the same way) — so a lookup never needs to know whether the string
+/// it was asked to resolve came from a bare or an explicitly-qualified
+/// reference, only whether the *declaration* it might match was
+/// namespaced. This is also why a namespaced declaration is reachable
+/// **only** via its qualified form: a bare reference (no `::` in it)
+/// can only ever equal a `None`-synthesized key, never a `Some`-
+/// synthesized one — no ambiguity between a program's top-level items
+/// and any module's namespaced ones is possible by construction, and
+/// no "which module am I currently inside" resolution context is ever
+/// needed anywhere (`typeck.rs`, `interpreter.rs` alike resolve purely
+/// from the literal string a reference already is).
+pub fn scope_key(ns: Option<&str>, name: &str) -> String {
+    match ns {
+        Some(n) => format!("{n}::{name}"),
+        None => name.to_string(),
+    }
+}
+
 pub struct TypeRegistry<'a> {
-    structs: HashMap<&'a str, &'a StructDecl>,
-    enums: HashMap<&'a str, &'a EnumDecl>,
-    /// `(owning enum's name, the variant itself)`, keyed by variant name
-    /// — variant names live in the same flat callable namespace as
-    /// functions/struct constructors (`nirdosha_row11_amendment.md` §3.2:
-    /// "a variant is just a constructor, registered by name exactly like
-    /// a struct's"), so a bare variant name alone is enough to look this
-    /// up without also knowing which enum it belongs to ahead of time.
+    /// Keyed by `scope_key(decl.ns, &decl.name)` — a plain `"Name"` for
+    /// every top-level/prelude/legacy-`module`-string declaration
+    /// (`ns: None`, today's exact behavior/key, unchanged), or
+    /// `"Mod::Name"` for one declared inside a real `module Mod { ... }`
+    /// block (`docs/ROADMAP.md` Track F, F2). Owned `String` keys, not
+    /// borrowed `&'a str` (unlike before F2) — a qualified key like
+    /// `"Mod::Name"` doesn't exist as a contiguous substring anywhere in
+    /// the AST to borrow from, only `scope_key` synthesizes it. Every
+    /// accessor below still takes a plain `&str` — `HashMap<String, _>`
+    /// queries by `&str` exactly as it always did (`Borrow<str>`), so
+    /// this changed nothing at any call site outside this `impl`.
+    structs: HashMap<String, &'a StructDecl>,
+    enums: HashMap<String, &'a EnumDecl>,
+    /// Bare variant name -> `(owning enum's own name, the variant
+    /// itself)` — populated **only** from `ns: None` enums (today's
+    /// exact set and exact behavior/collision rule, completely
+    /// unchanged: two top-level enums sharing a bare variant name is
+    /// still `typeck.rs`'s `DuplicateConstructor`). A namespaced enum's
+    /// variants are deliberately absent here — reachable only via
+    /// `find_variant`'s qualified (`"Enum::Variant"` /
+    /// `"Mod::Enum::Variant"`) path below, never by bare name, which is
+    /// exactly what makes adding a namespaced enum incapable of ever
+    /// colliding with an existing bare variant name (the documented
+    /// `CurrencyCode::SAR` bug's actual fix).
     variant_owner: HashMap<&'a str, (&'a str, &'a Variant)>,
 }
 
@@ -1756,12 +1859,14 @@ impl<'a> TypeRegistry<'a> {
         let mut enums = HashMap::new();
         let mut variant_owner = HashMap::new();
         for s in &program.structs {
-            structs.insert(s.name.as_str(), s);
+            structs.insert(scope_key(s.ns.as_deref(), &s.name), s);
         }
         for e in &program.enums {
-            enums.insert(e.name.as_str(), e);
-            for v in &e.variants {
-                variant_owner.insert(v.name.as_str(), (e.name.as_str(), v));
+            enums.insert(scope_key(e.ns.as_deref(), &e.name), e);
+            if e.ns.is_none() {
+                for v in &e.variants {
+                    variant_owner.insert(v.name.as_str(), (e.name.as_str(), v));
+                }
             }
         }
         TypeRegistry { structs, enums, variant_owner }
@@ -1799,8 +1904,35 @@ impl<'a> TypeRegistry<'a> {
         self.enums.contains_key(name)
     }
 
-    pub fn find_variant(&self, variant_name: &str) -> Option<(&'a str, &'a Variant)> {
-        self.variant_owner.get(variant_name).copied()
+    /// `variant_name` is either bare (`"SAR"` — looked up among `ns:
+    /// None` enums only, today's exact behavior) or qualified
+    /// (`"CurrencyCode::SAR"` / `"Mod::ReportType::SAR"` — the enum's
+    /// own `scope_key` up to the *last* `::`, the variant's bare name
+    /// after it; works uniformly whether that enum itself is namespaced
+    /// or not, since both are stored in `self.enums` under their own
+    /// `scope_key` already). See `StructDecl::ns`'s doc comment and
+    /// `docs/ROADMAP.md` Track F, F2 for the full design this implements.
+    ///
+    /// The returned owner string is the owning enum's own **canonical
+    /// registry key** (`scope_key(e.ns, &e.name)`), *not* `e.name`
+    /// itself — the two only differ for a namespaced enum, but every
+    /// caller (`typeck.rs::infer_call`/`infer_variant_construction`/
+    /// `check_match`) immediately turns around and looks that key back
+    /// up in this same registry (`enum_decl`/`enum_type_params`) or
+    /// compares it against another already-canonical `Ty::Named` name —
+    /// either would silently break for a namespaced enum if this
+    /// returned the bare, un-namespaced name instead. Owned (`String`),
+    /// not `&'a str`, because the qualified branch's key doesn't exist
+    /// as a borrowable substring anywhere in the AST, same reason
+    /// `scope_key` itself returns an owned `String`.
+    pub fn find_variant(&self, variant_name: &str) -> Option<(String, &'a Variant)> {
+        match variant_name.rsplit_once("::") {
+            Some((enum_ref, short)) => {
+                let e = *self.enums.get(enum_ref)?;
+                e.variants.iter().find(|v| v.name == short).map(|v| (enum_ref.to_string(), v))
+            }
+            None => self.variant_owner.get(variant_name).copied().map(|(owner, v)| (owner.to_string(), v)),
+        }
     }
 
     /// Registry-aware affinity — `Ty::is_affine`'s doc comment explains
@@ -2192,11 +2324,11 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "__workflow_start",
     "__workflow_advance",
     "__workflow_link_advance",
-    // `WORKFLOW.md`'s "state ownership + a generated queue UI" section:
+    // `docs/WORKFLOW.md`'s "state ownership + a generated queue UI" section:
     // backs every workflow's synthesized `list_<workflow>_pending_for_me`
     // — same "never written by hand" convention as the three above.
     "__workflow_pending_for_me",
-    // `WORKFLOW.md`'s "who submitted this" / "audit trail" sections:
+    // `docs/WORKFLOW.md`'s "who submitted this" / "audit trail" sections:
     // back every workflow's synthesized `list_<workflow>_submitted_by_me`
     // and `get_<workflow>_history` respectively — same "never written by
     // hand" convention.

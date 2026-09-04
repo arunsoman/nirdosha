@@ -100,9 +100,32 @@ parses as `return (x - y)` — one statement, a subtraction — never as
 `return x` followed by a separate `-y` statement.
 
 ```ebnf
-program     ::= item*
+program     ::= use_decl* item*
 
-item        ::= fn_decl | struct_decl | enum_decl | screen_decl | dashboard_decl | module_decl | workflow_decl | workspace_decl
+// `use "relative/path.nir"` (`docs/ROADMAP.md` Track F, F2 piece 3;
+// `docs/NEXT_GEN.md` §F2) — only legal in this leading run, before any
+// other item (`parser::parse_program`); a `use` anywhere else falls
+// through to `item`'s own dispatch and hits an ordinary "expected an
+// item" parse error, the ordinary consequence of a keyword misplaced
+// outside its one legal slot, not a special-cased rejection.
+use_decl    ::= "use" string
+
+item        ::= fn_decl | struct_decl | enum_decl | screen_decl | dashboard_decl | module_decl | workflow_decl | workspace_decl | validate_decl
+
+// `Mod::Name` / `Mod::Enum::Variant` — a qualified reference
+// (`docs/ROADMAP.md` Track F, F2). Only ever a *reference*: a declaration's
+// own name (`fn_decl`/`struct_decl`/`enum_decl`/`module_decl`'s own
+// `ident`) is always a single plain `ident`, never a path — nothing
+// can be *declared* at a qualified name, only namespaced by the
+// `module_decl` it's lexically inside. Reused wherever `ident` names
+// something to look up rather than to declare: `type`'s struct/enum
+// alternative, `primary`'s bare-name alternative (covers both a value
+// reference and, via `call`, a callee), and `variant_arm`'s pattern —
+// see `ast::scope_key`'s doc comment for the resolution rule this
+// feeds: a bare reference (no `::`) can only ever match a
+// non-namespaced declaration; a qualified one matches a namespaced
+// declaration's own canonical key exactly.
+qualified_ident ::= ident ("::" ident)*
 
 fn_decl     ::= "fn" ident "(" params? ")" ("->" type)? effect_annotation? requires_annotation? block
 
@@ -216,19 +239,35 @@ workspace_item ::= panel_decl | kv_entry
 panel_decl     ::= "panel" string "{" panel_item* "}"
 panel_item     ::= action_decl | kv_entry
 
-// Pure nav-grouping sugar for `ui_gen.rs`, not a scoping/namespace
+// Two forms, dispatched on the token right after `module` (`Tok::Str`
+// vs. `Tok::Ident` -- one-token lookahead, LL(1) holds). **`string`**
+// is pure nav-grouping sugar for `ui_gen.rs`, not a scoping/namespace
 // construct: every `fn`/`struct`/`enum` inside still registers into the
 // exact same flat global namespace a top-level declaration would --
-// `typeck.rs` never even looks at `module`, only `ui_gen.rs` does, to
-// group nav screens by it. `module` is a real reserved keyword (like
-// `struct`/`enum`/`screen`/`dashboard` above), since no existing example
-// uses "module" as an identifier. Single-level only: a `module` nested
-// inside a `module`, or a `screen`/`dashboard` inside one, is a parse
-// error (`parser.rs::parse_module_decl`) -- the same fixed-arity/
-// no-arbitrary-nesting discipline `transact` slots already have. A `.nir`
-// file that never uses `module` renders exactly as it did before this
-// construct existed (nav stays flat, ungrouped).
+// `typeck.rs` never even looks at it, only `ui_gen.rs` does, to group
+// nav screens by it. Unchanged since before `docs/ROADMAP.md` Track F, F2 --
+// a `.nir` file that only ever uses this form renders exactly as it did
+// before F2 existed (nav stays flat, ungrouped; no namespace, no `pub`
+// enforcement). **`ident`** (F2) is a real namespace -- every `fn`/
+// `struct`/`enum` inside registers under this identifier's own
+// qualified key (`ast::scope_key`), reachable from outside only via
+// `Mod::Name`, never bare, and only if marked `pub` (see
+// `qualified_ident`'s own doc comment for the resolution rule, and
+// `pub_item` below for the visibility grammar). `nav`, if given,
+// overrides the display string `ui_gen.rs` groups this module's
+// screens under (same field the `string` form sets directly) --
+// defaults to the identifier itself if omitted, the same
+// "override defaults to inferred" pattern `screen_decl { title:
+// "..." }` already establishes. `module` is a real reserved keyword
+// (like `struct`/`enum`/`screen`/`dashboard` above), since no existing
+// example uses "module" as an identifier. Single-level only in either
+// form: a `module` nested inside a `module`, or a `screen`/`dashboard`
+// inside one, is a parse error (`parser.rs::parse_module_decl`/
+// `parse_namespace_module_decl`) -- the same fixed-arity/no-arbitrary-
+// nesting discipline `transact` slots already have.
 module_decl ::= "module" string "{" (fn_decl | struct_decl | enum_decl)* "}"
+              | "module" ident "{" ("nav" ":" string)? pub_item* "}"
+pub_item    ::= "pub"? (fn_decl | struct_decl | enum_decl)
 
 // `validate <fn_name> { pre: <expr>  post: <expr> ... }` (`docs/ROADMAP.md`
 // Track F, F3; `docs/NEXT_GEN.md` §F3) -- a Hoare contract on an existing
@@ -377,7 +416,7 @@ type        ::= "&" type
               | "i8" | "i16" | "i32" | "i64"
               | "u8" | "u16" | "u32" | "u64" | "usize" | "f64"
               | "bool" | "unit" | "str" | "tcp" | "tcp_listener"
-              | ident ("(" type ("," type)* ")")?
+              | qualified_ident ("(" type ("," type)* ")")?
               | "fn" "(" (type ("," type)*)? ")" ("->" type)?
 
 // A block's *value* (relevant wherever a block sits in an expression
@@ -450,10 +489,10 @@ match_arm   ::= variant_arm | literal_arm
 // directly against `parser.rs::parse_match_expr`: `admin()` in a match
 // arm is `Tok::LParen` immediately followed by `Tok::RParen`, previously
 // undocumented here).
-variant_arm ::= ident ("(" (ident ("," ident)*)? ")")? "=>" expr
+variant_arm ::= qualified_ident ("(" (ident ("," ident)*)? ")")? "=>" expr
 literal_arm ::= (str | int | "true" | "false" | "_") "=>" expr
 
-// `TRANSACT.md`'s durable-effect construct — all five layers are
+// `docs/TRANSACT.md`'s durable-effect construct — all five layers are
 // implemented (in-process control flow, a real durability log, crash
 // replay, `network`'s own `retry`/`timeout`, and a real cross-process
 // `network`/`commit` test). Slot order is fixed — optional `precheck`,
@@ -677,7 +716,7 @@ postfix     ::= primary (("[" expr ("," expr)* "]") | ("." ident))*
 // no way to infer an element type for an empty literal. Deliberately
 // **not** Julia's space-sensitive `[1 2; 3 4]` — that grammar isn't
 // LL(1)/LALR-parseable (see this file's row-7 discipline above).
-primary     ::= int_lit | float_lit | str_lit | "true" | "false" | ident | "(" expr ")" | array_lit
+primary     ::= int_lit | float_lit | str_lit | "true" | "false" | qualified_ident | "(" expr ")" | array_lit
 array_lit   ::= "[" expr ("," expr)* "]"
 
 // `"` ... `"`, with a deliberately small escape set (`\"`, `\\`, `\n`,

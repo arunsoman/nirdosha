@@ -112,15 +112,26 @@ only covers the numeric/control-flow subset today)
   roughly in that order
 
 **Track C — Agent-facing HTTP API** (the spec exists —
-[`nirdosha-agent-api.md`](./nirdosha-agent-api.md) — about half the
+[`docs/nirdosha-agent-api.md`](./docs/nirdosha-agent-api.md) — about half the
 underlying capability already ships; the `/v1/*` server itself is 0% built)
 - [OPEN] The HTTP server and its 20 endpoints across code generation,
   execution, introspection, benchmarking, and provenance
 
 **Track D — Mobile app generation** (a second renderer of the existing
-UI manifest, independent of Tracks A–C — see [`MOBILE.md`](./MOBILE.md))
+UI manifest, independent of Tracks A–C — see [`docs/MOBILE.md`](./docs/MOBILE.md))
 - [OPEN] `emit-mobile` codegen scaffold — native iOS/Android from the
   same `struct`/`screen` declarations that drive the web UI today
+
+**Track F — Next-generation language & UI architecture** (design
+discussion, independent of every track above — see
+[`docs/NEXT_GEN.md`](./docs/NEXT_GEN.md))
+- [OPEN] A target-independent UI manifest with multiple renderers
+  (web/TUI/mobile), not just today's one fixed web template
+- [DONE] A real module/package system — `module Ident { ... }`
+  namespacing, `pub` visibility, and `use "path.nir"` splitting a
+  program across files, all real and tested — see `docs/ROADMAP.md` Track
+  F, F2. The legacy `module "Display Name" { ... }` nav-label form
+  (still just a nav label, no scoping) is untouched and still works.
 
 ---
 

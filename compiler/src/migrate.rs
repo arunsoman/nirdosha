@@ -289,6 +289,8 @@ mod tests {
             ],
             span: SPAN,
             module: None,
+            ns: None,
+            exported: true,
         });
         let ty = Ty::Named("Status".to_string(), vec![]);
         assert_eq!(column_def(&p, &mk_field("status", ty)).unwrap(), "status TEXT");
@@ -303,6 +305,8 @@ mod tests {
             variants: vec![Variant { name: "Circle".to_string(), payload: vec![Ty::F64], span: SPAN }],
             span: SPAN,
             module: None,
+            ns: None,
+            exported: true,
         });
         let ty = Ty::Named("Shape".to_string(), vec![]);
         assert!(column_def(&p, &mk_field("shape", ty)).is_none());
