@@ -16,15 +16,15 @@ design feedback — helps.
 - **Port a benchmark.** `benchmarks/{c,julia,nirdosha}/` compares
   Nirdosha against C and Julia on a handful of numeric kernels — more
   comparison points are useful.
-- **GBNF test cases.** `grammar_export/` validates that
-  `compiler/nirdosha.gbnf` (the constrained-decoding grammar) accepts
+- **GBNF test cases.** `crates/grammar_export/` validates that
+  `crates/compiler/nirdosha.gbnf` (the constrained-decoding grammar) accepts
   and rejects exactly what the real compiler does — corpus entries that
   exercise an edge case are valuable.
-- **Pick up an item from the [Public Roadmap](./PUBLIC_ROADMAP.md).**
+- **Pick up an item from the [Public Roadmap](./docs/PUBLIC_ROADMAP.md).**
 
 ## Before you contribute
 
-1. Check existing issues and the [Public Roadmap](./PUBLIC_ROADMAP.md)
+1. Check existing issues and the [Public Roadmap](./docs/PUBLIC_ROADMAP.md)
    so you're not duplicating work already scoped or underway.
 2. For anything non-trivial, open an issue first so we can agree on
    direction before you sink time into an implementation.
@@ -36,7 +36,7 @@ design feedback — helps.
 ```sh
 cd compiler
 cargo build          # fast dev build
-cargo test           # full suite (unit + compiler/tests/*.rs)
+cargo test           # full suite (unit + crates/compiler/tests/*.rs)
 ```
 
 System deps the build links against directly:
@@ -67,8 +67,8 @@ the right design doc for whatever you're changing.
 
 1. Fork and branch.
 2. Run the full test suite: `cargo test` in `compiler/`.
-3. Update relevant docs (`LANGUAGE.md`, `GRAMMAR.md`, `ROADMAP.md`,
-   `PUBLIC_ROADMAP.md`) in the *same* PR, not a follow-up — this
+3. Update relevant docs (`docs/LANGUAGE.md`, `docs/GRAMMAR.md`, `docs/ROADMAP.md`,
+   `docs/PUBLIC_ROADMAP.md`) in the *same* PR, not a follow-up — this
    project treats docs as load-bearing, not aspirational.
 4. Reference the issue your PR addresses: `Closes #123`.
 5. Keep commits small and messages descriptive.

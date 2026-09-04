@@ -4,7 +4,7 @@
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Wiki](https://img.shields.io/badge/docs-wiki-blue)](https://github.com/arunsoman/nirdosha/wiki)
 [![Contributing](https://img.shields.io/badge/CONTRIBUTING-read-blue)](./CONTRIBUTING.md)
-[![Roadmap](https://img.shields.io/badge/ROADMAP-view-purple)](./PUBLIC_ROADMAP.md)
+[![Roadmap](https://img.shields.io/badge/ROADMAP-view-purple)](./docs/PUBLIC_ROADMAP.md)
 [![Sponsor](https://img.shields.io/badge/%E2%9D%A4-Sponsor-ea4aaa)](https://github.com/sponsors/arunsoman)
 
 > **A systems language designed for LLMs to write, with a grammar so
@@ -14,7 +14,7 @@
 > write unsupervised can also be trusted to run.
 
 Status: active research prototype. The compiler is a real, runnable Rust
-crate (`compiler/`); many safety properties are *proven* today and some are
+crate (`crates/compiler/`); many safety properties are *proven* today and some are
 *aspirational* (called out honestly in the [wiki](https://github.com/arunsoman/nirdosha/wiki/Honest-Scope-and-Roadmap)).
 Source files use the `.nir` extension.
 
@@ -36,7 +36,7 @@ fn main() {
 ```
 
 ```sh
-cd compiler && cargo run -- ../examples/hello_above_fold.nir
+cd crates/compiler && cargo run -- ../../examples/hello_above_fold.nir
 # hello, Nirdosha
 # 21
 ```
@@ -74,7 +74,7 @@ matter more than volume. Right now:
   numeric/control-flow subset; `db`/`json`/`http`/`mq`/identity/
   `transact`/concurrency are interpreter-only. First gap to close:
   `transact` → `db`/`json`.
-- **LLM eval harness** — [`bench/`](./bench) has a real pass@1 +
+- **LLM eval harness** — [`crates/bench/`](./crates/bench) has a real pass@1 +
   self-repair-rate scaffold but ships with mock models; wiring it to
   DeepSeek/Kimi/GLM would make the LLM-writability claims independently
   checkable.
@@ -82,7 +82,7 @@ matter more than volume. Right now:
   runtime has never run on a real Windows machine; macOS binaries link
   system Z3 because `z3-src` doesn't build against current AppleClang.
 
-Full list with status tags: [`PUBLIC_ROADMAP.md`](./PUBLIC_ROADMAP.md).
+Full list with status tags: [`docs/PUBLIC_ROADMAP.md`](./docs/PUBLIC_ROADMAP.md).
 Issues are labeled `good first issue` / `help wanted` / `compiler` /
 `llm` / `infra` / `docs`. Pick one, comment before starting on anything
 non-trivial — see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
@@ -90,7 +90,7 @@ non-trivial — see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 | If you care about | Try | 
 |---|---|
 | Ownership/concurrency, PL theory | A `Track B` codegen gap, or an SMT/typeck edge case |
-| Constrained decoding, agent repair loops | `bench/` harness + real models, `grammar_export/` corpus entries |
+| Constrained decoding, agent repair loops | `crates/bench/` harness + real models, `crates/grammar_export/` corpus entries |
 | Real backends, CRUD, sandboxing | A new `examples/*.nir` service, or Track A production-readiness items |
 | Docs / DX | Error-message clarity, Getting Started walkthroughs, missing examples |
 

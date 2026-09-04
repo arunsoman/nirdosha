@@ -1,6 +1,6 @@
 # `ghcr.io/protobox/nirdosha-runtime` — the image protobox's
 # `plugins/languages/nirdosha.py` already names as `docker_image`
-# (KUBERNETES.md P0's first item: "no published nirdosha binary/base
+# (docs/KUBERNETES.md P0's first item: "no published nirdosha binary/base
 # image exists yet"). Bakes in the `nirdosha` binary itself plus
 # python3/pytest/requests, since a nirdosha-lane protobox project's
 # `test_command` is `pytest -q qa` (black-box HTTP tests against `nirdosha
@@ -30,9 +30,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src/compiler
-COPY compiler/Cargo.toml compiler/Cargo.lock ./
-COPY compiler/build.rs ./build.rs
-COPY compiler/src ./src
+COPY crates/compiler/Cargo.toml crates/compiler/Cargo.lock ./
+COPY crates/compiler/build.rs ./build.rs
+COPY crates/compiler/src ./src
 RUN cargo build --release --features dist
 
 # ---- runtime stage -------------------------------------------------------
@@ -56,7 +56,7 @@ RUN pip install --no-cache-dir --root-user-action=ignore pytest==8.* requests==2
 
 COPY --from=build /src/compiler/target/release/nirdosha /usr/local/bin/nirdosha
 
-# `KUBERNETES.md`'s "Security posture" row: non-root UID, and the only
+# `docs/KUBERNETES.md`'s "Security posture" row: non-root UID, and the only
 # writable path is `/data` (where a project's `.nir` source,
 # `.transact.db`/`.workflow.db` durability logs, and `--db`'s SQLite
 # table-browser file all live) — everything else can run under a

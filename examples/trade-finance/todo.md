@@ -164,7 +164,7 @@ the plan's Verification section — not on "code written."
 - [x] `[BUILD]` Financial ratio computation + credit score:
       `current_ratio_bps`/`debt_to_equity_bps` computed as real integer
       basis-points arithmetic (no int↔float cast exists in Nirdosha —
-      LANGUAGE.md §3 — so ratios are bps, not decimals, same convention
+      docs/LANGUAGE.md §3 — so ratios are bps, not decimals, same convention
       `rev_assurance.nir`'s `stat_leakage_rate_bps` already used),
       feeding a simple deterministic scoring formula, clamped [0,
       10000]. **Verified live**: known inputs produced the
@@ -390,7 +390,7 @@ the plan's Verification section — not on "code written."
       logic, zero false negatives by construction. **Verified live**: a
       byte-for-byte repeat submission was correctly rejected. Not a
       `sha256_hex`-built composite key like Module 1's audit chain:
-      Nirdosha has no i64→str cast (LANGUAGE.md §3), so the i64 amount
+      Nirdosha has no i64→str cast (docs/LANGUAGE.md §3), so the i64 amount
       can't be folded into a hashable string — the amount instead
       participates directly in the SQL match, same real guarantee, no
       Redis-backed hash index (`[SUBSTITUTED]`).
@@ -723,8 +723,8 @@ the plan's Verification section — not on "code written."
       today; out of scope for this pass.
 - [x] `[BUILD]` Field-level RBAC (`screen <Struct> { field <name> {
       view: role(...), edit: role(...) } }`) now actually enforced, not
-      just parsed/typechecked — see `LANGUAGE.md`'s `screen`/`dashboard`
-      section and `compiler/UI_DSL_TODO.md`'s BUILT list for the full
+      just parsed/typechecked — see `docs/LANGUAGE.md`'s `screen`/`dashboard`
+      section and `crates/compiler/UI_DSL_TODO.md`'s BUILT list for the full
       client+server design. One worked example in this app:
       `Counterparty.risk_rating` (`view: role("compliance_officer",
       "bank_ops")`, `edit: role("compliance_officer")`) — verified live
@@ -875,8 +875,8 @@ similar — each is a genuine, named substitution, not a silent one).
 Added as language/codegen defaults (not one-off template tweaks), per
 `/home/arun/.claude/plans/encapsulated-forging-puffin.md`:
 
-- **`module "Name" { ... }`** (new keyword, `LANGUAGE.md` SS12,
-  `GRAMMAR.md`'s `module_decl`): this file's 9 `// Module N: ...` banner
+- **`module "Name" { ... }`** (new keyword, `docs/LANGUAGE.md` SS12,
+  `docs/GRAMMAR.md`'s `module_decl`): this file's 9 `// Module N: ...` banner
   sections now wrap real `module` blocks; `emit-ui`'s nav groups into
   collapsible primary/secondary sections by it. Verified live (all 9
   modules render as collapsible sections; active one auto-expands).
@@ -896,7 +896,7 @@ Added as language/codegen defaults (not one-off template tweaks), per
   round-trips through create+update, invalid variant gives a clean 400.
 - **Temporal fields**: naming-convention heuristic only (`date`/`time`
   as a whole word-segment in a `str` field name) — no new language
-  type; Nirdosha's no-wall-clock stance is deliberate (LANGUAGE.md SS9).
+  type; Nirdosha's no-wall-clock stance is deliberate (docs/LANGUAGE.md SS9).
 - **Pagination/sort/search/filter**: `nirdosha serve --db <path>` new
   flag exposes `/_nirdosha/table/<snake>` (`serve.rs::
   dispatch_table_query`), on by default for every table when passed,

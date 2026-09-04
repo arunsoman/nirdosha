@@ -1,5 +1,5 @@
 {{- /*
-One path for both UI and API (KUBERNETES.md's "[DONE], by design" row —
+One path for both UI and API (docs/KUBERNETES.md's "[DONE], by design" row —
 `serve.rs` fuses UI+API on one listener, so there is no separate
 frontend Ingress/CORS config, ever). TLS termination is the Ingress
 controller's job, not this chart's — `serve.rs` itself is plain HTTP by

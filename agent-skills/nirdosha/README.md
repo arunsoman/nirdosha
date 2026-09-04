@@ -38,7 +38,7 @@ Swap the URL/destination for the other tools using the table above.
 
 Nirdosha's grammar is deliberately small and LL(1) — designed so an
 LLM sampler can be constrained to only emit syntactically valid tokens
-(`compiler/nirdosha.gbnf`, `README.md` §9). These files are the
+(`crates/compiler/nirdosha.gbnf`, `README.md` §9). These files are the
 human-readable half of that same bet: give an agent the actual rules
 up front instead of letting it guess from general programming
 knowledge and fail on Nirdosha's stricter parts (no `::`, no string
@@ -53,5 +53,5 @@ it. If you find a factual error, fix it in `core.md` first, then
 propagate the fix to the rest (they're intentionally *not* symlinks or
 build outputs — most of these platforms can't include external files,
 so duplication here is unavoidable). `core.md` itself defers to
-`LANGUAGE.md`/`GRAMMAR.md` in the main repo as the actual authoritative
+`docs/LANGUAGE.md`/`docs/GRAMMAR.md` in the main repo as the actual authoritative
 reference — if they ever disagree, those two win.

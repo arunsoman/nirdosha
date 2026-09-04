@@ -1,8 +1,9 @@
-/compiler/target
-/grammar_check/target
-/grammar_export/target
-/bench/target
-/presence-gateway/target
+/target
+/crates/compiler/target
+/crates/grammar_check/target
+/crates/grammar_export/target
+/crates/bench/target
+/crates/presence-gateway/target
 /benchmarks/c/*_bin*
 /benchmarks/nirdosha/*_bin*
 
@@ -12,6 +13,7 @@
 
 # Runtime database artifacts
 *.db
+*.db.lock
 
 # Claude Code local session/state (never commit)
 /.claude

@@ -1,7 +1,7 @@
 // A real invoicing app, served with `nirdosha serve examples/money_invoice.nir
 // --port 8080 --db money_invoice.db`.
 //
-// Demonstrates `LANGUAGE.md` §6c's `dec128`/`CurrencyCode`/`Money` end to
+// Demonstrates `docs/LANGUAGE.md` §6c's `dec128`/`CurrencyCode`/`Money` end to
 // end. As of 2026-08-27 all three are real **prelude** types
 // (`ast.rs::prelude_enums`/`prelude_structs`) -- built into every `.nir`
 // program automatically, the same way `Option`/`Result` already are, not
@@ -16,7 +16,7 @@
 // real `Money` value gets constructed and returned, not just its two
 // flattened parts.
 //
-// `combine_lines` is `LANGUAGE.md` §6c's `add_money` example, made into
+// `combine_lines` is `docs/LANGUAGE.md` §6c's `add_money` example, made into
 // a real callable endpoint: `POST /api/combine_lines` with body
 // `{"a": {...InvoiceLine...}, "b": {...InvoiceLine...}}` adds two lines'
 // `amount`s only if their `currency` matches -- a real, if narrow,
@@ -111,7 +111,7 @@ fn delete_invoice_line(id: i64) -> Result(i64, ErrorCode) requires(public) {
 
 // ---- the actual point of this demo --------------------------------------
 
-// `LANGUAGE.md` §6c's `add_money`, as a real endpoint returning a real
+// `docs/LANGUAGE.md` §6c's `add_money`, as a real endpoint returning a real
 // prelude `Money` value -- `POST /api/combine_lines` with
 // `{"a": {...}, "b": {...}}`.
 fn combine_lines(a: InvoiceLine, b: InvoiceLine) -> Result(Money, ErrorCode) requires(public) {

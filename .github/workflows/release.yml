@@ -2,7 +2,7 @@ name: release
 
 # Builds prebuilt `nirdosha` binaries and attaches them to a GitHub
 # Release whenever a `v*` tag is pushed. Z3 is statically vendored (the
-# `dist` feature, see compiler/Cargo.toml) on Linux/Windows, so those
+# `dist` feature, see crates/compiler/Cargo.toml) on Linux/Windows, so those
 # binaries need no system `libz3` — `clang` is still required on the
 # *user's* machine at runtime, but only for `nirdosha build`/`emit-llvm`
 # (native codegen); interpreting, `emit-ast`, `emit-ui`, and `serve` all
@@ -60,8 +60,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            compiler/target
-          key: ${{ matrix.target }}-cargo-${{ hashFiles('compiler/Cargo.lock') }}
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
 
       - name: Install system Z3 (macOS only — see workflow header)
         if: runner.os == 'macOS'
@@ -69,12 +69,12 @@ jobs:
 
       - name: Build (Z3 vendored, no system libz3 dependency)
         if: runner.os != 'macOS'
-        working-directory: compiler
+        working-directory: crates/compiler
         run: cargo build --release --features dist --target ${{ matrix.target }}
 
       - name: Build (macOS — system Z3, see workflow header)
         if: runner.os == 'macOS'
-        working-directory: compiler
+        working-directory: crates/compiler
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Assemble Nirdosha.app (macOS icon/file-association registrar)
@@ -109,17 +109,17 @@ jobs:
         # icon association instead (a different mechanism entirely,
         # Launch Services, not an icon-theme directory).
         if: runner.os != 'Windows'
-        working-directory: compiler
+        working-directory: crates/compiler
         run: |
           stage=$(mktemp -d)
-          cp target/${{ matrix.target }}/release/nirdosha "$stage/"
+          cp ../../target/${{ matrix.target }}/release/nirdosha "$stage/"
           if [ "${{ runner.os }}" = "Linux" ]; then
-            cp -r ../assets/brand/linux-icons "$stage/linux-icons"
-            cp ../assets/linux/nirdosha-mime.xml "$stage/nirdosha-mime.xml"
+            cp -r ../../assets/brand/linux-icons "$stage/linux-icons"
+            cp ../../assets/linux/nirdosha-mime.xml "$stage/nirdosha-mime.xml"
           fi
-          tar czf ../${{ matrix.asset }} -C "$stage" .
+          tar czf ../../${{ matrix.asset }} -C "$stage" .
           rm -rf "$stage"
-          cd ..
+          cd ../..
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
           else
@@ -132,22 +132,22 @@ jobs:
         # it already downloaded — same "install.ps1 never clones this
         # repo" reasoning as the Unix step above.
         if: runner.os == 'Windows'
-        working-directory: compiler
+        working-directory: crates/compiler
         shell: pwsh
         run: |
           $stage = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "nirdosha-pkg-$([guid]::NewGuid())")
-          Copy-Item target/${{ matrix.target }}/release/nirdosha.exe $stage
-          Copy-Item ../assets/brand/nirdosha.ico $stage
-          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath ../${{ matrix.asset }}
+          Copy-Item ../../target/${{ matrix.target }}/release/nirdosha.exe $stage
+          Copy-Item ../../assets/brand/nirdosha.ico $stage
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath ../../${{ matrix.asset }}
           Remove-Item -Recurse -Force $stage
-          cd ..
+          cd ../..
           Get-FileHash ${{ matrix.asset }} -Algorithm SHA256 | Select-Object -ExpandProperty Hash | Out-File -Encoding ascii "${{ matrix.asset }}.sha256"
 
       - name: Smoke test the built binary
         if: runner.os != 'Windows'
         run: |
-          chmod +x compiler/target/${{ matrix.target }}/release/nirdosha
-          compiler/target/${{ matrix.target }}/release/nirdosha examples/hello.nir
+          chmod +x target/${{ matrix.target }}/release/nirdosha
+          target/${{ matrix.target }}/release/nirdosha examples/hello.nir
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2

@@ -22,7 +22,7 @@ Context used to calibrate this inventory:
   `screen`/`dashboard`/`module` vocabulary in use (field relabeling, custom
   actions with confirm dialogs, RBAC-gated fields, nav grouping via
   `module`, `stat`/`chart` dashboard tiles).
-- `LANGUAGE.md` §11/§12: today a "screen" is one `struct`'s list+detail pair
+- `docs/LANGUAGE.md` §11/§12: today a "screen" is one `struct`'s list+detail pair
   plus optional custom row actions; a "dashboard" is a flat set of `stat`/
   `chart` tiles (exactly one chart type: an inline-SVG bar chart — no line/
   scatter/heatmap/treemap/geo/graph); `module` only groups nav items, it
@@ -262,7 +262,7 @@ a gap analysis — just the pointer for the next step):
    exactly one chart type (an inline-SVG bar chart) and no graph/network
    rendering primitive at all.
 3. **Geo Heatmap** (Module 5) — explicitly requested ("geospatial
-   heatmaps"), and explicitly out of scope in `LANGUAGE.md`'s own
+   heatmaps"), and explicitly out of scope in `docs/LANGUAGE.md`'s own
    "Deliberate non-goals" for `dashboard`'s chart types (no geo/heatmap
    chart).
 4. **Policy Management Engine / Rule Engine Config / Scoring Weights /
@@ -271,7 +271,7 @@ a gap analysis — just the pointer for the next step):
    — not a plain record CRUD form, and not covered by today's fixed
    seven-kind form-control set.
 5. **Case Workflow / Stage Tracker** (Module 3) — a 4-stage state-machine
-   UI. `workflow` (LANGUAGE.md §14) exists as a backend durable-state-machine
+   UI. `workflow` (docs/LANGUAGE.md §14) exists as a backend durable-state-machine
    construct, but nothing today renders its stage progression as a UI
    surface a Supervisor/Investigator would look at.
 6. **Report Generation & Scheduling screens** (Modules 4, 5, 6, 7 — SAR/

@@ -1,5 +1,5 @@
 // Row 11 layer 6 (generics) + layer 7 (the Option(T)/Result(T, E)
-// prelude) -- `nirdosha_row11_amendment.md` §3.6. Type identity is
+// prelude) -- `docs/nirdosha_row11_amendment.md` §3.6. Type identity is
 // structural-per-instantiation, not erased: `Duo(i64, i64)` is a real,
 // concrete `Ty`, the same way `Vector(f64, 3)` already is. No
 // monomorphizer pass exists or is needed -- see `ast::substitute_ty`.
