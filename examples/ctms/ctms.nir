@@ -257,11 +257,11 @@ fn create_transaction(t: Transaction) -> Result(i64, ErrorCode) requires(role: "
 }
 
 // The Investigation Workspace's "Transactions" panel source -- shaped
-// as `{ts, label}[]` (Track E2's timeline contract, `LANGUAGE.md`
+// as `{ts, label}[]` (Track E2's timeline contract, `docs/LANGUAGE.md`
 // SS11c) rather than raw columns, since this fn's only consumer is that
 // one `panel { render: "timeline" }`. Exactly one `i64` param,
 // `Result(json, _)` return -- `typeck.rs::check_workspace`'s required
-// shape (LANGUAGE.md SS15). `||`/`CAST` below are ordinary SQL, executed
+// shape (docs/LANGUAGE.md SS15). `||`/`CAST` below are ordinary SQL, executed
 // server-side by SQLite -- Nirdosha's own expression grammar still has
 // no `str` concatenation operator at all (`UI_CONSTRUCTS.md` SS7's own
 // disclosed limit); this sidesteps it by pushing the formatting into the

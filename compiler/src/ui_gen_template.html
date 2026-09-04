@@ -344,9 +344,34 @@ __NIRDOSHA_THEME_SCRIPT__
   .gate-note { font-size: 12px; color: var(--md-error); margin-top: 4px; }
   /* Track E3: field { render: "countdown" } -- live SLA countdown chip.
      Reuses the existing semantic error color token for an overdue row,
-     no new theme tokens (`ROADMAP.md` Track E3). */
+     no new theme tokens (`docs/ROADMAP.md` Track E3). */
   .countdown { font-variant-numeric: tabular-nums; }
   .countdown-overdue { color: var(--md-error); font-weight: 500; }
+  /* Track F, F1 Phase A: field { render: "badge" } -- a zero-payload
+     enum's variant, shown as a colored pill. Color is deterministic
+     (hashed from the variant name, `badgeColorClass`), not per-variant
+     configurable in this pass -- a real, disclosed narrowing, not an
+     oversight; a fixed 6-hue palette is enough to visually distinguish
+     an enum's variants from each other without per-app color config. */
+  .field-badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 500; }
+  .field-badge-0 { background: color-mix(in srgb, #6366f1 18%, transparent); color: #6366f1; }
+  .field-badge-1 { background: color-mix(in srgb, #16a34a 18%, transparent); color: #16a34a; }
+  .field-badge-2 { background: color-mix(in srgb, #d97706 18%, transparent); color: #d97706; }
+  .field-badge-3 { background: color-mix(in srgb, #dc2626 18%, transparent); color: #dc2626; }
+  .field-badge-4 { background: color-mix(in srgb, #0891b2 18%, transparent); color: #0891b2; }
+  .field-badge-5 { background: color-mix(in srgb, #9333ea 18%, transparent); color: #9333ea; }
+  /* Track F, F1 Phase A: `layout { }`'s own container/widget kinds. */
+  .layout-row { display: flex; flex-direction: row; flex-wrap: wrap; }
+  .layout-column { display: flex; flex-direction: column; }
+  .layout-grid { display: grid; }
+  .layout-group { border: 1px solid var(--md-outline); border-radius: var(--md-radius-md); padding: 16px; }
+  .layout-group-title { font-weight: 500; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; cursor: default; }
+  .layout-group-title.collapsible { cursor: pointer; }
+  .layout-divider { border: none; border-top: 1px solid var(--md-outline); margin: 8px 0; }
+  .layout-tabs-bar { display: flex; gap: 4px; border-bottom: 1px solid var(--md-outline); margin-bottom: 12px; }
+  .layout-tab-button { padding: 8px 14px; border: none; background: none; cursor: pointer; border-bottom: 2px solid transparent; color: var(--md-on-surface-variant); }
+  .layout-tab-button.active { color: var(--md-primary); border-bottom-color: var(--md-primary); }
+  .searchable-select-option:hover { background: var(--md-surface-variant); }
   /* Track E4: action { show_result: true } -- native <dialog>, styled
      to match every other `.card` surface in this file. */
   .result-modal { max-width: 560px; width: 90%; border: none; padding: 20px; }
@@ -648,6 +673,123 @@ function fieldLabel(f) {
   return f.displayLabel || f.name;
 }
 
+// A row's own display text for a `searchable_select` option -- no
+// generic "which column is the display column" concept exists
+// anywhere in the manifest, so this picks the first string-valued
+// field that isn't `id` (the common convention: `name`/`title`/`label`
+// tend to sort near the front of most structs), falling back to `id`
+// itself, then to the whole row JSON-stringified as a last resort.
+function rowDisplayText(row) {
+  if (row === null || typeof row !== "object") return String(row);
+  for (const [k, v] of Object.entries(row)) {
+    if (k !== "id" && typeof v === "string") return v;
+  }
+  if ("id" in row) return String(row.id);
+  return JSON.stringify(row);
+}
+
+// `field <name> { render: "searchable_select" source: <Struct|fn> }`
+// (`docs/ROADMAP.md` Track F, F1 Phase A) -- a text-input-driven dropdown
+// with debounced search and scroll-triggered pagination, the widget
+// this whole feature was named after. Two data sources, resolved
+// server-side already (`ui_gen.rs::apply_field_overrides`):
+// `f.selectTable` reuses the generic `/_nirdosha/table/<table>` route
+// (`fetchTablePage`, already used by `renderListScreen`'s own
+// pagination) -- real search + scroll-appended pages, the common case
+// once `--db` is in play. `f.selectFn` calls that fn directly via
+// `callFn` -- one unpaginated fetch per keystroke (debounced), no
+// scroll-appending, since an arbitrary fn has no page/cursor contract
+// of its own (`docs/NEXT_GEN.md` §F2's own disclosed-gap precedent: real,
+// working, just not paginated).
+function buildSearchableSelect(f, value, disabled) {
+  let selected = value !== undefined && value !== null ? value : null;
+  let selectedText = selected !== null ? String(selected) : "";
+  let page = 1;
+  let hasMore = true;
+  let loading = false;
+  let query = "";
+
+  const input = el("input", { type: "text", placeholder: "Type to search…", value: selectedText });
+  if (disabled) input.setAttribute("disabled", "");
+  const panel = el("div", { class: "searchable-select-panel", style: "display:none;max-height:220px;overflow-y:auto;border:1px solid var(--md-outline);border-radius:var(--radius-control);background:var(--md-surface);position:absolute;z-index:20;width:100%;" }, []);
+  const wrap = el("div", { class: "field", style: "position:relative;" }, [
+    el("label", { text: fieldLabel(f) + (f.required ? " *" : "") }),
+    input,
+    panel,
+  ]);
+
+  function selectRow(row) {
+    selected = row.id !== undefined ? row.id : row;
+    selectedText = rowDisplayText(row);
+    input.value = selectedText;
+    panel.style.display = "none";
+  }
+
+  function renderRows(rows, append) {
+    if (!append) panel.textContent = "";
+    for (const row of rows) {
+      panel.appendChild(el("div", { class: "searchable-select-option", style: "padding:8px 12px;cursor:pointer;", text: rowDisplayText(row), onclick: () => selectRow(row) }));
+    }
+    if (rows.length === 0 && !append) {
+      panel.appendChild(el("div", { class: "empty-state", text: "No matches." }));
+    }
+  }
+
+  async function loadPage(append) {
+    if (loading) return;
+    loading = true;
+    if (f.selectTable) {
+      const data = await fetchTablePage(f.selectTable, { page, page_size: f.selectPageSize, search: query || undefined });
+      loading = false;
+      if (data === null) return;
+      const rows = Array.isArray(data.rows) ? data.rows : [];
+      hasMore = page * f.selectPageSize < (typeof data.total === "number" ? data.total : 0);
+      renderRows(rows, append);
+    } else if (f.selectFn) {
+      const rows = await callFn(f.selectFn, { [f.searchParam]: query });
+      loading = false;
+      hasMore = false; // unpaginated fallback -- one fetch, no "load more"
+      renderRows(Array.isArray(rows) ? rows : [], append);
+    } else {
+      loading = false;
+    }
+  }
+
+  const doSearch = debounce(() => {
+    page = 1;
+    hasMore = true;
+    loadPage(false);
+  }, 300);
+
+  let loadedOnce = false;
+  input.addEventListener("input", () => { query = input.value; selected = null; doSearch(); });
+  input.addEventListener("focus", () => {
+    panel.style.display = "block";
+    // A pre-filled value (the raw stored id -- `rowDisplayText` has
+    // nothing better to show until the first real fetch resolves) gets
+    // selected, not left with the cursor merely placed after it, so
+    // the very next keystroke replaces it -- ordinary browser text-
+    // input behavior otherwise appends, which would search for
+    // "7carl" instead of "carl" after typing over an existing "7".
+    if (selected !== null) input.select();
+    if (!loadedOnce) { loadedOnce = true; loadPage(false); }
+  });
+  document.addEventListener("click", (e) => { if (!wrap.contains(e.target)) panel.style.display = "none"; });
+  // Scroll-triggered pagination -- the "scroll level pagination" this
+  // widget exists for: within ~20px of the panel's own bottom, and only
+  // when a table-backed source still has more pages, fetch the next one
+  // and append rather than replace.
+  panel.addEventListener("scroll", () => {
+    if (!f.selectTable || !hasMore || loading) return;
+    if (panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 20) {
+      page += 1;
+      loadPage(true);
+    }
+  });
+
+  return { el: wrap, getValue: () => selected };
+}
+
 // ---- generic field -> control, recursive (one level of struct nesting
 // per build_field's own depth cap on the Rust side) ----
 // `isEdit` (true only for an *update* form, never create) hides a field
@@ -720,12 +862,13 @@ function buildFieldControl(f, value, isEdit, topLevel) {
     const wrap = el("div", { class: "field" }, [el("label", { text: fieldLabel(f) + (f.required ? " *" : "") }), input, datalist]);
     return { el: wrap, getValue: () => input.value };
   }
+  if (f.control === "searchable_select") return buildSearchableSelect(f, value, editLocked);
   if (f.control === "date") {
     // A `date`/`time`-named str field (a naming-convention heuristic,
     // not a new language type -- `ui_gen.rs::is_date_like_field_name`'s
     // doc comment). The lock is decorative only: "human-supplied, not an
     // automatic clock-stamp" -- Nirdosha has no wall-clock builtin at
-    // all (LANGUAGE.md SS9), by deliberate design; the field stays a
+    // all (docs/LANGUAGE.md SS9), by deliberate design; the field stays a
     // plain, fully editable string underneath.
     const input = el("input", { type: "date", value: value !== undefined && value !== null ? value : "" });
     if (f.required) input.setAttribute("required", "");
@@ -854,15 +997,30 @@ setInterval(() => {
   document.querySelectorAll(".countdown").forEach(updateCountdownEl);
 }, 1000);
 
+// Deterministic (not random, not per-variant-configurable in this
+// pass) palette index for a `render: "badge"` field's variant name --
+// same string always gets the same color across every row/reload.
+function badgeColorClass(text) {
+  let hash = 0;
+  for (let i = 0; i < text.length; i++) hash = (hash * 31 + text.charCodeAt(i)) | 0;
+  return `field-badge-${Math.abs(hash) % 6}`;
+}
+
 // A table cell's own content -- a plain text node for every ordinary
-// field, or a live `.countdown` chip (immediately populated, not left
-// blank until the next tick) for one declared `render: "countdown"`.
+// field, a live `.countdown` chip (immediately populated, not left
+// blank until the next tick) for `render: "countdown"`, or a colored
+// pill for `render: "badge"` (`docs/ROADMAP.md` Track E3 / Track F, F1
+// Phase A).
 function buildCellContent(f, row) {
   if (f.render === "countdown") {
     const span = el("span", { class: "countdown" });
     span.dataset.deadline = String(row ? row[f.name] : "");
     updateCountdownEl(span);
     return span;
+  }
+  if (f.render === "badge") {
+    const text = cellText(f, row);
+    return el("span", { class: `field-badge ${badgeColorClass(text)}`, text });
   }
   return document.createTextNode(cellText(f, row));
 }
@@ -1237,6 +1395,141 @@ async function renderWorkflowQueue(wf, root) {
   load();
 }
 
+// ---- Track F, F1 Phase A: `layout { }` -- the generic manifest-node
+// dispatcher `docs/ROADMAP.md`/`docs/NEXT_GEN.md` §F1 calls for. Every container
+// kind (`row`/`column`/`grid`/`group`/`tabs`) only ever wraps -- it
+// recurses into its own children and never reimplements `field`/
+// `action`/widget rendering itself; a `field` leaf still goes through
+// the *exact same* `buildFieldControl` every flat `buildForm` already
+// uses, an `action` leaf mirrors the row/custom-action click handler
+// `renderListScreen` already establishes (`idParam`-or-whole-value
+// payload, `confirm`/`showResult` honored identically), and a
+// `timeline` widget reuses `renderTimelineList` unchanged. `ctx` is
+// shared, mutated in place across the whole recursion: `ctx.controls`
+// accumulates every `field` leaf's `{f, c}` pair (so a submit handler
+// can collect `c.getValue()` the same way `buildForm`'s own flat loop
+// does) and `ctx.placed` records every field name the layout actually
+// used (so `buildLayoutForm` below can still pass through a field the
+// author's `layout` block never mentioned, instead of silently
+// dropping it from the submitted payload).
+function renderLayoutNode(node, ctx) {
+  if (!node) return el("div", {}, []);
+  switch (node.type) {
+    case "row":
+    case "column": {
+      const style = node.gap != null ? `gap:${node.gap}px;` : "";
+      return el("div", { class: `layout-${node.type}`, style }, node.children.map((c) => renderLayoutNode(c, ctx)));
+    }
+    case "grid": {
+      const style = `grid-template-columns: repeat(${node.columns || 1}, 1fr);` + (node.gap != null ? `gap:${node.gap}px;` : "");
+      return el("div", { class: "layout-grid", style }, node.children.map((c) => renderLayoutNode(c, ctx)));
+    }
+    case "group": {
+      const body = el("div", { style: "display:flex;flex-direction:column;gap:8px;" }, node.children.map((c) => renderLayoutNode(c, ctx)));
+      let titleRow = null;
+      if (node.title) {
+        titleRow = el("div", { class: "layout-group-title" + (node.collapsible ? " collapsible" : ""), text: (node.collapsible ? "▾ " : "") + node.title });
+        if (node.collapsible) {
+          titleRow.addEventListener("click", () => {
+            const hidden = body.style.display === "none";
+            body.style.display = hidden ? "flex" : "none";
+            titleRow.textContent = (hidden ? "▾ " : "▸ ") + node.title;
+          });
+        }
+      }
+      return el("div", { class: "layout-group" }, [titleRow, body]);
+    }
+    case "tabs": {
+      const panels = node.tabs.map((t) => el("div", { style: "display:flex;flex-direction:column;gap:8px;" }, t.children.map((c) => renderLayoutNode(c, ctx))));
+      const bar = el("div", { class: "layout-tabs-bar" }, []);
+      const buttons = node.tabs.map((t, i) => {
+        const btn = el("button", { type: "button", class: "layout-tab-button", text: t.label });
+        btn.addEventListener("click", () => activate(i));
+        bar.appendChild(btn);
+        return btn;
+      });
+      function activate(i) {
+        panels.forEach((p, j) => { p.style.display = j === i ? "" : "none"; });
+        buttons.forEach((b, j) => b.classList.toggle("active", j === i));
+      }
+      activate(0);
+      return el("div", {}, [bar, ...panels]);
+    }
+    case "field": {
+      const f = node.field;
+      if (!f) return el("div", {}, []);
+      ctx.placed.add(f.name);
+      const value = ctx.values ? ctx.values[f.name] : undefined;
+      const c = buildFieldControl(f, value, ctx.isEdit, true);
+      ctx.controls.push({ f, c });
+      return c.el;
+    }
+    case "action": {
+      const a = node.action;
+      if (!a) return el("div", {}, []);
+      const label = a.label || (a.kind.charAt(0).toUpperCase() + a.kind.slice(1));
+      const btn = el("button", { type: "button", class: a.style === "outlined" ? "btn btn-outlined" : "btn btn-filled", text: label });
+      if (!canRun(a)) btn.setAttribute("disabled", "");
+      btn.addEventListener("click", async () => {
+        if (a.confirm && !window.confirm(a.confirm)) return;
+        const idParam = a.params[0];
+        const payload = idParam ? { [idParam.name]: ctx.values ? ctx.values[idParam.name] : undefined } : ctx.values;
+        const r = await callFn(a.fn, payload || {});
+        if (r !== null) {
+          showSnackbar(`${label} done.`);
+          if (a.showResult) showResultModal(label, r);
+        }
+      });
+      return btn;
+    }
+    case "widget": {
+      if (node.kind === "divider") return el("hr", { class: "layout-divider" });
+      if (node.kind === "card") {
+        return el("div", { class: "card" }, node.title ? [el("div", { class: "screen-sub", text: node.title })] : []);
+      }
+      if (node.kind === "timeline") {
+        const holder = el("div", { text: "Loading…" });
+        if (node.source) {
+          callFn(node.source, {}).then((data) => {
+            holder.textContent = "";
+            holder.appendChild(renderTimelineList(Array.isArray(data) ? data : []));
+          });
+        }
+        return holder;
+      }
+      return el("div", {}, []);
+    }
+    default:
+      return el("div", {}, []);
+  }
+}
+
+// `layout { }`-arranged mirror of `buildForm`, scoped (this pass) to
+// the common single-struct-param update convention (`update_<S>(x:
+// S)`) -- `paramField` is that one param's own `FieldSpec` (`control
+// === "struct"`, `nested` the struct's real fields). A field the
+// author's `layout` block never placed anywhere still round-trips
+// unchanged (`ctx.placed`), the same "don't silently drop what wasn't
+// authored here" guarantee `buildForm`'s own `id`/view-gated
+// passthrough already gives.
+function buildLayoutForm(layoutNode, paramField, values, onSubmit, submitLabel, disabled, disabledReason, isEdit) {
+  const ctx = { values, isEdit, controls: [], placed: new Set() };
+  const body = renderLayoutNode(layoutNode, ctx);
+  const submitBtn = el("button", { type: "submit", class: "btn btn-filled", text: submitLabel }, []);
+  if (disabled) submitBtn.setAttribute("disabled", "");
+  const form = el("form", { class: "card", onsubmit: (e) => {
+    e.preventDefault();
+    const nested = {};
+    for (const { f, c } of ctx.controls) nested[f.name] = c.getValue();
+    for (const nf of paramField.nested) {
+      if (!ctx.placed.has(nf.name)) nested[nf.name] = values ? values[nf.name] : undefined;
+    }
+    onSubmit({ [paramField.name]: nested });
+  }}, [body, submitBtn]);
+  if (disabled && disabledReason) form.appendChild(el("div", { class: "gate-note", text: disabledReason }));
+  return form;
+}
+
 async function renderSingularScreen(screen, root) {
   const getAction = screen.actions.find((a) => a.kind === "get");
   const updateAction = screen.actions.find((a) => a.kind === "update");
@@ -1245,11 +1538,25 @@ async function renderSingularScreen(screen, root) {
   let current = null;
   if (getAction && canRun(getAction)) current = await callFn(getAction.fn, {});
   if (updateAction) {
-    wrap.appendChild(buildForm(
-      updateAction.params, current,
-      async (values) => { const r = await callFn(updateAction.fn, values); if (r !== null) showSnackbar(`${screen.title} saved.`); },
-      "Save", !canRun(updateAction), gateReason(updateAction), true,
-    ));
+    // `layout { }` (`docs/ROADMAP.md` Track F, F1) only applies to the
+    // common single-struct-param update convention -- any other shape
+    // (a multi-param update fn) falls back to the ordinary flat
+    // `buildForm`, exactly as if no `layout` block existed at all; a
+    // screen with no `layout` block is likewise completely unaffected.
+    const paramField = updateAction.params.length === 1 && updateAction.params[0].control === "struct" ? updateAction.params[0] : null;
+    if (screen.layout && paramField) {
+      wrap.appendChild(buildLayoutForm(
+        screen.layout, paramField, current,
+        async (values) => { const r = await callFn(updateAction.fn, values); if (r !== null) showSnackbar(`${screen.title} saved.`); },
+        "Save", !canRun(updateAction), gateReason(updateAction), true,
+      ));
+    } else {
+      wrap.appendChild(buildForm(
+        updateAction.params, current,
+        async (values) => { const r = await callFn(updateAction.fn, values); if (r !== null) showSnackbar(`${screen.title} saved.`); },
+        "Save", !canRun(updateAction), gateReason(updateAction), true,
+      ));
+    }
   } else {
     wrap.appendChild(el("div", { class: "empty-state", text: "No update action defined for " + screen.title + "." }));
   }

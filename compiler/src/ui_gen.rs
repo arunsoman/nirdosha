@@ -70,7 +70,7 @@ use std::collections::{BTreeSet, HashMap};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 
-use crate::ast::{Effect, Expr, Field, FnDecl, MetricRef, Program, Requirement, ScreenDecl, Ty};
+use crate::ast::{Effect, Expr, Field, FnDecl, LayoutNode, MetricRef, Program, Requirement, ScreenDecl, Ty};
 use crate::effects::FnEffects;
 
 /// Prepended to every `Program.structs` by `ast::prelude_structs()` —
@@ -146,6 +146,34 @@ struct FieldSpec {
     /// how the client *displays* it changes. `None` means the ordinary
     /// per-control rendering every other field already has.
     render: Option<&'static str>,
+    /// `field <name> { render: "searchable_select" source: <Struct|fn>
+    /// }` (`docs/ROADMAP.md` Track F, F1 Phase A) — resolved once here at
+    /// generation time so the client never has to. `None` unless
+    /// `render == Some("searchable_select")`.
+    select_source: Option<SelectSource>,
+    /// `search_param: "q"` override for the query-string key sent to a
+    /// fn-backed `select_source` — meaningless for a table-backed one
+    /// (`/_nirdosha/table/<t>`'s own `search` key is fixed). Defaults to
+    /// `"q"` client-side when absent.
+    search_param: Option<String>,
+    /// `page_size: <int>` override for a table-backed `select_source`'s
+    /// scroll-pagination page size. Defaults to 25 client-side when absent.
+    select_page_size: Option<i64>,
+}
+
+/// Where a `searchable_select` field's dropdown options come from —
+/// `source: <Struct>` (resolves to that struct's own snake_case table,
+/// reusing the generic `/_nirdosha/table/<table>` pagination route
+/// exactly as the main list screen's own search+scroll already does —
+/// zero new backend work) or `source: <fn>` (calls that fn directly,
+/// unpaginated — the fallback for a program with no `--db`/`server_
+/// table_api`, or a struct whose real list logic isn't a plain `SELECT
+/// *`). Both proven to resolve by `typeck::check_searchable_select_
+/// source_expr` before this is ever built.
+#[derive(Debug, Clone)]
+enum SelectSource {
+    Table(String),
+    Fn(String),
 }
 
 /// One CRUD-convention function backing a screen, plus what it costs to
@@ -278,6 +306,14 @@ struct Screen {
     fields: Vec<FieldSpec>,
     actions: Vec<Action>,
     is_singular: bool,
+    /// `screen <Struct> { layout { ... } }` (`docs/ROADMAP.md` Track F, F1)
+    /// — `None` for every screen that doesn't declare one (renders
+    /// exactly as before this field existed). Carried through as the
+    /// already-typechecked `ast::LayoutNode` tree, converted to JSON
+    /// only at `manifest_json` time (`layout_json`) — same "keep the
+    /// typed AST until the very last step" idiom `Screen`'s other
+    /// fields already follow.
+    layout: Option<LayoutNode>,
 }
 
 /// One `panel "<label>" { source: <fn> ... }` inside a `workspace` block
@@ -527,12 +563,15 @@ fn build_field(program: &Program, name: &str, ty: &Ty, visiting: &mut Vec<String
         min: None,
         max: None,
         render: None,
+        select_source: None,
+        search_param: None,
+        select_page_size: None,
     };
     match ty {
         // `date`/`time`-named str fields get a calendar picker instead of
         // a plain text box (a naming-convention heuristic, not a new
         // language type — Nirdosha's lack of a date/time primitive is a
-        // deliberate no-wall-clock determinism stance, LANGUAGE.md §9,
+        // deliberate no-wall-clock determinism stance, docs/LANGUAGE.md §9,
         // left untouched here). The client shows a decorative lock badge
         // next to it ("human-supplied, not an auto clock-stamp") — the
         // field itself stays a plain, fully editable `str`.
@@ -591,6 +630,9 @@ fn build_field(program: &Program, name: &str, ty: &Ty, visiting: &mut Vec<String
                         min: None,
                         max: None,
                         render: None,
+                        select_source: None,
+                        search_param: None,
+                        select_page_size: None,
                     };
                 }
                 return base("readonly", false);
@@ -635,6 +677,9 @@ fn build_field(program: &Program, name: &str, ty: &Ty, visiting: &mut Vec<String
                     min: None,
                     max: None,
                     render: None,
+                    select_source: None,
+                    search_param: None,
+                    select_page_size: None,
                 };
             }
             base("readonly", false)
@@ -722,6 +767,21 @@ fn build_custom_action(
 fn kv_str<'a>(entries: &'a [(String, Expr)], key: &str) -> Option<&'a str> {
     entries.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
         Expr::Str(s, _) => Some(s.as_str()),
+        _ => None,
+    })
+}
+
+/// `kv_str`'s bare-name sibling, for a `key: <fn_or_struct_name>` entry
+/// (`layout { timeline { source: list_case_history } }`, `field <name>
+/// { render: "searchable_select" source: <Struct|fn> }`) — these name a
+/// real declared fn/struct, so their value is a plain `Expr::Ident`
+/// (`check_fn_ref`/`check_searchable_select_source_expr`'s own expected
+/// shape), never a string literal `kv_str` would match. `None` the same
+/// two ways `kv_str` is: the key is absent, or its value isn't a bare
+/// identifier.
+fn kv_ident<'a>(entries: &'a [(String, Expr)], key: &str) -> Option<&'a str> {
+    entries.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
+        Expr::Ident(n, _) => Some(n.as_str()),
         _ => None,
     })
 }
@@ -1098,12 +1158,12 @@ pub fn field_validations_for_fn(program: &Program, fn_name: &str) -> Option<(Str
 /// holding Counterparty's actual fields — recognized by that `label`
 /// match before descending, so a param belonging to some *other* struct
 /// entirely — a custom action's own unrelated params — is left alone).
-fn apply_field_overrides(decl: Option<&ScreenDecl>, fields: &mut [FieldSpec], owner_struct: &str) {
+fn apply_field_overrides(program: &Program, decl: Option<&ScreenDecl>, fields: &mut [FieldSpec], owner_struct: &str) {
     let Some(d) = decl else { return };
     for spec in fields.iter_mut() {
         if spec.control == "struct" {
             if spec.label == owner_struct {
-                apply_field_overrides(Some(d), &mut spec.nested, owner_struct);
+                apply_field_overrides(program, Some(d), &mut spec.nested, owner_struct);
             }
             continue;
         }
@@ -1121,14 +1181,37 @@ fn apply_field_overrides(decl: Option<&ScreenDecl>, fields: &mut [FieldSpec], ow
         spec.min = kv_num(&fo.entries, "min");
         spec.max = kv_num(&fo.entries, "max");
         // Already proven by `typeck.rs::check_field_render_expr` to be
-        // one of a fixed set — `"countdown"` is the only one with
-        // meaning yet (Track E3); matched explicitly rather than
-        // passing any string through, so a future closed-vocabulary
-        // addition here is a deliberate one-line change, not implicit.
+        // one of a fixed set (`docs/ROADMAP.md` Track E3, extended by Track
+        // F, F1 Phase A) — matched explicitly rather than passing any
+        // string through, so a future closed-vocabulary addition here
+        // is a deliberate one-line change, not implicit.
         spec.render = match kv_str(&fo.entries, "render") {
             Some("countdown") => Some("countdown"),
+            Some("badge") => Some("badge"),
+            Some("searchable_select") => Some("searchable_select"),
             _ => None,
         };
+        if spec.render == Some("searchable_select") {
+            // `control` drives `buildFieldControl`'s own dispatch
+            // (form/edit rendering) — `render` alone only affects
+            // table-cell *display*, which a searchable-select field
+            // has no real use for, so both are set together here.
+            spec.control = "searchable_select";
+            spec.search_param = kv_str(&fo.entries, "search_param").map(str::to_string);
+            spec.select_page_size = kv_num(&fo.entries, "page_size").map(|n| n as i64);
+            // Already proven to resolve by `typeck::
+            // check_searchable_select_source_expr` — a struct resolves
+            // to its own table (the scroll-paginated
+            // `/_nirdosha/table/<table>` path), anything else must be a
+            // real fn (the unpaginated `callFn` fallback).
+            spec.select_source = kv_ident(&fo.entries, "source").map(|name| {
+                if resolve_struct(program, name).is_some() {
+                    SelectSource::Table(to_snake_case(name))
+                } else {
+                    SelectSource::Fn(name.to_string())
+                }
+            });
+        }
     }
 }
 
@@ -1190,18 +1273,19 @@ fn build_screens(program: &Program, effects: &HashMap<String, FnEffects>) -> Vec
         // detail views are rendered from different manifest paths — so
         // without this second pass, a form would never see the override
         // at all, only the list/detail view would).
-        apply_field_overrides(decl, &mut fields, &s.name);
+        apply_field_overrides(program, decl, &mut fields, &s.name);
         for action in &mut actions {
-            apply_field_overrides(decl, &mut action.params, &s.name);
+            apply_field_overrides(program, decl, &mut action.params, &s.name);
         }
 
         let title = decl.and_then(|d| kv_str(&d.entries, "title")).map(str::to_string).unwrap_or_else(|| to_display_label(&s.name));
-        screens.push(Screen { struct_name: s.name.clone(), title, module: s.module.clone(), fields, actions, is_singular });
+        let layout = decl.and_then(|d| d.layout.clone());
+        screens.push(Screen { struct_name: s.name.clone(), title, module: s.module.clone(), fields, actions, is_singular, layout });
     }
     screens
 }
 
-/// One `WorkflowQueue` per declared `workflow` — `WORKFLOW.md`'s "state
+/// One `WorkflowQueue` per declared `workflow` — `docs/WORKFLOW.md`'s "state
 /// ownership + a generated queue UI" section. Both synthesized fns
 /// (`list_<workflow>_pending_for_me`/`advance_<workflow>`) always exist
 /// once `workflow_lower.rs` has run (this pass only ever sees an already-
@@ -1343,7 +1427,79 @@ fn workspaces_json(workspaces: &[Workspace]) -> String {
     serde_json::to_string(&value).expect("workspace manifest is built from plain strings/bools, always serializes")
 }
 
+fn action_json(a: &Action) -> serde_json::Value {
+    serde_json::json!({
+        "kind": a.kind, "fn": a.fn_name, "requiresLogin": a.requires_login,
+        "requiredRole": a.required_role, "requiredClaim": a.required_claim,
+        "badges": a.effect_badges,
+        "params": a.params.iter().map(field_json).collect::<Vec<_>>(),
+        "label": a.label, "style": a.style, "confirm": a.confirm, "showResult": a.show_result,
+    })
+}
+
+/// `layout { ... }` -> its JSON tree (`docs/ROADMAP.md` Track F, F1). A
+/// `Field`/`ActionRef` leaf embeds the *actual resolved* `FieldSpec`/
+/// `Action` JSON directly (via `field_json`/`action_json`, the exact
+/// same shapes `manifest_json`'s own flat `fields`/`actions` arrays
+/// already use) rather than just a name — so the client never needs a
+/// second lookup pass to render one. `fields`/`actions` are already
+/// proven by `typeck::check_screen_layout` to resolve; a `None` here
+/// (defensive — typeck already rejected an unresolved name before this
+/// ever runs) renders as a `null` leaf the client skips, never a panic.
+fn layout_json(node: &LayoutNode, fields: &[FieldSpec], actions: &[Action]) -> serde_json::Value {
+    match node {
+        LayoutNode::Row { children, entries, .. } => serde_json::json!({
+            "type": "row",
+            "gap": kv_num(entries, "gap"),
+            "children": children.iter().map(|c| layout_json(c, fields, actions)).collect::<Vec<_>>(),
+        }),
+        LayoutNode::Column { children, entries, .. } => serde_json::json!({
+            "type": "column",
+            "gap": kv_num(entries, "gap"),
+            "children": children.iter().map(|c| layout_json(c, fields, actions)).collect::<Vec<_>>(),
+        }),
+        LayoutNode::Grid { children, entries, .. } => serde_json::json!({
+            "type": "grid",
+            "columns": kv_num(entries, "columns").unwrap_or(1.0),
+            "gap": kv_num(entries, "gap"),
+            "children": children.iter().map(|c| layout_json(c, fields, actions)).collect::<Vec<_>>(),
+        }),
+        LayoutNode::Group { children, entries, .. } => serde_json::json!({
+            "type": "group",
+            "title": kv_str(entries, "title"),
+            "collapsible": kv_bool(entries, "collapsible"),
+            "children": children.iter().map(|c| layout_json(c, fields, actions)).collect::<Vec<_>>(),
+        }),
+        LayoutNode::Tabs { tabs, .. } => serde_json::json!({
+            "type": "tabs",
+            "tabs": tabs.iter().map(|(label, children)| serde_json::json!({
+                "label": label,
+                "children": children.iter().map(|c| layout_json(c, fields, actions)).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }),
+        LayoutNode::Field { name, .. } => serde_json::json!({
+            "type": "field",
+            "field": fields.iter().find(|f| &f.name == name).map(field_json),
+        }),
+        LayoutNode::ActionRef { label, .. } => serde_json::json!({
+            "type": "action",
+            "action": actions.iter().find(|a| a.label.as_deref() == Some(label.as_str()) || a.kind == label.as_str()).map(action_json),
+        }),
+        LayoutNode::Widget { kind, entries, .. } => serde_json::json!({
+            "type": "widget",
+            "kind": kind,
+            "source": kv_ident(entries, "source"),
+            "title": kv_str(entries, "title"),
+        }),
+    }
+}
+
 fn field_json(f: &FieldSpec) -> serde_json::Value {
+    let (select_table, select_fn) = match &f.select_source {
+        Some(SelectSource::Table(t)) => (Some(t.as_str()), None),
+        Some(SelectSource::Fn(n)) => (None, Some(n.as_str())),
+        None => (None, None),
+    };
     serde_json::json!({
         "name": f.name, "control": f.control, "required": f.required, "label": f.label,
         "displayLabel": f.display_label,
@@ -1352,6 +1508,9 @@ fn field_json(f: &FieldSpec) -> serde_json::Value {
         "requiredViewRoles": f.view_roles, "requiredViewClaim": f.view_claim,
         "requiredEditRoles": f.edit_roles, "requiredEditClaim": f.edit_claim,
         "pattern": f.pattern, "min": f.min, "max": f.max, "render": f.render,
+        "selectTable": select_table, "selectFn": select_fn,
+        "searchParam": f.search_param.as_deref().unwrap_or("q"),
+        "selectPageSize": f.select_page_size.unwrap_or(25),
     })
 }
 
@@ -1427,13 +1586,8 @@ fn manifest_json(screens: &[Screen]) -> String {
                 "columns": sc.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
                 "singular": sc.is_singular,
                 "fields": sc.fields.iter().map(field_json).collect::<Vec<_>>(),
-                "actions": sc.actions.iter().map(|a| serde_json::json!({
-                    "kind": a.kind, "fn": a.fn_name, "requiresLogin": a.requires_login,
-                    "requiredRole": a.required_role, "requiredClaim": a.required_claim,
-                    "badges": a.effect_badges,
-                    "params": a.params.iter().map(field_json).collect::<Vec<_>>(),
-                    "label": a.label, "style": a.style, "confirm": a.confirm, "showResult": a.show_result,
-                })).collect::<Vec<_>>(),
+                "actions": sc.actions.iter().map(action_json).collect::<Vec<_>>(),
+                "layout": sc.layout.as_ref().map(|l| layout_json(l, &sc.fields, &sc.actions)),
             })
         })
         .collect::<Vec<_>>());
@@ -1971,6 +2125,7 @@ mod tests {
                 crate::ast::FieldOverride { field_name: "untouched".to_string(), entries: vec![], span: SPAN },
             ],
             actions: vec![],
+            layout: None,
             span: SPAN,
         };
         let validations = validations_from_screen_decl(&decl);
