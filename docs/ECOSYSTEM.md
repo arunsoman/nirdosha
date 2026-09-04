@@ -152,6 +152,17 @@ crates.io-hosted `.nir`-source-only crate needs:
    this change too (`Connection refused` — they need a real local Redis,
    an environment gap, not a regression).
 
+   Also runnable directly, not just tested: `cargo run -p
+   nirdosha-plugin-rot13 --example run -- crates/plugin-example-rot13/
+   examples/scramble.nir` prints `Aveqbfun` — the literal "install a
+   package via Cargo" proposal, executed. `crates/plugin-example-rot13/
+   README.md` has the full walkthrough for both sides: what a plugin
+   author writes (the `NirdoshaPlugin` impl + `[package.metadata.
+   nirdosha]` block) and what a consuming project writes today (a small
+   entrypoint calling `run_with_plugins` — see "What Stage 1 does *not*
+   cover" just below for why that's still a hand-written entrypoint,
+   not a CLI flag).
+
    **What Stage 1 does *not* cover, honestly disclosed:** `serve`/
    `emit-ui`/`emit-llvm` never see `plugins` — only the plain-interpreter
    `run_with_plugins` path does (real future work, not silently implied).
