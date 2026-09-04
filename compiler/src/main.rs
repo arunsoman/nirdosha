@@ -286,7 +286,45 @@ fn typecheck_and_own_impl(src: &str, require_main: bool) -> Result<nirdosha::ast
         let joined = errors.iter().map(|e| format!("ownership error: {e}")).collect::<Vec<_>>().join("\n");
         return Err(joined);
     }
+    // `validate <fn_name> { pre: ... post: ... }`'s build-time
+    // "self-check and fail" gate (`docs/ROADMAP.md` Track F, F3;
+    // `docs/NEXT_GEN.md` §F3) — here, not in `cmd_build`/`cmd_emit_llvm`
+    // alongside `smt::analyze`, deliberately: those two are the
+    // *compiled*-codegen path only, and codegen doesn't support `db`
+    // yet, so a `db`-backed app (nearly every real one) can never reach
+    // them at all. This is the one choke point every command that owns
+    // a typechecked program actually goes through — `build`/`run`/
+    // `serve`/`emit-ui`/`emit-llvm`/`typecheck` alike — so a declared
+    // contract's build-time proof/counterexample-fail applies uniformly
+    // regardless of which command is running. Only a real, *proven*
+    // defect fails here (a genuine counterexample, or an unbound
+    // identifier the contract references) — a contract this Tier-1
+    // walker can't statically model at all is neither proved nor
+    // disproved by this call; it's still enforced, just at runtime
+    // instead (`interpreter.rs::call`'s own backstop) — see
+    // `print_unsupported_validate_notes`, called separately by the
+    // commands where "why isn't this proven" is worth surfacing.
+    if let Err(errors) = nirdosha::contract_check::check_program_contracts(&program) {
+        return Err(errors.join("\n"));
+    }
     Ok(program)
+}
+
+/// Prints `contract_check::unsupported_validate_notes` to stderr —
+/// non-fatal, the same "surface a previously-silent case" posture
+/// `print_ungated_fn_warnings` already takes for an ungated `fn`.
+/// Called from exactly the same two commands as that function, for the
+/// same reason (`print_ungated_fn_warnings`'s own doc comment: `serve`/
+/// `emit-ui` are where "why isn't this enforced up front" is actually
+/// the question being asked). The real enforcement — the build-time
+/// hard-fail above, and `interpreter.rs::call`'s runtime backstop — is
+/// unconditional everywhere regardless of whether this notice gets
+/// printed; only the informational "here's why it's not statically
+/// proven" heads-up is scoped this narrowly.
+fn print_unsupported_validate_notes(program: &nirdosha::ast::Program) {
+    for note in nirdosha::contract_check::unsupported_validate_notes(program) {
+        eprintln!("{note}");
+    }
 }
 
 /// `--theme <path>` for `emit-ui`/`serve` — reads a JSON file matching
@@ -625,6 +663,7 @@ fn cmd_emit_ui(mut args: impl Iterator<Item = String>) -> ExitCode {
         }
     };
     print_ungated_fn_warnings(&program);
+    print_unsupported_validate_notes(&program);
     let theme = match load_theme(theme_path.as_deref()) {
         Ok(t) => t,
         Err(msg) => {
@@ -875,6 +914,7 @@ fn cmd_serve(
         }
     };
     print_ungated_fn_warnings(&program);
+    print_unsupported_validate_notes(&program);
     let theme = match load_theme(theme_path.as_deref()) {
         Ok(t) => t,
         Err(msg) => {

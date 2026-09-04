@@ -206,6 +206,7 @@ pub fn error_kind_name(kind: &crate::interpreter::ErrorKind) -> &'static str {
         WorkflowLogUnavailable { .. } => "WorkflowLogUnavailable",
         WorkflowActionPending { .. } => "WorkflowActionPending",
         Deadlock { .. } => "Deadlock",
+        ContractViolation { .. } => "ContractViolation",
     }
 }
 

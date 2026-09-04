@@ -136,6 +136,15 @@ pub enum Tok {
     /// being a `string`, never a `:`, so LL(1) holds with no
     /// second-token lookahead beyond that same one-token check.
     Workspace,
+    /// `validate <fn_name> { pre: <expr>  post: <expr> ... }` — a Hoare
+    /// contract on an existing fn (`docs/ROADMAP.md` Track F, F3;
+    /// `docs/NEXT_GEN.md` §F3). A real reserved keyword, same reasoning as
+    /// `Screen`/`Dashboard`/`Module`/`Workflow`/`Workspace` above (no
+    /// existing example uses "validate" as an identifier); its body's
+    /// `pre`/`post` are contextual-only `kv_entry` keys, the same
+    /// "keyword only within one specific syntactic slot" treatment
+    /// `screen`'s own `field`/`action`/`paginate` already get.
+    Validate,
     /// `Vector`/`Matrix` in *type* position (`Vector(f64, 3)`) — deliberately
     /// capitalized, distinct from the lowercase `TypeName` scalars, matching
     /// the surface syntax the unified plan's architecture table already
@@ -402,6 +411,7 @@ impl<'a> Lexer<'a> {
                     "workflow" => Tok::Workflow,
                     "state" => Tok::State,
                     "workspace" => Tok::Workspace,
+                    "validate" => Tok::Validate,
                     "Vector" => Tok::VectorKw,
                     "Matrix" => Tok::MatrixKw,
                     "true" => Tok::True,

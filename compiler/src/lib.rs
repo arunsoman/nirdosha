@@ -98,6 +98,21 @@ pub fn run_with_tracer_transact_and_workflow_log(
         let joined = errors.iter().map(|e| format!("ownership error: {e}")).collect::<Vec<_>>().join("\n");
         return Err(joined);
     }
+    // `validate <fn_name> { pre: ... post: ... }`'s build-time
+    // "self-check and fail" gate — see `contract_check::
+    // check_program_contracts`'s own doc comment for what this does and
+    // doesn't catch (a genuine, *proven* defect only; anything the
+    // Tier-1 walker can't statically model falls through to
+    // `interpreter.rs::call`'s runtime backstop instead). Mirrors
+    // `main.rs::typecheck_and_own_impl`'s identical gate, placed here
+    // too since `main.rs`'s own pipeline is only reached by `build`/
+    // `serve`/`emit-ui`/`emit-llvm` — plain `nirdosha <file.nir>` (the
+    // default interpret command) goes through this function instead, by
+    // a completely separate path, and needs the exact same gate to not
+    // silently skip it.
+    if let Err(errors) = contract_check::check_program_contracts(&program) {
+        return Err(errors.join("\n"));
+    }
     let mut interp = Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src));
     if let Some(t) = tracer {
         interp = interp.with_tracer(t);
@@ -161,6 +176,11 @@ pub enum Diagnostic {
     Parse(parser::ParseError),
     Type(typeck::TypeError),
     Ownership(ownership::OwnershipError),
+    /// `validate <fn_name> { pre: ... post: ... }`'s build-time gate
+    /// (`docs/ROADMAP.md` Track F, F3) — a genuine, *proven* Tier-1 defect
+    /// (never `Unsupported`, which isn't an error at all — see
+    /// `contract_check::check_program_contracts`'s own doc comment).
+    Contract(contract_check::ContractDiagnostic),
     Runtime(interpreter::RuntimeError),
 }
 
@@ -171,6 +191,7 @@ impl Diagnostic {
             Diagnostic::Parse(e) => e.span,
             Diagnostic::Type(e) => e.span,
             Diagnostic::Ownership(e) => e.span,
+            Diagnostic::Contract(e) => e.span,
             Diagnostic::Runtime(e) => e.span,
         }
     }
@@ -227,6 +248,10 @@ pub fn run_diagnostic_with_tracer_transact_and_workflow_log(
     }
     if let Err(errors) = ownership::check_ownership(&program) {
         return Err(RunFailure::Diagnostics(errors.into_iter().map(Diagnostic::Ownership).collect()));
+    }
+    let contract_diagnostics = contract_check::check_program_contracts_diagnostics(&program);
+    if !contract_diagnostics.is_empty() {
+        return Err(RunFailure::Diagnostics(contract_diagnostics.into_iter().map(Diagnostic::Contract).collect()));
     }
     let mut interp = Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src));
     if let Some(t) = tracer {

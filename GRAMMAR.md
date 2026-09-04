@@ -230,6 +230,35 @@ panel_item     ::= action_decl | kv_entry
 // construct existed (nav stays flat, ungrouped).
 module_decl ::= "module" string "{" (fn_decl | struct_decl | enum_decl)* "}"
 
+// `validate <fn_name> { pre: <expr>  post: <expr> ... }` (`docs/ROADMAP.md`
+// Track F, F3; `docs/NEXT_GEN.md` §F3) -- a Hoare contract on an existing
+// `fn`, declared separately (mirrors `screen_decl`'s own "separate
+// top-level declaration referencing an existing item" shape, not new
+// per-parameter annotation syntax on the `fn` line itself). `pre`/
+// `post` are `kv_entry`s reusing this file's own `expr` production
+// unchanged -- no separate predicate mini-language, the exact same
+// choice `contract_check.rs::check_fn_contract`'s pre-existing
+// string-based entry point already made (`parser::
+// parse_standalone_expr`), just fed real parsed `.nir` syntax now
+// instead of a string pulled from an extraction JSON. Multiple `pre`/
+// `post` entries are meaningful: every `pre` is a conjunctive
+// hypothesis, every `post` is checked independently. `validate` is a
+// real reserved keyword (like `screen`/`dashboard`/`module`/
+// `workflow`/`workspace` above; no existing example uses "validate" as
+// an identifier); `pre`/`post` are contextual-only, the same "keyword
+// only within this one leading position" treatment `field`/`action`/
+// `paginate` already get inside `screen_item`. Two independent
+// enforcement paths consume the same `entries`, neither part of this
+// grammar layer: `contract_check::check_program_contracts` (a real
+// Z3-backed Tier-1 proof, hard-failing the build only on a genuine
+// counterexample -- integer params/return, no loop/call/division) and
+// `interpreter.rs::call`'s runtime backstop (re-checks every `pre`/
+// `post` against the real concrete values on every actual call,
+// unconditionally -- the only enforcement for a contract on a `fn`
+// outside that static subset, true of nearly every real `fn` in a real
+// app).
+validate_decl ::= "validate" ident "{" kv_entry* "}"
+
 // `WORKFLOW.md`'s durable state machine — desugared by `workflow_lower.rs`
 // (right after parsing, `Parser::parse_program`'s own tail call) into
 // ordinary `fn_decl`/`enum_decl`/`struct_decl`, the same "pure lowering,

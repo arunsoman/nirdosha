@@ -24,6 +24,12 @@ Status tags: `[DONE]` (verified — tests pass or run end-to-end),
   runtime-guard fallback
 - [DONE] Native codegen via LLVM (`-O2`) for the compiled subset —
   within 1.4× of `gcc -O2` on scalar benchmarks
+- [DONE] `validate <fn_name> { pre: ... post: ... }` — real Hoare
+  contracts on a function: a Z3-backed static proof that hard-fails the
+  build on a genuine counterexample where it can reach one, plus an
+  unconditional runtime check on every actual call as the backstop for
+  everything it can't (most real functions) — see `docs/ROADMAP.md` Track F,
+  F3
 
 **Backend/services**
 - [DONE] `db` (SQLite + Postgres), `json`, `http`/`https`, `mq` (Redis)

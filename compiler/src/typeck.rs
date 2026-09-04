@@ -337,6 +337,12 @@ pub enum TypeErrorKind {
     // ---- Row 12's UI DSL (`screen`/`dashboard`) ----------------------
     /// `screen <Name>` where `<Name>` is not a declared struct.
     UnknownScreenStruct(String),
+    /// `validate <fn_name>` where `<fn_name>` is not a declared `fn`
+    /// (`docs/ROADMAP.md` Track F, F3).
+    ValidateFnNotFound(String),
+    /// A `validate <fn_name> { ... }` entry whose key isn't `pre`/`post`
+    /// — the only two contextual keys this block recognizes.
+    ValidateUnknownKey { fn_name: String, key: String },
     /// `field <fname>` inside a `screen <Struct>` where `<Struct>` has no
     /// field named `<fname>`.
     UnknownScreenField { struct_name: String, field_name: String },
@@ -761,6 +767,13 @@ impl std::fmt::Display for TypeError {
             TypeErrorKind::UnknownScreenStruct(name) => {
                 write!(f, "{line}:{col}: `screen {name}` — no struct named `{name}` is declared")
             }
+            TypeErrorKind::ValidateFnNotFound(name) => {
+                write!(f, "{line}:{col}: `validate {name}` — no function named `{name}` is declared")
+            }
+            TypeErrorKind::ValidateUnknownKey { fn_name, key } => write!(
+                f,
+                "{line}:{col}: `validate {fn_name}` — `{key}` isn't a recognized key here, only `pre`/`post` are"
+            ),
             TypeErrorKind::UnknownScreenField { struct_name, field_name } => write!(
                 f,
                 "{line}:{col}: `field {field_name}` — struct `{struct_name}` has no field named `{field_name}`"
@@ -1329,12 +1342,15 @@ fn typecheck_impl(program: &Program, require_main: bool) -> Result<(), Vec<TypeE
     for ws in &program.workspaces {
         c.check_workspace(ws);
     }
+    for v in &program.validates {
+        c.check_validate(v, program);
+    }
 
     for f in &program.fns {
         c.check_fn(f);
     }
 
-    // `WorkflowDecl`'s own structural rules (WORKFLOW.md) — walked
+    // `WorkflowDecl`'s own structural rules (docs/WORKFLOW.md) — walked
     // independently of `workflow_lower.rs`'s desugared `FnDecl`s/
     // `EnumDecl`s (which get the exact same `check_fn`/enum-registration
     // treatment as any other declaration, above): this is the one pass
@@ -1591,6 +1607,64 @@ impl<'a> Checker<'a> {
         for action in &screen.actions {
             self.check_fn_ref("action", &Expr::Ident(action.target_fn.clone(), action.span));
             self.check_action_show_result(format!("`action \"{}\"` on `screen {}`", action.label, screen.struct_name), action);
+        }
+    }
+
+    /// `validate <fn_name> { pre: <expr>  post: <expr> ... }`
+    /// (`docs/ROADMAP.md` Track F, F3) — `fn_name` resolves to a real `fn`,
+    /// every key is `pre`/`post`, *and* (as of this pass) every `pre`/
+    /// `post` expression is itself real-type-checked as a `bool`
+    /// against a scope seeded with `fn_name`'s own real parameter names/
+    /// types (plus `result: <fn_name's real return type>`, `post` only)
+    /// — the exact same `Checker::check` entry point an ordinary `if`
+    /// condition or `let` initializer already goes through, just seeded
+    /// from a target fn's signature instead of the surrounding block's
+    /// live scope (`validate_fragment`'s `FragmentEnv` established this
+    /// same "seed `Scopes` from a caller-supplied name→`Ty` map, then
+    /// reuse the ordinary checker" shape first). A non-bool predicate, or
+    /// one referencing something that doesn't resolve, is now a real,
+    /// span-located `TypeError` here — a build-time diagnostic instead
+    /// of surfacing only as a runtime evaluation failure the first time
+    /// the function is actually called (this pass's own previous,
+    /// disclosed gap, `docs/ROADMAP.md` Track F, F3). Unlike `contract_check::
+    /// check_program_contracts`'s own `UnboundIdentifier`/`Unsupported`
+    /// reporting (which only ever runs *after* typecheck already passed,
+    /// and only reaches Tier-1's narrower integer-only subset), this
+    /// runs first and covers every `validate` block regardless of the
+    /// target fn's shape — a struct-typed param, a `db`-touching body, a
+    /// loop, all still get real static type errors for a malformed
+    /// predicate now, even though none of those are ever statically
+    /// *proven* by the Z3 pass.
+    fn check_validate(&mut self, decl: &ValidateDecl, program: &Program) {
+        if !self.sigs.contains_key(&decl.fn_name) {
+            self.error(TypeErrorKind::ValidateFnNotFound(decl.fn_name.clone()), decl.span);
+            return;
+        }
+        // `sigs` and `program.fns` are built from the same `Program` in
+        // the same pass (`typecheck_impl`, right before either loop
+        // runs) — a name present in `sigs` always has a matching
+        // `FnDecl`; `else { return }` is defensive, not reachable in
+        // practice, matching this file's own discipline elsewhere
+        // (`check_validate`'s own earlier `NoSuchFunction` handling in
+        // `contract_check.rs` takes the identical stance).
+        let Some(f) = program.fns.iter().find(|f| f.name == decl.fn_name) else { return };
+        for (key, value) in &decl.entries {
+            match key.as_str() {
+                "pre" | "post" => {
+                    let mut scopes = Scopes::new();
+                    for p in &f.params {
+                        scopes.define(&p.name, p.ty.clone());
+                    }
+                    if key == "post" {
+                        scopes.define("result", f.ret.clone());
+                    }
+                    self.check(value, &Ty::Bool, &Ty::Unit, &mut scopes);
+                }
+                other => self.error(
+                    TypeErrorKind::ValidateUnknownKey { fn_name: decl.fn_name.clone(), key: other.to_string() },
+                    value.span(),
+                ),
+            }
         }
     }
 
