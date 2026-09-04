@@ -3124,6 +3124,255 @@ fn stat_blocked_attempt_count() -> Result(i64, ErrorCode) requires(role: "fraud_
     return match db_connect("ctms_pro.db") { Ok(conn) => stat_blocked_attempt_count_inner(conn), Err(e) => Err(DbError(e)) }
 }
 
+// =========================================================================
+// Module 9: Identity and Access Management (IAM)
+// Doc: "Federated Identity Integration" / "RBAC + ABAC" / "Multi-Factor
+// Authentication & Session Security" / "Delegated Administration"
+// (internal approval workflows for user onboarding, role elevation, and
+// revocation -- the doc's own words, matched here by a real second
+// `workflow{}` block) / "Behavioural Access Analytics".
+// =========================================================================
+
+module "Identity & Access Management" {
+    struct AppUser {
+        id: i64,
+        username: str,
+        role_name: UserRole,
+        department: str,
+        active: bool,
+    }
+
+    struct IdentityProviderConfig {
+        id: i64,
+        provider_name: str,
+        protocol: str,
+        attribute_mapping: str,
+    }
+
+    struct SessionSecurityPolicy {
+        id: i64,
+        mfa_method: str,
+        session_timeout_minutes: i64,
+        ip_allowlist: str,
+    }
+
+    struct AccessLogEntry {
+        id: i64,
+        accessed_by: str,
+        what: str,
+        when_unix: i64,
+        why: str,
+    }
+
+    struct DeviationAlertEntry {
+        id: i64,
+        user_ref: str,
+        deviation_kind: str,
+        risk_score: i64,
+        occurred_unix: i64,
+    }
+}
+
+fn list_app_user_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS app_user (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, role_name TEXT, department TEXT, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, username, role_name, department, active FROM app_user ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_app_user() -> Result(json, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_app_user_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_app_user_inner(conn: db, u: AppUser) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS app_user (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, role_name TEXT, department TEXT, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO app_user (username, role_name, department, active) VALUES (?, ?, ?, ?)", u.username, u.role_name, u.department, u.active) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_app_user(u: AppUser) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_app_user_inner(conn, u), Err(e) => Err(DbError(e)) }
+}
+fn update_app_user_inner(conn: db, u: AppUser) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS app_user (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, role_name TEXT, department TEXT, active INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE app_user SET role_name = ?, department = ?, active = ? WHERE id = ?", u.role_name, u.department, u.active, u.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_app_user(u: AppUser) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => update_app_user_inner(conn, u), Err(e) => Err(DbError(e)) }
+}
+
+screen AppUser {
+    title: "User & Role Management"
+    field role_name {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field username
+                field department
+            }
+            column {
+                field role_name
+                field active
+            }
+        }
+    }
+}
+
+fn list_identity_provider_config_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS identity_provider_config (id INTEGER PRIMARY KEY AUTOINCREMENT, provider_name TEXT, protocol TEXT, attribute_mapping TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, provider_name, protocol, attribute_mapping FROM identity_provider_config ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_identity_provider_config() -> Result(json, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_identity_provider_config_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_identity_provider_config_inner(conn: db, c: IdentityProviderConfig) -> Result(i64, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS identity_provider_config (id INTEGER PRIMARY KEY AUTOINCREMENT, provider_name TEXT, protocol TEXT, attribute_mapping TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO identity_provider_config (provider_name, protocol, attribute_mapping) VALUES (?, ?, ?)", c.provider_name, c.protocol, c.attribute_mapping) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_identity_provider_config(c: IdentityProviderConfig) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_identity_provider_config_inner(conn, c), Err(e) => Err(DbError(e)) }
+}
+
+screen IdentityProviderConfig {
+    title: "Identity Provider Config"
+
+    layout {
+        row {
+            field provider_name
+            field protocol
+            field attribute_mapping
+        }
+    }
+}
+
+fn list_session_security_policy_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS session_security_policy (id INTEGER PRIMARY KEY AUTOINCREMENT, mfa_method TEXT, session_timeout_minutes INTEGER, ip_allowlist TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, mfa_method, session_timeout_minutes, ip_allowlist FROM session_security_policy ORDER BY id") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_session_security_policy() -> Result(json, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_session_security_policy_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_session_security_policy_inner(conn: db, p: SessionSecurityPolicy) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS session_security_policy (id INTEGER PRIMARY KEY AUTOINCREMENT, mfa_method TEXT, session_timeout_minutes INTEGER, ip_allowlist TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO session_security_policy (mfa_method, session_timeout_minutes, ip_allowlist) VALUES (?, ?, ?)", p.mfa_method, p.session_timeout_minutes, p.ip_allowlist) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_session_security_policy(p: SessionSecurityPolicy) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_session_security_policy_inner(conn, p), Err(e) => Err(DbError(e)) }
+}
+
+screen SessionSecurityPolicy {
+    title: "Session Security Policy"
+
+    layout {
+        row {
+            field mfa_method
+            field session_timeout_minutes
+            field ip_allowlist
+        }
+    }
+}
+
+fn list_access_log_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS access_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, accessed_by TEXT, what TEXT, when_unix INTEGER, why TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, accessed_by, what, when_unix, why FROM access_log_entry ORDER BY when_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_access_log_entry() -> Result(json, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_access_log_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_access_log_entry_inner(conn: db, l: AccessLogEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS access_log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, accessed_by TEXT, what TEXT, when_unix INTEGER, why TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO access_log_entry (accessed_by, what, when_unix, why) VALUES (?, ?, ?, ?)", l.accessed_by, l.what, l.when_unix, l.why) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_access_log_entry(l: AccessLogEntry) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_access_log_entry_inner(conn, l), Err(e) => Err(DbError(e)) }
+}
+
+screen AccessLogEntry {
+    title: "Access Log"
+
+    layout {
+        row {
+            field accessed_by
+            field what
+            field when_unix
+            field why
+        }
+    }
+}
+
+fn list_deviation_alert_entry_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS deviation_alert_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, user_ref TEXT, deviation_kind TEXT, risk_score INTEGER, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, user_ref, deviation_kind, risk_score, occurred_unix FROM deviation_alert_entry ORDER BY occurred_unix DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_deviation_alert_entry() -> Result(json, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_deviation_alert_entry_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_deviation_alert_entry_inner(conn: db, d: DeviationAlertEntry) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS deviation_alert_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, user_ref TEXT, deviation_kind TEXT, risk_score INTEGER, occurred_unix INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO deviation_alert_entry (user_ref, deviation_kind, risk_score, occurred_unix) VALUES (?, ?, ?, ?)", d.user_ref, d.deviation_kind, d.risk_score, d.occurred_unix) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_deviation_alert_entry(d: DeviationAlertEntry) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_deviation_alert_entry_inner(conn, d), Err(e) => Err(DbError(e)) }
+}
+
+screen DeviationAlertEntry {
+    title: "Behavioural Access Deviation Alerts"
+
+    layout {
+        row {
+            field user_ref
+            field deviation_kind
+            field risk_score
+            field occurred_unix
+        }
+    }
+}
+
+// Doc: "Internal approval workflows for user onboarding, role
+// elevation, and revocation" -- a second, independent `workflow{}`
+// block coexisting with `CaseLifecycle` (confirmed viable in `ctms.nir`
+// already: multiple `workflow{}` blocks can serve/queue at once, unlike
+// the single-`dashboard{}`-per-program rule).
+workflow RoleElevationApproval {
+    data {
+        app_user_id: i64,
+    }
+
+    state Requested {
+        owner: role("admin")
+        label: "Elevation Requested"
+        on Approve -> Approved
+        on Deny -> Denied
+    }
+    state Approved terminal {
+        owner: role("admin")
+        label: "Approved"
+    }
+    state Denied terminal {
+        owner: role("admin")
+        label: "Denied"
+    }
+}
+
 // === APPEND POINT ===
 
 fn main() {}
