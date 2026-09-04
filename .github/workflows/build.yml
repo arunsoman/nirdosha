@@ -96,6 +96,52 @@ jobs:
         working-directory: crates/compiler
         run: cargo test --release
 
+  # macOS didn't get a CI job of its own until now — it was only ever
+  # actually built when a `v*` tag triggered release.yml, so a regular
+  # push/PR to `main` could break macOS and nothing here would notice
+  # until release time. This job mirrors release.yml's macOS leg exactly:
+  # same runner (macos-14, the aarch64-apple-darwin leg there), same
+  # `brew install z3` + non-`dist` (system Z3, not vendored) build --
+  # `z3-src` 416.0.2 fails to compile against the AppleClang on GitHub's
+  # macos-13/macos-14 runners (see release.yml's header comment), so this
+  # job deliberately does NOT pass `--features dist` here either. No
+  # `Z3_SYS_Z3_HEADER`/similar env var is set because release.yml doesn't
+  # set one either -- the `z3` crate finds Homebrew's system Z3 (headers +
+  # lib) on its own once it's installed.
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system Z3 (see workflow header)
+        run: brew install z3
+      - name: Install and start Redis (mq_connect/mq_publish/mq_consume tests)
+        # tests/mq.rs's own header comment: needs a real Redis at
+        # 127.0.0.1:6379, no auth. Unlike Postgres's own integration
+        # tests (#[ignore]d, opt-in via NIRDOSHA_TEST_POSTGRES_URL),
+        # mq.rs's tests run unconditionally -- this job is the first CI
+        # job that ever runs the full `cargo test --release` (see this
+        # workflow's own build-macos header comment), which is what
+        # surfaced the gap: without this step, every mq.rs test fails
+        # with "Connection refused" instead of exercising real behavior.
+        run: |
+          brew install redis
+          brew services start redis
+          for i in $(seq 1 10); do redis-cli ping && break; sleep 1; done
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: Build (macOS — system Z3, see workflow header)
+        working-directory: crates/compiler
+        run: cargo build --release
+      - name: Run the test suite
+        working-directory: crates/compiler
+        run: cargo test --release
+
   # Windows didn't get a CI job of its own until now — the release
   # workflow's `x86_64-pc-windows-msvc` leg was the only thing that ever
   # actually compiled this crate for Windows, and it was failing outright

@@ -16,28 +16,24 @@ members = [
     "crates/plugin-examples",
 ]
 
-# Real, pre-existing gap found while running the full suite in release
-# mode (2026-09-05): `crates/compiler/Cargo.toml` has carried its own
-# `[profile.release] overflow-checks = true` since before this was a
-# Cargo workspace (see that file's own comment on why: Rust's i64
-# overflow panic is Nirdosha's only runtime overflow guard, and
-# Cargo's default release profile disables it, silently making every
-# distributed binary wrap instead of erroring -- directly contradicting
-# the project's overflow-safety guarantees). Cargo profiles are
-# workspace-level only -- a member crate's own `[profile.*]` table is
-# silently ignored once it's part of a workspace ("profiles for the
-# non root package will be ignored" is cargo's own warning, present on
-# every build since whichever commit first turned this into a
-# workspace). That means overflow-checks has been OFF in every real
-# release build since this repo became a workspace, unnoticed until
-# `concurrency.rs`'s `a_panic_inside_a_spawned_function_surfaces_as_
-# thread_panicked` test failed under `cargo test --release` at the
-# workspace root -- the first time anyone appears to have run the
-# release-profile suite from here rather than always building via
-# `crates/compiler`'s own now-silently-ignored profile table. Fixed by
-# duplicating the setting at the one place Cargo actually honors it;
-# `crates/compiler/Cargo.toml`'s own copy is now dead and kept there
-# only as documentation of the *reason*, not as the effective setting.
+# Rust's own integer-overflow panic is `nirdosha`'s only runtime guard for
+# i64 arithmetic (there's no dynamic `OutOfRange` check for it, see
+# `scalar_binop`/`eval_binary` in crates/compiler/src/interpreter.rs) --
+# `spawn`/`join` catches that panic via `catch_unwind` and reports
+# `ThreadPanicked`. Cargo's default release profile disables overflow
+# checks, which would silently make every distributed `nirdosha` binary
+# wrap i64 overflow instead of erroring -- directly contradicting the
+# project's overflow-safety guarantees. Keep this on in release builds.
+#
+# Must live HERE, at the workspace root -- Cargo only honors `[profile.*]`
+# from the root manifest, silently ignoring the same section in a member
+# crate's own Cargo.toml (with a build-time warning, easy to miss). This
+# setting used to live in crates/compiler/Cargo.toml, back when that file
+# was itself the workspace root; the `crates/`/`docs/` reorg moved it under
+# a real workspace without moving this section along with it, silently
+# turning overflow-checks off in every `--release` build since -- caught by
+# `tests/concurrency.rs::a_panic_inside_a_spawned_function_surfaces_as_
+# thread_panicked` failing in `--release` (it passed in plain `cargo test`,
+# which defaults to debug-mode overflow panics regardless of this setting).
 [profile.release]
 overflow-checks = true
-

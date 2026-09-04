@@ -50,8 +50,8 @@ fn serve_one(listener: TcpListener, raw_response: &'static [u8]) -> std::thread:
 
 #[test]
 fn http_get_returns_the_status_and_body() {
-    let port = free_port();
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
     let server = serve_one(listener, b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello from server");
 
     let src = format!(
@@ -82,8 +82,8 @@ fn http_get_returns_the_status_and_body() {
 
 #[test]
 fn http_get_reports_a_non_200_status_code() {
-    let port = free_port();
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
     let server = serve_one(listener, b"HTTP/1.1 404 Not Found\r\n\r\nnope");
 
     let src = format!(
@@ -105,8 +105,8 @@ fn http_get_reports_a_non_200_status_code() {
 
 #[test]
 fn http_post_sends_the_body_with_a_matching_content_length() {
-    let port = free_port();
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
     let server = serve_one(listener, b"HTTP/1.1 201 Created\r\n\r\nok");
 
     let src = format!(
@@ -131,8 +131,8 @@ fn http_post_sends_the_body_with_a_matching_content_length() {
 
 #[test]
 fn a_response_body_composes_directly_with_json_get_str() {
-    let port = free_port();
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
     let server = serve_one(
         listener,
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"message\": \"pong\"}",
@@ -190,8 +190,8 @@ fn connecting_to_a_closed_port_is_a_recoverable_err_not_a_trap() {
 
 #[test]
 fn a_response_with_no_header_body_separator_is_a_recoverable_err() {
-    let port = free_port();
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
     let server = serve_one(listener, b"not a real HTTP response at all");
 
     let src = format!(
@@ -280,8 +280,8 @@ fn http_is_interpreter_only_rejected_by_codegen() {
 
 #[test]
 fn example_http_runs_to_completion() {
-    let port = free_port();
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
     let server = serve_one(
         listener,
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"message\": \"pong\"}",

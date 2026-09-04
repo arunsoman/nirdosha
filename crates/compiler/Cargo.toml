@@ -41,23 +41,10 @@ signal-hook = { version = "0.4", default-features = false }
 [features]
 dist = ["z3/vendored"]
 
-# Rust's own integer-overflow panic is `nirdosha`'s only runtime guard
-# for i64 arithmetic (there's no dynamic `OutOfRange` check for it, see
-# `scalar_binop`/`eval_binary` in src/interpreter.rs) -- `spawn`/`join`
-# catches that panic via `catch_unwind` and reports `ThreadPanicked`.
-# Cargo's default release profile disables overflow checks, which would
-# silently make every distributed `nirdosha` binary wrap i64 overflow
-# instead of erroring -- directly contradicting the project's overflow-
-# safety guarantees. Keep this on in release builds.
-#
-# DEAD as of 2026-09-05 -- kept only as documentation of *why*, not as
-# the effective setting. Cargo profiles are workspace-level only; once
-# this crate became a workspace member (this table predates that), the
-# root `Cargo.toml` is the one place that actually applies. See the
-# root `Cargo.toml`'s own copy of this comment/setting for the real one
-# — found via `cargo test --release`'s own "profiles for the non root
-# package will be ignored" warning, present on every build since,
-# finally traced to a real failure (`concurrency.rs`'s
-# `a_panic_inside_a_spawned_function_surfaces_as_thread_panicked`).
-[profile.release]
-overflow-checks = true
+# `overflow-checks = true` for release builds used to live here, back
+# when this file was itself the workspace root. It's now at the real
+# workspace root (../../Cargo.toml) -- Cargo only honors `[profile.*]`
+# from there, silently ignoring it in a member crate's own manifest (see
+# that file's comment for the full story, including the regression this
+# caused after the crates/-reorg moved this file without moving that
+# section along with it).

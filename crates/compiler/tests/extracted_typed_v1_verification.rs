@@ -1,6 +1,10 @@
 //! End-to-end demonstration of the two new verbatim-verification
-//! constructs against the real, checked-in extraction file
-//! `scratch/extracted_typed_v1.json` — not a synthetic fixture.
+//! constructs against a local extraction file, `scratch/
+//! extracted_typed_v1.json` — not a synthetic fixture, but also **not
+//! checked into git** (`scratch/` is in `.gitignore`; this file's
+//! original "the real, checked-in extraction file" claim was wrong —
+//! `scratch/extracted_typed_v1.json` has never once been committed).
+//! It's the output of a one-off LLM extraction pass.
 //!
 //! - `workflow_conformance::check_workflow_conformance` — structural,
 //!   exact (no solver): does a real `workflow { ... }` declare exactly
@@ -18,6 +22,14 @@
 //! than `include_str!`-ing the real, much larger, DB-backed
 //! `trade_finance.nir`: a small, self-contained snippet a unit test can
 //! actually typecheck/own-check/run on its own.
+//!
+//! Every `#[test]` below is `#[ignore]`d (same convention `postgres.rs`'s
+//! `NIRDOSHA_TEST_POSTGRES_URL`-gated tests use for "needs a local
+//! resource the test suite can't assume exists"): a plain `cargo test`
+//! never touches this file, so the fixture's absence can't break a clean
+//! checkout or CI. Anyone who still has it locally can run it directly:
+//! `cargo test --release --test extracted_typed_v1_verification --
+//! --ignored`.
 
 use std::collections::HashMap;
 
@@ -29,10 +41,21 @@ use nirdosha::token::Lexer;
 use nirdosha::typeck::typecheck_optional_main;
 use nirdosha::workflow_conformance::check_workflow_conformance;
 
-const EXTRACTED_JSON: &str = include_str!("../../../scratch/extracted_typed_v1.json");
-
+/// Read at test-run time, not compiled in via `include_str!` — the
+/// fixture is gitignored and won't exist on a clean checkout/CI runner,
+/// and `include_str!` would fail the whole *build* (every test in this
+/// binary, including ones that don't need this file) rather than just
+/// this one, ignored test.
 fn load_extraction() -> ExtractionFile {
-    serde_json::from_str(EXTRACTED_JSON).expect("scratch/extracted_typed_v1.json should match extraction_schema::ExtractionFile")
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scratch/extracted_typed_v1.json");
+    let json = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "couldn't read {path}: {e} -- this is a local-only fixture (scratch/ is gitignored, \
+             not shipped with the repo); only run this test with it present, via \
+             `cargo test --release --test extracted_typed_v1_verification -- --ignored`"
+        )
+    });
+    serde_json::from_str(&json).expect("scratch/extracted_typed_v1.json should match extraction_schema::ExtractionFile")
 }
 
 fn build_program(src: &str) -> nirdosha::ast::Program {
@@ -201,6 +224,7 @@ fn extracted_workflow<'a>(file: &'a ExtractionFile, id: &str) -> &'a nirdosha::e
     file.workflows.iter().find(|w| w.id == id).unwrap_or_else(|| panic!("no workflow with id {id} in the extraction file"))
 }
 
+#[ignore = "needs local scratch/extracted_typed_v1.json, not checked into git"]
 #[test]
 fn wf_trdpay_001_matches_the_real_workflow_verbatim() {
     let file = load_extraction();
@@ -209,6 +233,7 @@ fn wf_trdpay_001_matches_the_real_workflow_verbatim() {
     assert!(report.is_exact_match(), "conformance mismatches: {:#?}", report.mismatches);
 }
 
+#[ignore = "needs local scratch/extracted_typed_v1.json, not checked into git"]
 #[test]
 fn wf_trdpay_002_escrow_tranche_release_matches_verbatim() {
     let file = load_extraction();
@@ -217,6 +242,7 @@ fn wf_trdpay_002_escrow_tranche_release_matches_verbatim() {
     assert!(report.is_exact_match(), "conformance mismatches: {:#?}", report.mismatches);
 }
 
+#[ignore = "needs local scratch/extracted_typed_v1.json, not checked into git"]
 #[test]
 fn wf_comm_001_wallet_settlement_matches_verbatim() {
     let file = load_extraction();
@@ -228,6 +254,7 @@ fn wf_comm_001_wallet_settlement_matches_verbatim() {
 /// Proves the checker actually catches a real drift, rather than
 /// trivially reporting a match — drop one transition from the real
 /// workflow and confirm it's reported by name, not silently ignored.
+#[ignore = "needs local scratch/extracted_typed_v1.json, not checked into git"]
 #[test]
 fn conformance_check_actually_detects_a_missing_transition() {
     let file = load_extraction();
@@ -251,6 +278,7 @@ fn conformance_check_actually_detects_a_missing_transition() {
 /// `WorkflowStateHasNoTransitions` only requires a *non*-terminal state
 /// to have a way out; a terminal state with existing transitions still
 /// compiles fine, exactly the shape needed to isolate this one flag.
+#[ignore = "needs local scratch/extracted_typed_v1.json, not checked into git"]
 #[test]
 fn conformance_check_actually_detects_a_terminal_flag_mismatch() {
     let file = load_extraction();
@@ -280,6 +308,7 @@ fn wf_trdpay_001_routing_fn(file: &ExtractionFile) -> &nirdosha::extraction_sche
 /// concretely is today (the code's own hardcoded 5,000,000 cents,
 /// `docs/ROADMAP.md` A9). This is real: Z3 is asked to find a violation and
 /// fails, over the whole `i64` domain.
+#[ignore = "needs local scratch/extracted_typed_v1.json, not checked into git"]
 #[test]
 fn required_eyes_for_amount_satisfies_extracted_post_logic_when_threshold_is_bound() {
     let file = load_extraction();
@@ -296,6 +325,7 @@ fn required_eyes_for_amount_satisfies_extracted_post_logic_when_threshold_is_bou
 /// amount`'s own parameters — the real code hardcodes the number
 /// instead. Without a supplied binding, this is correctly reported as
 /// unresolvable, not silently treated as "any value" or skipped.
+#[ignore = "needs local scratch/extracted_typed_v1.json, not checked into git"]
 #[test]
 fn required_eyes_for_amount_post_logic_is_unbound_without_a_threshold_binding() {
     let file = load_extraction();
@@ -309,6 +339,7 @@ fn required_eyes_for_amount_post_logic_is_unbound_without_a_threshold_binding() 
 /// is supplied (one that doesn't match what the code actually
 /// hardcodes), the checker must find a real counterexample, not report
 /// `Proved` anyway.
+#[ignore = "needs local scratch/extracted_typed_v1.json, not checked into git"]
 #[test]
 fn required_eyes_for_amount_post_logic_fails_against_a_mismatched_threshold() {
     let file = load_extraction();
