@@ -129,6 +129,16 @@ enum FederatedStage {
     FederatedStageInReview,
     FederatedStageCompleted,
 }
+enum ResponseStatus {
+    ResponseStatusPending,
+    ResponseStatusInProgress,
+    ResponseStatusResolved,
+}
+enum DownloadStatus {
+    DownloadStatusPending,
+    DownloadStatusReady,
+    DownloadStatusFailed,
+}
 
 struct Text {
     value: str,
@@ -1131,7 +1141,7 @@ fn graph_case_links() -> Result(json, ErrorCode) requires(role: "investigator") 
 // SLA / Workload Routing Config.
 struct SlaRoutingRule {
     id: i64,
-    severity_tier: str,
+    severity_tier: Severity,
     sla_minutes: i64,
     jurisdiction_scope: str,
     skillset_required: str,
@@ -1167,6 +1177,22 @@ fn update_sla_routing_rule(r: SlaRoutingRule) -> Result(i64, ErrorCode) requires
 
 screen SlaRoutingRule {
     title: "SLA / Workload Routing Config"
+    field severity_tier {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field severity_tier
+                field sla_minutes
+            }
+            column {
+                field jurisdiction_scope
+                field skillset_required
+            }
+        }
+    }
 }
 
 // Case Analytics Dashboard tiles + Case Linking graph, folded into the
@@ -1939,7 +1965,7 @@ module "Data Exchange" {
         what: str,
         destination: str,
         occurred_unix: i64,
-        signature_status: str,
+        signature_status: SignatureStatus,
     }
 
     struct AbacPolicy {
@@ -1967,17 +1993,17 @@ module "Data Exchange" {
         id: i64,
         report_type: str,
         jurisdiction: str,
-        status: str,
+        status: RegReportStatus,
         due_unix: i64,
-        transmission_status: str,
+        transmission_status: TransmissionStatus,
     }
 
     struct AccessViolationEntry {
         id: i64,
         violation_type: str,
         affected_subject: str,
-        severity: str,
-        response_status: str,
+        severity: Severity,
+        response_status: ResponseStatus,
         occurred_unix: i64,
     }
 
@@ -1985,7 +2011,7 @@ module "Data Exchange" {
         id: i64,
         export_name: str,
         format: str,
-        download_status: str,
+        download_status: DownloadStatus,
         generated_unix: i64,
     }
 }
@@ -2011,6 +2037,27 @@ fn create_data_sharing_log_entry(e: DataSharingLogEntry) -> Result(i64, ErrorCod
 
 screen DataSharingLogEntry {
     title: "Secure Data Sharing Log"
+    field signature_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Exchange" {
+                    field who
+                    field what
+                    field destination
+                }
+            }
+            column {
+                group "Verification" {
+                    field signature_status
+                    field occurred_unix
+                }
+            }
+        }
+    }
 }
 
 fn list_abac_policy_inner(conn: db) -> Result(json, ErrorCode) {
@@ -2145,7 +2192,7 @@ fn update_regulatory_report(r: RegulatoryReport) -> Result(i64, ErrorCode) requi
 }
 fn transmit_regulatory_report_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
     let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS regulatory_report (id INTEGER PRIMARY KEY AUTOINCREMENT, report_type TEXT, jurisdiction TEXT, status TEXT, due_unix INTEGER, transmission_status TEXT)") { Ok(n) => n, Err(e) => -1 }
-    let updated: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE regulatory_report SET transmission_status = 'transmitted' WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let updated: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE regulatory_report SET transmission_status = 'TransmissionStatusTransmitted' WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
     let result: Result(json, ErrorCode) = match updated {
         Ok(n) => match db_query(conn, "SELECT id, transmission_status FROM regulatory_report WHERE id = ?", id) {
             Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
@@ -2162,9 +2209,35 @@ fn transmit_regulatory_report(id: i64) -> Result(json, ErrorCode) requires(role:
 
 screen RegulatoryReport {
     title: "Regulatory Reporting Queue"
+    field status {
+        render: "badge"
+    }
+    field transmission_status {
+        render: "badge"
+    }
     action "Generate/Transmit" -> transmit_regulatory_report {
         style: "filled"
         show_result: true
+    }
+
+    layout {
+        row {
+            column {
+                group "Report" {
+                    field report_type
+                    field jurisdiction
+                    field due_unix
+                }
+            }
+            column {
+                group "Status" {
+                    field status
+                    field transmission_status
+                }
+                divider {}
+                action "Generate/Transmit"
+            }
+        }
     }
 }
 
@@ -2198,6 +2271,30 @@ fn update_access_violation_entry(v: AccessViolationEntry) -> Result(i64, ErrorCo
 
 screen AccessViolationEntry {
     title: "Access Violation / Breach Monitor"
+    field severity {
+        render: "badge"
+    }
+    field response_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Violation" {
+                    field violation_type
+                    field affected_subject
+                    field occurred_unix
+                }
+            }
+            column {
+                group "Response" {
+                    field severity
+                    field response_status
+                }
+            }
+        }
+    }
 }
 
 fn list_regulator_export_inner(conn: db) -> Result(json, ErrorCode) {
@@ -2221,6 +2318,22 @@ fn create_regulator_export(r: RegulatorExport) -> Result(i64, ErrorCode) require
 
 screen RegulatorExport {
     title: "Regulator/Partner Portal"
+    field download_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field export_name
+                field format
+            }
+            column {
+                field download_status
+                field generated_unix
+            }
+        }
+    }
 }
 
 fn stat_shared_volume_count_inner(conn: db) -> Result(i64, ErrorCode) {
@@ -2408,9 +2521,9 @@ module "Compliance" {
         rule_matched: str,
         entity_ref: str,
         threshold_value: i64,
-        severity: str,
+        severity: Severity,
         flagged_unix: i64,
-        status: str,
+        status: FlagStatus,
     }
 
     struct ComplianceReportTemplate {
@@ -2425,7 +2538,7 @@ module "Compliance" {
         id: i64,
         matter_id: i64,
         applied_by: str,
-        status: str,
+        status: HoldStatus,
         expiry_unix: i64,
     }
 
@@ -2468,6 +2581,31 @@ fn update_compliance_flag_entry(f: ComplianceFlagEntry) -> Result(i64, ErrorCode
 
 screen ComplianceFlagEntry {
     title: "Compliance Flag Queue"
+    field severity {
+        render: "badge"
+    }
+    field status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                group "Flag" {
+                    field rule_matched
+                    field entity_ref
+                    field threshold_value
+                }
+            }
+            column {
+                group "Disposition" {
+                    field severity
+                    field status
+                    field flagged_unix
+                }
+            }
+        }
+    }
 }
 
 fn list_compliance_report_template_inner(conn: db) -> Result(json, ErrorCode) {
@@ -2532,6 +2670,26 @@ fn update_legal_hold(h: LegalHold) -> Result(i64, ErrorCode) requires(role: "com
 
 screen LegalHold {
     title: "Legal Hold Management"
+    field matter_id {
+        render: "searchable_select"
+        source: Matter
+    }
+    field status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field matter_id
+                field applied_by
+            }
+            column {
+                field status
+                field expiry_unix
+            }
+        }
+    }
 }
 
 fn list_filing_deadline_inner(conn: db) -> Result(json, ErrorCode) {
