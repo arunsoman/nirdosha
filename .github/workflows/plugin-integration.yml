@@ -1,0 +1,88 @@
+name: plugin-integration
+
+# Track F of the plugin-ecosystem plan's live-service tests
+# (crates/plugin-example-{mysql,activemq,cassandra,neo4j,hbase}/tests/
+# end_to_end.rs's `#[ignore]`d tests) — deliberately NOT wired into
+# build.yml's push/pull_request triggers. These need five real external
+# services (one of them, Cassandra, slow to start; HBase slower still)
+# and talk over real network sockets, which makes them exactly the kind
+# of slow/flaky-under-load job that shouldn't gate an ordinary PR. Run
+# by hand (workflow_dispatch) or on a schedule instead.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *" # once a day
+
+jobs:
+  plugin-integration:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: nirdosha
+          MYSQL_DATABASE: nirdosha_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pnirdosha --silent"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      activemq:
+        image: apache/activemq-classic:latest
+        ports:
+          - 61613:61613
+      cassandra:
+        image: cassandra:5
+        ports:
+          - 9042:9042
+      neo4j:
+        image: neo4j:5
+        env:
+          NEO4J_AUTH: neo4j/nirdosha123
+        ports:
+          - 7687:7687
+        options: >-
+          --health-cmd "wget -q -O - http://127.0.0.1:7474 || exit 1"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      hbase:
+        image: dajobe/hbase-docker
+        ports:
+          - 9090:9090
+          - 2181:2181
+          - 16010:16010
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies (clang, z3)
+        run: sudo apt-get update && sudo apt-get install -y clang libz3-dev
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-plugin-integration-cargo-${{ hashFiles('Cargo.lock') }}
+      # Cassandra's `services:` healthcheck can't easily shell out to
+      # `cqlsh` (not installed in the runner image) -- wait on the CQL
+      # port itself accepting connections instead, matching the manual
+      # verification this workflow's own README-documented local
+      # equivalent (docker logs | grep "Startup complete") does.
+      - name: Wait for Cassandra to accept CQL connections
+        run: |
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/9042) 2>/dev/null && echo "cassandra ready after ${i}0s" && exit 0
+            sleep 10
+          done
+          echo "cassandra did not become ready in time" && exit 1
+      # dajobe/hbase-docker ships no healthcheck at all -- same
+      # port-open wait, generous timeout (HBase is the slowest of the
+      # five to start, per crates/plugin-example-hbase/README.md).
+      - name: Wait for the HBase Thrift gateway
+        run: |
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/9090) 2>/dev/null && echo "hbase thrift ready after ${i}0s" && exit 0
+            sleep 10
+          done
+          echo "hbase did not become ready in time" && exit 1
+      - name: Run every reference plugin's live integration tests
+        run: cargo test --workspace --release -- --ignored

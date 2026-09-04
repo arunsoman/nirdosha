@@ -1,0 +1,53 @@
+# Docker integration harness for the five reference plugins in
+# crates/plugin-example-{mysql,activemq,cassandra,neo4j,hbase}/ (Track F
+# of the plugin-ecosystem plan). Brings up one real instance of each
+# external system these plugins talk to, matching the connection
+# details each plugin's tests/examples already hardcode.
+#
+# Usage:
+#   docker compose -f crates/plugin-examples/docker-compose.yml up -d
+#   # wait for each service to become ready (see each plugin's README
+#   # for what "ready" looks like -- Cassandra and HBase are slow)
+#   cargo test --workspace -- --ignored
+#   docker compose -f crates/plugin-examples/docker-compose.yml down
+#
+# Or bring up just one service (e.g. while iterating on one plugin):
+#   docker compose -f crates/plugin-examples/docker-compose.yml up -d mysql
+
+services:
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: nirdosha
+      MYSQL_DATABASE: nirdosha_test
+    ports:
+      - "3306:3306"
+
+  activemq:
+    image: apache/activemq-classic:latest
+    ports:
+      - "61613:61613"  # STOMP
+      - "8161:8161"    # web console (admin/admin)
+
+  cassandra:
+    image: cassandra:5
+    ports:
+      - "9042:9042"    # native protocol (CQL)
+
+  neo4j:
+    image: neo4j:5
+    environment:
+      NEO4J_AUTH: neo4j/nirdosha123
+    ports:
+      - "7687:7687"    # Bolt
+
+  hbase:
+    # dajobe/hbase-docker exposes the Thrift gateway this crate's plugin
+    # actually talks to (port 9090) -- see crates/plugin-example-hbase/
+    # README.md's "why this is the hardest one" for why this is the one
+    # plugin here not built on a mainstream, actively-maintained crate.
+    image: dajobe/hbase-docker
+    ports:
+      - "9090:9090"    # Thrift gateway
+      - "2181:2181"    # ZooKeeper (internal, exposed for diagnostics)
+      - "16010:16010"  # Master web UI

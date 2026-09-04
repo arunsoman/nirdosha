@@ -1,0 +1,21 @@
+[package]
+name = "nirdosha-plugin-mysql"
+version = "0.1.0"
+edition = "2024"
+description = "Reference Kind-A Nirdosha plugin: MySQL connectivity (mysql_connect/mysql_query/mysql_execute/mysql_close), built on the sync `mysql` crate and nirdosha-plugin-support's HandleRegistry. Track F of the plugin-ecosystem plan -- see README.md."
+
+[package.metadata.nirdosha]
+kind = "native"
+nirdosha_schema = "1"
+builtins = [
+    { name = "mysql_connect", params = ["str"], ret = "i64" },
+    { name = "mysql_query", params = ["i64", "str"], ret = "str" },
+    { name = "mysql_execute", params = ["i64", "str"], ret = "i64" },
+    { name = "mysql_close", params = ["i64"], ret = "i64" },
+]
+
+[dependencies]
+nirdosha = { path = "../compiler" }
+nirdosha-plugin-support = { path = "../plugin-support" }
+mysql = "25"
+serde_json = "1"

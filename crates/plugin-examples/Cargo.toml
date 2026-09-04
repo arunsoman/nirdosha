@@ -1,0 +1,14 @@
+[package]
+name = "nirdosha-plugin-examples"
+version = "0.1.0"
+edition = "2024"
+description = "No library code of its own -- just the cross-cutting proof (tests/all_five.rs) that all five reference plugins in crates/plugin-example-{mysql,activemq,cassandra,neo4j,hbase}/ compose into one run_with_plugins call, plus docker-compose.yml, the shared integration harness for their live tests."
+publish = false
+
+[dependencies]
+nirdosha = { path = "../compiler" }
+nirdosha-plugin-mysql = { path = "../plugin-example-mysql" }
+nirdosha-plugin-activemq = { path = "../plugin-example-activemq" }
+nirdosha-plugin-cassandra = { path = "../plugin-example-cassandra" }
+nirdosha-plugin-neo4j = { path = "../plugin-example-neo4j" }
+nirdosha-plugin-hbase = { path = "../plugin-example-hbase" }

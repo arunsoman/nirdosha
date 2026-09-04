@@ -1,0 +1,26 @@
+[package]
+name = "nirdosha-plugin-hbase"
+version = "0.1.0"
+edition = "2024"
+description = "Reference Kind-A Nirdosha plugin: HBase connectivity (hbase_connect/put/get/close) via the Thrift gateway, using the hbase-thrift crate. Built last and disclosed honestly as the roughest of this gallery's five plugins -- see README.md's 'Why this is the hardest one' section. Track F of the plugin-ecosystem plan; this was the ORIGINAL motivating example ('what if a developer needs HBase or Cassandra')."
+
+[package.metadata.nirdosha]
+kind = "native"
+nirdosha_schema = "1"
+builtins = [
+    { name = "hbase_connect", params = ["str", "i64"], ret = "i64" },
+    { name = "hbase_create_table", params = ["i64", "str", "str"], ret = "i64" },
+    { name = "hbase_put", params = ["i64", "str", "str", "str", "str", "str"], ret = "i64" },
+    { name = "hbase_get", params = ["i64", "str", "str", "str", "str"], ret = "str" },
+    { name = "hbase_close", params = ["i64"], ret = "i64" },
+]
+
+[dependencies]
+nirdosha = { path = "../compiler" }
+nirdosha-plugin-support = { path = "../plugin-support" }
+# NOT a direct `thrift` dependency: hbase-thrift 0.3 bundles (and
+# re-exports as `hbase_thrift::thrift`) thrift 0.15 internally. Pinning
+# our own `thrift` version here pulled in a SECOND, incompatible copy
+# of the crate -- two distinct `TBinaryInputProtocol` types that don't
+# satisfy each other's trait bounds. Always go through the re-export.
+hbase-thrift = "0.3"

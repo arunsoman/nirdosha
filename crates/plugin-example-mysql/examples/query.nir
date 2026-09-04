@@ -1,0 +1,10 @@
+// Talks to the MySQL container docker-compose.yml (crates/plugin-examples/)
+// starts: user root, password nirdosha, database nirdosha_test.
+fn main() {
+    let h: i64 = mysql_connect("mysql://root:nirdosha@127.0.0.1:3306/nirdosha_test")
+    mysql_execute(h, "CREATE TABLE IF NOT EXISTS widgets (id INT PRIMARY KEY, name VARCHAR(64))")
+    mysql_execute(h, "REPLACE INTO widgets (id, name) VALUES (1, 'sprocket')")
+    let rows: str = mysql_query(h, "SELECT id, name FROM widgets")
+    print(rows)
+    mysql_close(h)
+}

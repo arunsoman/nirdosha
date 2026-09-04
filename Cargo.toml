@@ -7,4 +7,11 @@ members = [
     "crates/bench",
     "crates/presence-gateway",
     "crates/plugin-example-rot13",
+    "crates/plugin-support",
+    "crates/plugin-example-mysql",
+    "crates/plugin-example-activemq",
+    "crates/plugin-example-cassandra",
+    "crates/plugin-example-neo4j",
+    "crates/plugin-example-hbase",
+    "crates/plugin-examples",
 ]

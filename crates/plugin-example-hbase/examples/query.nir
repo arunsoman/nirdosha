@@ -1,0 +1,10 @@
+// Talks to the HBase container docker-compose.yml (crates/plugin-examples/)
+// starts, Thrift gateway on 9090.
+fn main() {
+    let h: i64 = hbase_connect("127.0.0.1", 9090)
+    hbase_create_table(h, "widgets", "data")
+    hbase_put(h, "widgets", "row1", "data", "name", "sprocket")
+    let name: str = hbase_get(h, "widgets", "row1", "data", "name")
+    print(name)
+    hbase_close(h)
+}

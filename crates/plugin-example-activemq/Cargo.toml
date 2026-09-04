@@ -1,0 +1,19 @@
+[package]
+name = "nirdosha-plugin-activemq"
+version = "0.1.0"
+edition = "2024"
+description = "Reference Kind-A Nirdosha plugin: ActiveMQ connectivity over STOMP (activemq_connect/send/receive/close). Hand-rolls the STOMP 1.2 wire protocol over std::net::TcpStream rather than depending on the Rust STOMP crate ecosystem, which is thin/stale -- see README.md. Track F of the plugin-ecosystem plan."
+
+[package.metadata.nirdosha]
+kind = "native"
+nirdosha_schema = "1"
+builtins = [
+    { name = "activemq_connect", params = ["str"], ret = "i64" },
+    { name = "activemq_send", params = ["i64", "str", "str"], ret = "i64" },
+    { name = "activemq_receive", params = ["i64", "str", "i64"], ret = "str" },
+    { name = "activemq_close", params = ["i64"], ret = "i64" },
+]
+
+[dependencies]
+nirdosha = { path = "../compiler" }
+nirdosha-plugin-support = { path = "../plugin-support" }
