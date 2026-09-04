@@ -2815,16 +2815,23 @@ sequencing in `docs/ECOSYSTEM.md`; this entry only tracks status.*
   A1–A4 above, which already track real status for each. See
   `docs/ECOSYSTEM.md` §G4 for the explicit mapping — deliberately not
   duplicated as new tracked items here.
-- `[OPEN]` **G5. Community/governance depth.** Solo-maintained today
+- `[DONE]` **G5. Community/governance depth.** Was solo-maintained
   (GitHub contributor graph: `arunsoman` only, 94 contributions) — no
-  RFC process, no bus-factor resilience. `docs/ECOSYSTEM.md` §G5: an
-  RFC-lite process for breaking changes in `CONTRIBUTING.md` (same
-  root cause as A4's versioning-policy gap), plus turning
-  `deploy/helm/nirdosha/Chart.yaml`'s `maintainers:` entries
-  (`lekshmideepu`, `maheshmindlabs`, added 2026-09-04) into real GitHub
-  collaborator access and branch protection — flagged here, not done
-  here; granting real repo access is a maintainer-only action for the
-  repo owner, not a side effect of a design doc.
+  RFC process, no bus-factor resilience. Closed 2026-09-04:
+  `GOVERNANCE.md` (roles + decision process), `MAINTAINERS.md` (honest
+  activation status, not just access), `AREAS.md` +
+  `.github/CODEOWNERS`, an RFC process (`rfcs/`, seeded with G1's
+  package-manifest-format and G2's editor-tooling drafts), ADRs
+  (`docs/adr/`, backfilled for the Z3-vendoring and str-ban decisions),
+  branch protection on `main` (1 review + green CI required), and a
+  48h triage SLA in `CONTRIBUTING.md`. Real GitHub write access for
+  `lekshmideepu`/`maheshmindlabs`/`arulrajan123`/`Baskarrajcodeflow`
+  was confirmed already granted (not just the Helm chart field this
+  row used to flag as insufficient) — `MAINTAINERS.md` discloses that
+  three of the four aren't yet *active* (no commits/reviews on
+  record), so real bus-factor improvement still needs those seats
+  used, not just held. See `docs/ECOSYSTEM.md` §G5 for the full
+  before/after.
 
 ---
 

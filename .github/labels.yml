@@ -1,28 +1,30 @@
-# Documented label set for this repo. Not yet applied to GitHub — this
-# is the source of truth to create them from (manually, via `gh label
-# create`, or a labeler GitHub Action) once the maintainer is ready.
+# Documented label set for this repo — kept in sync with the live
+# GitHub labels (`gh label list --repo arunsoman/nirdosha`), last
+# reconciled 2026-09-04. This file is the source of truth for *intent*;
+# if it and the live repo ever drift, fix the repo to match this file
+# (`gh label create`/`gh label edit`), not the other way around.
 #
 #   gh label create "good first issue" --color 7057ff --description "..."
 #   (repeat per row, or script it from this file)
 
 - name: "good first issue"
   color: "7057ff"
-  description: "Small, well-scoped, good for a first contribution"
+  description: "Good for newcomers"
 - name: "help wanted"
   color: "008672"
-  description: "Open for anyone to pick up"
+  description: "Extra attention is needed"
 - name: bug
   color: "d73a4a"
-  description: "Something isn't working as documented"
+  description: "Something isn't working"
 - name: enhancement
   color: "a2eeef"
-  description: "New feature or capability request"
-- name: docs
+  description: "New feature or request"
+- name: documentation
   color: "0075ca"
-  description: "Documentation only"
+  description: "Improvements or additions to documentation"
 - name: compiler
-  color: "5319e7"
-  description: "Parser, typeck, ownership, codegen, interpreter"
+  color: "1d76db"
+  description: "Parser, typeck, codegen, interpreter"
 - name: grammar
   color: "5319e7"
   description: "Grammar/GBNF/LL(1) surface, not codegen internals"
@@ -32,9 +34,27 @@
 - name: examples
   color: "c5def5"
   description: "A `.nir` example — new, broken, or needs updating"
+- name: llm
+  color: "5319e7"
+  description: "LLM/agent-facing: prompts, grammar, eval harness"
+- name: infra
+  color: "c2e0c6"
+  description: "CI, packaging, install, cross-platform"
 - name: question
   color: "d876e3"
   description: "Further information is requested"
 - name: blocked
   color: "b60205"
   description: "Can't proceed until a named dependency lands"
+- name: accessibility
+  color: "f143ab"
+  description: "Barrier affecting people with disabilities"
+- name: duplicate
+  color: "cfd3d7"
+  description: "This issue or pull request already exists"
+- name: invalid
+  color: "e4e669"
+  description: "This doesn't seem right"
+- name: wontfix
+  color: "ffffff"
+  description: "This will not be worked on"
