@@ -1137,6 +1137,493 @@ fn chart_alert_volume_by_severity() -> Result(json, ErrorCode) requires(role: "f
     return match db_connect("ctms_pro.db") { Ok(conn) => chart_alert_volume_by_severity_inner(conn), Err(e) => Err(DbError(e)) }
 }
 
+// =========================================================================
+// Module 3: Investigative Case Management System
+// Doc: "Case Intake Service" / "Assignment and Workflow Manager" /
+// "Investigation Workspace" / "Collaboration & Escalation Tools" /
+// "Evidence Management" / "Decision Engine" / "Audit & Reporting Layer".
+// The core entity is named `Investigation`, not `Case` -- `CASE` is a
+// reserved SQL keyword and this file hand-writes real SQL against it
+// (same avoidance `ctms.nir` already used, naming it `Matter` there;
+// `Investigation` is the doc's own term for the same thing -- "Stage 1:
+// Investigation & Enrichment").
+// =========================================================================
+
+struct Investigation {
+    id: i64,
+    subject_name: str,
+    status: CaseStatus,
+    severity: Severity,
+    risk_score: i64,
+    // Doc: "SLA-based queues (e.g., P1 must be touched within 30 mins)".
+    sla_deadline_unix: i64,
+    assigned_to: str,
+}
+
+fn list_investigation_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS investigation (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, severity TEXT, risk_score INTEGER, sla_deadline_unix INTEGER, assigned_to TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, subject_name, status, severity, risk_score, sla_deadline_unix, assigned_to FROM investigation ORDER BY sla_deadline_unix") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_investigation() -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_investigation_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn get_investigation_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS investigation (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, severity TEXT, risk_score INTEGER, sla_deadline_unix INTEGER, assigned_to TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let row: Result(json, ErrorCode) = match db_query(conn, "SELECT id, subject_name, status, severity, risk_score, sla_deadline_unix, assigned_to FROM investigation WHERE id = ?", id) {
+        Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return row
+}
+fn get_investigation(id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => get_investigation_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+fn create_investigation_inner(conn: db, m: Investigation) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS investigation (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, severity TEXT, risk_score INTEGER, sla_deadline_unix INTEGER, assigned_to TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO investigation (subject_name, status, severity, risk_score, sla_deadline_unix, assigned_to) VALUES (?, ?, ?, ?, ?, ?)", m.subject_name, m.status, m.severity, m.risk_score, m.sla_deadline_unix, m.assigned_to) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_investigation(m: Investigation) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_investigation_inner(conn, m), Err(e) => Err(DbError(e)) }
+}
+fn update_investigation_inner(conn: db, m: Investigation) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS investigation (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, severity TEXT, risk_score INTEGER, sla_deadline_unix INTEGER, assigned_to TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE investigation SET subject_name = ?, status = ?, severity = ?, risk_score = ?, sla_deadline_unix = ?, assigned_to = ? WHERE id = ?", m.subject_name, m.status, m.severity, m.risk_score, m.sla_deadline_unix, m.assigned_to, m.id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn update_investigation(m: Investigation) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => update_investigation_inner(conn, m), Err(e) => Err(DbError(e)) }
+}
+fn delete_investigation_inner(conn: db, id: i64) -> Result(i64, ErrorCode) {
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "DELETE FROM investigation WHERE id = ?", id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn delete_investigation(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => delete_investigation_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+// Decision Engine (doc): "Users select resolution (Confirmed Fraud,
+// False Positive, Suspicious -- Re-monitor)". A real `Decision` enum
+// parameter, not free text -- a `workspace` `panel` action renders a
+// genuine multi-field form (unlike a plain `screen` action, which only
+// auto-fills one param from the row), so this can be a proper closed
+// choice this time instead of `ctms.nir`'s disclosed free-text gap.
+fn record_investigation_decision_inner(conn: db, id: i64, resolution: Decision, justification: Text) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS investigation (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, severity TEXT, risk_score INTEGER, sla_deadline_unix INTEGER, assigned_to TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let new_status: CaseStatus = match resolution {
+        DecisionConfirmedFraud() => CaseStatusEscalated(),
+        DecisionFalsePositive() => CaseStatusClosed(),
+        DecisionSuspiciousReMonitor() => CaseStatusInProgress(),
+    }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE investigation SET status = ? WHERE id = ?", new_status, id) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    let confirm: Result(json, ErrorCode) = match result {
+        Ok(n) => match db_query(conn, "SELECT id, status FROM investigation WHERE id = ?", id) {
+            Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(e),
+    }
+    stop conn
+    return confirm
+}
+fn record_investigation_decision(id: i64, resolution: Decision, justification: Text) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => record_investigation_decision_inner(conn, id, resolution, justification), Err(e) => Err(DbError(e)) }
+}
+// Doc: "Audit-Ready Documentation & Export -- Downloadable dossier of
+// all case artifacts (PDF/CSV/JSON)". No file/blob type in Nirdosha yet
+// (same disclosed gap `ctms.nir` already named) -- this returns the
+// JSON summary a real signed PDF/CSV bundle would be built from.
+fn export_investigation_dossier_inner(conn: db, id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS investigation (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, severity TEXT, risk_score INTEGER, sla_deadline_unix INTEGER, assigned_to TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(json, ErrorCode) = match db_query(conn, "SELECT id, subject_name, status, severity, risk_score FROM investigation WHERE id = ?", id) {
+        Ok(r) => match json_array_get(r, 0) { Ok(one) => Ok(one), Err(e) => Err(DbError(e)) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn export_investigation_dossier(id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => export_investigation_dossier_inner(conn, id), Err(e) => Err(DbError(e)) }
+}
+
+screen Investigation {
+    title: "Investigation Queue"
+    field status {
+        render: "badge"
+    }
+    field severity {
+        render: "badge"
+    }
+    field sla_deadline_unix {
+        label: "SLA"
+        render: "countdown"
+    }
+    action "Export Dossier" -> export_investigation_dossier {
+        style: "outlined"
+        show_result: true
+    }
+
+    layout {
+        row {
+            column {
+                group "Investigation" {
+                    field subject_name
+                    field status
+                    field severity
+                    field risk_score
+                }
+            }
+            column {
+                group "Routing" {
+                    field assigned_to
+                    field sla_deadline_unix
+                }
+                divider {}
+                action "Export Dossier"
+            }
+        }
+    }
+}
+
+// ---- Transaction: workspace-panel-only (scoped per investigation). ---
+
+fn create_investigation_transaction_inner(conn: db, investigation_id: i64, amount_cents: i64, geo_country: Text, geo_lat: f64, geo_lng: f64, created_unix: i64) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS investigation_transaction (id INTEGER PRIMARY KEY AUTOINCREMENT, investigation_id INTEGER, amount_cents INTEGER, geo_country TEXT, created_unix INTEGER, geo_lat REAL, geo_lng REAL)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(
+        conn,
+        "INSERT INTO investigation_transaction (investigation_id, amount_cents, geo_country, created_unix, geo_lat, geo_lng) VALUES (?, ?, ?, ?, ?, ?)",
+        investigation_id, amount_cents, geo_country.value, created_unix, geo_lat, geo_lng
+    ) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_investigation_transaction(investigation_id: i64, amount_cents: i64, geo_country: Text, geo_lat: f64, geo_lng: f64, created_unix: i64) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_investigation_transaction_inner(conn, investigation_id, amount_cents, geo_country, geo_lat, geo_lng, created_unix), Err(e) => Err(DbError(e)) }
+}
+// Timeline contract: `{ts, label}[]`.
+fn list_transaction_for_investigation_inner(conn: db, investigation_id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS investigation_transaction (id INTEGER PRIMARY KEY AUTOINCREMENT, investigation_id INTEGER, amount_cents INTEGER, geo_country TEXT, created_unix INTEGER, geo_lat REAL, geo_lng REAL)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(
+        conn,
+        "SELECT created_unix AS ts, (CAST(amount_cents AS TEXT) || ' cents -- ' || geo_country) AS label FROM investigation_transaction WHERE investigation_id = ? ORDER BY created_unix",
+        investigation_id
+    ) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_transaction_for_investigation(investigation_id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_transaction_for_investigation_inner(conn, investigation_id), Err(e) => Err(DbError(e)) }
+}
+
+// ---- CaseNote: real-time commenting. ------------------------------------
+
+fn list_case_note_for_investigation_inner(conn: db, investigation_id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS case_note (id INTEGER PRIMARY KEY AUTOINCREMENT, investigation_id INTEGER, author TEXT, body TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, author, body FROM case_note WHERE investigation_id = ? ORDER BY id", investigation_id) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_case_note_for_investigation(investigation_id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_case_note_for_investigation_inner(conn, investigation_id), Err(e) => Err(DbError(e)) }
+}
+fn add_case_note_inner(conn: db, investigation_id: i64, author: Text, body: Text) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS case_note (id INTEGER PRIMARY KEY AUTOINCREMENT, investigation_id INTEGER, author TEXT, body TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO case_note (investigation_id, author, body) VALUES (?, ?, ?)", investigation_id, author.value, body.value) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn add_case_note(investigation_id: i64, body: Text) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => add_case_note_inner(conn, investigation_id, Text("investigator"), body), Err(e) => Err(DbError(e)) }
+}
+
+// ---- CaseEvidence: evidence management with versioning. --------------
+
+fn list_case_evidence_for_investigation_inner(conn: db, investigation_id: i64) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS case_evidence (id INTEGER PRIMARY KEY AUTOINCREMENT, investigation_id INTEGER, evidence_type TEXT, uploader TEXT, content_hash TEXT, version_number INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, evidence_type, uploader, content_hash, version_number FROM case_evidence WHERE investigation_id = ? ORDER BY id", investigation_id) { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_case_evidence_for_investigation(investigation_id: i64) -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_case_evidence_for_investigation_inner(conn, investigation_id), Err(e) => Err(DbError(e)) }
+}
+fn add_case_evidence_inner(conn: db, investigation_id: i64, evidence_type: Text, uploader: Text, content_hash: Text) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS case_evidence (id INTEGER PRIMARY KEY AUTOINCREMENT, investigation_id INTEGER, evidence_type TEXT, uploader TEXT, content_hash TEXT, version_number INTEGER)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO case_evidence (investigation_id, evidence_type, uploader, content_hash, version_number) VALUES (?, ?, ?, ?, 1)", investigation_id, evidence_type.value, uploader.value, content_hash.value) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn add_case_evidence(investigation_id: i64, evidence_type: Text, uploader: Text, content_hash: Text) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => add_case_evidence_inner(conn, investigation_id, evidence_type, uploader, content_hash), Err(e) => Err(DbError(e)) }
+}
+
+workspace CaseInvestigation {
+    title: "Investigation Workspace"
+    subject: Investigation
+
+    panel "Transactions" {
+        source: list_transaction_for_investigation
+        render: "timeline"
+    }
+    panel "Notes" {
+        source: list_case_note_for_investigation
+        action "Add Note" -> add_case_note {
+            style: "filled"
+        }
+    }
+    panel "Evidence" {
+        source: list_case_evidence_for_investigation
+        action "Add Evidence" -> add_case_evidence {
+            style: "outlined"
+        }
+    }
+    panel "Decision" {
+        source: list_case_note_for_investigation
+        action "Record Decision" -> record_investigation_decision {
+            style: "filled"
+            confirm: "Record this resolution? This advances the case workflow."
+            show_result: true
+        }
+    }
+}
+
+// ---- CaseEscalation: regulatory escalation / legal-hold referral. ----
+
+struct CaseEscalation {
+    id: i64,
+    investigation_id: i64,
+    reason: str,
+    target: str,
+    referral_status: ReviewStatus,
+    regulator_response: str,
+}
+
+fn list_case_escalation_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS case_escalation (id INTEGER PRIMARY KEY AUTOINCREMENT, investigation_id INTEGER, reason TEXT, target TEXT, referral_status TEXT, regulator_response TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, investigation_id, reason, target, referral_status, regulator_response FROM case_escalation ORDER BY id DESC") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_case_escalation() -> Result(json, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_case_escalation_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_case_escalation_inner(conn: db, e: CaseEscalation) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS case_escalation (id INTEGER PRIMARY KEY AUTOINCREMENT, investigation_id INTEGER, reason TEXT, target TEXT, referral_status TEXT, regulator_response TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO case_escalation (investigation_id, reason, target, referral_status, regulator_response) VALUES (?, ?, ?, ?, ?)", e.investigation_id, e.reason, e.target, e.referral_status, e.regulator_response) { Ok(n) => Ok(n), Err(err) => Err(DbError(err)) }
+    stop conn
+    return result
+}
+fn create_case_escalation(e: CaseEscalation) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_case_escalation_inner(conn, e), Err(err) => Err(DbError(err)) }
+}
+fn update_case_escalation_inner(conn: db, e: CaseEscalation) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS case_escalation (id INTEGER PRIMARY KEY AUTOINCREMENT, investigation_id INTEGER, reason TEXT, target TEXT, referral_status TEXT, regulator_response TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "UPDATE case_escalation SET reason = ?, target = ?, referral_status = ?, regulator_response = ? WHERE id = ?", e.reason, e.target, e.referral_status, e.regulator_response, e.id) { Ok(n) => Ok(n), Err(err) => Err(DbError(err)) }
+    stop conn
+    return result
+}
+fn update_case_escalation(e: CaseEscalation) -> Result(i64, ErrorCode) requires(role: "compliance_officer") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => update_case_escalation_inner(conn, e), Err(err) => Err(DbError(err)) }
+}
+
+screen CaseEscalation {
+    title: "Escalation & Regulatory Referral"
+    field investigation_id {
+        render: "searchable_select"
+        source: Investigation
+    }
+    field referral_status {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            column {
+                field investigation_id
+                field reason
+                field target
+            }
+            column {
+                field referral_status
+                field regulator_response
+            }
+        }
+    }
+}
+
+// ---- SlaRoutingRule: workload routing config. --------------------------
+
+struct SlaRoutingRule {
+    id: i64,
+    severity_tier: Severity,
+    sla_minutes: i64,
+    jurisdiction_scope: str,
+    skillset_required: str,
+}
+
+fn list_sla_routing_rule_inner(conn: db) -> Result(json, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS sla_routing_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, severity_tier TEXT, sla_minutes INTEGER, jurisdiction_scope TEXT, skillset_required TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, severity_tier, sla_minutes, jurisdiction_scope, skillset_required FROM sla_routing_rule ORDER BY sla_minutes") { Ok(r) => Ok(r), Err(e) => Err(DbError(e)) }
+    stop conn
+    return rows
+}
+fn list_sla_routing_rule() -> Result(json, ErrorCode) requires(role: "supervisor") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => list_sla_routing_rule_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn create_sla_routing_rule_inner(conn: db, r: SlaRoutingRule) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS sla_routing_rule (id INTEGER PRIMARY KEY AUTOINCREMENT, severity_tier TEXT, sla_minutes INTEGER, jurisdiction_scope TEXT, skillset_required TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO sla_routing_rule (severity_tier, sla_minutes, jurisdiction_scope, skillset_required) VALUES (?, ?, ?, ?)", r.severity_tier, r.sla_minutes, r.jurisdiction_scope, r.skillset_required) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_sla_routing_rule(r: SlaRoutingRule) -> Result(i64, ErrorCode) requires(role: "supervisor") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_sla_routing_rule_inner(conn, r), Err(e) => Err(DbError(e)) }
+}
+
+screen SlaRoutingRule {
+    title: "SLA / Workload Routing Config"
+    field severity_tier {
+        render: "badge"
+    }
+
+    layout {
+        row {
+            field severity_tier
+            field sla_minutes
+            field jurisdiction_scope
+            field skillset_required
+        }
+    }
+}
+
+// ---- CaseLink: "linked cases by common entity or pattern (case
+// graphing)" -- feeds the Case Linking / Entity Graph dashboard visual.
+
+struct CaseLink {
+    id: i64,
+    source_investigation_id: i64,
+    target_investigation_id: i64,
+    link_reason: str,
+}
+
+fn create_case_link_inner(conn: db, l: CaseLink) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS case_link (id INTEGER PRIMARY KEY AUTOINCREMENT, source_investigation_id INTEGER, target_investigation_id INTEGER, link_reason TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO case_link (source_investigation_id, target_investigation_id, link_reason) VALUES (?, ?, ?)", l.source_investigation_id, l.target_investigation_id, l.link_reason) { Ok(n) => Ok(n), Err(e) => Err(DbError(e)) }
+    stop conn
+    return result
+}
+fn create_case_link(l: CaseLink) -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => create_case_link_inner(conn, l), Err(e) => Err(DbError(e)) }
+}
+
+screen CaseLink {
+    title: "Linked Cases"
+    field source_investigation_id {
+        render: "searchable_select"
+        source: Investigation
+    }
+    field target_investigation_id {
+        render: "searchable_select"
+        source: Investigation
+    }
+
+    layout {
+        row {
+            field source_investigation_id
+            field target_investigation_id
+            field link_reason
+        }
+    }
+}
+
+fn graph_case_links_inner(conn: db) -> Result(json, ErrorCode) {
+    let c1: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS investigation (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, severity TEXT, risk_score INTEGER, sla_deadline_unix INTEGER, assigned_to TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let c2: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS case_link (id INTEGER PRIMARY KEY AUTOINCREMENT, source_investigation_id INTEGER, target_investigation_id INTEGER, link_reason TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(json, ErrorCode) = match db_query(
+        conn,
+        "SELECT json_object('nodes', (SELECT json_group_array(json_object('id', id, 'label', subject_name, 'risk', risk_score)) FROM investigation), 'edges', (SELECT json_group_array(json_object('source', source_investigation_id, 'target', target_investigation_id, 'weight', 1)) FROM case_link)) AS value"
+    ) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "value") {
+                Ok(s) => match json_parse(s) { Ok(v) => Ok(v), Err(e) => Err(DbError(e)) },
+                Err(e) => Err(DbError(e)),
+            },
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn graph_case_links() -> Result(json, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => graph_case_links_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
+// ---- Track E5: the Case Workflow/Stage Tracker, the doc's own
+// 4-stage "Multi-Stage Workflow Model" verbatim. -------------------------
+
+workflow CaseLifecycle {
+    data {
+        investigation_id: i64,
+    }
+
+    state Investigation_Enrichment {
+        owner: role("investigator")
+        label: "Investigation & Enrichment"
+        on Escalate -> ComplianceEscalation
+        on Resolve -> Resolution
+    }
+    state ComplianceEscalation {
+        owner: role("compliance_officer")
+        label: "Compliance Escalation / Legal Hold"
+        on Resolve -> Resolution
+    }
+    state Resolution {
+        owner: role("investigator")
+        label: "Resolution"
+        on FileReport -> RegulatoryFiling
+    }
+    state RegulatoryFiling terminal {
+        owner: role("compliance_officer")
+        label: "Regulatory Filing"
+    }
+}
+
+// ---- Module 3 dashboard contributions. ---------------------------------
+
+fn stat_open_investigation_count_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS investigation (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, severity TEXT, risk_score INTEGER, sla_deadline_unix INTEGER, assigned_to TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COUNT(*) AS value FROM investigation WHERE status = 'CaseStatusOpen'") {
+        Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn stat_open_investigation_count() -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => stat_open_investigation_count_inner(conn), Err(e) => Err(DbError(e)) }
+}
+fn stat_investigation_nearing_sla_breach_inner(conn: db) -> Result(i64, ErrorCode) {
+    let c: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS investigation (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT, status TEXT, severity TEXT, risk_score INTEGER, sla_deadline_unix INTEGER, assigned_to TEXT)") { Ok(n) => n, Err(e) => -1 }
+    let result: Result(i64, ErrorCode) = match db_query(
+        conn,
+        "SELECT COUNT(*) AS value FROM investigation WHERE status != 'CaseStatusClosed' AND (sla_deadline_unix - strftime('%s','now')) BETWEEN 0 AND 3600"
+    ) {
+        Ok(rows) => match json_array_get(rows, 0) { Ok(row) => match json_get_i64(row, "value") { Ok(n) => Ok(n), Err(e) => Ok(0) }, Err(e) => Ok(0) },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+fn stat_investigation_nearing_sla_breach() -> Result(i64, ErrorCode) requires(role: "investigator") {
+    return match db_connect("ctms_pro.db") { Ok(conn) => stat_investigation_nearing_sla_breach_inner(conn), Err(e) => Err(DbError(e)) }
+}
+
 // === APPEND POINT ===
 
 fn main() {}
