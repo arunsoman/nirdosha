@@ -1,0 +1,85 @@
+name: label-first-contribution
+
+# Tags a first-time issue/PR author's item with the `first-time
+# contributor` label (see .github/labels.yml) so a maintainer scanning
+# the issue/PR list can tell at a glance which threads deserve a
+# warmer, more patient response — the actual GitHub UI doesn't surface
+# that on its own. Companion to welcome.yml (which posts the comment);
+# kept as a separate workflow, as suggested, since the two do different
+# jobs against different APIs and either can be disabled independently.
+#
+# "First" is checked directly against the GitHub API rather than
+# trusted from `author_association` (whose FIRST_TIME_CONTRIBUTOR/NONE
+# values are keyed off prior *commits*, not prior *issues/PRs*, so they
+# don't actually answer "has this person opened one of these before"):
+#   - issues: `issues.listForRepo` supports a `creator` filter directly,
+#     same lookup actions/first-interaction itself uses to decide
+#     whether to post its own comment.
+#   - PRs: `pulls.list` has no author filter, so this uses the Search
+#     API (`type:pr author:<login>`) instead of paginating every PR in
+#     the repo and filtering client-side.
+# Either way: first == no earlier-numbered issue/PR by the same sender.
+#
+# `pull_request_target` (not `pull_request`), same reasoning as
+# welcome.yml: a first-time PR is almost always from a fork, and a
+# fork's `pull_request` event gets a read-only GITHUB_TOKEN no matter
+# what `permissions:` says, so labeling would silently fail. This job
+# never checks out the PR head or runs any of its code — it only calls
+# the REST/Search API with the sender's login, so running with the base
+# repo's write token is safe.
+
+on:
+  issues:
+    types: [opened]
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  label:
+    name: Label first-time contributors
+    runs-on: ubuntu-latest
+    steps:
+      - name: Label if this is the sender's first issue/PR here
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const sender = context.payload.sender.login;
+            const isIssue = Boolean(context.payload.issue) && !context.payload.issue.pull_request;
+            let isFirst = false;
+
+            if (isIssue) {
+              const currentNumber = context.payload.issue.number;
+              const issues = await github.paginate(github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                creator: sender,
+                state: "all",
+              });
+              isFirst = issues
+                .filter((i) => !i.pull_request)
+                .every((i) => i.number >= currentNumber);
+            } else {
+              const currentNumber = context.payload.pull_request.number;
+              const { data: search } = await github.rest.search.issuesAndPullRequests({
+                q: `repo:${context.repo.owner}/${context.repo.repo} type:pr author:${sender}`,
+                per_page: 100,
+              });
+              isFirst = search.items.every((p) => p.number >= currentNumber);
+            }
+
+            if (!isFirst) {
+              core.info(`Skipping — ${sender} has an earlier issue/PR in this repo.`);
+              return;
+            }
+
+            core.info(`Labeling #${context.issue.number} as a first-time contribution from ${sender}.`);
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ["first-time contributor"],
+            });

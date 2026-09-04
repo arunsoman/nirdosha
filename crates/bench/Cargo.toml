@@ -8,6 +8,15 @@ publish = false
 nirdosha = { path = "../compiler" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `blocking`, not the default async client -- this crate is a plain
+# synchronous CLI (no tokio runtime anywhere in it, unlike
+# `presence-gateway`'s fully-async use of `reqwest` below), so a blocking
+# client is the right fit rather than pulling in an executor just to
+# issue one HTTP call at a time. `rustls-tls` (not the default
+# `default-tls`/system-OpenSSL) matches the TLS choice `presence-gateway`
+# already made in this workspace, for the same reason: no system TLS lib
+# dependency in the built binary.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 
 [[bin]]
 name = "nirdosha-bench"
