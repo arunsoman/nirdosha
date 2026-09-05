@@ -28,7 +28,7 @@ write access below is broader than that.
 
 **Read this table honestly, not optimistically.** GitHub write access
 exists for all four names above (confirmed via
-`gh api repos/arunsoman/nirdosha/collaborators/<user>/permission`,
+`gh api repos/kannamma-labs/nirdosha/collaborators/<user>/permission`,
 2026-09-04) — that part of `docs/ECOSYSTEM.md` §G5's ask is already
 done. What's still open is *activation*: none of the four has an
 assigned area, and three have no commits or reviews on this repo yet.

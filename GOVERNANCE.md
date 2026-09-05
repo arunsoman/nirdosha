@@ -95,7 +95,7 @@ rule and should get called out in the next PR, not left silent.
   "seen, will look") on a new issue or PR — not to a full resolution.
   See [`CONTRIBUTING.md`](./CONTRIBUTING.md#response-time) for how this
   relates to the "about a week" full-response expectation.
-- [GitHub Discussions](https://github.com/arunsoman/nirdosha/discussions)
+- [GitHub Discussions](https://github.com/kannamma-labs/nirdosha/discussions)
   is enabled for design chatter that isn't yet a formal RFC.
 - The [Public Roadmap](./docs/PUBLIC_ROADMAP.md) is linked from the
   README so a prospective contributor can see what's open without

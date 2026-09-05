@@ -1,5 +1,5 @@
 # Documented label set for this repo — kept in sync with the live
-# GitHub labels (`gh label list --repo arunsoman/nirdosha`), last
+# GitHub labels (`gh label list --repo kannamma-labs/nirdosha`), last
 # reconciled 2026-09-04. This file is the source of truth for *intent*;
 # if it and the live repo ever drift, fix the repo to match this file
 # (`gh label create`/`gh label edit`), not the other way around.

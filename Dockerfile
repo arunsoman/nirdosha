@@ -44,7 +44,7 @@ RUN cargo build --release --features dist
 # against a first version of this image that mismatched the two.
 FROM python:3.12-slim-trixie AS runtime
 
-LABEL org.opencontainers.image.source="https://github.com/arunsoman/nirdosha" \
+LABEL org.opencontainers.image.source="https://github.com/kannamma-labs/nirdosha" \
       org.opencontainers.image.description="nirdosha: one process serves both the API and the UI generated from a single .nir program" \
       org.opencontainers.image.licenses="Apache-2.0"
 

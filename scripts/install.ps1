@@ -1,6 +1,6 @@
 # One-line installer for the nirdosha CLI (Windows).
 #
-#   irm https://raw.githubusercontent.com/arunsoman/nirdosha/main/scripts/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/kannamma-labs/nirdosha/main/scripts/install.ps1 | iex
 #
 # Downloads the prebuilt x86_64 binary from GitHub Releases, verifies its
 # sha256 checksum, and installs it to $env:NIRDOSHA_INSTALL_DIR (default
@@ -12,7 +12,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$repo = "arunsoman/nirdosha"
+$repo = "kannamma-labs/nirdosha"
 $installDir = if ($env:NIRDOSHA_INSTALL_DIR) { $env:NIRDOSHA_INSTALL_DIR } else { "$env:LOCALAPPDATA\nirdosha\bin" }
 $version = if ($env:NIRDOSHA_VERSION) { $env:NIRDOSHA_VERSION } else { "latest" }
 $asset = "nirdosha-x86_64-pc-windows-msvc.zip"

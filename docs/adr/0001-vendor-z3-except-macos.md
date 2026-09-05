@@ -43,7 +43,7 @@ first real CI run for that leg, not a local config mistake.
   story this ADR exists to protect.
 - macOS users carry one extra install step (`brew install z3`) that
   Linux/Windows users don't — a real, if narrow, platform-support gap,
-  tracked as [issue #5](https://github.com/arunsoman/nirdosha/issues/5)
+  tracked as [issue #5](https://github.com/kannamma-labs/nirdosha/issues/5)
   ("macOS: z3-src 416.0.2 fails against current AppleClang — vendor Z3
   or document workaround").
 - This decision reverses automatically, with no code change needed
