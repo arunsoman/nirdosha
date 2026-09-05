@@ -1,72 +1,90 @@
-// Compiles `src/runtime_kernels.rs` — the freestanding, data-dependent
-// linalg kernels (`det`/`inv`/`solve`/`rank`/`kf_update_state`/
-// `kf_update_cov`), plus the `tcp`/`tcp_listener` native socket kernels —
-// into a static library at `nirdosha`'s own build time, once, not per
-// user program. `codegen.rs` embeds the resulting `.a` via
-// `include_bytes!` and links it into every native binary `nirdosha
-// build` produces, alongside the `.ll` file it generates — see
-// runtime_kernels.rs's module doc for why these builtins go through a
-// linked native `call` instead of hand-emitted branchy IR.
+// Builds `../runtime-kernels` — the freestanding, data-dependent linalg
+// kernels (`det`/`inv`/`solve`/`rank`/`kf_update_state`/`kf_update_cov`),
+// the `tcp`/`tcp_listener`/`file` native I/O kernels, and (as of this
+// pass) the `dec128` kernels — into a static library at `nirdosha`'s own
+// build time, once, not per user program. `codegen.rs` embeds the
+// resulting `.a` via `include_bytes!` and links it into every native
+// binary `nirdosha build` produces, alongside the `.ll` file it
+// generates — see `runtime-kernels/src/lib.rs`'s module doc for why
+// these builtins go through a linked native `call` instead of
+// hand-emitted branchy IR.
 //
-// A plain `rustc` invocation, not `cargo build` on a sub-crate: the file
-// is intentionally self-contained (no dependency on the `nirdosha` lib
-// crate — see runtime_kernels.rs's own doc comment), so there's no crate
-// graph to resolve and no circular-dependency risk from a sub-crate that
-// would otherwise want to depend on `nirdosha` itself.
+// **`cargo rustc` on a real sub-crate, not a bare `rustc` invocation on a
+// loose file** — the change this comment used to argue against, before
+// `dec128` needed a real dependency (`rust_decimal`) a dependency-free
+// `rustc` call had no way to reach
+// (rfcs/0005-plugin-boundary-safety-and-performance.md's own finding).
+// `../runtime-kernels` is deliberately its *own* Cargo workspace (its
+// `Cargo.toml`'s doc comment), not a member of this repository's root
+// workspace: a `cargo build` invoked from *inside* this very build
+// script, against the *same* workspace this build script's own `cargo
+// build` is already running under, would contend for that workspace's
+// `target/` lock — the outer build is waiting on this script to finish,
+// so a nested call sharing that lock would deadlock, not just run
+// slowly. A separate workspace, built into its own private
+// `--target-dir` under `OUT_DIR`, shares no lock with the outer build
+// at all.
+//
+// `cargo rustc ... -- --print=native-static-libs`, not a plain `cargo
+// build`, for the same reason the old code used `rustc
+// --print=native-static-libs` instead of a plain `rustc` call: it
+// forwards that flag straight to the one real `rustc` invocation that
+// produces the final artifact, so the OS-level native libraries this
+// staticlib's own code transitively needs (`-lm -lpthread ...` on Unix,
+// `ws2_32.lib ...` on Windows — `codegen.rs` links this `.a` with a bare
+// `clang` invocation, not `rustc`, so `rustc`'s own usual "supply this
+// list at final link time" behavior has to be captured explicitly) come
+// out of the exact same command that builds the artifact, not a second,
+// possibly-divergent one.
 use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("cargo always sets OUT_DIR"));
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/runtime_kernels.rs");
-    let out_lib = out_dir.join("libnirdosha_runtime.a");
+    let kernels_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../runtime-kernels");
+    let kernels_manifest = kernels_dir.join("Cargo.toml");
+    let kernels_target_dir = out_dir.join("runtime_kernels_target");
 
-    println!("cargo::rerun-if-changed={}", src.display());
+    println!("cargo::rerun-if-changed={}", kernels_dir.join("src/lib.rs").display());
+    println!("cargo::rerun-if-changed={}", kernels_manifest.display());
 
-    // `--print=native-static-libs` doesn't change what gets built — it
-    // makes rustc additionally emit (to stderr) the OS-level system
-    // libraries this staticlib's own code transitively needs at final
-    // link time (e.g. `-lm -lpthread ...` on Unix, `ws2_32.lib
-    // userenv.lib ...` on Windows-MSVC). A `staticlib` crate type bundles
-    // only *Rust* code into the `.a` — it does not, and cannot, bundle
-    // the OS socket/threading libraries `std::net`/`std::thread`
-    // themselves call into. Normally `rustc` supplies this list itself
-    // when it drives the final link of a binary; `codegen.rs` bypasses
-    // that (it links this `.a` with a bare `clang` invocation, not
-    // `rustc`), so it has to be captured here, at the one point `rustc`
-    // is actually invoked, and threaded through explicitly. Found via a
-    // real Windows CI failure (`docs/ROADMAP.md` A7): the TCP kernels
-    // (`nir_tcp_*`) added after this file was Unix-only-tested pulled in
-    // `std::net`, which needs `ws2_32.lib` on Windows — link failed with
-    // "linker command failed with exit code 1120" (unresolved externals)
-    // until this was threaded through. Captured on every platform (not
-    // just Windows) so this stays correct automatically if the Unix list
-    // ever changes too, instead of only being right for whichever
-    // platform someone happened to be testing on.
-    let output = Command::new("rustc")
+    // `CARGO`, not a bare `"cargo"` on `PATH`: cargo always sets this to
+    // the exact `cargo` binary driving the outer build (same toolchain,
+    // same version) when it runs a build script — the correct binary to
+    // re-invoke, not an assumption that whatever `cargo` happens to
+    // resolve first on `PATH` matches.
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+
+    let output = Command::new(&cargo)
+        .arg("rustc")
+        .arg("--release")
+        .arg("--manifest-path")
+        .arg(&kernels_manifest)
+        .arg("--target-dir")
+        .arg(&kernels_target_dir)
+        .arg("--")
         .arg("--print=native-static-libs")
-        .arg("--edition")
-        .arg("2024")
-        .arg("--crate-type")
-        .arg("staticlib")
-        .arg("-C")
-        .arg("panic=abort")
-        .arg("-O")
-        .arg(&src)
-        .arg("-o")
-        .arg(&out_lib)
         .output()
         .expect(
-            "failed to invoke `rustc` to build runtime_kernels.rs -- \
-             a Rust toolchain with `rustc` on PATH is required to build the \
-             `nirdosha` compiler itself, same as `cargo` already is",
+            "failed to invoke `cargo rustc` to build ../runtime-kernels -- \
+             a Rust toolchain with `cargo`/`rustc` on PATH is required to build the \
+             `nirdosha` compiler itself, same as before this change",
         );
 
     assert!(
         output.status.success(),
-        "rustc failed to compile src/runtime_kernels.rs into a staticlib:\n{}",
+        "cargo rustc failed to build ../runtime-kernels into a staticlib:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+
+    let built_lib = kernels_target_dir.join("release/libnirdosha_runtime_kernels.a");
+    let out_lib = out_dir.join("libnirdosha_runtime.a");
+    std::fs::copy(&built_lib, &out_lib).unwrap_or_else(|e| {
+        panic!(
+            "expected cargo rustc to produce {} -- copy failed: {e}",
+            built_lib.display()
+        )
+    });
 
     // rustc prefixes every note with `note: ` (`note: native-static-libs:
     // ...`), so this looks for the marker as a substring rather than
@@ -78,7 +96,7 @@ fn main() {
         .find_map(|line| line.find(MARKER).map(|i| &line[i + MARKER.len()..]))
         .unwrap_or_else(|| {
             panic!(
-                "expected a `native-static-libs:` note in rustc's stderr, found none:\n{stderr}"
+                "expected a `native-static-libs:` note in cargo rustc's stderr, found none:\n{stderr}"
             )
         });
     std::fs::write(out_dir.join("native_static_libs.txt"), native_libs)

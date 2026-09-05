@@ -3437,3 +3437,91 @@ fn file_type_is_accepted_by_check_supported() {
     let program = parse_typed(src);
     assert!(codegen::check_supported(&program).is_ok(), "Ty::File should compile now");
 }
+
+// ---- dec128 (rust_decimal-backed, via the new dependency-aware
+//      ../runtime-kernels crate) --------------------------------------
+//
+// Real `rust_decimal::Decimal` arithmetic, compiled to native code with
+// zero interpreter involvement -- the kernel crate split
+// (`crates/runtime-kernels/Cargo.toml`'s own doc comment) is what makes
+// this reachable at all; the old bare-`rustc` kernel build had no way
+// to depend on `rust_decimal`.
+
+#[test]
+fn dec_from_i64_and_dec_to_str_compile_and_match_interpreter() {
+    let src = r#"
+        fn main() {
+            let a: dec128 = dec_from_i64(1999, 2)
+            print(dec_to_str(a))
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(stdout, "19.99\n");
+    assert_eq!(code, 0);
+    assert_eq!(nirdosha::run(src), Ok(nirdosha::interpreter::Value::Unit), "interpreted path should agree");
+}
+
+#[test]
+fn dec128_arithmetic_compiles_and_matches_interpreter() {
+    let src = r#"
+        fn main() {
+            let a: dec128 = dec_from_i64(1999, 2)
+            let b: dec128 = dec_from_i64(500, 2)
+            print(dec_to_str(a + b))
+            print(dec_to_str(a - b))
+            let three: dec128 = dec_from_i64(3, 0)
+            print(dec_to_str(a * three))
+            let ten: dec128 = dec_from_i64(1000, 2)
+            let four: dec128 = dec_from_i64(400, 2)
+            print(dec_to_str(ten / four))
+        }
+    "#;
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(stdout, "24.99\n14.99\n59.97\n2.50\n");
+    assert_eq!(code, 0);
+    assert_eq!(nirdosha::run(src), Ok(nirdosha::interpreter::Value::Unit), "interpreted path should agree");
+}
+
+/// `dec128` division by zero traps (`abort()`), matching
+/// `interpreter.rs`'s own `ErrorKind::DivByZero` for the *fact* that
+/// it's an error -- the compiled path has no catchable-`Result` channel
+/// for this, same category as integer division's own Tier-2 guard, so
+/// it aborts instead of returning a language-visible error.
+#[test]
+fn dec128_division_by_zero_traps() {
+    let src = r#"
+        fn main() {
+            let a: dec128 = dec_from_i64(1000, 2)
+            let z: dec128 = dec_from_i64(0, 2)
+            print(dec_to_str(a / z))
+        }
+    "#;
+    let program = parse_checked(src);
+    let report = analyze(&program);
+    let mut out_path = std::env::temp_dir();
+    out_path.push(format!("nirdosha_test_{}_{}", std::process::id(), unique_suffix()));
+    codegen::build(&program, &report, &out_path, codegen::OptLevel::O2).expect("should compile cleanly");
+    let status = Command::new(&out_path).status().expect("compiled binary should run");
+    let _ = std::fs::remove_file(&out_path);
+    assert!(!status.success(), "division by zero should abort, not succeed");
+    assert_ne!(status.code(), Some(0));
+}
+
+/// A `dec128` comparison (no `nir_dec128_cmp` kernel exists yet) is a
+/// clean, named rejection -- not silently running its raw `{i64,i64}`
+/// bit pattern through `icmp`, which would be wrong, not just
+/// unsupported.
+#[test]
+fn dec128_comparison_is_cleanly_rejected_not_silently_wrong() {
+    let src = r#"
+        fn main() -> bool {
+            let a: dec128 = dec_from_i64(1, 0)
+            let b: dec128 = dec_from_i64(2, 0)
+            return a < b
+        }
+    "#;
+    let program = parse_typed(src);
+    let report = analyze(&program);
+    let err = codegen::emit_llvm_ir(&program, &report).expect_err("dec128 `<` must be rejected, not silently wrong");
+    assert!(err.to_string().contains("dec128"), "expected a named dec128 rejection, got: {err}");
+}

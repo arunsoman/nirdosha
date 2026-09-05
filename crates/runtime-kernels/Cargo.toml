@@ -1,0 +1,46 @@
+# Deliberately its own workspace root (this empty `[workspace]` table),
+# NOT a member of the repo's root workspace — see
+# `crates/compiler/build.rs`'s own doc comment for why: a `cargo
+# build`/`cargo rustc` invoked *from inside* `crates/compiler/build.rs`
+# (itself running under an outer `cargo build` of the very same
+# workspace) would contend for that workspace's own `target/` directory
+# lock — the outer build already holds it and is waiting on this build
+# script to finish, so a nested `cargo` call sharing that lock would
+# deadlock, not merely run slowly. An entirely separate workspace, built
+# into its own private `--target-dir` under `OUT_DIR`, has no lock in
+# common with the outer build at all.
+[workspace]
+
+[package]
+name = "nirdosha-runtime-kernels"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# Also linked as a plain Rust `staticlib`, same as before this crate
+# existed — `crate-type` is a `[lib]` setting either way; nothing about
+# switching from a bare `rustc` invocation to `cargo` changes what kind
+# of artifact comes out.
+crate-type = ["staticlib"]
+
+[dependencies]
+# The actual point of this whole crate split (rfcs/0005-plugin-boundary-
+# safety-and-performance.md's own Dec128 finding: the old bare-`rustc`
+# build had zero Cargo dependency resolution, so `rust_decimal` — already
+# a real `nirdosha` lib dependency, used by `interpreter.rs::Value::Dec128`
+# — was unreachable from here). `Decimal::serialize()`/`deserialize()`
+# (stable, public, `#[doc]`-covered API, not an internal-layout
+# assumption) round-trip a `Decimal` through a fixed `[u8; 16]` — the
+# ABI boundary every `nir_dec128_*` kernel below actually crosses, on
+# purpose, instead of relying on the `c-repr`/`align16` feature flags'
+# internal struct layout.
+rust_decimal = "1"
+
+[profile.release]
+# Every kernel in this crate is called from a `nirdosha build` binary
+# that has no Rust panic/unwind runtime of its own linked in (the
+# generated `.ll`'s own convention, `codegen.rs`'s module doc) — a panic
+# reaching this crate's own ABI boundary with unwinding enabled would be
+# undefined behavior across that `extern "C"` edge, not a clean abort.
+# Matches the old bare-`rustc` invocation's `-C panic=abort` exactly.
+panic = "abort"

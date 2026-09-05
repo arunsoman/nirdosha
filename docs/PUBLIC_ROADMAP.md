@@ -105,10 +105,10 @@ critical apps on the interpreted path)
   upstream incompatibility); revisit once a fixed `z3`/`z3-src` release
   ships
 
-**Track B — Full compilation** (`db`/`json`/`http`/`mq`/identity/
-`transact`/concurrency/sandboxing remain interpreter-only; native
-codegen covers the numeric/control-flow subset, `tcp`/`tcp_listener`,
-and, as of this pass, `file` and scalar-only native plugin calls)
+**Track B — Full compilation** (`json`/`http`/`mq`/identity/`transact`/
+concurrency/sandboxing remain interpreter-only; native codegen covers
+the numeric/control-flow subset, `tcp`/`tcp_listener`, and, as of this
+pass, `file`, scalar-only native plugin calls, and `dec128` arithmetic)
 - [DONE] `file` (`open`/`send`/`recv`/`stop`) — linked `nir_file_*`
   kernels, the same "declare + link a staticlib" pattern `tcp` already
   used; `examples/file_io.nir` compiles and runs as a native binary
@@ -119,6 +119,18 @@ and, as of this pass, `file` and scalar-only native plugin calls)
   (`rfcs/0005-plugin-boundary-safety-and-performance.md` §3), ~250x
   faster than interpreted plugin dispatch for this subset; `str`/
   aggregate-typed plugin builtins still interpreter-only
+- [DONE] The compiled-path runtime kernels (`det`/`inv`/`tcp`/`file`/...)
+  moved from a bare, dependency-free `rustc` invocation to a real Cargo
+  package (`crates/runtime-kernels/`, `docs/adr/0003-runtime-kernels-
+  cargo-dependency.md`) that can depend on crates.io crates — the
+  actual, previously-invisible reason `dec128` stayed interpreter-only
+  this long: `rust_decimal` was simply unreachable from the old build.
+- [PARTIAL] `dec128` — `dec_from_i64`/`dec_to_str`/`+`/`-`/`*`/`/`
+  compile to real `rust_decimal`-backed native code (`nir_dec128_*`
+  kernels), verified against the interpreter byte for byte, including
+  the division-by-zero trap. `dec_from_str`/`dec_round`/`dec_scale` and
+  all six comparisons aren't wired into codegen yet — cleanly rejected
+  (`codegen.rs` tests), not silently wrong, in the meantime.
 - [OPEN] `transact` → `db`/`json` → `mq` → identity → `http`/`https` →
   concurrency/sandboxing → first-class functions → compiled `serve` mode,
   roughly in that order. `db`/`json`/`mq` share `file`'s "linked

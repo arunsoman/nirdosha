@@ -113,7 +113,7 @@ pub(crate) fn effect_map(plugins: &[PluginBuiltin]) -> std::collections::HashMap
 /// `nir_str_eq` (Phase 5's "linked native call into a staticlib"
 /// pattern, `emit_llvm_ir`'s preamble) already work — this generalizes
 /// that mechanism to a third-party-provided symbol/library instead of
-/// only `runtime_kernels.rs`'s own.
+/// only `runtime-kernels/src/lib.rs`'s own.
 ///
 /// Deliberately **not** a field on `PluginBuiltin` (which stays exactly
 /// as it was): a native-callable builtin is a *stricter* subset (no

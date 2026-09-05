@@ -10,18 +10,33 @@
 //! compiled code costs exactly what inlined IR would; this is an
 //! implementation-risk choice, not a performance one.
 //!
-//! **This file is compiled as its own freestanding crate** by
-//! `crates/compiler/build.rs` (a direct `rustc --crate-type staticlib`
-//! invocation, not part of the `nirdosha` lib's own crate graph — see
-//! that file for why), so it cannot `use` anything from `interpreter.rs`
-//! across that compilation-unit boundary. Every algorithm here is
-//! therefore a deliberate line-for-line mirror of the corresponding
-//! `&[f64]`-taking function in `interpreter.rs` (`matrix_det`/
-//! `matrix_inv`/`matrix_solve`/`matrix_rank`/`kf_update`/`mat_mul_f64`/
+//! **This crate is its own, separate Cargo workspace** (`Cargo.toml`'s
+//! own doc comment), built by `crates/compiler/build.rs` via `cargo
+//! rustc` into a `.a` at `nirdosha`'s own build time — not part of the
+//! `nirdosha` lib's own crate graph, so it still cannot `use` anything
+//! from `interpreter.rs` directly across that compilation-unit
+//! boundary. Every Vector/Matrix algorithm here is therefore a
+//! deliberate line-for-line mirror of the corresponding `&[f64]`-taking
+//! function in `interpreter.rs` (`matrix_det`/`matrix_inv`/
+//! `matrix_solve`/`matrix_rank`/`kf_update`/`mat_mul_f64`/
 //! `mat_vec_mul_f64`/`mat_transpose_f64`/`vec_add_f64`/`vec_sub_f64`) —
 //! if you change the algorithm in one place, change it in the other, and
 //! `crates/compiler/tests/codegen.rs`'s interpreter-parity tests will catch a
 //! divergence immediately if you forget.
+//!
+//! **Unlike before, this crate is a genuine Cargo package with real
+//! dependencies** (`Cargo.toml`'s `[dependencies]` — `rust_decimal`,
+//! used by this file's `nir_dec128_*` kernels): the old bare-`rustc`
+//! invocation had no dependency resolution at all, which is exactly
+//! why `Ty::Dec128` stayed interpreter-only long after `tcp`/`file`
+//! were compiled — `rust_decimal` simply wasn't reachable from a
+//! dependency-free `rustc` call. `cargo rustc`, not `cargo build`, is
+//! what `build.rs` actually invokes: it both compiles this crate *and*
+//! forwards `--print=native-static-libs` to the one real `rustc`
+//! invocation that produces the final artifact, in a single command —
+//! the same two facts the old bare-`rustc` call captured together, now
+//! captured through Cargo's own dependency-resolved build instead of
+//! around it.
 #![allow(clippy::missing_safety_doc)]
 
 const SINGULAR_EPSILON: f64 = 1e-10;
@@ -989,4 +1004,139 @@ pub unsafe extern "C" fn nir_free(ptr: *mut u8) {
             .expect("matches the layout nir_alloc used to allocate this same pointer");
         std::alloc::dealloc(base, layout);
     }
+}
+
+// ---- dec128 kernels ---------------------------------------------------
+//
+// The actual point of this crate's split into a real Cargo package
+// (`Cargo.toml`'s own doc comment): `rust_decimal::Decimal` is a real
+// dependency here, reachable for the first time. `Ty::Dec128` stays a
+// plain two-word *value* (not an aggregate — `ast::Ty::is_aggregate()`
+// deliberately excludes it, since `transact_log.rs`'s slot-eligibility
+// check already depends on `dec128` being a plain scalar it can
+// serialize directly), so every kernel here takes/returns `Dec128Bits`
+// by value — a `#[repr(C)]` two-`u64` struct, the same "return in two
+// registers" ABI shape `codegen.rs` already relies on for `str`'s own
+// `{ptr, i64}` value (LLVM `{i64, i64}` on the caller side; see
+// `codegen.rs`'s own `Ty::Dec128` doc comment for the exact LLVM type
+// string this pairs with).
+//
+// `Decimal::serialize()`/`deserialize()` (stable, public API, not an
+// internal-layout assumption -- `Cargo.toml`'s own doc comment) is the
+// actual boundary every kernel crosses: `Dec128Bits`'s two `u64`s are
+// exactly that 16-byte buffer, split at the midpoint, little-endian
+// (matching `serialize()`'s own byte order).
+use rust_decimal::Decimal;
+
+#[repr(C)]
+pub struct Dec128Bits {
+    pub lo: u64,
+    pub hi: u64,
+}
+
+fn bits_to_decimal(bits: Dec128Bits) -> Decimal {
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&bits.lo.to_le_bytes());
+    bytes[8..16].copy_from_slice(&bits.hi.to_le_bytes());
+    Decimal::deserialize(bytes)
+}
+
+fn decimal_to_bits(d: Decimal) -> Dec128Bits {
+    let bytes = d.serialize();
+    let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    Dec128Bits { lo, hi }
+}
+
+/// `dec_from_i64(v, scale)` — matches `interpreter.rs`'s own
+/// `dec_from_i64` arm exactly, `Decimal::new`'s own call included:
+/// `Decimal::new` panics past `scale > 28` (the representation's own
+/// limit — `docs/LANGUAGE.md` §5), which is exactly the right behavior
+/// here too, unchanged, since this crate's own `panic = "abort"`
+/// profile (`Cargo.toml`) turns that panic into a clean process abort
+/// at the FFI boundary rather than an unwind — the same "checker can't
+/// see this coming, so trap at runtime" treatment every other Tier-2
+/// guard in this codebase already gets.
+#[unsafe(no_mangle)]
+pub extern "C" fn nir_dec128_from_i64(value: i64, scale: u32) -> Dec128Bits {
+    decimal_to_bits(Decimal::new(value, scale))
+}
+
+/// `dec_to_str(d)` — writes `d`'s canonical `Display` string into the
+/// caller-provided `out_ptr`/`out_cap` buffer, same "fixed buffer,
+/// return actual length" convention `nir_tcp_recv`/`nir_file_read`
+/// already use for a variable-length result. A `dec128`'s longest
+/// possible representation (a sign, up to 29 decimal digits for the
+/// 96-bit mantissa, one decimal point) is well under 64 bytes —
+/// `codegen.rs` allocates exactly that; `-1` here (never expected in
+/// practice, kept as a real, checked failure mode rather than an
+/// assumed-safe `unwrap`) means the caller's buffer was too small.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nir_dec128_to_str(value: Dec128Bits, out_ptr: *mut u8, out_cap: i64) -> i64 {
+    let d = bits_to_decimal(value);
+    let s = d.to_string();
+    let bytes = s.as_bytes();
+    if bytes.len() as i64 > out_cap {
+        return -1;
+    }
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_ptr, bytes.len()) };
+    bytes.len() as i64
+}
+
+/// `dec_from_str(s)` — matches `interpreter.rs`'s `Decimal::from_str`
+/// call exactly. Returns `Dec128Bits` by value plus an `i32` success
+/// flag (`1` ok, `0` malformed) via `ok_ptr`, the same "packed result,
+/// no `Result` type at this ABI layer" shape `nir_inv`/`nir_solve`
+/// already use for their own fallible linear-algebra kernels.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nir_dec128_from_str(s_ptr: *const u8, s_len: i64, ok_ptr: *mut i32) -> Dec128Bits {
+    use std::str::FromStr;
+    let bytes = unsafe { std::slice::from_raw_parts(s_ptr, s_len as usize) };
+    let parsed = std::str::from_utf8(bytes).ok().and_then(|s| Decimal::from_str(s).ok());
+    match parsed {
+        Some(d) => {
+            unsafe { *ok_ptr = 1 };
+            decimal_to_bits(d)
+        }
+        None => {
+            unsafe { *ok_ptr = 0 };
+            decimal_to_bits(Decimal::ZERO)
+        }
+    }
+}
+
+/// `a + b` — matches `interpreter.rs`'s `scalar_binop` `Dec128` arm:
+/// `x + y` via `rust_decimal`'s own `Add` impl, which panics on genuine
+/// overflow (the 96-bit mantissa's own limit) -- same abort-at-the-FFI-
+/// boundary reasoning as `nir_dec128_from_i64`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nir_dec128_add(a: Dec128Bits, b: Dec128Bits) -> Dec128Bits {
+    decimal_to_bits(bits_to_decimal(a) + bits_to_decimal(b))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nir_dec128_sub(a: Dec128Bits, b: Dec128Bits) -> Dec128Bits {
+    decimal_to_bits(bits_to_decimal(a) - bits_to_decimal(b))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nir_dec128_mul(a: Dec128Bits, b: Dec128Bits) -> Dec128Bits {
+    decimal_to_bits(bits_to_decimal(a) * bits_to_decimal(b))
+}
+
+/// `a / b` — matches `interpreter.rs`'s own `Div`/`ElemDiv` arm: a zero
+/// divisor is `ErrorKind::DivByZero` there (a real, catchable Nirdosha
+/// `RuntimeError`, not a Rust panic) — the compiled path has no
+/// equivalent catchable-error channel (same category as integer
+/// division's own Tier-2 div-by-zero guard, which `codegen.rs` compiles
+/// to an unconditional `abort()`, never a language-visible `Result`),
+/// so this traps too, via a genuine Rust panic (`panic = "abort"` turns
+/// it into exactly that `abort()`), for the same reason.
+#[unsafe(no_mangle)]
+pub extern "C" fn nir_dec128_div(a: Dec128Bits, b: Dec128Bits) -> Dec128Bits {
+    let (a, b) = (bits_to_decimal(a), bits_to_decimal(b));
+    if b.is_zero() {
+        std::process::abort();
+    }
+    decimal_to_bits(a / b)
 }

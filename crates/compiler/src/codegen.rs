@@ -150,13 +150,13 @@ const PHASE4_BUILTINS: &[&str] = &[
 
 /// Phase 5's builtins — genuine data-dependent control flow (partial-pivot
 /// row selection), so these go through a linked native `call` into
-/// `runtime_kernels.rs`'s staticlib (see `call_builtin_scalar`/
+/// `runtime-kernels/src/lib.rs`'s staticlib (see `call_builtin_scalar`/
 /// `call_builtin_agg`'s dispatch and `build()`'s embedded-lib linking)
 /// rather than unrolled IR the way every `PHASE4_BUILTINS` name is.
 const PHASE5_BUILTINS: &[&str] = &["det", "inv", "solve", "rank", "kf_update_state", "kf_update_cov"];
 
 /// `sha256_hex`/`constant_time_str_eq` — also linked native calls into
-/// `runtime_kernels.rs` (a from-scratch SHA-256, since that file has no
+/// `runtime-kernels/src/lib.rs` (a from-scratch SHA-256, since that file has no
 /// access to the `sha2` crate `interpreter.rs` uses — its own module doc
 /// explains why), but kept as their own list rather than folded into
 /// `PHASE5_BUILTINS`: that list's whole documented reason is "genuine
@@ -170,13 +170,28 @@ const PHASE5_BUILTINS: &[&str] = &["det", "inv", "solve", "rank", "kf_update_sta
 const STR_CRYPTO_BUILTINS: &[&str] = &["sha256_hex", "constant_time_str_eq"];
 
 /// `rand_seed`/`rand_f64`/`rand_gaussian` — a process-wide SplitMix64/
-/// Box-Muller stream in `runtime_kernels.rs` (its own module doc on why
+/// Box-Muller stream in `runtime-kernels/src/lib.rs` (its own module doc on why
 /// this needed real RNG *state* in generated code, the one thing that
 /// was actually missing before — the algorithm itself is a small, pure
 /// function, same class as `sha256_hex`). Its own list, not folded into
 /// `STR_CRYPTO_BUILTINS`, for the same "describes something different"
 /// reason that one isn't folded into `PHASE5_BUILTINS`.
 const RAND_BUILTINS: &[&str] = &["rand_seed", "rand_f64", "rand_gaussian"];
+
+/// `dec_from_i64`/`dec_to_str` — linked calls into `runtime-kernels/src/lib.rs`'s
+/// `rust_decimal`-backed kernels (rfcs/0005-plugin-boundary-safety-and-
+/// performance.md's own build-architecture-change finding: `dec128` was
+/// interpreter-only specifically because the old bare-`rustc` kernel
+/// build had no way to reach `rust_decimal` at all). Own list, not
+/// folded into `STR_CRYPTO_BUILTINS`/`RAND_BUILTINS`, for the same
+/// "describes something different" reason those two aren't folded into
+/// each other. **Not yet included**: `dec_from_str`/`dec_round`/
+/// `dec_scale` — the kernels exist (`nir_dec128_from_str`, `Decimal`'s
+/// own `round_dp_with_strategy`/scale accessor not yet wrapped), but
+/// wiring their codegen call sites is real follow-up work, not done in
+/// this pass; a program calling any of them is still cleanly rejected
+/// here, same as before.
+const DEC128_BUILTINS: &[&str] = &["dec_from_i64", "dec_to_str"];
 
 /// WGS84 ellipsoid constants — mirrors `interpreter.rs`'s own
 /// `WGS84_A`/`WGS84_F`/`wgs84_e2()` exactly (same values, same derived
@@ -327,12 +342,20 @@ fn llvm_ty(ty: &Ty, registry: &TypeRegistry) -> Result<String, CodegenError> {
             "codegen doesn't support `sandbox` yet — sandbox/stop are interpreter-only for now",
         ),
         // A file descriptor/handle, exactly like `Ty::Tcp`/`Ty::TcpListener`
-        // above — `nir_file_*` (`runtime_kernels.rs`) is the linked-kernel
+        // above — `nir_file_*` (`runtime-kernels/src/lib.rs`) is the linked-kernel
         // backend `open`/`send`/`recv`/`stop` on a `file` compile to.
         Ty::File => Ok("i64".to_string()),
-        Ty::Dec128 => unsupported(
-            "codegen doesn't support `dec128` yet — decimal arithmetic is interpreter-only for now (docs/LANGUAGE.md §6c/§6d)",
-        ),
+        // A plain two-word value, matching `rust_decimal::Decimal::
+        // serialize()`'s own 16-byte, little-endian round trip
+        // (`runtime-kernels/src/lib.rs`'s `Dec128Bits`) split at the
+        // midpoint. Not an aggregate (`Ty::is_aggregate()` deliberately
+        // excludes `Dec128` — `transact_log.rs`'s own slot-eligibility
+        // check already depends on that), so `dec128` values pass/return
+        // through `expr()`/`call_args`/`call()`'s ordinary *value* paths
+        // exactly the way `Ty::Str`'s own `{ptr, i64}` two-word value
+        // already does, never through the pointer-based aggregate path
+        // Vector/Matrix use.
+        Ty::Dec128 => Ok("{i64, i64}".to_string()),
         Ty::Json => unsupported("codegen doesn't support `json` yet — JSON is interpreter-only for now"),
         Ty::Db => unsupported("codegen doesn't support `db` yet — DB connectivity is interpreter-only for now"),
         Ty::Handle(kind) => unsupported(&format!(
@@ -835,6 +858,7 @@ fn check_expr(e: &Expr, plugin_names: &std::collections::HashSet<String>, regist
                 && !PHASE5_BUILTINS.contains(&name.as_str())
                 && !STR_CRYPTO_BUILTINS.contains(&name.as_str())
                 && !RAND_BUILTINS.contains(&name.as_str())
+                && !DEC128_BUILTINS.contains(&name.as_str())
             {
                 // Every builtin not in `PHASE4_BUILTINS` (unrolled IR),
                 // `PHASE5_BUILTINS`/`STR_CRYPTO_BUILTINS` (linked runtime
@@ -937,7 +961,7 @@ fn check_expr(e: &Expr, plugin_names: &std::collections::HashSet<String>, regist
         }
         Expr::StopSandbox(inner, _) => check_expr(inner, plugin_names, registry),
         // `open(path, mode)` compiles now (`nir_file_open`,
-        // `runtime_kernels.rs`) — recurse into both operands the same as
+        // `runtime-kernels/src/lib.rs`) — recurse into both operands the same as
         // `Expr::Connect` below.
         Expr::Open(path, mode, _) => {
             check_expr(path, plugin_names, registry)?;
@@ -1228,7 +1252,7 @@ fn emit_llvm_ir_impl<'a>(
     writeln!(cg.out, "declare double @atan2(double, double)").unwrap();
     // Phase 5's data-dependent-control-flow builtins (`det`/`inv`/
     // `solve`/`rank`/`kf_update_state`/`kf_update_cov`) — linked native
-    // calls into `runtime_kernels.rs`'s staticlib (`build()` writes it
+    // calls into `runtime-kernels/src/lib.rs`'s staticlib (`build()` writes it
     // out and links it alongside this `.ll`) rather than hand-emitted
     // branchy IR for partial-pivot selection. `i32` return, not `i1`:
     // Rust's `extern "C" fn -> bool` ABI representation isn't guaranteed
@@ -1263,11 +1287,20 @@ fn emit_llvm_ir_impl<'a>(
     writeln!(cg.out, "declare i64 @nir_tcp_recv(i64, ptr, i64)").unwrap();
     writeln!(cg.out, "declare i32 @nir_tcp_stop(i64)").unwrap();
     // `file`'s kernels — `open`/`send`/`recv`/`stop`, same shape as the
-    // `tcp` kernels just above (`runtime_kernels.rs`'s own "file" section).
+    // `tcp` kernels just above (`runtime-kernels/src/lib.rs`'s own "file" section).
     writeln!(cg.out, "declare i64 @nir_file_open(ptr, i64, ptr, i64)").unwrap();
     writeln!(cg.out, "declare i64 @nir_file_write(i64, ptr, i64)").unwrap();
     writeln!(cg.out, "declare i64 @nir_file_read(i64, ptr, i64)").unwrap();
     writeln!(cg.out, "declare i32 @nir_file_stop(i64)").unwrap();
+    // `dec128`'s kernels (`runtime-kernels/src/lib.rs`'s "dec128 kernels"
+    // section) — `{i64, i64}` by value everywhere, matching `llvm_ty`'s
+    // own `Ty::Dec128` arm exactly.
+    writeln!(cg.out, "declare {{i64, i64}} @nir_dec128_from_i64(i64, i32)").unwrap();
+    writeln!(cg.out, "declare i64 @nir_dec128_to_str({{i64, i64}}, ptr, i64)").unwrap();
+    writeln!(cg.out, "declare {{i64, i64}} @nir_dec128_add({{i64, i64}}, {{i64, i64}})").unwrap();
+    writeln!(cg.out, "declare {{i64, i64}} @nir_dec128_sub({{i64, i64}}, {{i64, i64}})").unwrap();
+    writeln!(cg.out, "declare {{i64, i64}} @nir_dec128_mul({{i64, i64}}, {{i64, i64}})").unwrap();
+    writeln!(cg.out, "declare {{i64, i64}} @nir_dec128_div({{i64, i64}}, {{i64, i64}})").unwrap();
     // `box`'s heap allocator — see `Expr::Box`'s doc comment for why
     // `nir_free` isn't called anywhere yet (this phase deliberately
     // leaks; a later phase wires the calls once ownership.rs's move data
@@ -1300,7 +1333,7 @@ fn emit_llvm_ir_impl<'a>(
     // Native plugin builtins (rfcs/0005 §3): one `declare` per symbol,
     // the same "linked native call into a staticlib" shape as
     // `nir_det`/`nir_rank`/etc. above, just for a third-party-supplied
-    // symbol/library instead of `runtime_kernels.rs`'s own. `validate()`
+    // symbol/library instead of `runtime-kernels/src/lib.rs`'s own. `validate()`
     // (called by `emit_llvm_ir_with_native_plugins` before this ever
     // runs) already proved every param/ret is a plain scalar `llvm_ty`
     // knows how to render.
@@ -2012,6 +2045,8 @@ impl Codegen<'_> {
             Expr::Call(name, _, _) if name == "constant_time_str_eq" => Ty::Bool,
             Expr::Call(name, _, _) if name == "rand_f64" || name == "rand_gaussian" => Ty::F64,
             Expr::Call(name, _, _) if name == "rand_seed" => Ty::Unit,
+            Expr::Call(name, _, _) if name == "dec_from_i64" => Ty::Dec128,
+            Expr::Call(name, _, _) if name == "dec_to_str" => Ty::Str,
             // Row 11: a struct/variant constructor call produces a
             // `Ty::Named` value (the struct's own type, or the owning
             // enum's), not the `Ty::I64` the `self.sigs.get` fallback
@@ -2585,7 +2620,7 @@ impl Codegen<'_> {
             }
             // `open(path, mode)` — `path`/`mode` are both `str`, matching
             // `nir_file_open`'s `{ptr, len}` x2 signature exactly
-            // (`runtime_kernels.rs`). `-1` (bad mode string, or a real
+            // (`runtime-kernels/src/lib.rs`). `-1` (bad mode string, or a real
             // I/O failure `interpreter.rs`'s own `Expr::Open` would
             // return as `Err`) traps via `guard_io_ok`, the same
             // "checker can't see this coming, so trap at runtime"
@@ -2980,7 +3015,7 @@ impl Codegen<'_> {
             return Ok("0".to_string()); // print's own "value" is unit; never read
         }
         // `sha256_hex`/`constant_time_str_eq` — linked calls into
-        // `runtime_kernels.rs`'s from-scratch SHA-256 (`STR_CRYPTO_BUILTINS`'
+        // `runtime-kernels/src/lib.rs`'s from-scratch SHA-256 (`STR_CRYPTO_BUILTINS`'
         // doc comment on why these two don't go through
         // `call_builtin_scalar`/`call_builtin_agg` like `PHASE4`/
         // `PHASE5_BUILTINS` do).
@@ -3061,6 +3096,51 @@ impl Codegen<'_> {
             let r = self.fresh_reg("rand_gaussian");
             writeln!(self.out, "  {r} = call double @nir_rand_gaussian(double {mean}, double {stddev})").unwrap();
             return Ok(r);
+        }
+        // `dec_from_i64`/`dec_to_str` — linked calls into
+        // `runtime-kernels/src/lib.rs`'s `rust_decimal`-backed kernels
+        // (`DEC128_BUILTINS`' own doc comment). `dec128`'s LLVM shape is
+        // the plain two-word value `{i64, i64}` (`llvm_ty`'s `Ty::Dec128`
+        // arm) -- passed/returned by value here exactly like `Ty::Str`'s
+        // own `{ptr, i64}` already is, never through a pointer.
+        if name == "dec_from_i64" {
+            // Every integer-typed `expr()` result is already `i64`
+            // (module doc) regardless of the argument's own declared
+            // width -- `scale`'s declared `u32` narrows the same way
+            // `rand_seed`'s argument already does, no extra handling
+            // needed beyond the narrow itself.
+            let value = self.expr(&args[0], scopes)?;
+            let scale64 = self.expr(&args[1], scopes)?;
+            let scale32 = self.narrow_from_i64(&scale64, &Ty::U32)?;
+            let r = self.fresh_reg("dec_from_i64");
+            writeln!(self.out, "  {r} = call {{i64, i64}} @nir_dec128_from_i64(i64 {value}, i32 {scale32})").unwrap();
+            return Ok(r);
+        }
+        if name == "dec_to_str" {
+            let d = self.expr(&args[0], scopes)?;
+            // 64 bytes, always -- `runtime-kernels/src/lib.rs`'s own
+            // `nir_dec128_to_str` doc comment: a dec128's longest
+            // possible `Display` string is well under this. Heap-
+            // allocated and never freed, same as `sha256_hex`'s own
+            // output buffer above, for the identical reason (`Ty::Str`
+            // isn't affine, so there's no scope-closing point to hook a
+            // matching `nir_free` onto).
+            let out_ptr = self.fresh_reg("dec_to_str_out");
+            writeln!(self.out, "  {out_ptr} = call ptr @nir_alloc(i64 64)").unwrap();
+            let len = self.fresh_reg("dec_to_str_len");
+            writeln!(self.out, "  {len} = call i64 @nir_dec128_to_str({{i64, i64}} {d}, ptr {out_ptr}, i64 64)").unwrap();
+            // `nir_dec128_to_str` only ever returns `-1` if the 64-byte
+            // buffer was too small, which the kernel's own doc comment
+            // already argues never happens in practice -- `guard_io_ok`
+            // (traps only on negative) is the honest backstop for that
+            // "shouldn't happen but stay checked" case, same posture
+            // every other linked kernel's unexpected-failure path gets.
+            self.guard_io_ok(&len);
+            let partial = self.fresh_reg("dec_to_str_partial");
+            writeln!(self.out, "  {partial} = insertvalue {{ptr, i64}} undef, ptr {out_ptr}, 0").unwrap();
+            let result = self.fresh_reg("dec_to_str_result");
+            writeln!(self.out, "  {result} = insertvalue {{ptr, i64}} {partial}, i64 {len}, 1").unwrap();
+            return Ok(result);
         }
         if PHASE4_BUILTINS.contains(&name) || name == "det" || name == "rank" {
             return self.call_builtin_scalar(name, args, scopes);
@@ -3346,7 +3426,7 @@ impl Codegen<'_> {
             }
             // Phase 5: genuine data-dependent control flow (partial-pivot
             // row selection) — a linked native `call` into
-            // `runtime_kernels.rs`'s staticlib instead of unrolled IR
+            // `runtime-kernels/src/lib.rs`'s staticlib instead of unrolled IR
             // (module doc's `PHASE5_BUILTINS` note, and `build()`'s
             // embedded-lib linking). Neither is fallible: `det` returns
             // `0.0` for a singular matrix (a real, legitimate answer,
@@ -4041,6 +4121,36 @@ impl Codegen<'_> {
             }
         }
 
+        // `dec128` arithmetic — linked calls into `runtime-kernels/src/lib.rs`'s
+        // `rust_decimal`-backed kernels (`DEC128_BUILTINS`'s doc comment
+        // covers the builtin-call half; this is the operator half).
+        // Checked before the `is_float` dispatch below, which assumes a
+        // bare scalar `i64`/`double` SSA value on both sides, not a
+        // `{i64, i64}` struct. Comparisons aren't wired yet (no
+        // `nir_dec128_cmp` kernel exists) — a clean, named rejection
+        // here rather than silently running dec128's raw bit pattern
+        // through `icmp`/`fcmp`, which would be wrong, not just
+        // unsupported.
+        if self.local_ty_of(lhs, scopes) == Ty::Dec128 {
+            let l = self.expr(lhs, scopes)?;
+            let r = self.expr(rhs, scopes)?;
+            let kernel = match op {
+                BinOp::Add => "nir_dec128_add",
+                BinOp::Sub => "nir_dec128_sub",
+                BinOp::Mul | BinOp::ElemMul => "nir_dec128_mul",
+                BinOp::Div | BinOp::ElemDiv => "nir_dec128_div",
+                _ => {
+                    return unsupported(format!(
+                        "codegen doesn't support `{op:?}` on `dec128` operands yet — only +, -, *, / are wired \
+                         (comparisons are interpreter-only for now)"
+                    ));
+                }
+            };
+            let out = self.fresh_reg("dec128_binop");
+            writeln!(self.out, "  {out} = call {{i64, i64}} @{kernel}({{i64, i64}} {l}, {{i64, i64}} {r})").unwrap();
+            return Ok(out);
+        }
+
         // Arithmetic and ordering comparisons only ever apply to numeric
         // operands (typeck.rs's `unify_operands` rejects `bool` for all
         // of these except `==`/`!=`) — every arm below except Eq/NotEq
@@ -4570,7 +4680,7 @@ impl Codegen<'_> {
     }
 
     /// `str`'s `==`/`!=` — a linked call into `nir_str_eq` (length check +
-    /// byte compare, `runtime_kernels.rs`), the same "reuse proven Rust
+    /// byte compare, `runtime-kernels/src/lib.rs`), the same "reuse proven Rust
     /// code via a call" choice as `det`/`inv`/etc., not hand-emitted IR.
     /// `binary()`'s `Eq`/`NotEq` intercept routes here before the
     /// `is_float` dispatch that assumes a scalar operand.
@@ -5517,12 +5627,14 @@ impl OptLevel {
     }
 }
 
-/// The `det`/`inv`/`solve`/`rank`/`kf_update_state`/`kf_update_cov`
-/// kernels, compiled once at `nirdosha`'s own build time by `build.rs`
-/// from `src/runtime_kernels.rs` and embedded here — `build()` writes
-/// this out alongside the generated `.ll` file and links it in, so every
-/// native binary `nirdosha build` produces carries its own copy, with no
-/// runtime dependency on this compiler's installation.
+/// The `det`/`inv`/`solve`/`rank`/`kf_update_state`/`kf_update_cov`/
+/// `tcp`/`file`/`dec128` kernels, built once at `nirdosha`'s own build
+/// time by `build.rs` (`cargo rustc` against `../runtime-kernels`, its
+/// own real Cargo package — see that crate's and `build.rs`'s own doc
+/// comments) and embedded here — `build()` writes this out alongside
+/// the generated `.ll` file and links it in, so every native binary
+/// `nirdosha build` produces carries its own copy, with no runtime
+/// dependency on this compiler's installation.
 static RUNTIME_KERNELS_LIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libnirdosha_runtime.a"));
 
 /// The OS-level system libraries `RUNTIME_KERNELS_LIB`'s own code (now
