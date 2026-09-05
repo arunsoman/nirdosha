@@ -2,6 +2,12 @@
 name = "nirdosha"
 version = "0.1.0"
 edition = "2024"
+description = "A systems language designed for LLMs to write: an LL(1) grammar constrained-decodable to GBNF, no GC/data races/deadlocks/overflow, OS-process sandboxing as a language primitive."
+license = "MIT"
+repository = "https://github.com/kannamma-labs/nirdosha"
+homepage = "https://github.com/kannamma-labs/nirdosha"
+keywords = ["compiler", "llm", "ai-agents", "language", "sandboxing"]
+categories = ["compilers", "command-line-utilities"]
 
 [dependencies]
 z3 = "0.20.2"
