@@ -233,6 +233,7 @@ fn start_production_server(mock_idp_port: u16) -> u16 {
             None,
             false,
             Some(sso),
+            &[],
         )
         .expect("serve::run should not fail to bind");
     });

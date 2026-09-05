@@ -1,0 +1,9 @@
+// Talks to the ActiveMQ container docker-compose.yml (crates/plugin-examples/)
+// starts, STOMP on 61613, default admin/admin credentials.
+fn main() {
+    let h: i64 = activemq_connect("stomp://admin:admin@127.0.0.1:61613")
+    activemq_send(h, "nirdosha-demo", "hello from nirdosha")
+    let msg: str = activemq_receive(h, "nirdosha-demo", 5000)
+    print(msg)
+    activemq_close(h)
+}

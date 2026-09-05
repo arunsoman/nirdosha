@@ -1,0 +1,17 @@
+[package]
+name = "nirdosha-plugin-support"
+version = "0.1.0"
+edition = "2024"
+description = "Reusable helpers (Track C of the plugin-ecosystem plan) for Kind-A Nirdosha plugins that hold a stateful, possibly async-backed resource -- a database session, a message-queue connection, anything a plugin author would otherwise hand-roll a global OnceLock/HashMap for."
+
+# Deliberately its own crate, NOT folded into `nirdosha` itself
+# (crates/compiler): a plugin that never touches an async client (like
+# rot13) shouldn't pull in tokio at all, and a plugin author who *does*
+# need it depends on this crate the same ordinary way they depend on
+# `nirdosha` -- ergonomics, not a compiler feature.
+[dependencies]
+nirdosha = { path = "../compiler" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

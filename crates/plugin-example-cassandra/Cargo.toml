@@ -1,0 +1,21 @@
+[package]
+name = "nirdosha-plugin-cassandra"
+version = "0.1.0"
+edition = "2024"
+description = "Reference Kind-A Nirdosha plugin: Cassandra connectivity (cassandra_connect/query/execute/close), via the async `scylla` driver (CQL-compatible with real Apache Cassandra) bridged through nirdosha-plugin-support's shared Tokio runtime. Track F of the plugin-ecosystem plan -- the first plugin in this gallery that's actually async-backed."
+
+[package.metadata.nirdosha]
+kind = "native"
+nirdosha_schema = "1"
+builtins = [
+    { name = "cassandra_connect", params = ["str"], ret = "i64" },
+    { name = "cassandra_query", params = ["i64", "str"], ret = "str" },
+    { name = "cassandra_execute", params = ["i64", "str"], ret = "i64" },
+    { name = "cassandra_close", params = ["i64"], ret = "i64" },
+]
+
+[dependencies]
+nirdosha = { path = "../compiler" }
+nirdosha-plugin-support = { path = "../plugin-support" }
+scylla = "1"
+serde_json = "1"

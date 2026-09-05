@@ -1071,7 +1071,7 @@ pub struct Checker<'a> {
 /// rejects. Requires a zero-arg `fn main()` — the entrypoint every
 /// `run`/`build`/`emit-llvm` caller is about to execute.
 pub fn typecheck(program: &Program) -> Result<(), Vec<TypeError>> {
-    typecheck_impl(program, true, &HashMap::new())
+    typecheck_impl(program, true, &HashMap::new(), &HashMap::new())
 }
 
 /// Same as `typecheck`, plus a plugin crate's declared builtin
@@ -1081,7 +1081,7 @@ pub fn typecheck(program: &Program) -> Result<(), Vec<TypeError>> {
 /// resolvable, right arity, right argument/return types, and unusable in
 /// a `spawn`/`transact` slot or as a `fn`/`struct`/variant name.
 pub fn typecheck_with_plugins(program: &Program, plugins: &[crate::plugin::PluginBuiltin]) -> Result<(), Vec<TypeError>> {
-    typecheck_impl(program, true, &crate::plugin::signatures(plugins))
+    typecheck_impl(program, true, &crate::plugin::signatures(plugins), &crate::plugin::effect_map(plugins))
 }
 
 /// Same checks as `typecheck`, but does not require a `fn main()`. For
@@ -1096,7 +1096,21 @@ pub fn typecheck_with_plugins(program: &Program, plugins: &[crate::plugin::Plugi
 /// `main`), so requiring one here would make every such program
 /// permanently unservable.
 pub fn typecheck_optional_main(program: &Program) -> Result<(), Vec<TypeError>> {
-    typecheck_impl(program, false, &HashMap::new())
+    typecheck_impl(program, false, &HashMap::new(), &HashMap::new())
+}
+
+/// Same relationship `typecheck_with_plugins` has to `typecheck` --
+/// `typecheck_optional_main`'s own plugin-aware sibling, for a
+/// plugin-aware `serve`/`emit-ui`/`--sandbox-worker`-shaped caller
+/// (Track B of the plugin-ecosystem plan). The one function this
+/// pattern was missing: `typecheck`/`typecheck_with_plugins`/
+/// `typecheck_optional_main` already existed as a matched trio; this
+/// completes the square.
+pub fn typecheck_optional_main_with_plugins(
+    program: &Program,
+    plugins: &[crate::plugin::PluginBuiltin],
+) -> Result<(), Vec<TypeError>> {
+    typecheck_impl(program, false, &crate::plugin::signatures(plugins), &crate::plugin::effect_map(plugins))
 }
 
 /// A non-fatal diagnostic — unlike `TypeError`, this never blocks
@@ -1309,6 +1323,7 @@ fn typecheck_impl(
     program: &Program,
     require_main: bool,
     plugins: &HashMap<String, (Vec<Ty>, Ty)>,
+    plugin_effects: &HashMap<String, crate::effects::EffectSet>,
 ) -> Result<(), Vec<TypeError>> {
     let registry = TypeRegistry::build(program);
     let mut c = Checker {
@@ -1500,7 +1515,7 @@ fn typecheck_impl(
     // on its RHS, say, would already be a different error above), so
     // there's nothing sound to check yet if that assumption doesn't hold.
     if c.errors.is_empty() {
-        let inferred = crate::effects::infer_effects(program, &c.registry);
+        let inferred = crate::effects::infer_effects_with_plugins(program, &c.registry, plugin_effects);
         for f in &program.fns {
             let Some(declared) = &f.declared_effects else { continue };
             let Some(fx) = inferred.get(&f.name) else { continue };

@@ -1,0 +1,9 @@
+// Talks to the Neo4j container docker-compose.yml (crates/plugin-examples/)
+// starts, Bolt on 7687, user neo4j / password nirdosha123.
+fn main() {
+    let h: i64 = neo4j_connect("127.0.0.1:7687", "neo4j", "nirdosha123")
+    neo4j_run(h, "CREATE (w:Widget {name: 'sprocket'})")
+    let rows: str = neo4j_run(h, "MATCH (w:Widget) RETURN w.name AS name")
+    print(rows)
+    neo4j_close(h)
+}

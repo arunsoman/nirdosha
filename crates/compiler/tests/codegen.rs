@@ -3298,3 +3298,65 @@ fn main_returning_a_struct_is_rejected_cleanly() {
         .expect_err("`main` returning a struct should be rejected (no sensible exit code)");
     assert!(err.to_string().contains("struct"), "got: {err}");
 }
+
+// ---- plugin builtins (rfcs/0003-plugin-abi-v2.md, Track B) -----------------
+//
+// Before `check_supported_with_plugins` existed, a plugin call passing
+// `typecheck_with_plugins` would fall straight through `check_expr`'s
+// `Expr::Call` arm (a plugin name matches neither `is_builtin` nor any
+// rejection list there) and proceed as if it were an ordinary,
+// codegen-supported call — reaching real `Codegen::call` with no
+// matching entry in either the builtin or user-fn tables, an untested
+// path rather than a clean, named rejection. This is a real gap Track
+// B's own plan called out explicitly: the moment `build`/`emit-llvm`
+// ever become plugin-aware, this is what would have to already work.
+
+#[test]
+fn a_plugin_builtin_call_is_cleanly_rejected_by_check_supported_with_plugins() {
+    let src = r#"
+        fn main() -> i64 {
+            return fake_plugin_call()
+        }
+    "#;
+    let toks = Lexer::new(src).tokenize().expect("lex should succeed");
+    let program = Parser::new(toks).parse_program().expect("parse should succeed");
+    let plugin = nirdosha::plugin::PluginBuiltin {
+        name: "fake_plugin_call".to_string(),
+        params: vec![],
+        ret: nirdosha::ast::Ty::I64,
+        effects: Default::default(),
+        call: std::sync::Arc::new(|_args, _span| Ok(nirdosha::interpreter::Value::Int(1))),
+    };
+    let plugins = [plugin];
+    nirdosha::typeck::typecheck_with_plugins(&program, &plugins).expect("a plugin call should typecheck cleanly");
+
+    let plugin_names: std::collections::HashSet<String> = plugins.iter().map(|p| p.name.clone()).collect();
+    let err = codegen::check_supported_with_plugins(&program, &plugin_names)
+        .expect_err("a plugin call must be cleanly rejected, not silently accepted or left to panic later");
+    assert!(
+        err.to_string().contains("plugin builtin `fake_plugin_call`"),
+        "expected a named, actionable rejection, got: {err}"
+    );
+}
+
+/// The un-plugin-aware `check_supported` (empty plugin set, same as
+/// every existing caller uses today) still accepts this program at the
+/// syntactic level -- it has no way to know `fake_plugin_call` is a
+/// plugin name rather than a typo'd/undeclared user function, and
+/// that's fine: `typecheck` alone (not `typecheck_with_plugins`) would
+/// already have rejected this program before codegen is ever reached
+/// in the real, un-plugin-aware pipeline `build`/`emit-llvm` use today.
+#[test]
+fn without_the_plugin_name_set_check_supported_has_no_opinion_about_an_unknown_call() {
+    let src = r#"
+        fn main() -> i64 {
+            return fake_plugin_call()
+        }
+    "#;
+    let toks = Lexer::new(src).tokenize().expect("lex should succeed");
+    let program = Parser::new(toks).parse_program().expect("parse should succeed");
+    assert!(
+        codegen::check_supported(&program).is_ok(),
+        "check_supported alone is purely syntactic -- it doesn't resolve names, typecheck does"
+    );
+}

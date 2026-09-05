@@ -986,6 +986,7 @@ fn cmd_serve(
         otel_token,
         demo_mode,
         sso,
+        &[],
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {

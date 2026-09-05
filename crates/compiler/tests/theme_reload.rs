@@ -52,6 +52,7 @@ fn start_server(theme_path: &std::path::Path) -> u16 {
         nirdosha::serve::run(
             program, "127.0.0.1", port, None, None, transact_log, workflow_log, None, None, Some(&theme),
             Some(&theme_path_owned), None, None, false, None,
+            &[],
         )
         .expect("serve::run should not fail to bind");
     });

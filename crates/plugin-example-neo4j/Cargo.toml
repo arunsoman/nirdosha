@@ -1,0 +1,20 @@
+[package]
+name = "nirdosha-plugin-neo4j"
+version = "0.1.0"
+edition = "2024"
+description = "Reference Kind-A Nirdosha plugin: Neo4j connectivity (neo4j_connect/run/close) via the async neo4rs driver (Bolt protocol), bridged through nirdosha-plugin-support's shared Tokio runtime -- same async-bridge pattern as nirdosha-plugin-cassandra, different domain (graph queries, not tabular). Track F of the plugin-ecosystem plan."
+
+[package.metadata.nirdosha]
+kind = "native"
+nirdosha_schema = "1"
+builtins = [
+    { name = "neo4j_connect", params = ["str", "str", "str"], ret = "i64" },
+    { name = "neo4j_run", params = ["i64", "str"], ret = "str" },
+    { name = "neo4j_close", params = ["i64"], ret = "i64" },
+]
+
+[dependencies]
+nirdosha = { path = "../compiler" }
+nirdosha-plugin-support = { path = "../plugin-support" }
+neo4rs = "0.8"
+serde_json = "1"

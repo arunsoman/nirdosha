@@ -86,13 +86,29 @@ pub fn run_with_tracer_transact_and_workflow_log(
     transact_log_path: Option<durability::LogTarget>,
     workflow_log_path: Option<durability::LogTarget>,
 ) -> Result<Value, String> {
+    run_with_tracer_transact_workflow_and_plugins(src, tracer, transact_log_path, workflow_log_path, &[])
+}
+
+/// Lex/parse then delegate to
+/// [`run_program_with_tracer_transact_workflow_and_plugins`] — the same
+/// relationship every other `run_with_tracer*` function above has to
+/// its `run_program_with_tracer*` counterpart. `run_with_plugins`
+/// (below) is now a one-line call into this instead of duplicating its
+/// own lex/parse/typecheck/ownership/contract-check pipeline.
+pub fn run_with_tracer_transact_workflow_and_plugins(
+    src: &str,
+    tracer: Option<std::sync::Arc<observability::Tracer>>,
+    transact_log_path: Option<durability::LogTarget>,
+    workflow_log_path: Option<durability::LogTarget>,
+    plugins: &[plugin::PluginBuiltin],
+) -> Result<Value, String> {
     let toks = Lexer::new(src)
         .tokenize()
         .map_err(|e| format!("lex error at {}:{}: {}", e.span.line, e.span.col, e.message))?;
     let program = Parser::new(toks)
         .parse_program()
         .map_err(|e| format!("parse error at {}:{}: {}", e.span.line, e.span.col, e.message))?;
-    run_program_with_tracer_transact_and_workflow_log(program, src, tracer, transact_log_path, workflow_log_path)
+    run_program_with_tracer_transact_workflow_and_plugins(program, src, tracer, transact_log_path, workflow_log_path, plugins)
 }
 
 /// Same pipeline as `run_with_tracer_transact_and_workflow_log`, but
@@ -113,7 +129,34 @@ pub fn run_program_with_tracer_transact_and_workflow_log(
     transact_log_path: Option<durability::LogTarget>,
     workflow_log_path: Option<durability::LogTarget>,
 ) -> Result<Value, String> {
-    if let Err(errors) = typeck::typecheck(&program) {
+    run_program_with_tracer_transact_workflow_and_plugins(program, src, tracer, transact_log_path, workflow_log_path, &[])
+}
+
+/// The fully generalized core every `run*`/`run_program*` entrypoint in
+/// this file ultimately delegates to (Track B of the plugin-ecosystem
+/// plan, rfcs/0003-plugin-abi-v2.md) — tracer + transact/workflow log +
+/// plugins, all at once, closing the disclosed gap `run_with_plugins`'s
+/// own doc comment used to name ("combining plugins with tracer/
+/// transact-log/workflow-log support is real future work"). Every
+/// existing public function above keeps its exact signature — this is
+/// additive only: `run_program_with_tracer_transact_and_workflow_log`
+/// (just above) is now a one-line call into this with `plugins: &[]`,
+/// and `run_with_plugins` (below) is the same, the other direction.
+/// `typeck::typecheck_with_plugins(&program, &[])` behaves identically
+/// to plain `typecheck::typecheck(&program)` (`plugin::signatures`/
+/// `effect_map` of an empty slice are both empty maps) — so unifying
+/// onto this one path changes nothing for any caller passing no
+/// plugins, verified by every existing test in this crate staying
+/// green through this refactor.
+pub fn run_program_with_tracer_transact_workflow_and_plugins(
+    program: ast::Program,
+    src: &str,
+    tracer: Option<std::sync::Arc<observability::Tracer>>,
+    transact_log_path: Option<durability::LogTarget>,
+    workflow_log_path: Option<durability::LogTarget>,
+    plugins: &[plugin::PluginBuiltin],
+) -> Result<Value, String> {
+    if let Err(errors) = typeck::typecheck_with_plugins(&program, plugins) {
         let joined = errors.iter().map(|e| format!("type error: {e}")).collect::<Vec<_>>().join("\n");
         return Err(joined);
     }
@@ -136,7 +179,7 @@ pub fn run_program_with_tracer_transact_and_workflow_log(
     if let Err(errors) = contract_check::check_program_contracts(&program) {
         return Err(errors.join("\n"));
     }
-    let mut interp = Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src));
+    let mut interp = Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src)).with_plugins(plugins);
     if let Some(t) = tracer {
         interp = interp.with_tracer(t);
     }
@@ -185,33 +228,20 @@ pub fn run_program_with_tracer_transact_and_workflow_log(
 /// static checking stage (`typeck::typecheck_with_plugins`, so a call to
 /// a plugin builtin is proved well-typed *before* anything runs, the
 /// same discipline every other builtin already gets) and the evaluation
-/// stage (`Interpreter::with_plugins`). Deliberately a separate, minimal
-/// entrypoint rather than one more parameter threaded through the
-/// `run_with_tracer_transact_and_workflow_log` family above — combining
-/// plugins with tracer/transact-log/workflow-log support is real future
-/// work (`docs/ECOSYSTEM.md` §G1 stays honest about that), not silently
-/// implied by this function's existence today.
+/// stage (`Interpreter::with_plugins`).
+///
+/// Previously a separate, minimal pipeline duplicating ~20 lines of
+/// lex/parse/typecheck/ownership/contract-check logic independently of
+/// the `run_with_tracer_transact_and_workflow_log` family above — that
+/// duplication is gone as of Track B of the plugin-ecosystem plan
+/// (rfcs/0003-plugin-abi-v2.md): this is now a one-line call into
+/// [`run_with_tracer_transact_workflow_and_plugins`], the same
+/// generalized core every other `run*` entrypoint in this file shares.
+/// A caller wanting a tracer/transact-log/workflow-log *and* plugins
+/// together — not possible before this refactor — calls that function
+/// directly instead of this convenience wrapper.
 pub fn run_with_plugins(src: &str, plugins: &[plugin::PluginBuiltin]) -> Result<Value, String> {
-    let toks = Lexer::new(src)
-        .tokenize()
-        .map_err(|e| format!("lex error at {}:{}: {}", e.span.line, e.span.col, e.message))?;
-    let program = Parser::new(toks)
-        .parse_program()
-        .map_err(|e| format!("parse error at {}:{}: {}", e.span.line, e.span.col, e.message))?;
-    if let Err(errors) = typeck::typecheck_with_plugins(&program, plugins) {
-        let joined = errors.iter().map(|e| format!("type error: {e}")).collect::<Vec<_>>().join("\n");
-        return Err(joined);
-    }
-    if let Err(errors) = ownership::check_ownership(&program) {
-        let joined = errors.iter().map(|e| format!("ownership error: {e}")).collect::<Vec<_>>().join("\n");
-        return Err(joined);
-    }
-    if let Err(errors) = contract_check::check_program_contracts(&program) {
-        return Err(errors.join("\n"));
-    }
-    let interp =
-        Interpreter::new(std::sync::Arc::new(program), std::sync::Arc::from(src)).with_plugins(plugins);
-    interp.run_main_on_big_stack().map_err(|e| format!("runtime error: {e}"))
+    run_with_tracer_transact_workflow_and_plugins(src, None, None, None, plugins)
 }
 
 /// docs/goal.md row 9's actual content: a caller that wants the structured

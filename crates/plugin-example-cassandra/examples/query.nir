@@ -1,0 +1,11 @@
+// Talks to the Cassandra container docker-compose.yml (crates/plugin-examples/)
+// starts, native protocol on 9042, no auth.
+fn main() {
+    let h: i64 = cassandra_connect("127.0.0.1:9042")
+    cassandra_execute(h, "CREATE KEYSPACE IF NOT EXISTS nirdosha_test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+    cassandra_execute(h, "CREATE TABLE IF NOT EXISTS nirdosha_test.widgets (id int PRIMARY KEY, name text)")
+    cassandra_execute(h, "INSERT INTO nirdosha_test.widgets (id, name) VALUES (1, 'sprocket')")
+    let rows: str = cassandra_query(h, "SELECT id, name FROM nirdosha_test.widgets")
+    print(rows)
+    cassandra_close(h)
+}
