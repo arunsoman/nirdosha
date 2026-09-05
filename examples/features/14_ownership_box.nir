@@ -1,0 +1,45 @@
+// Feature: `box`/`*`/move semantics -- affine ownership (LANGUAGE.md
+// §2, §6, §8). `box T` is a single-owner heap allocation; `*expr`
+// dereferences. Using an affine binding by name moves it -- a later use
+// of the same path is a static "use after move" error, checked by a
+// real move-checker, not just at runtime.
+
+fn consume(b: box i64) -> i64 {
+    return *b
+}
+
+fn make_boxed(n: i64) -> box i64 {
+    return box n
+}
+
+struct Payload {
+    id: i64,
+    weight: f64,
+}
+
+fn archive(p: box Payload) -> i64 {
+    return (*p).id
+}
+
+fn main() {
+    let a: box i64 = box 10
+    print(consume(a)) // moves `a` -- using `a` again here would not typecheck
+
+    let b: box i64 = make_boxed(32)
+    print(*b + 10) // 42
+
+    // box works over any type, not just scalars
+    let payload: box Payload = box Payload(7, 12.5)
+    print(archive(payload)) // 7 -- `payload` is moved away here
+
+    // ownership across branches: both arms move `c` exactly once, so
+    // the checker can still prove single ownership either way.
+    let c: box i64 = box 99
+    let flag: bool = true
+    let result: i64 = if flag {
+        consume(c)
+    } else {
+        consume(c)
+    }
+    print(result) // 99
+}

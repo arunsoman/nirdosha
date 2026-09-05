@@ -1,0 +1,69 @@
+// Feature: `db_connect`/`db_query`/`db_execute` (LANGUAGE.md §5,
+// `docs/PROTOLANG_PORT.md`'s "Locked design 5"). A bare path or
+// `:memory:` opens local SQLite; `postgres://`/`postgresql://` instead
+// connects to a real Postgres server -- same four-function surface
+// either way. `db` is affine, like `box`/`file`/`tcp` -- connect, use,
+// and `stop` inside one function; no borrowing story yet.
+
+struct Text {
+    value: str,
+}
+
+enum ErrorCode {
+    DbError(str),
+}
+
+fn run_all(conn: db) -> Text {
+    let created: i64 = match db_execute(conn, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, rating INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    // `?` placeholders, bound via trailing arguments -- the only way to
+    // parameterize a query, since `str` has no concatenation.
+    let inserted: i64 = match db_execute(conn, "INSERT INTO users (name, rating) VALUES (?, ?)", "ada", 5) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let inserted2: i64 = match db_execute(conn, "INSERT INTO users (name, rating) VALUES (?, ?)", "grace", 4) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+
+    // every row comes back as one JSON object; the whole result set is
+    // a JSON array, navigated with json_array_len/json_array_get/
+    // json_get_* like any other JSON document.
+    let name: Text = match db_query(conn, "SELECT name FROM users WHERE rating >= ? ORDER BY id", 5) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "name") {
+                Ok(n) => Text(n),
+                Err(e) => Text(e),
+            },
+            Err(e) => Text(e),
+        },
+        Err(e) => Text(e),
+    }
+
+    let updated: i64 = match db_execute(conn, "UPDATE users SET rating = ? WHERE name = ?", 5, "grace") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+
+    stop conn
+    return name
+}
+
+fn main() {
+    let result: Text = match db_connect(":memory:") {
+        Ok(conn) => run_all(conn),
+        Err(e) => Text(e),
+    }
+    print(result.value) // ada
+
+    // a connection failure is a real `Err`, never a trap -- the
+    // database engine's own message passed straight through.
+    let failed: bool = match db_connect("/no/such/directory/at/all/db.sqlite") {
+        Ok(conn) => false,
+        Err(e) => true,
+    }
+    print(failed) // true
+}

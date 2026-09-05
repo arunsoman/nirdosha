@@ -1,0 +1,59 @@
+// Feature: `dashboard { visual ... }` -- graph/heatmap/timeline
+// (LANGUAGE.md §11c, Track E2). `chart`'s one-inline-SVG-bar-chart limit
+// stays exactly as closed as ever; `visual "<label>" -> <fn> { render:
+// "graph" | "heatmap" | "timeline" }` is a second, separate item kind
+// with no naming-convention equivalent -- always explicitly declared,
+// since a render *kind* can't be inferred from a function name.
+//
+// Each kind fixes its backing fn's expected `json` shape:
+//   graph:    {"nodes": [{"id","label","risk"?}], "edges": [{"source","target","weight"?}]}
+//   heatmap:  [{"lat","lng","weight","label"?}]
+//   timeline: [{"ts","label","detail"?}]
+
+enum ErrorCode {
+    MalformedVisual(str),
+}
+
+fn graph_of_relationships() -> Result(json, ErrorCode) {
+    let text: str = "{\"nodes\": [{\"id\": \"a\", \"label\": \"Vendor A\"}, {\"id\": \"b\", \"label\": \"Vendor B\"}], \"edges\": [{\"source\": \"a\", \"target\": \"b\", \"weight\": 3}]}"
+    return match json_parse(text) {
+        Ok(doc) => Ok(doc),
+        Err(e) => Err(MalformedVisual(e)),
+    }
+}
+
+fn heatmap_of_shipments() -> Result(json, ErrorCode) {
+    let text: str = "[{\"lat\": 37.77, \"lng\": -122.41, \"weight\": 5}]"
+    return match json_parse(text) {
+        Ok(doc) => Ok(doc),
+        Err(e) => Err(MalformedVisual(e)),
+    }
+}
+
+fn timeline_of_events() -> Result(json, ErrorCode) {
+    let text: str = "[{\"ts\": 1700000000, \"label\": \"submitted\"}, {\"ts\": 1700003600, \"label\": \"approved\"}]"
+    return match json_parse(text) {
+        Ok(doc) => Ok(doc),
+        Err(e) => Err(MalformedVisual(e)),
+    }
+}
+
+dashboard {
+    visual "Vendor Network" -> graph_of_relationships {
+        render: "graph"
+    }
+    visual "Shipment Density" -> heatmap_of_shipments {
+        render: "heatmap"
+    }
+    visual "Case History" -> timeline_of_events {
+        render: "timeline"
+    }
+}
+
+fn main() {
+    let graph_ok: bool = match graph_of_relationships() {
+        Ok(doc) => true,
+        Err(e) => false,
+    }
+    print(graph_ok) // true
+}

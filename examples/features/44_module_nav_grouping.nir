@@ -1,0 +1,63 @@
+// Feature: `module "Display Name" { ... }` -- nav grouping, not scoping
+// (LANGUAGE.md §12). Completely unrelated to real namespacing (see
+// 45_module_namespacing.nir) -- `parser.rs` tells the two forms apart
+// by the very next token after `module` (a string literal here, a bare
+// identifier for the real-namespace form). Pure syntactic sugar:
+// everything inside still registers into the exact same single flat
+// global namespace a top-level declaration would -- `emit-ui`'s nav
+// just groups screens by this display name into collapsible sections.
+// Single-level only: nesting a `module`, `screen`, or `dashboard` inside
+// one is a parse error.
+
+module "Billing" {
+    struct Invoice {
+        id: i64,
+        amount_cents: i64,
+    }
+
+    fn list_invoice() -> Result(json, InvoiceError) {
+        return match json_parse("[]") {
+            Ok(doc) => Ok(doc),
+            Err(e) => Err(MalformedListing(e)),
+        }
+    }
+
+    fn create_invoice(inv: Invoice) -> Result(i64, InvoiceError) {
+        return Ok(inv.id)
+    }
+}
+
+enum InvoiceError {
+    MalformedListing(str),
+}
+
+module "Shipping" {
+    struct Shipment {
+        id: i64,
+        invoice_id: i64,
+    }
+
+    fn list_shipment() -> Result(json, InvoiceError) {
+        return match json_parse("[]") {
+            Ok(doc) => Ok(doc),
+            Err(e) => Err(MalformedListing(e)),
+        }
+    }
+}
+
+fn main() {
+    // `Invoice`/`Shipment` and their fns are ordinary, flat, top-level
+    // declarations -- calling one from outside its own `module "..."`
+    // block needs no qualification at all, unlike 45's real namespaces.
+    let created: i64 = match create_invoice(Invoice(1, 5000)) {
+        Ok(id) => id,
+        Err(e) => -1,
+    }
+    print(created) // 1
+
+    let listed_ok: bool = match list_shipment() {
+        Ok(doc) => true,
+        Err(e) => false,
+    }
+    print(listed_ok) // true
+}

@@ -176,8 +176,8 @@ fn link_transition_mints_a_single_use_token_that_advances_the_state() {
 /// typechecks cleanly end to end.
 #[test]
 fn kyc_onboarding_example_typechecks() {
-    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/kyc_onboarding.nir"))
-        .expect("examples/kyc_onboarding.nir should exist and be readable");
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/kyc_onboarding.nir"))
+        .expect("tests/fixtures/kyc_onboarding.nir should exist and be readable");
     build_program(&src);
 }
 

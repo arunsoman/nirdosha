@@ -1,0 +1,44 @@
+// Feature: scalar types & literals (LANGUAGE.md §2, §3).
+//
+// i8/i16/i32/i64, u8/u16/u32/u64/usize, f64, bool, str, unit. Integer
+// literals flex to whichever narrower declared width they fit; a float
+// literal is always exactly `f64` (no scientific notation, no int<->
+// float conversion operator at all -- no implicit numeric conversions,
+// ever, between two already-typed values).
+
+fn returns_unit() {
+    // no `return` needed -- falling off the end of a `unit`-returning
+    // fn is fine; `unit` itself has no literal syntax at all.
+}
+
+fn main() {
+    let a: i8 = 100
+    let b: i16 = 30000
+    let c: i32 = 2000000000
+    let d: i64 = 9000000000000000000
+    let e: u8 = 200
+    let f: u32 = 4000000000
+    let g: usize = 42
+    print(a)
+    print(b)
+    print(c)
+    print(d)
+    print(e)
+    print(f)
+    print(g)
+
+    let pi: f64 = 3.14159
+    print(pi)
+
+    let ok: bool = true
+    print(ok)
+
+    // `str`: literal + escapes only -- no concatenation, slicing, or
+    // indexing, and it can never be a fn's parameter/return type
+    // directly (see 08_str_boundary_convention.nir).
+    let s: str = "line one\nline two\ttabbed\\backslash\"quoted\""
+    print(s)
+
+    returns_unit()
+    print(returns_unit()) // unit prints as "()"
+}

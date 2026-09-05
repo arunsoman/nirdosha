@@ -383,10 +383,10 @@ fn db_is_interpreter_only_rejected_by_codegen() {
 
 #[test]
 fn example_db_runs_to_completion() {
-    let program = parse_ok(include_str!("../../../examples/db.nir"));
+    let program = parse_ok(include_str!("fixtures/db.nir"));
     typecheck(&program).expect("should typecheck cleanly");
     check_ownership(&program).expect("should pass ownership checking");
-    assert_eq!(run(include_str!("../../../examples/db.nir")), Ok(Value::Unit));
+    assert_eq!(run(include_str!("fixtures/db.nir")), Ok(Value::Unit));
 }
 
 // ---- parameterized queries: the only way to embed runtime data into SQL,

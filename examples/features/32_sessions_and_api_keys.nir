@@ -1,0 +1,46 @@
+// Feature: session & API-key management -- Row 12 continued
+// (`create_application_session`/`session_cookie`/`new_refresh_token`/
+// `exchange_refresh_token`/`check_revocation`/`validate_api_key`).
+// "Validate a token and manage sessions," not a full OAuth2
+// authorization server: a session layer on top of OIDC token
+// validation, with real revocation checking and refresh-token exchange.
+
+fn main() {
+    let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
+    let issuer: str = "https://mock-idp.local"
+    let audience: str = "features-demo"
+    let claims: str = "{\"roles\":[\"admin\"]}"
+
+    let token: str = match mock_issue_token("carol", issuer, audience, 1700000000, 3600, claims, jwks) {
+        Ok(t) => t,
+        Err(e) => e,
+    }
+    let identity: VerifiedIdentity = match oidc_validate_token(token, issuer, audience, jwks) {
+        Ok(id) => id,
+        Err(e) => VerifiedIdentity("", "", "", 0, 0, "{}"),
+    }
+
+    // an application session, and the `Set-Cookie`-ready string for it
+    let session: ApplicationSession = create_application_session(identity)
+    let cookie: str = session_cookie(session)
+    print(cookie) // a real, unpredictable session-id cookie value
+
+    // a refresh token, and exchanging it back for a fresh identity
+    let refresh: RefreshTokenHandle = new_refresh_token(1700000000)
+    let renewed: VerifiedIdentity = match exchange_refresh_token(identity, refresh, 1700003000) {
+        Ok(id) => id,
+        Err(e) => identity,
+    }
+    print(renewed.subject) // carol -- same identity, freshly re-issued
+
+    // real revocation checking -- a token minted a moment ago hasn't
+    // been revoked
+    print(check_revocation(identity)) // false
+
+    // API keys: constant-time-compared under the hood
+    let key_check: bool = match validate_api_key("demo-key-id", "demo-key-secret") {
+        Ok(id) => true,
+        Err(e) => false,
+    }
+    print(key_check) // false -- no such key registered in this demo
+}

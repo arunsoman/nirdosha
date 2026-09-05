@@ -1,0 +1,45 @@
+// Feature: deterministic simulation builtins -- Phase 3 (LANGUAGE.md
+// §5, §9). `rand_seed`/`rand_f64`/`rand_gaussian` are a from-scratch
+// SplitMix64 stream stored *per interpreter instance* -- same seed,
+// same OS, same run, byte-for-byte identical draws every time. Plus
+// geometry (ECEF/ENU/bearing/distance) and a linear Kalman filter's
+// predict/update steps.
+
+fn main() {
+    rand_seed(42) // required before any draw
+    print(rand_f64())              // uniform [0, 1)
+    print(rand_gaussian(100.0, 5.0)) // Box-Muller
+
+    // geometry: lat/lon/alt <-> ECEF, a local ENU frame, distance, bearing
+    let here: Vector(f64, 3) = [37.7749, -122.4194, 0.0]  // San Francisco
+    let there: Vector(f64, 3) = [34.0522, -118.2437, 0.0] // Los Angeles
+    print(distance(here, there)) // Euclidean distance, in the same units as the inputs
+    print(bearing(here, there))  // initial great-circle bearing, degrees [0, 360)
+
+    let ecef: Vector(f64, 3) = lla_to_ecef(here)
+    let back: Vector(f64, 3) = ecef_to_lla(ecef)
+    print(back) // round-trips (approximately) to `here`
+
+    let enu: Vector(f64, 3) = ecef_to_enu(lla_to_ecef(there), here)
+    print(enu) // `there`'s position in a local East-North-Up frame centered on `here`
+
+    // a 4-state constant-velocity Kalman filter, one predict+update step
+    let x: Vector(f64, 4) = [0.0, 0.0, 1.0, 1.0]
+    let p: Matrix(f64, 4, 4) = identity(4)
+    let f: Matrix(f64, 4, 4) = [
+        [1.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+    ]
+    let q: Matrix(f64, 4, 4) = identity(4)
+    let x_pred: Vector(f64, 4) = kf_predict_state(x, p, f, q)
+    let p_pred: Matrix(f64, 4, 4) = kf_predict_cov(x, p, f, q)
+    print(x_pred) // [1, 1, 1, 1]
+
+    let z: Vector(f64, 2) = [1.1, 0.9]
+    let h: Matrix(f64, 2, 4) = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+    let r: Matrix(f64, 2, 2) = identity(2)
+    let x_upd: Vector(f64, 4) = kf_update_state(x_pred, p_pred, z, h, r)
+    print(x_upd) // position pulled slightly toward the measurement
+}

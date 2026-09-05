@@ -1,0 +1,47 @@
+// Feature: `validate` -- Hoare contracts on a function (LANGUAGE.md
+// §16, `docs/NEXT_GEN.md` §F3). Orthogonal to `requires`: `requires`
+// gates *who* may call a function; `validate` states a fact the
+// function itself must honor, checked two independent ways -- a real
+// static Z3 proof where the function is simple enough (integer params/
+// return, no loop, no division), and always, dynamically, against the
+// real concrete argument/return values on every actual call.
+
+fn max_of(a: i64, b: i64) -> i64 {
+    if a > b { return a }
+    return b
+}
+
+// multiple `pre`/`post` entries are meaningful: every `pre` is a
+// conjunctive hypothesis, every `post` is checked independently, so a
+// violation names exactly which clause failed.
+validate max_of {
+    post: result >= a
+    post: result >= b
+}
+
+fn clamp_positive(n: i64) -> i64 {
+    if n < 0 { return 0 }
+    return n
+}
+
+validate clamp_positive {
+    post: result >= 0
+}
+
+// a `pre` -- a hypothesis about the arguments, asserted before the body
+// runs at all.
+fn half_of_even(n: i64) -> i64 {
+    return n / 2
+}
+
+validate half_of_even {
+    pre: n - (n / 2) * 2 == 0 // n is even
+    post: result * 2 == n
+}
+
+fn main() {
+    print(max_of(3, 9))         // 9 -- both `post` clauses hold
+    print(clamp_positive(-5))   // 0
+    print(clamp_positive(7))    // 7
+    print(half_of_even(10))     // 5 -- `pre` holds (10 is even)
+}

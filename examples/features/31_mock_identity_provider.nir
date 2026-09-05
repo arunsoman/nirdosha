@@ -1,0 +1,39 @@
+// Feature: `mock_issue_token` -- the deliberate, explicitly-named
+// inverse of `oidc_validate_token` (LANGUAGE.md §5, Row 12). Mints an
+// ephemeral-secret-signed token for a self-declared identity, then that
+// same token re-verifies through the exact, unmodified
+// `oidc_validate_token` a real IdP's token would go through. `mock_` is
+// load-bearing, not decorative -- the runtime never signs a real token
+// anywhere else. Deterministic/pure: `issued_at` is an explicit
+// argument, not a hidden wall-clock read.
+
+fn main() {
+    let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
+    let issuer: str = "https://mock-idp.local"
+    let audience: str = "features-demo"
+    let claims: str = "{\"roles\":[\"admin\",\"analyst\"],\"department\":\"engineering\"}"
+
+    let token: str = match mock_issue_token("bob", issuer, audience, 1700000000, 3600, claims, jwks) {
+        Ok(t) => t,
+        Err(e) => e,
+    }
+
+    // the minted token round-trips through the real verifier
+    let identity: VerifiedIdentity = match oidc_validate_token(token, issuer, audience, jwks) {
+        Ok(id) => id,
+        Err(e) => VerifiedIdentity("", "", "", 0, 0, "{}"),
+    }
+    print(identity.subject) // bob
+
+    let is_admin: bool = match check_role(identity, "admin") {
+        Ok(proof) => true,
+        Err(e) => false,
+    }
+    print(is_admin) // true
+
+    // `identity_expired` just compares an explicit `now` against the
+    // token's own `exp` claim (`issued_at` + `ttl_secs` = 1700003600
+    // here) -- there's no hidden wall-clock read anywhere in this check.
+    print(identity_expired(identity, 1700003700)) // true -- now is past exp
+    print(identity_expired(identity, 1700000001)) // false -- now is right after iat
+}

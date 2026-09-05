@@ -1,0 +1,34 @@
+// Feature: `file`, `open` (LANGUAGE.md §2, §7, `docs/PROTOLANG_PORT.md`'s
+// file I/O port). `send`/`recv`/`stop` are reused verbatim from `tcp`/
+// `chan` -- no new I/O keywords, only one new type-former (`file`) and
+// one new expression (`open`). Mode is `"r"`, `"w"`, or `"a"`.
+
+struct Text {
+    value: str,
+}
+
+fn main() {
+    let path: str = "/tmp/nirdosha_features_file_io.txt"
+
+    let out: file = open(path, "w")
+    send(out, "first line\n")
+    stop out
+
+    // "a" (append) -- opens the same path without truncating it
+    let appended: file = open(path, "a")
+    send(appended, "second line\n")
+    stop appended
+
+    let inp: file = open(path, "r")
+    let content: str = recv(inp) // reads all currently-available bytes
+    stop inp
+    let read_back: Text = Text(content)
+    print(read_back.value)
+
+    // reading past EOF is `""`, not an error
+    let inp2: file = open(path, "r")
+    let all: str = recv(inp2)
+    let eof: str = recv(inp2)
+    stop inp2
+    print(eof == "") // true
+}

@@ -1,0 +1,39 @@
+// Feature: `dashboard { ... }` -- `tile`/`chart` (LANGUAGE.md §11).
+// Additive, like `screen`: `tile "<label>" -> <fn>` and
+// `chart "<label>" -> <fn>` each name a real function (checked at
+// typeck, not just parsed) -- `stat_<name>`/`chart_<name>` naming
+// conventions already derive these automatically; a `dashboard` block
+// just gives them a friendlier label or points at a differently-named
+// fn. `chart` is exactly one chart type, an inline-SVG bar chart,
+// forever -- 41_dashboard_visual.nir is the escape hatch for anything
+// richer.
+
+enum ErrorCode {
+    MalformedChart(str),
+}
+
+fn stat_open_orders() -> i64 {
+    return 12
+}
+
+fn chart_orders_by_status() -> Result(json, ErrorCode) {
+    return match json_parse("[{\"label\": \"pending\", \"value\": 3}, {\"label\": \"paid\", \"value\": 9}]") {
+        Ok(doc) => Ok(doc),
+        Err(e) => Err(MalformedChart(e)),
+    }
+}
+
+dashboard {
+    tile "Open Orders" -> stat_open_orders
+    chart "By Status" -> chart_orders_by_status
+}
+
+fn main() {
+    print(stat_open_orders()) // 12 -- called directly, same as ever
+
+    let chart_ok: bool = match chart_orders_by_status() {
+        Ok(doc) => true,
+        Err(e) => false,
+    }
+    print(chart_ok) // true
+}

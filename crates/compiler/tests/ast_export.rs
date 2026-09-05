@@ -16,11 +16,27 @@ fn parse_ok(src: &str) -> Program {
     Parser::new(toks).parse_program().expect("parse should succeed")
 }
 
+// `examples/` is two nested directories now (`syntax/`, `features/`),
+// not a flat pile of `.nir` files -- a plain `read_dir` would silently
+// see zero of them (a directory entry has no `.nir` extension, so the
+// filter below would skip it and never look inside), so this walks the
+// tree instead of assuming it's flat.
+fn collect_nir_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("failed to read {dir:?}: {e}")) {
+        let path = entry.expect("dir entry should read").path();
+        if path.is_dir() {
+            collect_nir_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("nir") {
+            out.push(path);
+        }
+    }
+}
+
 // ---- whole-program AST round-trip -------------------------------------------
 
 #[test]
 fn a_whole_program_round_trips_through_json() {
-    let src = include_str!("../../../examples/matrices.nir");
+    let src = include_str!("fixtures/matrices.nir");
     let program = parse_ok(src);
     let json = serde_json::to_string(&program).expect("Program should serialize");
     let back: Program = serde_json::from_str(&json).expect("Program should deserialize");
@@ -41,11 +57,10 @@ fn every_example_program_round_trips_through_json() {
     // silently doesn't round-trip (e.g. a hand-written `impl` that
     // shadowed the derive incorrectly -- not the case here, but this is
     // the test that would catch it if it ever were).
-    for entry in std::fs::read_dir("../../examples").expect("examples/ should exist") {
-        let path = entry.expect("dir entry should read").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("nir") {
-            continue;
-        }
+    let mut paths = Vec::new();
+    collect_nir_files(std::path::Path::new("../../examples"), &mut paths);
+    assert!(!paths.is_empty(), "expected to find at least one .nir file under examples/");
+    for path in paths {
         let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
         let program = parse_ok(&src);
         let json = serde_json::to_string(&program).unwrap_or_else(|e| panic!("{path:?} failed to serialize: {e}"));

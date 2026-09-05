@@ -26,7 +26,7 @@ fn emit_ui(src: &str) -> String {
 
 #[test]
 fn derives_a_screen_per_struct_with_a_convention_fn() {
-    let html = emit_ui(include_str!("../../../examples/ui_todo.nir"));
+    let html = emit_ui(include_str!("fixtures/ui_todo.nir"));
 
     // Nav entry + manifest entry for `Todo`.
     assert!(html.contains("\"name\":\"Todo\""), "manifest should carry the Todo screen");
@@ -490,7 +490,7 @@ fn dark_mode_none_emits_no_dark_override_at_all() {
 
 #[test]
 fn every_generated_page_carries_the_nirdosha_favicon_with_no_placeholder_left_over() {
-    let html = emit_ui(include_str!("../../../examples/ui_todo.nir"));
+    let html = emit_ui(include_str!("fixtures/ui_todo.nir"));
     assert!(
         html.contains(r#"<link rel="icon" type="image/png" href="data:image/png;base64,"#),
         "every emit-ui page must self-contain the brand favicon, no network fetch"
@@ -504,7 +504,7 @@ fn every_generated_page_carries_the_nirdosha_favicon_with_no_placeholder_left_ov
 #[test]
 fn the_embedded_favicon_data_uri_decodes_to_a_real_png() {
     use base64::Engine;
-    let html = emit_ui(include_str!("../../../examples/ui_todo.nir"));
+    let html = emit_ui(include_str!("fixtures/ui_todo.nir"));
     let marker = r#"href="data:image/png;base64,"#;
     let start = html.find(marker).expect("favicon link tag present") + marker.len();
     let end = html[start..].find('"').expect("closing quote") + start;
@@ -587,7 +587,7 @@ fn workspace_and_panel_render_into_the_manifest() {
 
 #[test]
 fn a_program_with_no_workspace_block_renders_an_empty_workspaces_array() {
-    let html = emit_ui(include_str!("../../../examples/ui_todo.nir"));
+    let html = emit_ui(include_str!("fixtures/ui_todo.nir"));
     assert!(html.contains("const WORKSPACES = [];"), "no workspace block should mean a literally empty array, same as WORKFLOWS already does");
 }
 
@@ -775,7 +775,7 @@ fn action_show_result_reaches_the_manifest_and_client_wiring() {
 
 #[test]
 fn an_action_with_no_show_result_key_still_serializes_it_as_false() {
-    let html = emit_ui(include_str!("../../../examples/ui_todo.nir"));
+    let html = emit_ui(include_str!("fixtures/ui_todo.nir"));
     assert!(html.contains(r#""showResult":false"#));
 }
 
@@ -817,6 +817,6 @@ fn workflow_all_states_reach_the_manifest_in_declaration_order() {
 
 #[test]
 fn a_program_with_no_workflow_renders_an_empty_all_states_free_manifest() {
-    let html = emit_ui(include_str!("../../../examples/ui_todo.nir"));
+    let html = emit_ui(include_str!("fixtures/ui_todo.nir"));
     assert!(html.contains("const WORKFLOWS = [];"));
 }

@@ -1,0 +1,54 @@
+// Feature: identity / relying party -- `oidc_validate_token`,
+// `check_role`, `extract_claim`, `check_role_path`, `extract_claim_path`,
+// `identity_expired` (LANGUAGE.md §5, Row 12). Validates a real,
+// externally-issued OIDC/JWT ID token against a JWKS; the runtime never
+// mints its own tokens here, it only ever consumes one (see
+// 31_mock_identity_provider.nir for the deliberate, explicitly-named
+// mock exception used to produce one for local development/testing).
+
+struct Text {
+    value: str,
+}
+
+fn main() {
+    // fixture used throughout this tree's identity-flavored examples:
+    // roles=["physician"], department="cardiology".
+    let token: str = "eyJhbGciOiAiSFMyNTYiLCAia2lkIjogImtleTEifQ.eyJzdWIiOiAiYWxpY2UiLCAiaXNzIjogImh0dHBzOi8vZXhhbXBsZS5jb20iLCAiYXVkIjogIm15LWFwcCIsICJleHAiOiAyMDAwMDAwMDAwLCAiaWF0IjogMTcwMDAwMDAwMCwgInJvbGVzIjogWyJwaHlzaWNpYW4iXSwgImRlcGFydG1lbnQiOiAiY2FyZGlvbG9neSJ9.nrFdeqNDwXWLeGzud6X9Q4ITzCXULzZBBK8y51LGYXs"
+    let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
+
+    let identity: VerifiedIdentity = match oidc_validate_token(token, "https://example.com", "my-app", jwks) {
+        Ok(id) => id,
+        Err(e) => VerifiedIdentity("", "", "", 0, 0, "{}"),
+    }
+    print(identity.subject)     // alice
+    print(identity.issuer)      // https://example.com
+    print(identity.audience)    // my-app
+
+    let has_physician: bool = match check_role(identity, "physician") {
+        Ok(proof) => true,
+        Err(e) => false,
+    }
+    print(has_physician) // true
+
+    let has_admin: bool = match check_role(identity, "admin") {
+        Ok(proof) => true,
+        Err(e) => false,
+    }
+    print(has_admin) // false
+
+    let department: Text = match extract_claim(identity, "department") {
+        Ok(claim) => Text(claim.value),
+        Err(e) => Text(e),
+    }
+    print(department.value) // cardiology
+
+    print(identity_expired(identity, 999999999999)) // true -- far past `exp`
+    print(identity_expired(identity, 1700000001))   // false -- right after `iat`
+
+    // an invalid signature/issuer/audience is a real `Err`, never a trap
+    let rejected: bool = match oidc_validate_token(token, "https://wrong-issuer.example", "my-app", jwks) {
+        Ok(id) => false,
+        Err(e) => true,
+    }
+    print(rejected) // true
+}

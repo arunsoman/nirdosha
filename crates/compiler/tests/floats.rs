@@ -27,7 +27,7 @@ fn first_type_error(src: &str) -> TypeErrorKind {
 
 #[test]
 fn example_floats_runs_to_completion() {
-    let src = include_str!("../../../examples/floats.nir");
+    let src = include_str!("fixtures/floats.nir");
     assert_eq!(run(src), Ok(Value::Unit));
 }
 

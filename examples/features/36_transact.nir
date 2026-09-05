@@ -1,0 +1,64 @@
+// Feature: `transact { ... }` -- a durable-effect construct
+// (`docs/TRANSACT.md`). Full protocol: `precheck`?, `network`, `verify`,
+// `commit`, `compensate`?, `log`? -- `precheck` (optional) aborts
+// immediately on `false`, before anything durable is written; `txn_id`
+// is an unpredictable, always-unique idempotency key generated before
+// `network` runs; `network`'s result becomes an implicit `network`
+// binding visible to `verify`/`commit`; `verify == true` -> `commit`
+// (retried with backoff on failure); `verify == false` -> `compensate`
+// (same retry treatment). `log` (if present) always runs last, best-
+// effort. `transact` is an *expression* producing `bool`.
+
+fn db_reachable() -> bool {
+    return true
+}
+
+fn call_api(txn_id: str, amount: i64) -> i64 {
+    // a correctly-built downstream dedupes on `txn_id` -- what makes it
+    // safe for crash replay to resend this exact call after a restart.
+    return amount
+}
+
+fn check(resp: i64) -> bool {
+    return resp > 0
+}
+
+fn update_db(amount: i64) -> i64 {
+    print("committing", amount)
+    return amount
+}
+
+fn refund(amount: i64) -> i64 {
+    print("compensating", amount)
+    return amount
+}
+
+fn write_log(amount: i64, ok: bool) -> unit {
+    print("logged", amount, ok)
+}
+
+fn checkout(amount: i64) -> bool {
+    return transact {
+        precheck:   db_reachable()
+        network:    call_api(txn_id, amount)
+        verify:     check(network)
+        commit:     update_db(amount)
+        compensate: refund(amount)
+        log:        write_log(amount, verify)
+    }
+}
+
+// all three of `precheck`/`compensate`/`log` are optional
+fn minimal(amount: i64) -> bool {
+    return transact {
+        network: call_api(txn_id, amount)
+        verify:  check(network)
+        commit:  update_db(amount)
+    }
+}
+
+fn main() {
+    print(checkout(10))  // true -- committing 10
+    print(checkout(-5))  // false -- compensating -5
+    print(minimal(1))    // true -- committing 1, no compensate/log slot to run
+}

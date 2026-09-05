@@ -1,0 +1,56 @@
+// Feature: `str` at function boundaries -- the "enum favoring" rule
+// (LANGUAGE.md §6b, `TypeErrorKind::StrInFnSignature`).
+//
+// `str` may not be, or be part of, a user `fn`'s parameter or return
+// type -- not even nested inside a `Result(_, str)`. It stays a
+// completely ordinary struct field type, local variable type, and
+// literal everywhere else. Two escape hatches: wrap genuine free text
+// in a one-field carrier struct, or replace a closed set of string
+// values with a real `enum`.
+
+// Escape hatch 1: genuine free text -- a name, a message, a hostname --
+// gets wrapped in `Text`, the carrier struct convention every other
+// feature file in this tree also uses.
+struct Text {
+    value: str,
+}
+
+fn greet(name: Text) -> Text {
+    return Text(name.value)
+}
+
+// Escape hatch 2: a *closed* set of string values (a status, a
+// decision) belongs in a real `enum` instead of a bare `str`, so it
+// gets exhaustive `match`, `==`/`!=`, and a searchable `emit-ui`
+// dropdown for free.
+enum Status {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+fn describe(s: Status) -> Text {
+    return match s {
+        Pending() => Text("pending"),
+        Approved() => Text("approved"),
+        Rejected() => Text("rejected"),
+    }
+}
+
+fn main() {
+    // `str` is fine as a local variable and as a struct field --
+    let s: str = "hello, nirdosha"
+    print(s)
+
+    let g: Text = greet(Text("world"))
+    print(g.value)
+
+    let d: Text = describe(Approved())
+    print(d.value)
+
+    // a `Result(_, str)`-shaped error is banned too -- see how every
+    // other feature file that surfaces a builtin's own dynamic message
+    // (`db_connect`, `http_get`, ...) instead defines its own enum
+    // variant that *carries* the str, e.g. `enum ErrorCode { DbError(str)
+    // }`, never returns bare `str` in the error position.
+}

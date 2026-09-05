@@ -1,0 +1,60 @@
+// Feature: `transact`'s cross-process layer + `retry`/`timeout`
+// modifiers (`docs/TRANSACT.md` layer 5). A slot's named function can
+// use a real cross-process effect internally -- `connect`/`tcp`'s
+// `send`/`recv` here, `sandbox`/`db_connect` equally legal, since the
+// restriction is only "one named `Expr::Call`," never "no side effects
+// inside it." `network: <call> retry N timeout S` adds bounded retry
+// with a per-attempt timeout on top of the same slot syntax
+// 36_transact.nir already uses.
+//
+// Self-contained: hosts its own tiny TCP "gateway" on a background
+// thread rather than requiring an already-running external listener.
+
+fn call_gateway(txn_id: str, amount: i64) -> i64 {
+    let conn: tcp = connect("127.0.0.1", 9702)
+    send(conn, txn_id)
+    let reply: str = recv(conn)
+    stop conn
+    return amount
+}
+
+fn check(resp: i64) -> bool {
+    return resp > 0
+}
+
+fn update_db(amount: i64) -> i64 {
+    print("committing", amount)
+    return amount
+}
+
+fn checkout(amount: i64) -> bool {
+    return transact {
+        network: call_gateway(txn_id, amount) retry 3 timeout 5
+        verify:  check(network)
+        commit:  update_db(network)
+    }
+}
+
+struct Text {
+    value: str,
+}
+
+fn gateway(l: tcp_listener) -> Text {
+    let conn: tcp = accept(l)
+    let received_txn_id: str = recv(conn)
+    send(conn, "charged")
+    stop conn
+    stop l
+    return Text(received_txn_id)
+}
+
+fn main() {
+    let l: tcp_listener = listen(9702)
+    let h: thread Text = spawn gateway(l)
+
+    let committed: bool = checkout(42)
+    print(committed) // true
+
+    let seen: Text = join h
+    print(seen.value) // the real, unpredictable txn_id `transact` generated
+}

@@ -22,27 +22,27 @@ mod tests {
 
     #[test]
     fn hello_example_parses() {
-        assert!(parses(include_str!("../../examples/hello.nir")));
+        assert!(parses(include_str!("../../compiler/tests/fixtures/hello.nir")));
     }
 
     #[test]
     fn factorial_example_parses() {
-        assert!(parses(include_str!("../../examples/factorial.nir")));
+        assert!(parses(include_str!("../../compiler/tests/fixtures/factorial.nir")));
     }
 
     #[test]
     fn loop_example_parses() {
-        assert!(parses(include_str!("../../examples/loop.nir")));
+        assert!(parses(include_str!("../../compiler/tests/fixtures/loop.nir")));
     }
 
     #[test]
     fn ownership_example_parses() {
-        assert!(parses(include_str!("../../examples/ownership.nir")));
+        assert!(parses(include_str!("../../compiler/tests/fixtures/ownership.nir")));
     }
 
     #[test]
     fn borrow_example_parses() {
-        assert!(parses(include_str!("../../examples/borrow.nir")));
+        assert!(parses(include_str!("../../compiler/tests/fixtures/borrow.nir")));
     }
 
     #[test]

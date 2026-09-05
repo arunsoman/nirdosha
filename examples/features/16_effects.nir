@@ -1,0 +1,38 @@
+// Feature: `effect(...)` -- a Koka-style effect *set*, not a total
+// order (LANGUAGE.md §6, `effects.rs`). Omitted entirely: fully
+// inferred, nothing checked, zero notational cost. Declared: the real
+// effect set (by fixpoint iteration over the call graph, so mutual
+// recursion works) must be a *subset* of what's declared. Four tags:
+// `rng`/`io`/`concurrent`/`network`; `pure` is the empty set and can't
+// combine with the others.
+
+fn add(a: i64, b: i64) -> i64 effect(pure) {
+    return a + b
+}
+
+fn log_result(n: i64) -> unit effect(io) {
+    print(n)
+}
+
+fn roll_dice() -> f64 effect(rng) {
+    return rand_f64()
+}
+
+fn broadcast(n: i64) -> i64 effect(concurrent) {
+    let h: thread i64 = spawn add(n, 0)
+    return join h
+}
+
+// Declaring *more* than the body actually uses is fine -- only an
+// undeclared-but-performed effect is a compile error.
+fn generous(n: i64) -> i64 effect(io, rng, concurrent, network) {
+    return add(n, 1) // actually pure, but that's a subset of what's declared
+}
+
+fn main() {
+    log_result(add(2, 3)) // effect(pure) feeding effect(io)
+    rand_seed(1)
+    print(roll_dice())
+    print(broadcast(20))
+    print(generous(41))
+}

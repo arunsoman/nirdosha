@@ -1,0 +1,51 @@
+// Feature: `module Ident { ... }` real namespacing + `pub` + `use`
+// (LANGUAGE.md §17, `docs/ROADMAP.md` Track F, F2). Unrelated to
+// 44_module_nav_grouping.nir's legacy string-named form. Before this,
+// every `struct`/`enum`/`fn` name in a program -- prelude included --
+// lived in one flat namespace; a user `struct Pair` collided with the
+// prelude's own `Pair`. A real module closes that: everything inside
+// registers under a qualified key, reachable **only** in that qualified
+// form, even from a sibling declaration in the very same module.
+//
+// `use "path"` -- legal only in the leading run at the very top of a
+// file, before any other item -- imports another file's `pub`,
+// namespaced declarations (never a bare top-level one).
+use "45_module_namespacing_helper.nir"
+
+module Audit {
+    pub struct Entry {
+        id: i64,
+    }
+
+    pub fn make(id: i64) -> Audit::Entry {
+        return Audit::Entry(id)
+    }
+}
+
+// a second module, free to reuse a short name (`Entry`) the first
+// module already used -- zero collision, since each lives under its own
+// qualified key.
+module Billing {
+    pub struct Entry {
+        amount_cents: i64,
+    }
+
+    pub fn make(amount_cents: i64) -> Billing::Entry {
+        return Billing::Entry(amount_cents)
+    }
+}
+
+fn main() -> i64 {
+    let a: Audit::Entry = Audit::make(1)
+    let b: Billing::Entry = Billing::make(500)
+    print(a.id)             // 1
+    print(b.amount_cents)   // 500
+
+    // `Shared::` was `use`d from another file entirely -- reachable the
+    // same qualified way as a module declared in this file.
+    let entry: Shared::AuditEntry = Shared::make_entry(7)
+    print(entry.id)   // 7
+    print(entry.note) // created
+
+    return a.id + b.amount_cents
+}

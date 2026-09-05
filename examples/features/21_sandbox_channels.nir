@@ -1,0 +1,25 @@
+// Feature: `sandbox`/`stop` combined with `chan`/`send`/`recv`
+// (`docs/SANDBOXING.md` layer 2) -- a real cross-process transport for
+// the same `chan T` primitive 19_channels.nir demonstrates in-process.
+// A `chan`-typed argument to `sandbox worker(c)` gives the spawned OS
+// process a genuine, live communication channel with the parent -- a
+// real Unix domain socket under the hood, invisible from Nirdosha
+// source. Same handle, same `send`/`recv` syntax on both sides of the
+// process boundary.
+
+fn worker(c: chan i64) -> unit {
+    let v: i64 = recv(c)
+    send(c, v * 2)
+    return
+}
+
+fn main() {
+    let c: chan i64 = chan
+    let s: sandbox = sandbox worker(c)
+
+    send(c, 21)
+    let result: i64 = recv(c) // blocks until the separate process replies
+    stop s
+
+    print(result) // 42
+}

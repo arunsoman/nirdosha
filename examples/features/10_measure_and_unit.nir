@@ -1,0 +1,41 @@
+// Feature: `Measure`/`UnitCode` -- real prelude types (LANGUAGE.md §6d),
+// same shape and reasoning as `Money`/`CurrencyCode` (09_money_and_
+// currency.nir): a `dec128` value paired with a closed enum, built into
+// every `.nir` program automatically.
+//
+// Field is `unit_code`, not `unit` -- `unit` itself lexes as the `unit`
+// type keyword regardless of position, so it can never be a field or
+// local name.
+
+enum ErrorCode {
+    UnitMismatch,
+}
+
+// Refuses (rather than converts) a mismatched-unit combination -- the
+// same discipline `add_money` applies to currency. Real unit conversion
+// (`[ft_i]` -> `m`) needs a conversion-factor table this language
+// doesn't ship.
+fn add_measure(a: Measure, b: Measure) -> Result(Measure, ErrorCode) {
+    if a.unit_code != b.unit_code {
+        return Err(UnitMismatch())
+    }
+    return Ok(Measure(a.value + b.value, a.unit_code))
+}
+
+fn main() {
+    let box1: Measure = Measure(dec_from_i64(2, 0), Kilogram())
+    let box2: Measure = Measure(dec_from_i64(3, 0), Kilogram())
+    let total: Measure = match add_measure(box1, box2) {
+        Ok(m) => m,
+        Err(e) => Measure(dec_from_i64(0, 0), Kilogram()),
+    }
+    print(total.value)      // 5
+    print(total.unit_code)  // Kilogram()
+
+    let distance: Measure = Measure(dec_from_i64(10, 0), Mile())
+    let mismatch_caught: bool = match add_measure(total, distance) {
+        Ok(m) => false,
+        Err(e) => true,
+    }
+    print(mismatch_caught) // true -- kg + miles is refused, never silently summed
+}

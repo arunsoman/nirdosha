@@ -1,0 +1,58 @@
+// Feature: `http_get`/`http_post`/`https_get`/`https_post` (LANGUAGE.md
+// §5). Plain HTTP is client-only, built on the same real `TcpStream`
+// `connect` already uses; HTTPS layers a real `native_tls::TlsStream`
+// with certificate/hostname verification on top -- a vetted library
+// binding doing the security-critical work. Every fallible call returns
+// `Result(HttpResponse, str)`; a response body composes directly with
+// `json_parse`/`json_get_*`.
+//
+// No server is listening for this file, so both calls land in `Err` --
+// the point is the syntax and the `Result` handling (see
+// 22_tcp_client.nir for a self-hosted, successful round trip over raw
+// `tcp`).
+
+struct Text {
+    value: str,
+}
+
+fn try_http_get() -> Text {
+    return match http_get("127.0.0.1", 8977, "/ping") {
+        Ok(resp) => Text("http status unexpectedly succeeded"),
+        Err(e) => Text(e),
+    }
+}
+
+fn try_http_post() -> Text {
+    return match http_post("127.0.0.1", 8977, "/api/charge", "{}") {
+        Ok(resp) => Text("http status unexpectedly succeeded"),
+        Err(e) => Text(e),
+    }
+}
+
+fn try_https_get() -> i64 {
+    // a real external host -- if this succeeds, `resp.status` is a real
+    // HTTP status code (200, etc); no offline way to test the TLS
+    // handshake itself without a certificate the client would trust.
+    return match https_get("example.com", 443, "/") {
+        Ok(resp) => resp.status,
+        Err(e) => -1,
+    }
+}
+
+fn try_https_post() -> i64 {
+    return match https_post("example.com", 443, "/", "{}") {
+        Ok(resp) => resp.status,
+        Err(e) => -1,
+    }
+}
+
+fn main() {
+    let get_result: Text = try_http_get()
+    print(get_result.value) // a real connection-refused message
+
+    let post_result: Text = try_http_post()
+    print(post_result.value)
+
+    print(try_https_get())  // 200 if network access is available, -1 otherwise
+    print(try_https_post()) // same, over the POST form
+}

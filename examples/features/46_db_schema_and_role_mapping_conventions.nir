@@ -1,0 +1,50 @@
+// Feature: two `nirdosha serve --db`-gated *behaviors*, no new syntax
+// at all -- both are ordinary `struct` declarations that get special
+// treatment only once that flag is passed (LANGUAGE.md §11a, §13).
+// Omitting `--db` (or running via plain `nirdosha <file>`/`emit-ui`)
+// leaves a program exactly as it always behaved -- this file typechecks
+// and runs identically with or without either convention.
+//
+// 1. Auto-generated DB schema migrations (§13): `serve --db <path>`
+//    derives each top-level struct's SQL schema from its own field
+//    declarations at startup, diffing against the live table --
+//    `CREATE TABLE IF NOT EXISTS` when it's missing, one `ALTER TABLE
+//    ... ADD COLUMN` per newly-added field, nothing when nothing
+//    changed. A field literally named `id: i64` becomes
+//    `INTEGER PRIMARY KEY AUTOINCREMENT`, the convention every
+//    hand-written schema in this tree already follows. Additive-only:
+//    a field whose type has no single-column SQL shape (a nested
+//    struct, `Vector`/`Matrix`, an affine handle) skips that whole
+//    table, logged as a warning, never a partial one.
+struct Vendor {
+    id: i64,
+    name: str,
+    rating: i64,
+    active: bool,
+}
+
+// 2. Identity role-mapping cache (§11a): an ordinary admin-editable
+//    struct named exactly `RoleMapping`, with exactly these three
+//    fields -- `serve --db` loads every `(app_role, idp_role)` row into
+//    an in-memory cache, so `requires(role: "compliance_officer")`
+//    matches either the literal string or any `idp_role` mapped to it.
+//    A program with no `RoleMapping` declared (or no `--db` at all)
+//    gets byte-for-byte the original literal-match-only behavior.
+struct RoleMapping {
+    id: i64,
+    app_role: str,
+    idp_role: str,
+}
+
+fn main() {
+    // both structs are otherwise completely ordinary -- constructible,
+    // matchable on their fields, usable in `db_query`/`db_execute`'s
+    // own hand-written SQL exactly like any other struct.
+    let v: Vendor = Vendor(1, "Acme", 4, true)
+    print(v.name)   // Acme
+    print(v.active) // true
+
+    let mapping: RoleMapping = RoleMapping(1, "compliance_officer", "legal-and-compliance")
+    print(mapping.app_role) // compliance_officer
+    print(mapping.idp_role) // legal-and-compliance
+}

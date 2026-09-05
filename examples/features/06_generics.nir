@@ -1,0 +1,54 @@
+// Feature: generics -- Row 11 layer 6 (LANGUAGE.md §6, nirdosha_row11_
+// amendment.md §3.6).
+//
+// Type identity is structural-per-instantiation, not erased:
+// `Duo(i64, i64)` is a real, concrete `Ty`, the same way `Vector(f64, 3)`
+// is. No monomorphizer pass exists or is needed.
+
+struct Duo(A, B) {
+    first: A,
+    second: B,
+}
+
+enum Either(A, B) {
+    Left(A),
+    Right(B),
+}
+
+fn sum_pair(p: Duo(i64, i64)) -> i64 {
+    return p.first + p.second
+}
+
+fn pick(e: Either(i64, i64)) -> i64 {
+    return match e {
+        Left(n) => n,
+        Right(n) => n,
+    }
+}
+
+// A generic function over `Duo(A, B)` itself -- `A`/`B` are the
+// struct's own type parameters, not new function-level ones.
+fn swap(p: Duo(i64, bool)) -> Duo(bool, i64) {
+    return Duo(p.second, p.first)
+}
+
+fn main() {
+    let duo: Duo(i64, i64) = Duo(2, 3)
+    print(sum_pair(duo)) // 5
+
+    let left: Either(i64, i64) = Left(1)
+    let right: Either(i64, i64) = Right(9)
+    print(pick(left))  // 1
+    print(pick(right)) // 9
+
+    let flagged: Duo(i64, bool) = Duo(41, true)
+    let swapped: Duo(bool, i64) = swap(flagged)
+    print(swapped.first)  // true
+    print(swapped.second) // 41
+
+    // a different instantiation of the same generic struct -- a real,
+    // distinct concrete type, `Duo(f64, f64)`, not shared with `Duo(i64,
+    // i64)` above.
+    let point: Duo(f64, f64) = Duo(3.0, 4.0)
+    print(point.first + point.second) // 7
+}

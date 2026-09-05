@@ -1,0 +1,38 @@
+// Feature: `dec128` decimal arithmetic (LANGUAGE.md §2, §5). 128-bit
+// fixed-point (`rust_decimal::Decimal`), up to 28 significant digits.
+// No literal syntax and no implicit conversion to/from `i64`/`f64` --
+// construct only via `dec_from_str`/`dec_from_i64`. Interpreter-only
+// for now (`nirdosha build` rejects it, same as `db`/`json`/`mq`).
+
+fn main() {
+    // `dec_from_i64(unscaled, scale)` -- 1999 at scale 2 is 19.99
+    let a: dec128 = dec_from_i64(1999, 2)
+    print(dec_to_str(a)) // "19.99"
+    print(dec_scale(a))  // 2
+
+    // `dec_from_str` is fallible -- malformed input is a real `Result`,
+    // never a silent 0.
+    let b: dec128 = match dec_from_str("5.01") {
+        Ok(d) => d,
+        Err(e) => dec_from_i64(0, 0),
+    }
+    let malformed: bool = match dec_from_str("not-a-number") {
+        Ok(d) => false,
+        Err(e) => true,
+    }
+    print(malformed) // true
+
+    // native `+ - * /` and comparisons, same operator dispatch every
+    // numeric scalar gets -- no builtin functions needed.
+    let sum: dec128 = a + b
+    print(dec_to_str(sum)) // "25.00"
+    print(sum > a)         // true
+    print(sum == a)        // false
+
+    // `/` rounds to the max representable scale rather than trapping on
+    // a non-terminating result; `dec_round` narrows it afterward.
+    let one: dec128 = dec_from_i64(1, 0)
+    let three: dec128 = dec_from_i64(3, 0)
+    let third: dec128 = one / three
+    print(dec_to_str(dec_round(third, 4))) // "0.3333"
+}

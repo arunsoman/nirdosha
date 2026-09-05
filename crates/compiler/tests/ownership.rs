@@ -382,17 +382,17 @@ fn all_examples_pass_ownership_checking() {
     // is really a "the checker doesn't false-positive on ordinary scalar
     // code" test; `ownership.nir` is the one that actually exercises moves.
     for src in [
-        include_str!("../../../examples/hello.nir"),
-        include_str!("../../../examples/factorial.nir"),
-        include_str!("../../../examples/loop.nir"),
-        include_str!("../../../examples/ownership.nir"),
-        include_str!("../../../examples/borrow.nir"),
-        include_str!("../../../examples/threads.nir"),
-        include_str!("../../../examples/channels.nir"),
-        include_str!("../../../examples/sandbox.nir"),
-        include_str!("../../../examples/sandbox_channels.nir"),
-        include_str!("../../../examples/strings.nir"),
-        include_str!("../../../examples/tcp_client.nir"),
+        include_str!("fixtures/hello.nir"),
+        include_str!("fixtures/factorial.nir"),
+        include_str!("fixtures/loop.nir"),
+        include_str!("fixtures/ownership.nir"),
+        include_str!("fixtures/borrow.nir"),
+        include_str!("fixtures/threads.nir"),
+        include_str!("fixtures/channels.nir"),
+        include_str!("fixtures/sandbox.nir"),
+        include_str!("fixtures/sandbox_channels.nir"),
+        include_str!("fixtures/strings.nir"),
+        include_str!("fixtures/tcp_client.nir"),
     ] {
         let program = parse_ok(src);
         assert_eq!(check_ownership(&program), Ok(()));
@@ -401,12 +401,12 @@ fn all_examples_pass_ownership_checking() {
 
 #[test]
 fn example_ownership_runs_to_completion() {
-    let src = include_str!("../../../examples/ownership.nir");
+    let src = include_str!("fixtures/ownership.nir");
     assert_eq!(run(src), Ok(Value::Unit));
 }
 
 #[test]
 fn example_borrow_runs_to_completion() {
-    let src = include_str!("../../../examples/borrow.nir");
+    let src = include_str!("fixtures/borrow.nir");
     assert_eq!(run(src), Ok(Value::Unit));
 }

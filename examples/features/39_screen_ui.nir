@@ -1,0 +1,92 @@
+// Feature: `screen <Struct> { ... }` -- declarative UI DSL (LANGUAGE.md
+// §11, Row 12 `emit-ui`/`serve` only). `nirdosha emit-ui`/`serve`
+// already derive a full CRUD screen from nothing but a `struct` and its
+// `list_/create_/update_/delete_<struct>` naming convention; `screen`
+// is an **optional, additive** layer on top for the parts a naming
+// convention can't express -- a friendlier title, a relabeled/
+// constrained field, or a custom action beyond plain CRUD. A struct
+// with no matching `screen` block behaves exactly as before.
+//
+// Only `emit-ui`/`serve` actually render this -- plain `nirdosha
+// <file>` just typechecks it (existence/shape only: `screen <Name>`
+// must name a real struct, `field <fname>` a real field, an action's
+// `->` target a real function) and otherwise ignores it, which is what
+// `main` below exercises directly.
+
+enum ErrorCode {
+    MalformedListing(str),
+}
+
+struct Product {
+    id: i64,
+    name: str,
+    price_cents: i64,
+    stock: i64,
+}
+
+fn list_product() -> Result(json, ErrorCode) {
+    return match json_parse("[]") {
+        Ok(doc) => Ok(doc),
+        Err(e) => Err(MalformedListing(e)),
+    }
+}
+
+fn create_product(p: Product) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return Ok(p.id)
+}
+
+fn restock_product(id: i64) -> Result(i64, ErrorCode) requires(role: "admin") {
+    return Ok(id)
+}
+
+screen Product {
+    title: "Catalog"
+    field name {
+        label: "Product Name"
+        pattern: "^[A-Za-z0-9 ]+$"
+    }
+    field stock {
+        min: 0
+    }
+    action "Restock +10" -> restock_product {
+        style: "outlined"
+        confirm: "Restock this product by 10 units?"
+    }
+}
+
+fn main() {
+    // the `screen` block changes nothing about how these fns behave
+    // when called directly -- it only changes what `emit-ui`/`serve`
+    // render for `Product`.
+    let listed: Result(json, ErrorCode) = list_product()
+    let listed_ok: bool = match listed {
+        Ok(doc) => true,
+        Err(e) => false,
+    }
+    print(listed_ok) // true
+
+    // `restock_product` is `requires(role: "admin")`-gated -- calling it
+    // still needs a real, acquired proof, same as 33_privileged_
+    // functions.nir, regardless of `screen`'s own "Restock +10" action
+    // wrapping it.
+    let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
+    let claims: str = "{\"roles\":[\"admin\"]}"
+    let token: str = match mock_issue_token("admin-user", "https://mock-idp.local", "features-demo", 1700000000, 999999999, claims, jwks) {
+        Ok(t) => t,
+        Err(e) => e,
+    }
+    let restocked: i64 = match oidc_validate_token(token, "https://mock-idp.local", "features-demo", jwks) {
+        Ok(identity) => match check_role(identity, "admin") {
+            Ok(proof) => match acquire restock_product(proof) {
+                Ok(f) => match f(1) {
+                    Ok(id) => id,
+                    Err(e) => -1,
+                },
+                Err(e) => -1,
+            },
+            Err(e) => -1,
+        },
+        Err(e) => -1,
+    }
+    print(restocked) // 1
+}

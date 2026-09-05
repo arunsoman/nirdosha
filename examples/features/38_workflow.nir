@@ -1,0 +1,80 @@
+// Feature: `workflow { ... }` -- durable state machines with
+// notification actions (LANGUAGE.md §14, `docs/WORKFLOW.md`). Pure
+// desugaring, not a new runtime primitive: `workflow_lower.rs` turns
+// this into ordinary `fn`/`enum`/`struct` declarations right after
+// parsing (`start_<w>`, `advance_<w>`, a synthesized `<W>Event` enum and
+// `<W>Data` struct) -- everything later, including `nirdosha serve`'s
+// automatic `POST /api/<fn>` exposure, sees only those.
+//
+// Covers: `data { ... }`/`data.<field>` bindings, `on_entry` actions,
+// ordinary `on <Event> -> <State>` transitions, `terminal` states, and
+// an `owner: role(...)`-gated state (a real, disclosed leading
+// `identity: VerifiedIdentity` param on `advance_<w>`).
+
+fn log_decision(instance_id: i64, amount: i64) -> unit {
+    print("approval", instance_id, "for amount", amount)
+}
+
+workflow Approval {
+    data {
+        amount: i64,
+    }
+
+    state Pending {
+        // only an identity carrying this role may advance this state --
+        // `advance_approval` checks it at runtime, `Err(NotStateOwner)`
+        // on a mismatch, never a trap.
+        owner: role("finance_director")
+        on Approve -> Approved
+        on Reject -> Rejected
+    }
+
+    state Approved terminal {
+        on_entry {
+            log_decision(instance_id, data.amount)
+        }
+    }
+
+    state Rejected terminal {
+    }
+}
+
+// thin, `emit-ui`-friendly wrappers over the desugared `start_approval`/
+// `advance_approval` -- a caller shouldn't have to know the exact
+// synthesized name/shape to use this workflow.
+fn submit_approval(amount: i64) -> Result(i64, WorkflowActionError) {
+    return start_approval(None(), ApprovalData(amount))
+}
+
+fn decide_approval(identity: VerifiedIdentity, instance_id: i64, decision: ApprovalEvent) -> Result(bool, WorkflowActionError) {
+    return match json_parse("{}") {
+        Ok(payload) => advance_approval(identity, instance_id, decision, payload),
+        Err(e) => Err(NoSuchTransition()),
+    }
+}
+
+fn main() {
+    let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
+    let issuer: str = "https://mock-idp.local"
+    let audience: str = "features-demo"
+    let claims: str = "{\"roles\":[\"finance_director\"]}"
+    let token: str = match mock_issue_token("finance-user", issuer, audience, 1700000000, 999999999, claims, jwks) {
+        Ok(t) => t,
+        Err(e) => e,
+    }
+
+    let instance_id: i64 = match submit_approval(250000) {
+        Ok(id) => id,
+        Err(e) => -1,
+    }
+    print(instance_id) // 1 -- the workflow's own durable instance id
+
+    let approved: bool = match oidc_validate_token(token, issuer, audience, jwks) {
+        Ok(identity) => match decide_approval(identity, instance_id, Approve()) {
+            Ok(ok) => ok,
+            Err(e) => false,
+        },
+        Err(e) => false,
+    }
+    print(approved) // true -- also runs Approved's on_entry (the "approval ..." log line)
+}

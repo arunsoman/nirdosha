@@ -333,9 +333,9 @@ fn json_is_interpreter_only_rejected_by_codegen() {
 
 #[test]
 fn example_json_runs_to_completion() {
-    let program = parse_ok(include_str!("../../../examples/json.nir"));
+    let program = parse_ok(include_str!("fixtures/json.nir"));
     typecheck(&program).expect("should typecheck cleanly");
-    assert_eq!(run(include_str!("../../../examples/json.nir")), Ok(Value::Unit));
+    assert_eq!(run(include_str!("fixtures/json.nir")), Ok(Value::Unit));
 }
 
 // ---- json_set_str (json_get_str's inverse, docs/WORKFLOW.md) --------------

@@ -1,0 +1,47 @@
+// Feature: "External Data & Service Boundary" -- plugin-backed `db`/`mq`
+// by URL scheme (`docs/adr/0004`). `db_connect`'s connection string and
+// `mq_connect_via`'s own argument are dispatched at *runtime* by their
+// `scheme://` prefix to a plugin-registered `db_provider_<scheme>_*`/
+// `mq_provider_<scheme>_*` builtin, when one is registered (SQLite/
+// Postgres/Redis stay built in; anything else -- MySQL, Kafka,
+// ActiveMQ, Cassandra, Neo4j, HBase -- is exactly this mechanism, one
+// plugin crate per scheme, e.g. `crates/plugin-example-mysql`).
+//
+// No such plugin is loaded for this plain interpret run. `mq_connect_via`
+// names the exact missing provider builtin in its `Err`.  `db_connect`'s
+// own scheme-dispatch only intercepts a scheme with a *registered*
+// plugin -- an unregistered one (like `mysql://` here) instead falls
+// straight through to the built-in SQLite path, which then honestly
+// tries (and fails) to open a file literally named
+// "mysql://user:pass@localhost/orders" -- a real, disclosed gap
+// (`interpreter.rs`'s own comment on this exact fallthrough), not a
+// silent swallow either way. Both are still real `Err`s, never a trap;
+// a real deployment wires up the matching plugin crate for a live
+// connection instead.
+
+struct Text {
+    value: str,
+}
+
+fn try_scheme_dispatched_db() -> Text {
+    return match db_connect("mysql://user:pass@localhost/orders") {
+        Ok(conn) => Text("unexpectedly connected"),
+        Err(e) => Text(e),
+    }
+}
+
+fn try_scheme_dispatched_mq() -> Text {
+    return match mq_connect_via("kafka://localhost:9092") {
+        Ok(conn) => Text("unexpectedly connected"),
+        Err(e) => Text(e),
+    }
+}
+
+fn main() {
+    let db_result: Text = try_scheme_dispatched_db()
+    print(db_result.value) // the honest SQLite-fallthrough failure, since no
+                            // `db_provider_mysql_connect` plugin is registered
+
+    let mq_result: Text = try_scheme_dispatched_mq()
+    print(mq_result.value) // names the missing `mq_provider_kafka_connect`
+}

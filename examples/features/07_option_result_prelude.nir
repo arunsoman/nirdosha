@@ -1,0 +1,49 @@
+// Feature: the Option(T)/Result(T, E) prelude -- Row 11 layer 7
+// (LANGUAGE.md §6). Built in, no declaration needed, the same generic
+// machinery 06_generics.nir's own `Duo`/`Either` use.
+
+fn unwrap_option(o: Option(i64), default: i64) -> i64 {
+    return match o {
+        Some(n) => n,
+        None => default,
+    }
+}
+
+enum ErrorCode {
+    NotFound,
+}
+
+fn safe_div(a: i64, b: i64) -> Result(i64, ErrorCode) {
+    if b == 0 {
+        return Err(NotFound())
+    }
+    return Ok(a / b)
+}
+
+fn main() {
+    let some: Option(i64) = Some(41)
+    let none: Option(i64) = None()
+    print(unwrap_option(some, 0)) // 41
+    print(unwrap_option(none, 0)) // 0
+
+    let ok: i64 = match safe_div(10, 2) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    print(ok) // 5
+
+    let failed: i64 = match safe_div(10, 0) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    print(failed) // -1
+
+    // Nested: Result(Option(i64), ErrorCode) composes the same way any
+    // other generic instantiation does.
+    let nested: Result(Option(i64), ErrorCode) = Ok(Some(7))
+    let value: i64 = match nested {
+        Ok(inner) => unwrap_option(inner, -1),
+        Err(e) => -2,
+    }
+    print(value) // 7
+}

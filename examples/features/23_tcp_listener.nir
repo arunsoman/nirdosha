@@ -1,0 +1,41 @@
+// Feature: `tcp_listener`, `listen`, `accept` (LANGUAGE.md §2, §7). A
+// real bound+listening TCP socket; unlike `tcp`/`sandbox`/`file`,
+// `accept` does *not* consume the listener -- only `stop` does, so one
+// listener can `accept` more than one client before being closed.
+
+struct Text {
+    value: str,
+}
+
+fn handle_two_clients(l: tcp_listener) -> Text {
+    let first: tcp = accept(l)
+    let first_msg: str = recv(first)
+    stop first
+
+    let second: tcp = accept(l) // same listener, still usable
+    let second_msg: str = recv(second)
+    stop second
+
+    stop l
+    return Text(first_msg)
+}
+
+fn talk(port: i64, message: Text) -> unit {
+    let conn: tcp = connect("127.0.0.1", port)
+    send(conn, message.value)
+    stop conn
+    return
+}
+
+fn main() {
+    let l: tcp_listener = listen(9701)
+    let h: thread Text = spawn handle_two_clients(l)
+
+    let c1: thread unit = spawn talk(9701, Text("hello from client 1"))
+    join c1
+    let c2: thread unit = spawn talk(9701, Text("hello from client 2"))
+    join c2
+
+    let first: Text = join h
+    print(first.value) // "hello from client 1" -- the listener served both
+}

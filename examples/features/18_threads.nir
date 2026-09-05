@@ -1,0 +1,39 @@
+// Feature: `thread T`, `spawn`, `join` (LANGUAGE.md §2, §7). `spawn
+// f(args)` runs `f` concurrently on a real, reused OS worker thread and
+// immediately returns a `thread T` handle; `join h` blocks until that
+// computation finishes and consumes the handle, producing its `T`.
+// `thread` is affine -- `join` may only run once per handle.
+//
+// Race-freedom comes entirely from the ownership checker, not anything
+// thread-specific: `spawn`'s arguments move exactly like an ordinary
+// call's, so an affine value passed to `spawn` can never be touched
+// again by the spawning side.
+
+fn double(n: i64) -> i64 {
+    return n * 2
+}
+
+fn add(a: i64, b: i64) -> i64 {
+    return a + b
+}
+
+fn main() {
+    let h1: thread i64 = spawn double(21)
+    let h2: thread i64 = spawn add(10, 32)
+
+    let r1: i64 = join h1
+    let r2: i64 = join h2
+
+    print(r1) // 42
+    print(r2) // 42
+
+    // an affine value moved into `spawn` -- `boxed` is unusable again
+    // in `main` after this line.
+    let boxed: box i64 = box 100
+    let h3: thread i64 = spawn double_boxed(boxed)
+    print(join h3) // 200
+}
+
+fn double_boxed(b: box i64) -> i64 {
+    return *b * 2
+}

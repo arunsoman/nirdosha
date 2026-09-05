@@ -1,0 +1,28 @@
+// Feature: `audited "justification" { ... }` (LANGUAGE.md §6, §8) --
+// the one escape hatch from the compiler's automatic Tier-1/2 bounds
+// and div-by-zero guards. Suppresses codegen's guard emission inside
+// the block only; the interpreter is unaffected (it always runs its
+// own runtime checks regardless of `audited`). The compiler only
+// enforces that the justification string is non-empty -- judging its
+// content is a review-process concern, not a compiler one.
+
+fn safe_index(v: Vector(f64, 3), i: i64) -> f64 {
+    audited "i is checked against len(v) on the line right above" {
+        if i >= 0 && i < len(v) {
+            return v[i]
+        }
+    }
+    return 0.0
+}
+
+fn main() {
+    let v: Vector(f64, 3) = [10.0, 20.0, 30.0]
+    print(safe_index(v, 1)) // 20
+    print(safe_index(v, 9)) // 0 -- out of range, falls through to the default
+
+    let n: i64 = 100
+    let d: i64 = 5
+    audited "d is a literal 5, never zero, in this exact call site" {
+        print(n / d) // 20
+    }
+}

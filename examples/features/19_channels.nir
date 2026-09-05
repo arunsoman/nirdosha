@@ -1,0 +1,51 @@
+// Feature: `chan T`, `send`, `recv` (LANGUAGE.md §2, §7). `chan T` is a
+// handle to an unbounded, multi-producer multi-consumer queue; `send`
+// never blocks, `recv` blocks until a value is available. Unlike
+// `thread`, a channel handle is freely copyable -- both the sender and
+// the receiver keep their own handle to the same queue after `spawn`.
+// The payload itself still moves through `send` -- an affine value sent
+// on a channel is unusable by the sender the instant it's sent.
+
+fn producer(c: chan i64) -> unit {
+    send(c, 14)
+    send(c, 28)
+    return
+}
+
+fn box_producer(c: chan box i64) -> unit {
+    send(c, box 99)
+    return
+}
+
+fn main() {
+    let c: chan i64 = chan
+    let h: thread unit = spawn producer(c)
+
+    let a: i64 = recv(c)
+    let b: i64 = recv(c)
+    join h
+
+    print(a + b) // 42
+
+    // channels compose with actors: two producers feeding one consumer
+    let ca: chan f64 = chan
+    let cb: chan f64 = chan
+    let t1: thread unit = spawn emit(ca, 1.5)
+    let t2: thread unit = spawn emit(cb, 2.5)
+    let total: f64 = recv(ca) + recv(cb)
+    join t1
+    join t2
+    print(total) // 4
+
+    // an affine payload -- `box i64` -- crossing a channel
+    let bc: chan box i64 = chan
+    let h2: thread unit = spawn box_producer(bc)
+    let received: box i64 = recv(bc)
+    join h2
+    print(*received) // 99
+}
+
+fn emit(c: chan f64, v: f64) -> unit {
+    send(c, v)
+    return
+}

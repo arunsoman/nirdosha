@@ -1,0 +1,76 @@
+// Feature: `layout { ... }` -- composable screen arrangement
+// (LANGUAGE.md §18, Track F4). Declared inside a `screen` block, this is
+// an optional arrangement tree on top of that screen's own field/action
+// set -- the first construct in this language that can nest inside
+// itself. `row`/`column`/`grid` arrange children; `group "Title" { ... }`
+// is a titled box; `tabs { tab "Label" { ... } ... }` switches panels.
+// `field <name>`/`action "<label>"` *reference*, never duplicate, the
+// screen's own existing declarations by name.
+
+enum ErrorCode {
+    MalformedListing(str),
+}
+
+struct Case {
+    id: i64,
+    case_number: str,
+    status: str,
+    priority: i64,
+    assigned_to: str,
+}
+
+fn list_case() -> Result(json, ErrorCode) {
+    return match json_parse("[]") {
+        Ok(doc) => Ok(doc),
+        Err(e) => Err(MalformedListing(e)),
+    }
+}
+
+fn escalate_case(id: i64) -> Result(i64, ErrorCode) {
+    return Ok(id)
+}
+
+fn list_case_history(case_id: i64) -> Result(json, ErrorCode) {
+    return match json_parse("[]") {
+        Ok(doc) => Ok(doc),
+        Err(e) => Err(MalformedListing(e)),
+    }
+}
+
+screen Case {
+    action "Escalate" -> escalate_case
+
+    layout {
+        row {
+            column {
+                group "Details" {
+                    field case_number
+                    field status
+                    field priority
+                }
+                divider {}
+                group "Assignment" {
+                    field assigned_to
+                }
+            }
+            column {
+                tabs {
+                    tab "History" {
+                        timeline { source: list_case_history }
+                    }
+                    tab "Actions" {
+                        action "Escalate"
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn main() {
+    let escalated: i64 = match escalate_case(1) {
+        Ok(id) => id,
+        Err(e) => -1,
+    }
+    print(escalated) // 1
+}

@@ -1,0 +1,52 @@
+// Feature: operators (LANGUAGE.md §4).
+//
+// Arithmetic/comparison/logical/unary, plus Vector/Matrix's elementwise
+// and linear-algebra forms of `+ - * .* ./`. No `%`, no bitwise
+// operators, no broadcasting. `Vector * Vector` is a deliberate type
+// error -- ambiguous (inner vs. outer product); use `dot()` instead.
+
+fn main() {
+    // scalar arithmetic
+    print(7 + 3)   // 10
+    print(7 - 3)   // 4
+    print(7 * 3)   // 21
+    print(7 / 3)   // 2 -- int division
+    print(7.0 / 3.0) // 2.3333333333333335 -- float division saturates, never traps
+    print(-7)      // unary negate
+
+    // comparisons (numeric scalars only)
+    print(7 > 3)
+    print(7 >= 7)
+    print(7 < 3)
+    print(7 <= 7)
+    print(7 == 7)
+    print(7 != 3)
+
+    // short-circuit boolean logic
+    print(true && false)
+    print(true || false)
+    print(!true)
+
+    // box/&: unary `*` (deref) and `&` (borrow) -- see 14/15 for the
+    // full ownership story; here just the operator forms.
+    let boxed: box i64 = box 9
+    print(*boxed)
+    let n: i64 = 5
+    let r: &i64 = &n
+    print(*r)
+
+    // Vector/Matrix: elementwise +/-, Hadamard .*/./, linear-algebra *
+    let v: Vector(f64, 3) = [1.0, 2.0, 3.0]
+    let w: Vector(f64, 3) = [10.0, 20.0, 30.0]
+    print(v + w)   // [11, 22, 33] elementwise
+    print(v - w)   // [-9, -18, -27] elementwise
+    print(v .* w)  // [10, 40, 90] Hadamard
+    print(v ./ w)  // [0.1, 0.1, 0.1] Hadamard
+    print(v == v)  // true -- structural equality
+
+    let m: Matrix(f64, 2, 2) = [[1.0, 2.0], [3.0, 4.0]]
+    print(2.0 * m)      // [[2, 4], [6, 8]] -- scalar * matrix
+    print(m * 2.0)      // [[2, 4], [6, 8]] -- scalar * matrix, either order
+    let mv: Vector(f64, 2) = [1.0, 1.0]
+    print(m * mv)        // [3, 7] -- matrix * vector (inner dims match)
+}

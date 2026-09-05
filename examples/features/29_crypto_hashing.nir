@@ -1,0 +1,33 @@
+// Feature: `sha256_hex`, `constant_time_str_eq` (LANGUAGE.md §5, §10).
+// A from-scratch, bit-verified SHA-256; both forms are infallible, no
+// `Result` wrap. The 2-argument form hashes both parts in sequence
+// rather than concatenating first (there's no `+` on `str` to do that
+// with) -- exactly what a hash-chained audit log needs:
+// `hash = sha256_hex(prev_hash, payload)`. `constant_time_str_eq` is a
+// timing-safe comparison, for checking a secret (an API key, a HMAC)
+// without leaking how many leading bytes matched via response timing.
+
+struct Text {
+    value: str,
+}
+
+fn main() {
+    let h1: Text = Text(sha256_hex("hello, nirdosha"))
+    print(h1.value)
+
+    // a hash chain -- each link folds in the previous hash and a new
+    // payload, the backbone of a tamper-evident audit log.
+    let genesis: str = sha256_hex("genesis")
+    let link1: str = sha256_hex(genesis, "event: vendor created")
+    let link2: str = sha256_hex(link1, "event: purchase order approved")
+    let chain_head: Text = Text(link2)
+    print(chain_head.value)
+
+    // ordinary `==` would leak timing information proportional to how
+    // many leading bytes match; `constant_time_str_eq` doesn't.
+    let secret: str = "super-secret-api-key"
+    let attempt: str = "super-secret-api-key"
+    let wrong: str = "totally-different-key"
+    print(constant_time_str_eq(secret, attempt)) // true
+    print(constant_time_str_eq(secret, wrong))   // false
+}

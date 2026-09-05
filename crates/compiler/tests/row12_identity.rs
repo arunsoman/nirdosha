@@ -270,5 +270,5 @@ fn main() -> Text {
 
 #[test]
 fn example_runs_to_completion() {
-    assert_eq!(run(include_str!("../../../examples/row12_identity.nir")), Ok(Value::Unit));
+    assert_eq!(run(include_str!("fixtures/row12_identity.nir")), Ok(Value::Unit));
 }

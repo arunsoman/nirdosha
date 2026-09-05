@@ -1,0 +1,63 @@
+// Feature: privileged first-class functions -- `requires(role: ...)`/
+// `requires(claim: ..., ...)` + `acquire` (LANGUAGE.md §6a). A gated
+// function's *value* is unobtainable without proof: `transfer_funds(500)`
+// or `let f = transfer_funds` are both *compile-time* errors -- `fn`'s
+// name has no direct-call path at all once gated. `acquire fn_name(proof)`
+// is the only way to obtain a callable value, and it demands a real
+// proof: a `RoleView` (from `check_role`) or `ClaimView` (from
+// `extract_claim`), themselves only producible from a real, externally-
+// issued, validated token.
+
+fn transfer_funds(amount: i64) -> i64 requires(role: "admin") {
+    return amount
+}
+
+fn read_chart(id: i64) -> i64 requires(claim: "department", "cardiology") {
+    return id
+}
+
+// an ordinary (ungated) function is already first-class, no proof needed
+fn double(x: i64) -> i64 {
+    return x * 2
+}
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x)
+}
+
+fn main() {
+    print(apply(double, 21)) // 42 -- no privilege needed
+
+    // same fixture used throughout this tree: roles=["physician"],
+    // department="cardiology".
+    let token: str = "eyJhbGciOiAiSFMyNTYiLCAia2lkIjogImtleTEifQ.eyJzdWIiOiAiYWxpY2UiLCAiaXNzIjogImh0dHBzOi8vZXhhbXBsZS5jb20iLCAiYXVkIjogIm15LWFwcCIsICJleHAiOiAyMDAwMDAwMDAwLCAiaWF0IjogMTcwMDAwMDAwMCwgInJvbGVzIjogWyJwaHlzaWNpYW4iXSwgImRlcGFydG1lbnQiOiAiY2FyZGlvbG9neSJ9.nrFdeqNDwXWLeGzud6X9Q4ITzCXULzZBBK8y51LGYXs"
+    let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
+
+    // `claim`-gated: `extract_claim` proves "department=cardiology" is
+    // present, `acquire` accepts that proof against `read_chart`.
+    let chart_result: i64 = match oidc_validate_token(token, "https://example.com", "my-app", jwks) {
+        Ok(identity) => match extract_claim(identity, "department") {
+            Ok(proof) => match acquire read_chart(proof) {
+                Ok(f) => f(7),
+                Err(e) => -1,
+            },
+            Err(e) => -2,
+        },
+        Err(e) => -3,
+    }
+    print(chart_result) // 7
+
+    // `role`-gated, against a role this token doesn't carry ("admin")
+    // -- `check_role` itself fails, so `acquire` is never even reached.
+    let denied: i64 = match oidc_validate_token(token, "https://example.com", "my-app", jwks) {
+        Ok(identity) => match check_role(identity, "admin") {
+            Ok(proof) => match acquire transfer_funds(proof) {
+                Ok(f) => f(500),
+                Err(e) => -1,
+            },
+            Err(e) => -2,
+        },
+        Err(e) => -3,
+    }
+    print(denied) // -2 -- "physician" != "admin"
+}

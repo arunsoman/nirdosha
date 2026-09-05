@@ -1,0 +1,24 @@
+// Feature: real namespacing (LANGUAGE.md §17) -- a tiny library file,
+// imported by 45_module_namespacing.nir via `use`. `module Ident { ... }`
+// (a bare identifier, not a string) is a real namespace: every
+// declaration inside registers under its own qualified key
+// (`Shared::AuditEntry`, never bare `AuditEntry`), so it can share a
+// short name with the prelude or another module with zero collision.
+module Shared {
+    pub struct AuditEntry {
+        id: i64,
+        note: str,
+    }
+
+    // private -- unreachable from outside `Shared`, even qualified
+    struct RetentionPolicy {
+        days: i64,
+    }
+
+    // even inside its own module, a namespaced declaration is reachable
+    // only by its qualified form -- never bare, even from a sibling
+    // declaration in the very same module.
+    pub fn make_entry(id: i64) -> Shared::AuditEntry {
+        return Shared::AuditEntry(id, "created")
+    }
+}

@@ -49,7 +49,7 @@ fn first_ownership_error(src: &str) -> OwnershipErrorKind {
 
 #[test]
 fn example_threads_runs_to_completion() {
-    let src = include_str!("../../../examples/threads.nir");
+    let src = include_str!("fixtures/threads.nir");
     assert_eq!(run(src), Ok(Value::Unit));
 }
 

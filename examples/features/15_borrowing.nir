@@ -1,0 +1,27 @@
+// Feature: shared borrows, `&T` (LANGUAGE.md §2, §4). A read-only
+// borrow of a plain identifier only (`&x`, never `&(x + 1)`); no `&mut`
+// exists. Unlike passing an affine value directly, borrowing doesn't
+// move -- the caller can keep using the same binding afterward.
+
+fn peek(r: &i64) -> i64 {
+    return *r + 1
+}
+
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+fn distance_from_origin(p: &Point) -> f64 {
+    return norm([(*p).x, (*p).y])
+}
+
+fn main() {
+    let n: i64 = 41
+    print(peek(&n))
+    print(peek(&n)) // `n` was only borrowed, not moved -- this is fine
+
+    let origin_point: Point = Point(3.0, 4.0)
+    print(distance_from_origin(&origin_point)) // 5
+    print(origin_point.x) // still usable -- only borrowed above
+}

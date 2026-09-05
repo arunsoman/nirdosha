@@ -1,0 +1,67 @@
+// Feature: `workspace`/`panel` -- composite, multi-panel screens
+// (LANGUAGE.md §15, `examples/ctms/UI_CONSTRUCTS.md` §1). `screen` is
+// fundamentally one-struct-shaped; `workspace` composes fields/lists
+// from *several* structs onto one page, all scoped to one instance --
+// `subject: <Struct>` (must have an `id: i64` field) names which struct
+// this is opened per-instance of; every panel's `source` is called with
+// that instance's id, and must be `fn(i64) -> Result(json, _)`.
+
+enum ErrorCode {
+    MalformedListing(str),
+}
+
+struct Case {
+    id: i64,
+    title: str,
+    status: str,
+}
+
+fn list_transaction_for_case(case_id: i64) -> Result(json, ErrorCode) {
+    return match json_parse("[]") {
+        Ok(doc) => Ok(doc),
+        Err(e) => Err(MalformedListing(e)),
+    }
+}
+
+fn list_case_note(case_id: i64) -> Result(json, ErrorCode) {
+    return match json_parse("[]") {
+        Ok(doc) => Ok(doc),
+        Err(e) => Err(MalformedListing(e)),
+    }
+}
+
+fn add_case_note(case_id: i64) -> Result(i64, ErrorCode) {
+    return Ok(case_id)
+}
+
+workspace CaseInvestigation {
+    title: "Investigation Workspace"
+    subject: Case
+
+    panel "Transactions" {
+        source: list_transaction_for_case
+    }
+    panel "Notes" {
+        source: list_case_note
+        action "Add Note" -> add_case_note {
+            style: "filled"
+        }
+    }
+}
+
+fn main() {
+    // every panel's `source` and every panel action are ordinary,
+    // already-typechecked `.nir` functions -- `workspace` composes
+    // calls that already exist, it adds no new trust boundary.
+    let txns: bool = match list_transaction_for_case(1) {
+        Ok(doc) => true,
+        Err(e) => false,
+    }
+    print(txns) // true
+
+    let added: i64 = match add_case_note(1) {
+        Ok(id) => id,
+        Err(e) => -1,
+    }
+    print(added) // 1
+}

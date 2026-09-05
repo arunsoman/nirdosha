@@ -1,0 +1,42 @@
+// Feature: `Money`/`CurrencyCode` -- real prelude types (LANGUAGE.md
+// §6c). Built into every `.nir` program automatically, no declaration
+// needed. `amount` is a type-checked `dec128` (see 11_decimal_dec128.nir),
+// `currency` a closed, exhaustively-matchable enum -- not a bare `str`
+// tag.
+//
+// Deliberately doesn't give compile-time currency-mixing safety:
+// `Money(USD)` and `Money(EUR)` are the same *type* (currency lives in
+// a field, not a type parameter), so combining mismatched currencies is
+// caught at the point they're combined, not by the compiler.
+
+enum ErrorCode {
+    CurrencyMismatch,
+}
+
+fn add_money(a: Money, b: Money) -> Result(Money, ErrorCode) {
+    if a.currency != b.currency {
+        return Err(CurrencyMismatch())
+    }
+    return Ok(Money(a.amount + b.amount, a.currency))
+}
+
+fn main() {
+    let price: Money = Money(dec_from_i64(1999, 2), USD())
+    print(price.amount)   // 19.99
+    print(price.currency) // USD()
+
+    let tax: Money = Money(dec_from_i64(160, 2), USD())
+    let total: Money = match add_money(price, tax) {
+        Ok(m) => m,
+        Err(e) => Money(dec_from_i64(0, 0), USD()),
+    }
+    print(total.amount) // 21.59
+
+    let euros: Money = Money(dec_from_i64(500, 2), EUR())
+    let mismatched: Result(Money, ErrorCode) = add_money(price, euros)
+    let mismatch_caught: bool = match mismatched {
+        Ok(m) => false,
+        Err(e) => true,
+    }
+    print(mismatch_caught) // true -- USD + EUR is refused, not silently summed
+}

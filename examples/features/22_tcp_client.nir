@@ -1,0 +1,36 @@
+// Feature: `tcp`, `connect`, `send`/`recv`/`stop` (LANGUAGE.md §2, §7).
+// A raw TCP client -- connects to *any* service speaking a text
+// protocol, not just another Nirdosha process; `send`/`recv`/`stop` are
+// reused verbatim from `chan`/`sandbox`.
+//
+// Self-contained: rather than relying on something already listening
+// externally, this spawns its own `tcp_listener`-backed server on a
+// background thread first (see 23_tcp_listener.nir for that side on
+// its own) so the file runs standalone.
+
+struct Text {
+    value: str,
+}
+
+fn server(l: tcp_listener) -> Text {
+    let conn: tcp = accept(l)
+    let request: str = recv(conn)
+    send(conn, "HTTP/1.1 200 OK\r\n\r\nhello from the server")
+    stop conn
+    stop l
+    return Text(request)
+}
+
+fn main() {
+    let l: tcp_listener = listen(9700)
+    let h: thread Text = spawn server(l)
+
+    let conn: tcp = connect("127.0.0.1", 9700)
+    send(conn, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    let response: str = recv(conn) // one read syscall, not a loop
+    stop conn
+
+    let seen: Text = join h
+    print(seen.value)  // what the server received
+    print(response)    // what the client received back
+}

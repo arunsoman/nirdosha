@@ -1,0 +1,108 @@
+// Feature: `json` -- concrete, per-target-type accessors over an
+// already-parsed document (LANGUAGE.md §5). Every fallible call returns
+// a real `Result(_, str)`, never traps. No growable-collection type is
+// needed -- array/object navigation reads the already-parsed tree
+// directly.
+
+struct Text {
+    value: str,
+}
+
+// `json_parse` itself is fallible (`Result(json, str)`), so a fallback
+// used inside another `match`'s `Err` arm needs to already be a plain
+// `json`, not another `Result` -- these two literals are guaranteed
+// well-formed, so the `Err` arm here is unreachable in practice; the
+// recursive call just satisfies the type checker without a second,
+// divergent way to build an empty document.
+fn empty_object() -> json {
+    return match json_parse("{}") {
+        Ok(d) => d,
+        Err(e) => empty_object(),
+    }
+}
+
+fn empty_array() -> json {
+    return match json_parse("[]") {
+        Ok(d) => d,
+        Err(e) => empty_array(),
+    }
+}
+
+fn main() {
+    let text: str = "{\"name\": \"nirdosha\", \"version\": 1, \"pi\": 3.14, \"stable\": false, \"tags\": [\"lang\", \"compiler\"]}"
+
+    let doc: json = match json_parse(text) {
+        Ok(d) => d,
+        Err(e) => empty_object(),
+    }
+
+    let name: Text = match json_get_str(doc, "name") {
+        Ok(n) => Text(n),
+        Err(e) => Text(e),
+    }
+    print(name.value) // nirdosha
+
+    let version: i64 = match json_get_i64(doc, "version") {
+        Ok(v) => v,
+        Err(e) => -1,
+    }
+    print(version) // 1
+
+    let pi: f64 = match json_get_f64(doc, "pi") {
+        Ok(v) => v,
+        Err(e) => -1.0,
+    }
+    print(pi) // 3.14
+
+    let stable: bool = match json_get_bool(doc, "stable") {
+        Ok(v) => v,
+        Err(e) => false,
+    }
+    print(stable) // false
+
+    // arrays: `json_get` (the untyped, generic accessor) pulls out the
+    // "tags" field as its own `json` value; `json_array_len`/
+    // `json_array_get` then navigate it -- length + indexed access,
+    // each element itself a `json`.
+    let tags: json = match json_get(doc, "tags") {
+        Ok(t) => t,
+        Err(e) => empty_array(),
+    }
+    let tag_count: i64 = match json_array_len(tags) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    print(tag_count) // 2
+
+    // an array of *objects* is the common shape (a `db_query` result
+    // set, say -- see 27_database.nir): `json_array_get` returns one
+    // element, still a `json`, ready for the typed accessors above.
+    let rows: json = match json_parse("[{\"id\": 1}, {\"id\": 2}]") {
+        Ok(d) => d,
+        Err(e) => empty_array(),
+    }
+    let first_id: i64 = match json_array_get(rows, 0) {
+        Ok(row) => match json_get_i64(row, "id") {
+            Ok(i) => i,
+            Err(e) => -1,
+        },
+        Err(e) => -1,
+    }
+    print(first_id) // 1
+
+    // `json_set_str` -- `json_get_str`'s inverse, for building a
+    // response/payload document field by field.
+    let built: json = match json_parse("{}") {
+        Ok(d) => d,
+        Err(e) => empty_object(),
+    }
+    let with_field: json = match json_set_str(built, "greeting", "hello") {
+        Ok(d) => d,
+        Err(e) => built,
+    }
+    let greeting: Text = match json_get_str(with_field, "greeting") {
+        Ok(g) => Text(g),
+        Err(e) => Text(e),
+    }
+    print(greeting.value) // hello
+}

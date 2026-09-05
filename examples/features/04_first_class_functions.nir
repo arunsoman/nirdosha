@@ -1,0 +1,31 @@
+// Feature: first-class functions (LANGUAGE.md §6, interpreter-only).
+//
+// A plain (ungated) function name, used where a `fn(T1, T2) -> R`-typed
+// value is expected, evaluates to that function as a value. No
+// closures exist -- a first-class function value is just a target
+// name, nothing captured (no enclosing-scope capture at all).
+
+fn double(x: i64) -> i64 {
+    return x * 2
+}
+
+fn square(x: i64) -> i64 {
+    return x * x
+}
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x)
+}
+
+fn compose(f: fn(i64) -> i64, g: fn(i64) -> i64, x: i64) -> i64 {
+    return f(g(x))
+}
+
+fn main() {
+    let d: fn(i64) -> i64 = double
+    print(d(21)) // 42
+
+    print(apply(double, 10))  // 20
+    print(apply(square, 5))   // 25
+    print(compose(double, square, 3)) // double(square(3)) = 18
+}

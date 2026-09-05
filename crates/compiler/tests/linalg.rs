@@ -35,7 +35,7 @@ fn mat_f64(vals: &[f64], rows: usize, cols: usize) -> Value {
 
 #[test]
 fn example_linalg_runs_to_completion() {
-    let src = include_str!("../../../examples/linalg.nir");
+    let src = include_str!("fixtures/linalg.nir");
     assert_eq!(run(src), Ok(Value::Unit));
 }
 

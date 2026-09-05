@@ -1,0 +1,52 @@
+// Feature: struct/enum/match -- Row 11 layer 1 (LANGUAGE.md §6, no
+// generics yet -- that's 06_generics.nir).
+//
+// Fixed concrete fields, construction as an ordinary call, `.field`
+// access, and `match` destructuring a closed, exhaustively-checked
+// variant set (no wildcard for an enum scrutinee -- every variant is
+// named exactly once).
+
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+enum Shape {
+    Circle(f64),
+    Rectangle(f64, f64),
+    Origin, // a zero-payload variant still constructs/matches as `Origin()`
+}
+
+fn area(s: Shape) -> f64 {
+    return match s {
+        Circle(r) => 3.14159 * r * r,
+        Rectangle(w, h) => w * h,
+        Origin() => 0.0,
+    }
+}
+
+fn main() {
+    let p: Point = Point(3.0, 4.0)
+    print(p.x)
+    print(p.y)
+    print(norm([p.x, p.y])) // 5
+
+    let c: Shape = Circle(2.0)
+    let r: Shape = Rectangle(3.0, 4.0)
+    let o: Shape = Origin()
+    print(area(c)) // 12.56636
+    print(area(r)) // 12
+    print(area(o)) // 0
+
+    // a literal-pattern match over a plain scalar (post-v1 addition --
+    // `str`/`i64`/`bool` scrutinees only, closed by a mandatory,
+    // trailing `_` wildcard rather than exhaustive-by-construction the
+    // way an enum's own variant set is)
+    let code: i64 = 2
+    let label: Shape = match code {
+        1 => Circle(1.0),
+        2 => Rectangle(2.0, 2.0),
+        _ => Origin(),
+    }
+    print(area(label)) // 4
+}

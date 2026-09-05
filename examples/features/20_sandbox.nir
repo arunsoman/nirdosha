@@ -1,0 +1,41 @@
+// Feature: `sandbox`, `stop` (LANGUAGE.md §2, §7, `docs/SANDBOXING.md`
+// layer 1). `sandbox f(args)` runs `f` as a real, separate OS process
+// (a fresh `nirdosha` invocation re-interpreting this same source
+// file), returning an affine `sandbox` handle. `stop` terminates it
+// (killing it if still running) and yields its OS exit code.
+//
+// This layer has no typed IPC yet -- a sandboxed function's return
+// value never reaches the caller, only its exit status does, so it
+// must return `unit` and take only plain scalar parameters.
+//
+// A `sandbox` handle that goes out of scope without ever being
+// `stop`ped still kills its process -- no zombie left behind just
+// because a program forgot to clean up (the same deterministic, not
+// discipline-dependent, guarantee `box` gives memory).
+
+fn background_work() -> unit {
+    while true {
+    }
+}
+
+fn quick_work(n: i64) -> unit {
+    print(n)
+}
+
+fn main() {
+    let s: sandbox = sandbox background_work()
+    let code: i64 = stop s
+    print(code) // -1 -- background_work runs forever, so `stop` always
+                // catches it still running and kills it
+
+    // a sandboxed process given time to finish before `stop` runs --
+    // `sleep_ms` on the parent side, not inside the sandboxed fn itself,
+    // is what makes a *normal* exit observable at all: calling `stop`
+    // immediately after `sandbox` (like `s` above) almost always still
+    // catches the child mid-startup, the same race `docs/SANDBOXING.md`
+    // documents for layer 1's lack of any synchronization primitive.
+    let s2: sandbox = sandbox quick_work(7)
+    sleep_ms(200)
+    let code2: i64 = stop s2
+    print(code2) // 0 -- exited normally this time
+}

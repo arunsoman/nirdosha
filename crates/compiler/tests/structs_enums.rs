@@ -616,10 +616,10 @@ fn a_box_indirected_self_referential_struct_still_compiles() {
 
 #[test]
 fn example_structs_enums_runs_to_completion() {
-    let program = parse_ok(include_str!("../../../examples/structs_enums.nir"));
+    let program = parse_ok(include_str!("fixtures/structs_enums.nir"));
     typecheck(&program).expect("should typecheck cleanly");
     check_ownership(&program).expect("should pass ownership checking");
-    match run(include_str!("../../../examples/structs_enums.nir")) {
+    match run(include_str!("fixtures/structs_enums.nir")) {
         Ok(Value::Float(n)) => assert!((n - 29.56636).abs() < 1e-9, "got {n}"),
         other => panic!("expected Ok(Float(~29.56636)), got {other:?}"),
     }

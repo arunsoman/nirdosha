@@ -1,0 +1,25 @@
+// Feature: `requires(public)` (LANGUAGE.md §6a, `docs/ROADMAP.md` A10).
+// Unlike `requires(role: ...)`/`requires(claim: ..., ...)`, this does
+// **not** gate the function -- `FnDecl::requires` stays `None`, so a
+// `requires(public)`-marked fn needs no `acquire` and is exactly as
+// directly callable as one with no `requires(...)` at all. Its only
+// effect is silencing `nirdosha serve`/`emit-ui`'s "this fn has no
+// `requires(...)`, no `requires(public)`, and no `VerifiedIdentity`
+// parameter -- it will be reachable by anyone with no token at all"
+// warning, an explicit "yes, intentionally open" marker (a Kubernetes
+// liveness probe, a public status page) rather than a silent gap.
+
+fn health_check() -> bool requires(public) {
+    return true
+}
+
+fn version_info() -> i64 requires(public) {
+    return 1
+}
+
+fn main() {
+    // called exactly like any other ungated function -- no `acquire`,
+    // no token, no proof of any kind.
+    print(health_check())  // true
+    print(version_info())  // 1
+}

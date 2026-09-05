@@ -26,13 +26,13 @@ fn first_type_error(src: &str) -> TypeErrorKind {
 
 #[test]
 fn example_sensor_fusion_runs_to_completion() {
-    let src = include_str!("../../../examples/sensor_fusion.nir");
+    let src = include_str!("fixtures/sensor_fusion.nir");
     assert_eq!(run(src), Ok(Value::Unit));
 }
 
 #[test]
 fn example_wargame_agents_runs_to_completion() {
-    let src = include_str!("../../../examples/wargame_agents.nir");
+    let src = include_str!("fixtures/wargame_agents.nir");
     assert_eq!(run(src), Ok(Value::Unit));
 }
 

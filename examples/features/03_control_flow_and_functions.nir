@@ -1,0 +1,56 @@
+// Feature: control flow & functions (LANGUAGE.md §6).
+//
+// `fn`, `let`, reassignment, `return`, `while`, `if/else` (both as a
+// statement and as an expression), and recursion. No `for` loops exist.
+
+fn is_even(n: i64) -> bool {
+    return n - (n / 2) * 2 == 0
+}
+
+fn factorial(n: i64) -> i64 {
+    if n <= 1 {
+        return 1
+    } else {
+        return n * factorial(n - 1) // direct recursion
+    }
+}
+
+// mutual recursion: functions are looked up by name in a table, so the
+// order of declaration doesn't matter and two functions can call each
+// other.
+fn is_even_mutual(n: i64) -> bool {
+    if n == 0 { return true }
+    return is_odd_mutual(n - 1)
+}
+
+fn is_odd_mutual(n: i64) -> bool {
+    if n == 0 { return false }
+    return is_even_mutual(n - 1)
+}
+
+fn main() {
+    // `if`/`else` as an expression
+    let n: i64 = 7
+    let parity: i64 = if is_even(n) { 0 } else { 1 }
+    print(parity) // 1
+
+    // `if` as a statement -- its value discarded
+    if is_even(n) {
+        print("even")
+    } else {
+        print("odd")
+    }
+
+    // `while` + reassignment (`x = expr`, not a new binding)
+    let i: i64 = 0
+    let sum: i64 = 0
+    while i < 5 {
+        sum = sum + i
+        i = i + 1
+    }
+    print(sum) // 10
+
+    print(factorial(10))          // 3628800
+    print(is_even_mutual(10))     // true
+    print(is_odd_mutual(10))      // false
+}

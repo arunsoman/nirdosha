@@ -1,0 +1,50 @@
+// Feature: `mq_connect`/`mq_publish`/`mq_consume` -- Redis-backed pub/
+// sub (LANGUAGE.md §5, `Ty::Mq`'s doc comment). Affine like `db` --
+// connect, use, and `stop` inside one function.
+//
+// No Redis is guaranteed to be running for this file, so every call is
+// wrapped in its own `Result` handling -- the point is the syntax, not
+// a guaranteed successful round trip (if Redis *is* reachable at
+// 127.0.0.1:6379, this will actually publish and consume for real).
+
+fn publish_event(conn: mq) -> i64 {
+    let published: i64 = match mq_publish(conn, "features.demo", "hello from mq") {
+        Ok(u) => 0,
+        Err(e) => -1,
+    }
+    stop conn
+    return published
+}
+
+fn publish_demo() -> i64 {
+    return match mq_connect("127.0.0.1", 6379) {
+        Ok(conn) => publish_event(conn),
+        Err(e) => -1,
+    }
+}
+
+struct Text {
+    value: str,
+}
+
+fn consume_one(conn: mq) -> Text {
+    let message: str = match mq_consume(conn, "features.demo", 1) {
+        Ok(m) => m,
+        Err(e) => e,
+    }
+    stop conn
+    return Text(message)
+}
+
+fn consume_demo() -> Text {
+    return match mq_connect("127.0.0.1", 6379) {
+        Ok(conn) => consume_one(conn),
+        Err(e) => Text(e),
+    }
+}
+
+fn main() {
+    print(publish_demo()) // 0 if Redis is reachable, -1 otherwise
+    let consumed: Text = consume_demo()
+    print(consumed.value)
+}
