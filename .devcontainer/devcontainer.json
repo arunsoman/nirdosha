@@ -1,0 +1,24 @@
+{
+  // Zero-setup "try it" path for GitHub Codespaces / VS Code Dev Containers.
+  // Uses system libz3-dev (linked via pkg-config), not the vendored
+  // `dist` feature -- matches CONTRIBUTING.md's own local-dev instructions
+  // ("apt install clang libz3-dev"), and is much faster to spin up than
+  // compiling Z3 from source (see Dockerfile's build stage, which uses
+  // the `dist` feature only for release/CI binaries).
+  "name": "Nirdosha",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {}
+  },
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libz3-dev && cd crates/compiler && cargo build",
+  "postAttachCommand": "printf 'Built. Try:\\n  cd crates/compiler && cargo run -- ../../examples/hello.nir\\n  cd crates/compiler && cargo run -- serve ../../examples/store.nir --port 8080   # then use the Ports tab to open 8080\\n'",
+  "customizations": {
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer"]
+    }
+  },
+  "forwardPorts": [8080],
+  "portsAttributes": {
+    "8080": { "label": "nirdosha serve", "onAutoForward": "notify" }
+  }
+}

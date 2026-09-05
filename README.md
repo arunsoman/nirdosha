@@ -8,6 +8,7 @@
 [![Roadmap](https://img.shields.io/badge/ROADMAP-view-purple)](./docs/PUBLIC_ROADMAP.md)
 [![Maintainers](https://img.shields.io/badge/maintainers-5-green)](./MAINTAINERS.md)
 [![Sponsor](https://img.shields.io/badge/%E2%9D%A4-Sponsor-ea4aaa)](https://github.com/sponsors/arunsoman)
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/arunsoman/nirdosha?quickstart=1)
 
 > **A systems language designed for LLMs to write, with a grammar so
 > constrained the model can't emit invalid syntax.** No garbage collector,
@@ -178,6 +179,18 @@ Full comparison, plus the honest "why not just use Rust" answer, in the
 [wiki](https://github.com/kannamma-labs/nirdosha/wiki/Nirdosha-vs-Alternatives).
 
 ## Try it in under a minute
+
+**No local toolchain at all?** Click
+[**Open in GitHub Codespaces**](https://codespaces.new/arunsoman/nirdosha?quickstart=1)
+— it builds the compiler for you (system Z3, ~1 min) and drops you into a
+VS Code shell in the browser with everything already checked out. From
+there:
+
+```sh
+cd crates/compiler
+cargo run -- ../../examples/hello.nir
+cargo run -- serve ../../examples/store.nir --port 8080   # open via the Ports tab
+```
 
 **Don't want to learn the syntax first?** Paste
 [`agent-skills/nirdosha/paste-anywhere-prompt.md`](./agent-skills/nirdosha/paste-anywhere-prompt.md)
