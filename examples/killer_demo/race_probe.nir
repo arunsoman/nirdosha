@@ -1,23 +1,22 @@
-// Answers a fair objection to RESULTS.md head-on, with evidence instead
-// of prose: is the ledger really safe because of something Nirdosha's
-// *language* guarantees, or only because `nirdosha serve`'s request
-// loop happens to be single-threaded today? This file takes `serve.rs`
-// out of the picture entirely and drives the exact same naive
-// `transfer`/`total` logic from `ledger.nir` with Nirdosha's own
+// A naive two-account money-transfer ledger, raced with Nirdosha's own
 // `spawn`/`thread`/`join` -- real OS threads (`docs/ROADMAP.md`'s
 // reused-worker thread pool), all hitting the same pooled, WAL-mode
-// SQLite connection (`crates/compiler/src/dbconn.rs`) `ledger.db` also
-// uses. If the language's ownership/concurrency guarantees were what
-// made the HTTP demo safe, this should still come out at 2,000,000. If
-// it's `serve.rs`'s sequential dispatch doing the work instead, this
-// should corrupt exactly like `ledger_naive.py` under
-// `ThreadingHTTPServer` did.
+// SQLite connection (`crates/compiler/src/dbconn.rs`) `db_connect`
+// already shares process-wide. No HTTP, no `serve.rs`, nothing
+// server-shaped in the picture at all -- this asks the direct question
+// "does the language's own concurrency guarantee this class of
+// correctness for `db`?" and answers it empirically instead of by
+// argument: it doesn't, yet (`db`/`http`/`transact` are interpreter-only
+// today, `docs/PUBLIC_ROADMAP.md` Track B, with no ownership discipline
+// of their own the way `box`/`chan` already have). `race_probe.py` is
+// the direct Python twin -- same schema, same naive shape, same thread
+// count, `threading.Thread` instead of `spawn` -- for the apples-to-
+// apples comparison RESULTS.md reports.
 //
 // Run it:
 //   nirdosha examples/killer_demo/race_probe.nir
 //
-// See RESULTS.md's "Does the language itself prevent this?" section
-// for the result and what it means.
+// See RESULTS.md for the result and what it does and doesn't prove.
 
 enum ErrorCode {
     DbError(str),
@@ -86,8 +85,8 @@ fn total() -> Result(i64, ErrorCode) {
     }
 }
 
-// Identical shape to `ledger.nir`'s `transfer_inner`: read both
-// balances, `sleep_ms` to model a DB round trip, write both back.
+// Naive by design: read both balances, `sleep_ms` to model a DB round
+// trip, write both back -- no lock, no transaction, no version check.
 fn transfer_inner(conn: db, from_id: i64, to_id: i64, amount_cents: i64) -> Result(Text, ErrorCode) {
     let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, name TEXT, balance_cents INTEGER)") {
         Ok(n) => n,
@@ -188,8 +187,8 @@ fn main() {
     // 8 real OS threads, 250 transfers each -- 2,000 concurrent
     // transfers total, all against the same pooled SQLite connection
     // `db_connect` already shares process-wide (`dbconn.rs`'s
-    // `SQLITE_POOLS`), same as `ledger.nir` would under a hypothetical
-    // multi-threaded `serve.rs`.
+    // `SQLITE_POOLS`). `race_probe.py` runs the identical workload with
+    // Python's `threading.Thread` instead -- see RESULTS.md.
     let t1: thread i64 = spawn worker(1, 2, 250)
     let t2: thread i64 = spawn worker(2, 1, 250)
     let t3: thread i64 = spawn worker(1, 2, 250)
