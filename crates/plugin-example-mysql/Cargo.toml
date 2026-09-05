@@ -12,6 +12,10 @@ builtins = [
     { name = "mysql_query", params = ["i64", "str"], ret = "str" },
     { name = "mysql_execute", params = ["i64", "str"], ret = "i64" },
     { name = "mysql_close", params = ["i64"], ret = "i64" },
+    { name = "db_provider_mysql_connect", params = ["str"], ret = "i64" },
+    { name = "db_provider_mysql_query", params = ["i64", "str", "str"], ret = "str" },
+    { name = "db_provider_mysql_execute", params = ["i64", "str", "str"], ret = "i64" },
+    { name = "db_provider_mysql_close", params = ["i64"], ret = "i64" },
 ]
 
 [dependencies]

@@ -4176,6 +4176,16 @@ impl<'a> Checker<'a> {
                 self.check(&args[1], &Ty::I64, expected_ret, scopes); // port
                 result_of(Ty::Mq)
             }
+            // "External Data & Service Boundary" (docs/adr/0004) --
+            // same `Result(mq, str)` shape as `mq_connect`, but the
+            // whole connection string (`kafka://broker:9092`,
+            // `activemq://host:61613`, ...) is one `str` argument, its
+            // scheme dispatched at runtime to whichever plugin (if any)
+            // registered `mq_provider_<scheme>_connect`.
+            ("mq_connect_via", 1) => {
+                self.check(&args[0], &Ty::Str, expected_ret, scopes);
+                result_of(Ty::Mq)
+            }
             ("mq_publish", 3) => {
                 self.check(&args[0], &Ty::Mq, expected_ret, scopes);
                 self.check(&args[1], &Ty::Str, expected_ret, scopes); // queue

@@ -106,6 +106,30 @@ pub enum Param {
     Bool(bool),
 }
 
+/// `db_provider_<scheme>_query`/`_execute`'s third argument (a JSON
+/// array, `interpreter.rs`'s `eval_builtin` "db_query"/"db_execute"
+/// arms) -- the same bind-parameter values `sql_bind_params` already
+/// produces for the built-in SQLite/Postgres path, serialized across
+/// the plugin boundary as plain JSON rather than invented as a new,
+/// separate encoding. A plugin author decodes with `json_array_len`/
+/// `json_array_get`/`json_get_*` from *inside* their own plugin's Rust
+/// code (`serde_json` directly, not the `.nir`-facing builtins of the
+/// same name) -- see `crates/plugin-example-mysql`'s `db_provider_mysql_query`
+/// for the reference decode.
+pub fn params_to_json(params: &[Param]) -> JsonDoc {
+    JsonDoc::Array(
+        params
+            .iter()
+            .map(|p| match p {
+                Param::Int(n) => JsonDoc::Number((*n).into()),
+                Param::Float(f) => serde_json::Number::from_f64(*f).map(JsonDoc::Number).unwrap_or(JsonDoc::Null),
+                Param::Text(s) => JsonDoc::String(s.clone()),
+                Param::Bool(b) => JsonDoc::Bool(*b),
+            })
+            .collect(),
+    )
+}
+
 /// The live connection behind one `Value::Db` handle. Exactly one of
 /// these, picked once by `connect` and never switched mid-lifetime --
 /// `db_connect` doesn't reconnect. Four variants, not two, because
@@ -119,6 +143,23 @@ pub enum DbConn {
     SqlitePooled(r2d2::PooledConnection<SqliteConnectionManager>),
     Postgres(r2d2::PooledConnection<PostgresConnectionManager<postgres::NoTls>>),
     PostgresTls(r2d2::PooledConnection<PostgresConnectionManager<postgres_native_tls::MakeTlsConnector>>),
+    /// A connection owned by a **plugin**, not this module — the
+    /// "External Data & Service Boundary" design: `db_connect` on an
+    /// unrecognized `scheme://` URL checks whether a plugin has
+    /// registered `db_provider_<scheme>_connect` (see
+    /// `interpreter.rs`'s `eval_builtin` "db_connect" arm) instead of
+    /// falling through to this module's own SQLite-file-path guess.
+    /// `handle` is opaque here — an `i64` minted by the plugin's own
+    /// `HandleRegistry<T>` (`nirdosha-plugin-support`), exactly the same
+    /// shape a Kind-A plugin's own bespoke builtins (e.g.
+    /// `crates/plugin-example-mysql`'s `mysql_connect`) already return.
+    /// This variant doesn't hold, or know how to use, the real
+    /// resource at all — every operation on it (`query`/`execute`/
+    /// close) is dispatched back through the plugin's own registered
+    /// `db_provider_<scheme>_*` builtins, which is why `query`/
+    /// `execute` below don't gain a new match arm: `eval_builtin`
+    /// intercepts this variant *before* ever calling them.
+    PluginBacked { scheme: String, handle: i64 },
 }
 
 /// Neither the real driver types nor (transitively) `Value::Db` need
@@ -132,6 +173,7 @@ impl fmt::Debug for DbConn {
             DbConn::SqlitePooled(_) => write!(f, "DbConn::SqlitePooled(..)"),
             DbConn::Postgres(_) => write!(f, "DbConn::Postgres(..)"),
             DbConn::PostgresTls(_) => write!(f, "DbConn::PostgresTls(..)"),
+            DbConn::PluginBacked { scheme, handle } => write!(f, "DbConn::PluginBacked({scheme}, {handle})"),
         }
     }
 }
@@ -216,6 +258,9 @@ pub fn query(conn: &mut DbConn, sql: &str, params: &[Param]) -> Result<JsonDoc, 
         DbConn::SqlitePooled(c) => sqlite_query(c, sql, params),
         DbConn::Postgres(c) => pg_query(c, sql, params),
         DbConn::PostgresTls(c) => pg_query(c, sql, params),
+        DbConn::PluginBacked { .. } => {
+            unreachable!("eval_builtin's \"db_query\" arm intercepts DbConn::PluginBacked before ever calling this function")
+        }
     }
 }
 
@@ -227,6 +272,9 @@ pub fn execute(conn: &mut DbConn, sql: &str, params: &[Param]) -> Result<i64, St
         DbConn::SqlitePooled(c) => sqlite_execute(c, sql, params),
         DbConn::Postgres(c) => pg_execute(c, sql, params),
         DbConn::PostgresTls(c) => pg_execute(c, sql, params),
+        DbConn::PluginBacked { .. } => {
+            unreachable!("eval_builtin's \"db_execute\" arm intercepts DbConn::PluginBacked before ever calling this function")
+        }
     }
 }
 

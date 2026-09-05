@@ -42,3 +42,4 @@ honest downside, not just the win.
 | [0001](./0001-vendor-z3-except-macos.md) | Vendor Z3 for release builds, except macOS (system Z3 there) | accepted |
 | [0002](./0002-ban-str-in-fn-signatures.md) | Ban `str` as a function argument/return type | accepted |
 | [0003](./0003-runtime-kernels-cargo-dependency.md) | Split the compiled-path runtime kernels into their own Cargo-dependency-aware crate | accepted |
+| [0004](./0004-external-data-service-boundary.md) | External Data & Service Boundary — plugin-backed `db`/`mq` connections by URL scheme | accepted |

@@ -84,3 +84,57 @@ fn receive_with_no_message_times_out_to_an_empty_string() {
     let result = nirdosha::run_with_plugins(&src, &plugins);
     assert!(result.is_ok(), "a timeout must not be a runtime error, got {result:?}");
 }
+
+/// The "External Data & Service Boundary" (docs/adr/0004) proof for MQ:
+/// this program never mentions `activemq_connect`/`activemq_send`/
+/// `activemq_receive`/`activemq_close` by name -- it calls the exact
+/// same generic `mq_connect_via`/`mq_publish`/`mq_consume`/`stop`
+/// surface Redis already uses through `mq_connect` (`crates/compiler/
+/// tests/mq.rs`). It's the `mq_provider_stomp_*` naming-convention
+/// dispatch in `interpreter.rs`'s `eval_builtin` that routes a
+/// `stomp://` URL to this plugin.
+#[test]
+#[ignore = "needs a live ActiveMQ broker; see crates/plugin-examples/docker-compose.yml"]
+fn generic_mq_surface_transparently_dispatches_to_the_activemq_plugin() {
+    let queue = format!(
+        "nirdosha-generic-surface-test-{}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    );
+    let src = format!(
+        r#"
+        struct Text {{
+            value: str,
+        }}
+        fn run_all(conn: mq) -> Text {{
+            let published: i64 = match mq_publish(conn, "{queue}", "hello via generic surface") {{
+                Ok(u) => 1,
+                Err(e) => -1,
+            }}
+            let found: Text = match mq_consume(conn, "{queue}", 5) {{
+                Ok(msg) => Text(msg),
+                Err(e) => Text(e),
+            }}
+            stop conn
+            return found
+        }}
+        fn main() -> Text {{
+            return match mq_connect_via("{url}") {{
+                Ok(conn) => run_all(conn),
+                Err(e) => Text(e),
+            }}
+        }}
+    "#,
+        url = url(),
+        queue = queue,
+    );
+    let plugins = ActiveMqPlugin.builtins();
+    match nirdosha::run_with_plugins(&src, &plugins) {
+        Ok(nirdosha::interpreter::Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            nirdosha::interpreter::Value::Str(s) => assert_eq!(&**s, "hello via generic surface"),
+            other => panic!("expected Text(Str(\"hello via generic surface\")), got Text({other:?})"),
+        },
+        other => panic!(
+            "expected the generic mq_connect_via/mq_publish/mq_consume/stop surface to work transparently against ActiveMQ, got {other:?}"
+        ),
+    }
+}

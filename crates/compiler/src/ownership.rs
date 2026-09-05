@@ -292,6 +292,7 @@ fn builtin_return_ty(name: &str) -> Option<Ty> {
         "db_query" => Some(result_of(Ty::Json)),
         "db_execute" => Some(result_of(Ty::I64)),
         "mq_connect" => Some(result_of(Ty::Mq)),
+        "mq_connect_via" => Some(result_of(Ty::Mq)),
         "mq_publish" => Some(result_of(Ty::Unit)),
         "mq_consume" => Some(result_of(Ty::Str)),
         "mock_issue_token" => Some(result_of(Ty::Str)),

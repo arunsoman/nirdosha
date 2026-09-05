@@ -2414,6 +2414,12 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "mq_connect",
     "mq_publish",
     "mq_consume",
+    // "External Data & Service Boundary" (docs/adr/0004): a
+    // `scheme://`-prefixed generic connector, dispatched to a plugin-
+    // registered `mq_provider_<scheme>_connect` builtin instead of
+    // `mq_connect`'s own hardcoded Redis backend -- see
+    // `interpreter.rs`'s "mq_connect_via" arm.
+    "mq_connect_via",
     // Row 12's deliberate mock-only exception to "the runtime never
     // mints tokens" -- see its own doc comment at the builtin's typeck
     // signature (`typeck.rs`) for why the `mock_` prefix is load-bearing.

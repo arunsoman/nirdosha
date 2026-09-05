@@ -61,6 +61,44 @@ impl NirdoshaPlugin for ActiveMqPlugin {
                 effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(activemq_close_call),
             },
+            // "External Data & Service Boundary" (docs/adr/0004): the
+            // same connection table, registered under the
+            // `mq_provider_stomp_*` naming convention `mq_connect_via`/
+            // `mq_publish`/`mq_consume`/`stop` dispatch to automatically
+            // for a `stomp://...` URL -- a `.nir` program using these
+            // never writes `activemq_connect`/`activemq_send` by name;
+            // it calls the exact same generic `mq_connect_via`/
+            // `mq_publish`/`mq_consume`/`stop` surface Redis already
+            // uses through `mq_connect`. The bespoke `activemq_*`
+            // builtins above are kept, unchanged, for existing callers.
+            PluginBuiltin {
+                name: "mq_provider_stomp_connect".to_string(),
+                params: vec![Ty::Str],
+                ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
+                call: Arc::new(activemq_connect_call),
+            },
+            PluginBuiltin {
+                name: "mq_provider_stomp_publish".to_string(),
+                params: vec![Ty::I64, Ty::Str, Ty::Str],
+                ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
+                call: Arc::new(activemq_send_call),
+            },
+            PluginBuiltin {
+                name: "mq_provider_stomp_consume".to_string(),
+                params: vec![Ty::I64, Ty::Str, Ty::I64],
+                ret: Ty::Str,
+                effects: [Effect::Network].into_iter().collect(),
+                call: Arc::new(mq_provider_stomp_consume_call),
+            },
+            PluginBuiltin {
+                name: "mq_provider_stomp_close".to_string(),
+                params: vec![Ty::I64],
+                ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
+                call: Arc::new(activemq_close_call),
+            },
         ]
     }
 }
@@ -97,6 +135,29 @@ fn activemq_receive_call(args: &[Value], span: Span) -> Result<Value, RuntimeErr
     match result {
         Some(Ok(Some(body))) => Ok(Value::Str(Arc::from(body.as_str()))),
         Some(Ok(None)) => Ok(Value::Str(Arc::from(""))), // timeout: no message, not an error
+        Some(Err(e)) => Err(plugin_error(PLUGIN, span, format!("receive failed: {e}"))),
+        None => Err(plugin_error(PLUGIN, span, format!("no open activemq connection for handle {handle}"))),
+    }
+}
+
+/// `mq_provider_stomp_consume` -- unlike `activemq_receive_call`
+/// (empty string on timeout is a legitimate, silent poll result for
+/// this crate's own bespoke API), the generic `mq_consume` surface's
+/// contract (`interpreter.rs`'s "mq_consume" arm, matching Redis'
+/// BLPOP-timeout behavior) is "timeout is an error, not a hang" --
+/// `Result(str, str)`, not `str` with an empty-string sentinel. So this
+/// wraps the same `receive_one` call and turns a timeout into a real
+/// `RuntimeError` instead.
+fn mq_provider_stomp_consume_call(args: &[Value], span: Span) -> Result<Value, RuntimeError> {
+    let handle = int_arg(args, 0, PLUGIN, span)?;
+    let queue = str_arg(args, 1, PLUGIN, span)?.to_string();
+    let timeout_secs = int_arg(args, 2, PLUGIN, span)?;
+    let destination = as_destination(&queue);
+    let timeout = Duration::from_secs(timeout_secs.max(0) as u64);
+    let result = connections().with(handle, |conn| conn.receive_one(&destination, timeout));
+    match result {
+        Some(Ok(Some(body))) => Ok(Value::Str(Arc::from(body.as_str()))),
+        Some(Ok(None)) => Err(plugin_error(PLUGIN, span, format!("mq_consume: no message on `{queue}` within {timeout_secs}s"))),
         Some(Err(e)) => Err(plugin_error(PLUGIN, span, format!("receive failed: {e}"))),
         None => Err(plugin_error(PLUGIN, span, format!("no open activemq connection for handle {handle}"))),
     }

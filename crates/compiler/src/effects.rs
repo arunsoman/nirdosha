@@ -253,7 +253,7 @@ pub(crate) fn builtin_effect(name: &str) -> EffectSet {
         // Unlike `db` (SQLite, a local file), a queue is a real network
         // service -- same tag `http_get`/`connect`/`tcp` above get, not
         // `Io` (`Ty::Mq`'s doc comment).
-        "mq_connect" | "mq_publish" | "mq_consume" => {
+        "mq_connect" | "mq_publish" | "mq_consume" | "mq_connect_via" => {
             s.insert(Effect::Network);
         }
         _ => {}

@@ -12,6 +12,10 @@ builtins = [
     { name = "activemq_send", params = ["i64", "str", "str"], ret = "i64" },
     { name = "activemq_receive", params = ["i64", "str", "i64"], ret = "str" },
     { name = "activemq_close", params = ["i64"], ret = "i64" },
+    { name = "mq_provider_stomp_connect", params = ["str"], ret = "i64" },
+    { name = "mq_provider_stomp_publish", params = ["i64", "str", "str"], ret = "i64" },
+    { name = "mq_provider_stomp_consume", params = ["i64", "str", "i64"], ret = "str" },
+    { name = "mq_provider_stomp_close", params = ["i64"], ret = "i64" },
 ]
 
 [dependencies]

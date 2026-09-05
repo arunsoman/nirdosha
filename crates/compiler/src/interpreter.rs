@@ -79,27 +79,25 @@ use sha2::{Digest, Sha256};
 /// backend would need to free deterministically with no garbage collector
 /// at all. Don't read "the interpreter runs `box` correctly" as "row 1 is
 /// done" — it's the checker that's doing the row-1 work, not this file.
-/// Thin wrapper solely so `Value::Mq` can derive `Debug` — `redis::
-/// Connection` itself doesn't implement it. `Deref`/`DerefMut` make it
-/// otherwise transparent at call sites.
-pub struct MqConn(pub redis::Connection);
+/// `Redis(redis::Connection)` is layer 1's own built-in backend
+/// (`Ty::Mq`'s doc comment); `PluginBacked` is the "External Data &
+/// Service Boundary" extension (`docs/adr/0004-external-data-service-
+/// boundary.md`) -- `mq_connect_via`'s scheme dispatch (this module's
+/// own `"mq_connect_via"` arm) routes to a plugin-registered
+/// `mq_provider_<scheme>_connect` builtin instead of always assuming
+/// Redis, the same shape `DbConn::PluginBacked` already uses for `db`.
+/// `handle` is opaque, minted by the plugin's own `HandleRegistry`.
+pub enum MqConn {
+    Redis(redis::Connection),
+    PluginBacked { scheme: String, handle: i64 },
+}
 
 impl std::fmt::Debug for MqConn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("MqConn(..)")
-    }
-}
-
-impl std::ops::Deref for MqConn {
-    type Target = redis::Connection;
-    fn deref(&self) -> &redis::Connection {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for MqConn {
-    fn deref_mut(&mut self) -> &mut redis::Connection {
-        &mut self.0
+        match self {
+            MqConn::Redis(_) => f.write_str("MqConn::Redis(..)"),
+            MqConn::PluginBacked { scheme, handle } => write!(f, "MqConn::PluginBacked({scheme}, {handle})"),
+        }
     }
 }
 
@@ -2897,7 +2895,13 @@ fn kf_update(x: &[f64], p: &[f64], z: &[f64], h: &[f64], r: &[f64], n: usize, m:
 /// table), so every arm here just computes; a mismatched pattern is
 /// `unreachable!()`, the same "the checker is the real gate" convention
 /// this whole file already follows.
-fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell<Option<RngState>>) -> Result<Value, RuntimeError> {
+fn eval_builtin(
+    name: &str,
+    args: &[Value],
+    span: Span,
+    rng: &std::cell::RefCell<Option<RngState>>,
+    plugins: &HashMap<String, crate::plugin::PluginFn>,
+) -> Result<Value, RuntimeError> {
     match name {
         "rand_seed" => {
             let Value::Int(seed) = &args[0] else { unreachable!("typeck.rs already proved this is an integer") };
@@ -3447,8 +3451,32 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
         }
         // DB, layer 1 + layer 2 (`Ty::Db`'s doc comment; `dbconn.rs`'s
         // module doc for the SQLite-vs-Postgres dispatch).
+        // "External Data & Service Boundary": a `scheme://` `db_connect`
+        // whose scheme matches a plugin-registered `db_provider_<scheme>
+        // _connect(dsn: str) -> i64` builtin is routed there instead of
+        // falling through to `dbconn::connect`'s own SQLite-file-path
+        // guess (which would otherwise happily "open" a file literally
+        // named e.g. `mysql://user:pass@host/db`). `postgres://`/
+        // `postgresql://` are unaffected: no plugin registers those
+        // names, so they always fall through to the built-in path,
+        // unchanged. See `docs/adr/0004-external-data-service-boundary.md`.
         "db_connect" => {
             let Value::Str(conn_str) = &args[0] else { unreachable!("typeck.rs already proved this is a str") };
+            if let Some((scheme, _)) = conn_str.split_once("://") {
+                let connect_name = format!("db_provider_{scheme}_connect");
+                if let Some(plugin_fn) = plugins.get(&connect_name).cloned() {
+                    return match plugin_fn(&[Value::Str(Arc::clone(conn_str))], span) {
+                        Ok(Value::Int(handle)) => Ok(result_ok(Value::Db(Arc::new(Mutex::new(Some(
+                            crate::dbconn::DbConn::PluginBacked { scheme: scheme.to_string(), handle },
+                        )))))),
+                        Ok(other) => Ok(result_err(format!(
+                            "plugin builtin `{connect_name}` must return an i64 handle, got {}",
+                            other.ty_name()
+                        ))),
+                        Err(e) => Ok(result_err(e.to_string())),
+                    };
+                }
+            }
             match crate::dbconn::connect(conn_str.as_ref()) {
                 Ok(conn) => Ok(result_ok(Value::Db(Arc::new(Mutex::new(Some(conn)))))),
                 Err(e) => Ok(result_err(e)),
@@ -3461,6 +3489,30 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
             let mut guard = slot.lock().unwrap();
             match guard.as_mut() {
                 None => Ok(result_err("this db connection was already stopped")),
+                Some(crate::dbconn::DbConn::PluginBacked { scheme, handle }) => {
+                    let query_name = format!("db_provider_{scheme}_query");
+                    match sql_bind_params(&args[2..]) {
+                        Ok(params) => match plugins.get(&query_name).cloned() {
+                            Some(plugin_fn) => {
+                                let params_json = crate::dbconn::params_to_json(&params).to_string();
+                                match plugin_fn(&[Value::Int(*handle), Value::Str(Arc::clone(sql)), Value::Str(Arc::from(params_json.as_str()))], span) {
+                                    Ok(Value::Str(json_str)) => match serde_json::from_str(&json_str) {
+                                        Ok(doc) => Ok(result_ok(Value::Json(Arc::new(doc)))),
+                                        Err(e) => Ok(result_err(format!("plugin builtin `{query_name}` returned malformed JSON: {e}"))),
+                                    },
+                                    Ok(Value::Json(doc)) => Ok(result_ok(Value::Json(doc))),
+                                    Ok(other) => Ok(result_err(format!(
+                                        "plugin builtin `{query_name}` must return a JSON str (or Ty::Json), got {}",
+                                        other.ty_name()
+                                    ))),
+                                    Err(e) => Ok(result_err(e.to_string())),
+                                }
+                            }
+                            None => Ok(result_err(format!("no `{query_name}` plugin builtin registered for db scheme `{scheme}`"))),
+                        },
+                        Err(e) => Ok(result_err(e)),
+                    }
+                }
                 Some(conn) => match sql_bind_params(&args[2..]) {
                     Ok(params) => match crate::dbconn::query(conn, sql, &params) {
                         Ok(doc) => Ok(result_ok(Value::Json(Arc::new(doc)))),
@@ -3477,6 +3529,26 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
             let mut guard = slot.lock().unwrap();
             match guard.as_mut() {
                 None => Ok(result_err("this db connection was already stopped")),
+                Some(crate::dbconn::DbConn::PluginBacked { scheme, handle }) => {
+                    let execute_name = format!("db_provider_{scheme}_execute");
+                    match sql_bind_params(&args[2..]) {
+                        Ok(params) => match plugins.get(&execute_name).cloned() {
+                            Some(plugin_fn) => {
+                                let params_json = crate::dbconn::params_to_json(&params).to_string();
+                                match plugin_fn(&[Value::Int(*handle), Value::Str(Arc::clone(sql)), Value::Str(Arc::from(params_json.as_str()))], span) {
+                                    Ok(Value::Int(affected)) => Ok(result_ok(Value::Int(affected))),
+                                    Ok(other) => Ok(result_err(format!(
+                                        "plugin builtin `{execute_name}` must return an i64 affected-row count, got {}",
+                                        other.ty_name()
+                                    ))),
+                                    Err(e) => Ok(result_err(e.to_string())),
+                                }
+                            }
+                            None => Ok(result_err(format!("no `{execute_name}` plugin builtin registered for db scheme `{scheme}`"))),
+                        },
+                        Err(e) => Ok(result_err(e)),
+                    }
+                }
                 Some(conn) => match sql_bind_params(&args[2..]) {
                     Ok(params) => match crate::dbconn::execute(conn, sql, &params) {
                         Ok(affected) => Ok(result_ok(Value::Int(affected))),
@@ -3535,8 +3607,35 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
             let opened: Result<redis::Connection, redis::RedisError> =
                 redis::Client::open(format!("redis://{host}:{port}/")).and_then(|c| c.get_connection());
             match opened {
-                Ok(conn) => Ok(result_ok(Value::Mq(Arc::new(Mutex::new(Some(MqConn(conn))))))),
+                Ok(conn) => Ok(result_ok(Value::Mq(Arc::new(Mutex::new(Some(MqConn::Redis(conn))))))),
                 Err(e) => Ok(result_err(e.to_string())),
+            }
+        }
+        // "External Data & Service Boundary" (docs/adr/0004): the same
+        // scheme-dispatch `db_connect` gets, for `mq`. Unlike
+        // `db_connect` (which stays a bare, unprefixed connection
+        // string/file-path for its own built-in backends), `mq_connect`
+        // itself keeps its original `(host, port)` shape unchanged --
+        // this is a new, additional connector for anyone who wants a
+        // scheme-qualified URL routed to a plugin, not a replacement.
+        "mq_connect_via" => {
+            let Value::Str(conn_str) = &args[0] else { unreachable!("typeck.rs already proved this is a str") };
+            let Some((scheme, _)) = conn_str.split_once("://") else {
+                return Ok(result_err(format!("mq_connect_via: `{conn_str}` has no `scheme://` prefix")));
+            };
+            let connect_name = format!("mq_provider_{scheme}_connect");
+            match plugins.get(&connect_name).cloned() {
+                Some(plugin_fn) => match plugin_fn(&[Value::Str(Arc::clone(conn_str))], span) {
+                    Ok(Value::Int(handle)) => Ok(result_ok(Value::Mq(Arc::new(Mutex::new(Some(
+                        MqConn::PluginBacked { scheme: scheme.to_string(), handle },
+                    )))))),
+                    Ok(other) => Ok(result_err(format!(
+                        "plugin builtin `{connect_name}` must return an i64 handle, got {}",
+                        other.ty_name()
+                    ))),
+                    Err(e) => Ok(result_err(e.to_string())),
+                },
+                None => Ok(result_err(format!("no `{connect_name}` plugin builtin registered for mq scheme `{scheme}`"))),
             }
         }
         "mq_publish" => {
@@ -3546,7 +3645,17 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
             let mut guard = slot.lock().unwrap();
             match guard.as_mut() {
                 None => Ok(result_err("this mq connection was already stopped".to_string())),
-                Some(conn) => match redis::cmd("LPUSH").arg(queue.as_ref()).arg(message.as_ref()).query::<i64>(&mut conn.0) {
+                Some(MqConn::PluginBacked { scheme, handle }) => {
+                    let publish_name = format!("mq_provider_{scheme}_publish");
+                    match plugins.get(&publish_name).cloned() {
+                        Some(plugin_fn) => match plugin_fn(&[Value::Int(*handle), Value::Str(Arc::clone(queue)), Value::Str(Arc::clone(message))], span) {
+                            Ok(_) => Ok(result_ok(Value::Unit)),
+                            Err(e) => Ok(result_err(e.to_string())),
+                        },
+                        None => Ok(result_err(format!("no `{publish_name}` plugin builtin registered for mq scheme `{scheme}`"))),
+                    }
+                }
+                Some(MqConn::Redis(conn)) => match redis::cmd("LPUSH").arg(queue.as_ref()).arg(message.as_ref()).query::<i64>(conn) {
                     Ok(_) => Ok(result_ok(Value::Unit)),
                     Err(e) => Ok(result_err(e.to_string())),
                 },
@@ -3559,15 +3668,26 @@ fn eval_builtin(name: &str, args: &[Value], span: Span, rng: &std::cell::RefCell
             let mut guard = slot.lock().unwrap();
             match guard.as_mut() {
                 None => Ok(result_err("this mq connection was already stopped".to_string())),
-                Some(conn) => {
+                Some(MqConn::PluginBacked { scheme, handle }) => {
+                    let consume_name = format!("mq_provider_{scheme}_consume");
+                    match plugins.get(&consume_name).cloned() {
+                        Some(plugin_fn) => match plugin_fn(&[Value::Int(*handle), Value::Str(Arc::clone(queue)), Value::Int(*timeout_secs)], span) {
+                            Ok(Value::Str(message)) => Ok(result_ok(Value::Str(message))),
+                            Ok(other) => Ok(result_err(format!(
+                                "plugin builtin `{consume_name}` must return a str message, got {}",
+                                other.ty_name()
+                            ))),
+                            Err(e) => Ok(result_err(e.to_string())),
+                        },
+                        None => Ok(result_err(format!("no `{consume_name}` plugin builtin registered for mq scheme `{scheme}`"))),
+                    }
+                }
+                Some(MqConn::Redis(conn)) => {
                     // BLPOP: blocks up to `timeout_secs` for the first
                     // element pushed to `queue`, `None` on timeout --
                     // matches `Result(str, str)`'s "timeout is an error,
                     // not a hang" contract from `typeck.rs`'s signature.
-                    let popped = redis::cmd("BLPOP")
-                        .arg(queue.as_ref())
-                        .arg(*timeout_secs)
-                        .query::<Option<(String, String)>>(&mut conn.0);
+                    let popped = redis::cmd("BLPOP").arg(queue.as_ref()).arg(*timeout_secs).query::<Option<(String, String)>>(conn);
                     match popped {
                         Ok(Some((_key, message))) => Ok(result_ok(Value::Str(Arc::from(message)))),
                         Ok(None) => Ok(result_err(format!("mq_consume: no message on `{queue}` within {timeout_secs}s"))),
@@ -5294,6 +5414,17 @@ impl Interpreter {
         let Some(conn) = guard.as_mut() else {
             return Err(workflow_err("ProviderRequestFailed", vec![Value::Str(Arc::from("mq connection is stopped"))]));
         };
+        // Redis-specific (`PUBLISH`'s ephemeral pubsub has no equivalent
+        // this function generalizes to for a plugin-backed MQ scheme --
+        // real-time push over an arbitrary external MQ is a real, honest
+        // scope limit `docs/adr/0004-external-data-service-boundary.md`
+        // doesn't attempt to close, not a silent gap).
+        let MqConn::Redis(redis_conn) = conn else {
+            return Err(workflow_err(
+                "ProviderRequestFailed",
+                vec![Value::Str(Arc::from("real-time push notifications require a Redis-backed mq connection (mq_connect), not a plugin-backed one"))],
+            ));
+        };
         let Value::Json(doc) = vars else { unreachable!("typeck.rs already proved this is json") };
         let payload = serde_json::json!({
             "template": template,
@@ -5302,7 +5433,7 @@ impl Interpreter {
         })
         .to_string();
         let channel = format!("nirdosha:push:{subject}");
-        match redis::cmd("PUBLISH").arg(&channel).arg(&payload).query::<i64>(&mut conn.0) {
+        match redis::cmd("PUBLISH").arg(&channel).arg(&payload).query::<i64>(redis_conn) {
             Ok(_) => Ok(()),
             Err(e) => Err(workflow_err("ProviderRequestFailed", vec![Value::Str(Arc::from(e.to_string()))])),
         }
@@ -5808,13 +5939,13 @@ impl Interpreter {
                                     *span,
                                     static_name,
                                     None,
-                                    || eval_builtin(name, &vals, *span, &self.rng),
+                                    || eval_builtin(name, &vals, *span, &self.rng, &self.plugins),
                                     outcome_of_runtime_result,
                                 )
                                 .map_err(Signal::Err);
                         }
                     }
-                    return eval_builtin(name, &vals, *span, &self.rng).map_err(Signal::Err);
+                    return eval_builtin(name, &vals, *span, &self.rng, &self.plugins).map_err(Signal::Err);
                 }
                 // `docs/ROADMAP.md` Track G, G1 / `docs/ECOSYSTEM.md` §G1's
                 // Stage 1: a plugin builtin — `typeck.rs::infer_builtin_call`
@@ -6860,6 +6991,22 @@ impl Interpreter {
                         "db.stop",
                         None,
                         || {
+                            // A `DbConn::PluginBacked` connection isn't a
+                            // real Rust resource this process holds
+                            // directly -- it's an opaque `i64` pointing
+                            // into the *plugin's own* `HandleRegistry`.
+                            // Dropping the enum value alone would leak
+                            // whatever the plugin actually opened (a real
+                            // MySQL socket, say) -- `db_provider_<scheme>
+                            // _close` is called explicitly, first, same
+                            // as the plugin's own bespoke `close` builtin
+                            // (e.g. `mysql_close`) already would be.
+                            if let Some(crate::dbconn::DbConn::PluginBacked { scheme, handle }) = slot.lock().unwrap().as_ref() {
+                                let close_name = format!("db_provider_{scheme}_close");
+                                if let Some(plugin_fn) = self.plugins.get(&close_name).cloned() {
+                                    let _ = plugin_fn(&[Value::Int(*handle)], *span);
+                                }
+                            }
                             drop(slot.lock().unwrap().take());
                             Ok(Value::Unit)
                         },
@@ -6877,6 +7024,18 @@ impl Interpreter {
                         "mq.stop",
                         None,
                         || {
+                            // Same reasoning as `Value::Db` above: a
+                            // `MqConn::PluginBacked` connection's real
+                            // resource lives in the plugin's own
+                            // `HandleRegistry`, not here -- explicitly
+                            // call `mq_provider_<scheme>_close` before
+                            // dropping, or it leaks.
+                            if let Some(MqConn::PluginBacked { scheme, handle }) = slot.lock().unwrap().as_ref() {
+                                let close_name = format!("mq_provider_{scheme}_close");
+                                if let Some(plugin_fn) = self.plugins.get(&close_name).cloned() {
+                                    let _ = plugin_fn(&[Value::Int(*handle)], *span);
+                                }
+                            }
                             drop(slot.lock().unwrap().take());
                             Ok(Value::Unit)
                         },

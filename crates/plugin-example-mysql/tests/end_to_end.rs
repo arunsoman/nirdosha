@@ -112,3 +112,73 @@ fn double_close_is_a_clean_runtime_error_not_a_panic() {
     let err = nirdosha::run_with_plugins(&src, &plugins).expect_err("a double-close must be rejected");
     assert!(err.contains("already closed"), "expected a clear double-close message, got: {err}");
 }
+
+/// The "External Data & Service Boundary" (docs/adr/0004) proof: this
+/// program never mentions `mysql_connect`/`mysql_query`/`mysql_close` by
+/// name at all -- it calls the exact same generic `db_connect`/
+/// `db_query`/`db_execute`/`stop` surface every other backend (SQLite,
+/// Postgres) already uses (`crates/compiler/tests/db.rs`), and it is the
+/// `db_provider_mysql_*` naming-convention dispatch in `interpreter.rs`'s
+/// `eval_builtin` that routes a `mysql://` URL to this plugin instead of
+/// falling through to `dbconn::connect`. Bind parameters go through the
+/// real JSON boundary (`dbconn::params_to_json` -> this plugin's
+/// `json_params_to_mysql`), not string interpolation.
+#[test]
+#[ignore = "needs a live MySQL server; see crates/plugin-examples/docker-compose.yml"]
+fn generic_db_surface_transparently_dispatches_to_the_mysql_plugin() {
+    // Also exercises the real bind-parameter path (`name`/`label` below
+    // go through `dbconn::params_to_json` -> this plugin's
+    // `json_params_to_mysql`), not string interpolation.
+    let src = format!(
+        r#"
+        struct Text {{
+            value: str,
+        }}
+        fn run_all(conn: db) -> Text {{
+            let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS nirdosha_generic (id INTEGER PRIMARY KEY, label TEXT)") {{
+                Ok(n) => n,
+                Err(e) => -1,
+            }}
+            let id: i64 = 1
+            let label: str = "via-generic-surface"
+            let replaced: i64 = match db_execute(conn, "REPLACE INTO nirdosha_generic (id, label) VALUES (?, ?)", id, label) {{
+                Ok(n) => n,
+                Err(e) => -1,
+            }}
+            let found: Text = match db_query(conn, "SELECT id, label FROM nirdosha_generic WHERE id = ?", id) {{
+                Ok(rows) => match json_array_get(rows, 0) {{
+                    Ok(row) => match json_get_str(row, "label") {{
+                        Ok(v) => Text(v),
+                        Err(e) => Text(e),
+                    }},
+                    Err(e) => Text(e),
+                }},
+                Err(e) => Text(e),
+            }}
+            stop conn
+            return found
+        }}
+        fn main() -> Text {{
+            return match db_connect("{dsn}") {{
+                Ok(conn) => run_all(conn),
+                Err(e) => Text(e),
+            }}
+        }}
+    "#,
+        dsn = dsn()
+    );
+    let plugins = MysqlPlugin.builtins();
+    let result = nirdosha::run_with_plugins(&src, &plugins);
+    match result {
+        Ok(Value::Struct(name, fields)) if &*name == "Text" => match &fields[0] {
+            Value::Str(s) => assert_eq!(
+                &**s, "via-generic-surface",
+                "expected the row inserted through the generic surface to come back"
+            ),
+            other => panic!("expected Text(Str(\"via-generic-surface\")), got Text({other:?})"),
+        },
+        other => panic!(
+            "expected the generic db_connect/db_query/db_execute/stop surface to work transparently against MySQL, got {other:?}"
+        ),
+    }
+}

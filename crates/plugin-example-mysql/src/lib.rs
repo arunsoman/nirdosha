@@ -68,8 +68,72 @@ impl NirdoshaPlugin for MysqlPlugin {
                 effects: [Effect::Network].into_iter().collect(),
                 call: Arc::new(mysql_close_call),
             },
+            // "External Data & Service Boundary" (docs/adr/0004): the
+            // same four operations, registered under the
+            // `db_provider_mysql_*` naming convention `db_connect`/
+            // `db_query`/`db_execute`/`stop` dispatch to automatically
+            // for a `mysql://...` connection string — a `.nir` program
+            // using these never writes `mysql_connect`/`mysql_query` by
+            // name at all; it calls the exact same `db_connect`/
+            // `db_query`/`db_execute`/`stop` it would for SQLite or
+            // Postgres. The bespoke `mysql_*` builtins above are kept,
+            // unchanged, for existing callers that already use them
+            // directly — this is a second, additive surface over the
+            // same connection table, not a replacement.
+            PluginBuiltin {
+                name: "db_provider_mysql_connect".to_string(),
+                params: vec![Ty::Str],
+                ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
+                call: Arc::new(mysql_connect_call),
+            },
+            PluginBuiltin {
+                name: "db_provider_mysql_query".to_string(),
+                params: vec![Ty::I64, Ty::Str, Ty::Str],
+                ret: Ty::Str,
+                effects: [Effect::Network].into_iter().collect(),
+                call: Arc::new(db_provider_mysql_query_call),
+            },
+            PluginBuiltin {
+                name: "db_provider_mysql_execute".to_string(),
+                params: vec![Ty::I64, Ty::Str, Ty::Str],
+                ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
+                call: Arc::new(db_provider_mysql_execute_call),
+            },
+            PluginBuiltin {
+                name: "db_provider_mysql_close".to_string(),
+                params: vec![Ty::I64],
+                ret: Ty::I64,
+                effects: [Effect::Network].into_iter().collect(),
+                call: Arc::new(mysql_close_call),
+            },
         ]
     }
+}
+
+/// Decodes `db_query`/`db_execute`'s bind-parameter JSON array
+/// (`crate::dbconn::params_to_json`, `interpreter.rs`'s "db_query"/
+/// "db_execute" arms) into `mysql::Params` — the actual point of the
+/// `db_provider_*` variants having a third `str` argument the bespoke
+/// `mysql_query`/`mysql_execute` above don't.
+fn json_params_to_mysql(params_json: &str) -> Result<mysql::Params, String> {
+    let parsed: serde_json::Value = serde_json::from_str(params_json).map_err(|e| format!("malformed bind-parameter JSON: {e}"))?;
+    let serde_json::Value::Array(items) = parsed else {
+        return Err("bind-parameter JSON must be an array".to_string());
+    };
+    let values: Vec<mysql::Value> = items
+        .into_iter()
+        .map(|v| match v {
+            serde_json::Value::Null => mysql::Value::NULL,
+            serde_json::Value::Bool(b) => mysql::Value::Int(b as i64),
+            serde_json::Value::Number(n) if n.is_i64() => mysql::Value::Int(n.as_i64().unwrap()),
+            serde_json::Value::Number(n) => mysql::Value::Double(n.as_f64().unwrap_or(0.0)),
+            serde_json::Value::String(s) => mysql::Value::Bytes(s.into_bytes()),
+            other => mysql::Value::Bytes(other.to_string().into_bytes()),
+        })
+        .collect();
+    Ok(mysql::Params::Positional(values))
 }
 
 /// `dsn` is a standard MySQL URL: `mysql://user:pass@host:port/dbname`.
@@ -114,6 +178,58 @@ fn mysql_execute_call(args: &[Value], span: Span) -> Result<Value, RuntimeError>
     let sql = str_arg(args, 1, PLUGIN, span)?.to_string();
     let result = connections().with(handle, |conn| -> Result<u64, mysql::Error> {
         conn.query_drop(&sql)?;
+        Ok(conn.affected_rows())
+    });
+    match result {
+        Some(Ok(n)) => Ok(Value::Int(n as i64)),
+        Some(Err(e)) => Err(plugin_error(PLUGIN, span, format!("execute failed: {e}"))),
+        None => Err(plugin_error(PLUGIN, span, format!("no open mysql connection for handle {handle}"))),
+    }
+}
+
+/// `db_provider_mysql_query` — same as `mysql_query_call` but binds the
+/// third `params_json` argument (a JSON array, per `dbconn::params_to_json`)
+/// as positional MySQL bind parameters instead of only accepting a fully
+/// literal SQL string.
+fn db_provider_mysql_query_call(args: &[Value], span: Span) -> Result<Value, RuntimeError> {
+    let handle = int_arg(args, 0, PLUGIN, span)?;
+    let sql = str_arg(args, 1, PLUGIN, span)?.to_string();
+    let params_json = str_arg(args, 2, PLUGIN, span)?;
+    let params = json_params_to_mysql(params_json).map_err(|e| plugin_error(PLUGIN, span, e))?;
+    let result = connections().with(handle, |conn| -> Result<String, mysql::Error> {
+        let rows: Vec<mysql::Row> = conn.exec(&sql, params)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let columns = row.columns();
+            let values = row.unwrap();
+            let mut obj = serde_json::Map::new();
+            for (col, val) in columns.iter().zip(values) {
+                obj.insert(col.name_str().to_string(), mysql_value_to_json(val));
+            }
+            out.push(serde_json::Value::Object(obj));
+        }
+        Ok(serde_json::to_string(&out).unwrap())
+    });
+    match result {
+        Some(Ok(json)) => Ok(Value::Str(Arc::from(json.as_str()))),
+        Some(Err(e)) => Err(plugin_error(PLUGIN, span, format!("query failed: {e}"))),
+        None => Err(plugin_error(
+            PLUGIN,
+            span,
+            format!("no open mysql connection for handle {handle} (already closed, or never connected)"),
+        )),
+    }
+}
+
+/// `db_provider_mysql_execute` — same as `mysql_execute_call` but binds
+/// the third `params_json` argument as positional MySQL bind parameters.
+fn db_provider_mysql_execute_call(args: &[Value], span: Span) -> Result<Value, RuntimeError> {
+    let handle = int_arg(args, 0, PLUGIN, span)?;
+    let sql = str_arg(args, 1, PLUGIN, span)?.to_string();
+    let params_json = str_arg(args, 2, PLUGIN, span)?;
+    let params = json_params_to_mysql(params_json).map_err(|e| plugin_error(PLUGIN, span, e))?;
+    let result = connections().with(handle, |conn| -> Result<u64, mysql::Error> {
+        conn.exec_drop(&sql, params)?;
         Ok(conn.affected_rows())
     });
     match result {
