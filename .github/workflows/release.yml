@@ -147,7 +147,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           chmod +x target/${{ matrix.target }}/release/nirdosha
-          target/${{ matrix.target }}/release/nirdosha examples/hello.nir
+          target/${{ matrix.target }}/release/nirdosha crates/compiler/tests/fixtures/hello.nir
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
