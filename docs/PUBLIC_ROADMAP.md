@@ -125,12 +125,17 @@ pass, `file`, scalar-only native plugin calls, and `dec128` arithmetic)
   cargo-dependency.md`) that can depend on crates.io crates — the
   actual, previously-invisible reason `dec128` stayed interpreter-only
   this long: `rust_decimal` was simply unreachable from the old build.
-- [PARTIAL] `dec128` — `dec_from_i64`/`dec_to_str`/`+`/`-`/`*`/`/`
-  compile to real `rust_decimal`-backed native code (`nir_dec128_*`
-  kernels), verified against the interpreter byte for byte, including
-  the division-by-zero trap. `dec_from_str`/`dec_round`/`dec_scale` and
-  all six comparisons aren't wired into codegen yet — cleanly rejected
-  (`codegen.rs` tests), not silently wrong, in the meantime.
+- [PARTIAL] `dec128` — `dec_from_i64`/`dec_to_str`/`dec_round`/
+  `dec_scale`, `+`/`-`/`*`/`/`, and all six comparisons compile to real
+  `rust_decimal`-backed native code (`nir_dec128_*` kernels), verified
+  against the interpreter byte for byte, including the division-by-zero
+  trap and a `dec128` field inside a real `struct`. Only `dec_from_str`
+  remains — its `.nir`-visible return type is `Result(dec128, str)`,
+  and no existing compiled builtin actually constructs a real
+  `Result(_, _)` enum value as its return yet (`inv`/`solve`, this
+  codebase's other fallible builtins, present failure a different way)
+  — a real, deliberately deferred design question, not a shortcut;
+  cleanly rejected in the meantime.
 - [OPEN] `transact` → `db`/`json` → `mq` → identity → `http`/`https` →
   concurrency/sandboxing → first-class functions → compiled `serve` mode,
   roughly in that order. `db`/`json`/`mq` share `file`'s "linked

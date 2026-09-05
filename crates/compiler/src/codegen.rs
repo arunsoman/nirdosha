@@ -178,20 +178,34 @@ const STR_CRYPTO_BUILTINS: &[&str] = &["sha256_hex", "constant_time_str_eq"];
 /// reason that one isn't folded into `PHASE5_BUILTINS`.
 const RAND_BUILTINS: &[&str] = &["rand_seed", "rand_f64", "rand_gaussian"];
 
-/// `dec_from_i64`/`dec_to_str` — linked calls into `runtime-kernels/src/lib.rs`'s
-/// `rust_decimal`-backed kernels (rfcs/0005-plugin-boundary-safety-and-
-/// performance.md's own build-architecture-change finding: `dec128` was
-/// interpreter-only specifically because the old bare-`rustc` kernel
-/// build had no way to reach `rust_decimal` at all). Own list, not
-/// folded into `STR_CRYPTO_BUILTINS`/`RAND_BUILTINS`, for the same
-/// "describes something different" reason those two aren't folded into
-/// each other. **Not yet included**: `dec_from_str`/`dec_round`/
-/// `dec_scale` — the kernels exist (`nir_dec128_from_str`, `Decimal`'s
-/// own `round_dp_with_strategy`/scale accessor not yet wrapped), but
-/// wiring their codegen call sites is real follow-up work, not done in
-/// this pass; a program calling any of them is still cleanly rejected
-/// here, same as before.
-const DEC128_BUILTINS: &[&str] = &["dec_from_i64", "dec_to_str"];
+/// `dec_from_i64`/`dec_to_str`/`dec_round`/`dec_scale` — linked calls
+/// into `runtime-kernels/src/lib.rs`'s `rust_decimal`-backed kernels
+/// (rfcs/0005-plugin-boundary-safety-and-performance.md's own build-
+/// architecture-change finding: `dec128` was interpreter-only
+/// specifically because the old bare-`rustc` kernel build had no way to
+/// reach `rust_decimal` at all). Own list, not folded into
+/// `STR_CRYPTO_BUILTINS`/`RAND_BUILTINS`, for the same "describes
+/// something different" reason those two aren't folded into each
+/// other.
+///
+/// **Not yet included**: `dec_from_str`. Its kernel
+/// (`nir_dec128_from_str`) already exists, but its `.nir`-visible
+/// return type is `Result(dec128, str)` — checked directly, no
+/// existing compiled builtin actually constructs a real `Result(_, _)`
+/// enum value as its return (`inv`/`solve`, this codebase's other
+/// fallible `PHASE5_BUILTINS`, present their own failure some other
+/// way — `local_ty_of`'s own `"inv" => self.local_ty_of(&args[0],
+/// scopes)`/`"solve" => self.local_ty_of(&args[1], scopes)` arms report
+/// the *matrix* type, not a `Result` wrapping it). Wiring
+/// `dec_from_str` would mean being the first to establish that
+/// convention in codegen, not reusing a proven one the way every other
+/// `dec128` builtin here does — real, deliberately deferred design
+/// work, not a shortcut. `construct_variant`'s generic payload-
+/// placement machinery (`conservative_word_count`'s new `Ty::Dec128 =>
+/// 2` arm, added for this pass) should make it straightforward once
+/// someone picks this convention question up; cleanly rejected in the
+/// meantime, same as before.
+const DEC128_BUILTINS: &[&str] = &["dec_from_i64", "dec_to_str", "dec_round", "dec_scale"];
 
 /// WGS84 ellipsoid constants — mirrors `interpreter.rs`'s own
 /// `WGS84_A`/`WGS84_F`/`wgs84_e2()` exactly (same values, same derived
@@ -490,7 +504,7 @@ fn mangle_ty(ty: &Ty) -> String {
 /// doc has the full reasoning).
 fn conservative_word_count(ty: &Ty, registry: &TypeRegistry) -> u64 {
     match ty {
-        Ty::Str => 2,
+        Ty::Str | Ty::Dec128 => 2,
         Ty::Vector(_, _) | Ty::Matrix(_, _, _) => {
             let (_, _, bytes) = agg_layout(ty);
             bytes.div_ceil(8)
@@ -1301,6 +1315,9 @@ fn emit_llvm_ir_impl<'a>(
     writeln!(cg.out, "declare {{i64, i64}} @nir_dec128_sub({{i64, i64}}, {{i64, i64}})").unwrap();
     writeln!(cg.out, "declare {{i64, i64}} @nir_dec128_mul({{i64, i64}}, {{i64, i64}})").unwrap();
     writeln!(cg.out, "declare {{i64, i64}} @nir_dec128_div({{i64, i64}}, {{i64, i64}})").unwrap();
+    writeln!(cg.out, "declare i32 @nir_dec128_cmp({{i64, i64}}, {{i64, i64}})").unwrap();
+    writeln!(cg.out, "declare {{i64, i64}} @nir_dec128_round({{i64, i64}}, i32)").unwrap();
+    writeln!(cg.out, "declare i64 @nir_dec128_scale({{i64, i64}})").unwrap();
     // `box`'s heap allocator — see `Expr::Box`'s doc comment for why
     // `nir_free` isn't called anywhere yet (this phase deliberately
     // leaks; a later phase wires the calls once ownership.rs's move data
@@ -2045,8 +2062,9 @@ impl Codegen<'_> {
             Expr::Call(name, _, _) if name == "constant_time_str_eq" => Ty::Bool,
             Expr::Call(name, _, _) if name == "rand_f64" || name == "rand_gaussian" => Ty::F64,
             Expr::Call(name, _, _) if name == "rand_seed" => Ty::Unit,
-            Expr::Call(name, _, _) if name == "dec_from_i64" => Ty::Dec128,
+            Expr::Call(name, _, _) if name == "dec_from_i64" || name == "dec_round" => Ty::Dec128,
             Expr::Call(name, _, _) if name == "dec_to_str" => Ty::Str,
+            Expr::Call(name, _, _) if name == "dec_scale" => Ty::U32,
             // Row 11: a struct/variant constructor call produces a
             // `Ty::Named` value (the struct's own type, or the owning
             // enum's), not the `Ty::I64` the `self.sigs.get` fallback
@@ -3142,6 +3160,20 @@ impl Codegen<'_> {
             writeln!(self.out, "  {result} = insertvalue {{ptr, i64}} {partial}, i64 {len}, 1").unwrap();
             return Ok(result);
         }
+        if name == "dec_round" {
+            let d = self.expr(&args[0], scopes)?;
+            let scale64 = self.expr(&args[1], scopes)?;
+            let scale32 = self.narrow_from_i64(&scale64, &Ty::U32)?;
+            let r = self.fresh_reg("dec_round");
+            writeln!(self.out, "  {r} = call {{i64, i64}} @nir_dec128_round({{i64, i64}} {d}, i32 {scale32})").unwrap();
+            return Ok(r);
+        }
+        if name == "dec_scale" {
+            let d = self.expr(&args[0], scopes)?;
+            let r = self.fresh_reg("dec_scale");
+            writeln!(self.out, "  {r} = call i64 @nir_dec128_scale({{i64, i64}} {d})").unwrap();
+            return Ok(r);
+        }
         if PHASE4_BUILTINS.contains(&name) || name == "det" || name == "rank" {
             return self.call_builtin_scalar(name, args, scopes);
         }
@@ -4121,34 +4153,43 @@ impl Codegen<'_> {
             }
         }
 
-        // `dec128` arithmetic — linked calls into `runtime-kernels/src/lib.rs`'s
-        // `rust_decimal`-backed kernels (`DEC128_BUILTINS`'s doc comment
-        // covers the builtin-call half; this is the operator half).
-        // Checked before the `is_float` dispatch below, which assumes a
-        // bare scalar `i64`/`double` SSA value on both sides, not a
-        // `{i64, i64}` struct. Comparisons aren't wired yet (no
-        // `nir_dec128_cmp` kernel exists) — a clean, named rejection
-        // here rather than silently running dec128's raw bit pattern
-        // through `icmp`/`fcmp`, which would be wrong, not just
-        // unsupported.
+        // `dec128` arithmetic and comparisons — linked calls into
+        // `runtime-kernels/src/lib.rs`'s `rust_decimal`-backed kernels
+        // (`DEC128_BUILTINS`'s doc comment covers the builtin-call half;
+        // this is the operator half). Checked before the `is_float`
+        // dispatch below, which assumes a bare scalar `i64`/`double` SSA
+        // value on both sides, not a `{i64, i64}` struct.
         if self.local_ty_of(lhs, scopes) == Ty::Dec128 {
             let l = self.expr(lhs, scopes)?;
             let r = self.expr(rhs, scopes)?;
-            let kernel = match op {
-                BinOp::Add => "nir_dec128_add",
-                BinOp::Sub => "nir_dec128_sub",
-                BinOp::Mul | BinOp::ElemMul => "nir_dec128_mul",
-                BinOp::Div | BinOp::ElemDiv => "nir_dec128_div",
-                _ => {
-                    return unsupported(format!(
-                        "codegen doesn't support `{op:?}` on `dec128` operands yet — only +, -, *, / are wired \
-                         (comparisons are interpreter-only for now)"
-                    ));
-                }
+            if let Some(kernel) = match op {
+                BinOp::Add => Some("nir_dec128_add"),
+                BinOp::Sub => Some("nir_dec128_sub"),
+                BinOp::Mul | BinOp::ElemMul => Some("nir_dec128_mul"),
+                BinOp::Div | BinOp::ElemDiv => Some("nir_dec128_div"),
+                _ => None,
+            } {
+                let out = self.fresh_reg("dec128_binop");
+                writeln!(self.out, "  {out} = call {{i64, i64}} @{kernel}({{i64, i64}} {l}, {{i64, i64}} {r})").unwrap();
+                return Ok(out);
+            }
+            // Every comparison is `nir_dec128_cmp`'s real total
+            // ordering (`Decimal: Ord`, `runtime-kernels/src/lib.rs`'s own doc
+            // comment) compared against `0` — matches
+            // `interpreter.rs`'s own `Eq`/`NotEq`/`Lt`/`Gt`/`LtEq`/
+            // `GtEq` arm, which is just `Decimal`'s own `<`/`>`/etc.
+            // operators underneath.
+            let cmp = self.fresh_reg("dec128_cmp");
+            writeln!(self.out, "  {cmp} = call i32 @nir_dec128_cmp({{i64, i64}} {l}, {{i64, i64}} {r})").unwrap();
+            return match op {
+                BinOp::Eq => self.icmp("eq", "i32", &cmp, "0"),
+                BinOp::NotEq => self.icmp("ne", "i32", &cmp, "0"),
+                BinOp::Lt => self.icmp("slt", "i32", &cmp, "0"),
+                BinOp::Gt => self.icmp("sgt", "i32", &cmp, "0"),
+                BinOp::LtEq => self.icmp("sle", "i32", &cmp, "0"),
+                BinOp::GtEq => self.icmp("sge", "i32", &cmp, "0"),
+                _ => unreachable!("BinOp has no other variants besides arithmetic/comparison/And/Or, and And/Or short-circuit before this function even runs"),
             };
-            let out = self.fresh_reg("dec128_binop");
-            writeln!(self.out, "  {out} = call {{i64, i64}} @{kernel}({{i64, i64}} {l}, {{i64, i64}} {r})").unwrap();
-            return Ok(out);
         }
 
         // Arithmetic and ordering comparisons only ever apply to numeric

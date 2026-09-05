@@ -1124,6 +1124,35 @@ pub extern "C" fn nir_dec128_mul(a: Dec128Bits, b: Dec128Bits) -> Dec128Bits {
     decimal_to_bits(bits_to_decimal(a) * bits_to_decimal(b))
 }
 
+/// `a <=> b` — a real total ordering (`Decimal: Ord`, no NaN-like case
+/// to worry about, unlike `f64`), matching `interpreter.rs`'s own
+/// `Eq`/`NotEq`/`Lt`/`Gt`/`LtEq`/`GtEq` arm exactly: every one of those
+/// six operators is just this result compared against `0`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nir_dec128_cmp(a: Dec128Bits, b: Dec128Bits) -> i32 {
+    match bits_to_decimal(a).cmp(&bits_to_decimal(b)) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// `dec_round(d, scale)` — matches `interpreter.rs`'s own `dec_round`
+/// exactly: `round_dp_with_strategy`, `MidpointNearestEven` (banker's
+/// rounding, `docs/LANGUAGE.md` §5's "the only rounding policy v1
+/// ships," not `rust_decimal`'s own away-from-zero default).
+#[unsafe(no_mangle)]
+pub extern "C" fn nir_dec128_round(value: Dec128Bits, scale: u32) -> Dec128Bits {
+    decimal_to_bits(bits_to_decimal(value).round_dp_with_strategy(scale, rust_decimal::RoundingStrategy::MidpointNearestEven))
+}
+
+/// `dec_scale(d)` — matches `interpreter.rs`'s own `dec_scale` exactly:
+/// `Decimal::scale()`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nir_dec128_scale(value: Dec128Bits) -> i64 {
+    bits_to_decimal(value).scale() as i64
+}
+
 /// `a / b` — matches `interpreter.rs`'s own `Div`/`ElemDiv` arm: a zero
 /// divisor is `ErrorKind::DivByZero` there (a real, catchable Nirdosha
 /// `RuntimeError`, not a Rust panic) — the compiled path has no

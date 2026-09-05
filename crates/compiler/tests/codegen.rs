@@ -3507,21 +3507,33 @@ fn dec128_division_by_zero_traps() {
     assert_ne!(status.code(), Some(0));
 }
 
-/// A `dec128` comparison (no `nir_dec128_cmp` kernel exists yet) is a
-/// clean, named rejection -- not silently running its raw `{i64,i64}`
-/// bit pattern through `icmp`, which would be wrong, not just
-/// unsupported.
+/// All six `dec128` comparisons (`nir_dec128_cmp`'s real total
+/// ordering, compared against `0`), plus `dec_round`/`dec_scale` —
+/// compiled and matched against the interpreter, not just "didn't
+/// crash."
 #[test]
-fn dec128_comparison_is_cleanly_rejected_not_silently_wrong() {
+fn dec128_comparisons_round_and_scale_compile_and_match_interpreter() {
     let src = r#"
-        fn main() -> bool {
+        fn main() {
             let a: dec128 = dec_from_i64(1, 0)
             let b: dec128 = dec_from_i64(2, 0)
-            return a < b
+            print(a == b)
+            print(a != b)
+            print(a < b)
+            print(a > b)
+            print(a <= b)
+            print(a >= b)
+            print(a == a)
+
+            let pi: dec128 = dec_from_i64(31416, 4)
+            let rounded: dec128 = dec_round(pi, 2)
+            print(dec_to_str(rounded))
+            print(dec_scale(pi))
+            print(dec_scale(rounded))
         }
     "#;
-    let program = parse_typed(src);
-    let report = analyze(&program);
-    let err = codegen::emit_llvm_ir(&program, &report).expect_err("dec128 `<` must be rejected, not silently wrong");
-    assert!(err.to_string().contains("dec128"), "expected a named dec128 rejection, got: {err}");
+    let (stdout, code) = compile_and_run(src);
+    assert_eq!(stdout, "0\n1\n1\n0\n1\n0\n1\n3.14\n4\n2\n");
+    assert_eq!(code, 0);
+    assert_eq!(nirdosha::run(src), Ok(nirdosha::interpreter::Value::Unit), "interpreted path should agree");
 }
