@@ -45,6 +45,7 @@ with none of this, which is the concrete gap it closes.
 | [0003](./0003-plugin-abi-v2.md) | Plugin ABI v2 — effect declarations, async/sync policy, versioning | draft | *unassigned* |
 | [0004](./0004-native-plugin-sandboxing.md) | Trust model for native (Kind A) plugins | draft | *unassigned* |
 | [0005](./0005-plugin-boundary-safety-and-performance.md) | The Nirdosha↔Rust plugin boundary — safety and performance | draft | *unassigned* |
+| [0006](./0006-structured-concurrency.md) | Structured concurrency for native threads — Pillars 1-4 | draft | *unassigned* |
 
 ## What doesn't need an RFC
 

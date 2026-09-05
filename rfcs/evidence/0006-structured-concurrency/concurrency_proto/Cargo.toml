@@ -1,0 +1,13 @@
+[workspace]
+
+[package]
+name = "concurrency_proto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossbeam-channel = "0.5"
+
+[[bin]]
+name = "bench"
+path = "src/bench.rs"

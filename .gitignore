@@ -5,6 +5,7 @@
 /crates/bench/target
 /crates/presence-gateway/target
 /crates/runtime-kernels/target
+/rfcs/evidence/0006-structured-concurrency/concurrency_proto/target
 /benchmarks/c/*_bin*
 /benchmarks/nirdosha/*_bin*
 
