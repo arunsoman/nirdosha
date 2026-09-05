@@ -695,6 +695,117 @@ pub unsafe extern "C" fn nir_tcp_stop(handle: i64) -> i32 {
     0
 }
 
+// ---- file kernels ---------------------------------------------------------
+//
+// `open`/`file` (docs/PROTOLANG_PORT.md's "Locked design 2") reuses `send`/
+// `recv`/`stop` verbatim, the same way `tcp` itself reuses them from `chan`
+// (`examples/file_io.nir`'s own doc comment) -- so this section mirrors the
+// `tcp` kernels above almost exactly, differing only where a file's real
+// semantics genuinely differ from a socket's: `nir_file_read`'s `0` return
+// is valid EOF (`interpreter.rs::read_file`'s own doc comment: "a file
+// simply running out of bytes to read is the normal, expected way a file
+// ends"), never a trap the way `nir_tcp_recv`'s `0` (peer closed) is —
+// `codegen.rs` dispatches to `guard_io_ok` (traps only on negative) for
+// `Ty::File`'s `recv`, not `guard_recv_ok` (traps on `<= 0`), to match.
+//
+// On Unix a file descriptor and a socket descriptor are the same `RawFd`
+// type, so `handle_of_stream`/`stream_from_handle`'s *traits*
+// (`IntoRawFd`/`FromRawFd`, already imported above) apply to
+// `std::fs::File` unchanged -- only Windows genuinely needs its own
+// conversion, since a Win32 file `HANDLE` and a `SOCKET` are different,
+// differently-APIed types (`IntoRawHandle`/`FromRawHandle`, not
+// `IntoRawSocket`/`FromRawSocket`). Same "believed-correct, untested on
+// real Windows hardware" disclosure as every other Windows-conditional
+// kernel in this file.
+#[cfg(unix)]
+fn handle_of_file(f: std::fs::File) -> i64 {
+    f.into_raw_fd() as i64
+}
+#[cfg(windows)]
+fn handle_of_file(f: std::fs::File) -> i64 {
+    use std::os::windows::io::IntoRawHandle;
+    f.into_raw_handle() as i64
+}
+
+#[cfg(unix)]
+unsafe fn file_from_handle(h: i64) -> std::fs::File {
+    unsafe { std::fs::File::from_raw_fd(h as RawFd) }
+}
+#[cfg(windows)]
+unsafe fn file_from_handle(h: i64) -> std::fs::File {
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+    unsafe { std::fs::File::from_raw_handle(h as RawHandle) }
+}
+
+/// `open(path, mode)` — matches `interpreter.rs`'s `Expr::Open` exactly:
+/// `"r"` opens for reading, `"w"` creates/truncates for writing, `"a"`
+/// creates/appends; any other mode string is `-1`, the same "invalid mode"
+/// failure a real I/O error already collapses into (`codegen.rs`'s
+/// `guard_io_ok` can't distinguish *why* `open` failed, only that it did —
+/// same limitation `nir_tcp_connect`'s own bad-port/bad-host cases already
+/// have). `path`/`mode` are `{ptr, len}` UTF-8 buffers, same convention
+/// `nir_tcp_connect`'s `host` argument already uses.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nir_file_open(path_ptr: *const u8, path_len: i64, mode_ptr: *const u8, mode_len: i64) -> i64 {
+    let path = unsafe { std::slice::from_raw_parts(path_ptr, path_len as usize) };
+    let Ok(path) = std::str::from_utf8(path) else { return -1 };
+    let mode = unsafe { std::slice::from_raw_parts(mode_ptr, mode_len as usize) };
+    let Ok(mode) = std::str::from_utf8(mode) else { return -1 };
+    let opened = match mode {
+        "r" => std::fs::File::open(path),
+        "w" => std::fs::File::create(path),
+        "a" => std::fs::OpenOptions::new().append(true).create(true).open(path),
+        _ => return -1,
+    };
+    match opened {
+        Ok(file) => handle_of_file(file),
+        Err(_) => -1,
+    }
+}
+
+/// `send(file, s)` — `write_all`, matching `interpreter.rs::write_file`
+/// exactly (loops internally until every byte is written). Returns
+/// `buf_len` on success, `-1` on failure — same convention as
+/// `nir_tcp_send`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nir_file_write(handle: i64, buf_ptr: *const u8, buf_len: i64) -> i64 {
+    let mut file = ManuallyDrop::new(unsafe { file_from_handle(handle) });
+    let buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len as usize) };
+    match file.write_all(buf) {
+        Ok(()) => buf_len,
+        Err(_) => -1,
+    }
+}
+
+/// `recv(file)` — one read syscall into a fixed 64KiB buffer, matching
+/// `interpreter.rs::read_file` exactly (same buffer size, same "one
+/// chunk" scope). Returns bytes read (`0` is valid EOF, not an error —
+/// see this section's own module doc), or `-1` on a real I/O failure.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nir_file_read(handle: i64, buf_ptr: *mut u8, buf_cap: i64) -> i64 {
+    let mut file = ManuallyDrop::new(unsafe { file_from_handle(handle) });
+    let buf = unsafe { std::slice::from_raw_parts_mut(buf_ptr, buf_cap as usize) };
+    match file.read(buf) {
+        Ok(n) => n as i64,
+        Err(_) => -1,
+    }
+}
+
+/// Closes `handle` — `ownership.rs`'s affine typing already proves this
+/// runs at most once per handle in a well-typed program, same "the
+/// checker is the real gate" convention `nir_tcp_stop` already documents.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nir_file_stop(handle: i64) -> i32 {
+    #[cfg(unix)]
+    drop(unsafe { OwnedFd::from_raw_fd(handle as RawFd) });
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
+        drop(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) });
+    }
+    0
+}
+
 // ---- sha256_hex / constant_time_str_eq extern boundary --------------------
 //
 // Backs the `sha256_hex(s)`/`sha256_hex(prev_hash, payload)` and

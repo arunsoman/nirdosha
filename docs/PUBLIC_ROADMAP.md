@@ -105,12 +105,30 @@ critical apps on the interpreted path)
   upstream incompatibility); revisit once a fixed `z3`/`z3-src` release
   ships
 
-**Track B — Full compilation** (currently 100% interpreter-only for
-`db`/`json`/`http`/`mq`/identity/`transact`/concurrency; native codegen
-only covers the numeric/control-flow subset today)
+**Track B — Full compilation** (`db`/`json`/`http`/`mq`/identity/
+`transact`/concurrency/sandboxing remain interpreter-only; native
+codegen covers the numeric/control-flow subset, `tcp`/`tcp_listener`,
+and, as of this pass, `file` and scalar-only native plugin calls)
+- [DONE] `file` (`open`/`send`/`recv`/`stop`) — linked `nir_file_*`
+  kernels, the same "declare + link a staticlib" pattern `tcp` already
+  used; `examples/file_io.nir` compiles and runs as a native binary
+  unchanged, verified against the interpreter's own output
+  (`crates/compiler/tests/codegen.rs`)
+- [DONE] Scalar-only native plugin calls (Kind A plugins) —
+  `plugin::NativePluginBuiltin`/`codegen::build_with_native_plugins`
+  (`rfcs/0005-plugin-boundary-safety-and-performance.md` §3), ~250x
+  faster than interpreted plugin dispatch for this subset; `str`/
+  aggregate-typed plugin builtins still interpreter-only
 - [OPEN] `transact` → `db`/`json` → `mq` → identity → `http`/`https` →
   concurrency/sandboxing → first-class functions → compiled `serve` mode,
-  roughly in that order
+  roughly in that order. `db`/`json`/`mq` share `file`'s "linked
+  handle-based kernel" shape but need a real dynamically-typed value
+  representation for query results first (`Ty::Handle`'s own affine
+  fix, `rfcs/0005` §1, generalizes to a `db`/`mq` connection handle for
+  free once that representation exists). Concurrency/sandboxing are a
+  materially harder, separate design question (a native thread-spawn +
+  cross-thread `box`-ownership model, not a kernel to link) — see
+  `rfcs/0005` §0's own difficulty ranking for the fuller breakdown.
 
 **Track C — Agent-facing HTTP API** (the spec exists —
 [`docs/nirdosha-agent-api.md`](./docs/nirdosha-agent-api.md) — about half the

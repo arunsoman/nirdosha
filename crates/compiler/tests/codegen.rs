@@ -3360,3 +3360,80 @@ fn without_the_plugin_name_set_check_supported_has_no_opinion_about_an_unknown_c
         "check_supported alone is purely syntactic -- it doesn't resolve names, typecheck does"
     );
 }
+
+// ---- file I/O (`open`/`send`/`recv`/`stop` on `file`) ----------------------
+//
+// `examples/file_io.nir`'s exact shape, compiled and actually run: real
+// `nir_file_open`/`nir_file_write`/`nir_file_read`/`nir_file_stop` kernels
+// (`runtime_kernels.rs`), a real file on disk, no interpreter involved.
+
+#[test]
+fn file_write_then_read_compiles_and_matches_interpreter() {
+    let path = std::env::temp_dir().join(format!("nirdosha_codegen_file_io_test_{}_{}.txt", std::process::id(), unique_suffix()));
+    let path_str = path.to_str().unwrap().replace('\\', "\\\\"); // Windows path separators, if this ever runs there
+    let src = format!(
+        r#"
+        fn main() {{
+            let out: file = open("{path_str}", "w")
+            send(out, "hello from compiled nirdosha")
+            stop out
+
+            let inp: file = open("{path_str}", "r")
+            let content: str = recv(inp)
+            stop inp
+
+            print(content)
+        }}
+        "#
+    );
+    let (stdout, code) = compile_and_run(&src);
+    assert_eq!(stdout, "hello from compiled nirdosha\n");
+    assert_eq!(code, 0);
+    assert_eq!(nirdosha::run(&src), Ok(nirdosha::interpreter::Value::Unit), "interpreted path should agree");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `recv` at EOF is a valid empty string, not a trap -- the one place
+/// `file`'s `recv` semantics genuinely differ from `tcp`'s (a `0`-byte
+/// TCP read means the peer closed, a real error; a `0`-byte file read at
+/// EOF is just "nothing left," `interpreter.rs::read_file`'s own
+/// documented convention). Proves `codegen.rs` dispatches `Ty::File`'s
+/// `recv` to `guard_io_ok` (traps only on negative), not `guard_recv_ok`
+/// (traps on `<= 0` too, the `Ty::Tcp` arm's own guard).
+#[test]
+fn recv_on_an_empty_file_returns_empty_string_not_a_trap() {
+    let path = std::env::temp_dir().join(format!("nirdosha_codegen_file_io_empty_test_{}_{}.txt", std::process::id(), unique_suffix()));
+    let path_str = path.to_str().unwrap().replace('\\', "\\\\");
+    let src = format!(
+        r#"
+        fn main() {{
+            let out: file = open("{path_str}", "w")
+            stop out
+
+            let inp: file = open("{path_str}", "r")
+            let content: str = recv(inp)
+            stop inp
+
+            print(content)
+        }}
+        "#
+    );
+    let (stdout, code) = compile_and_run(&src);
+    assert_eq!(stdout, "\n", "an empty file's recv should print an empty string, not trap");
+    assert_eq!(code, 0);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `Ty::File` is accepted, end to end -- `check_supported` no longer
+/// rejects it (this used to be `Ty::File => unsupported(...)`).
+#[test]
+fn file_type_is_accepted_by_check_supported() {
+    let src = r#"
+        fn main() {
+            let f: file = open("/tmp/nirdosha_check_supported_file_probe.txt", "w")
+            stop f
+        }
+    "#;
+    let program = parse_typed(src);
+    assert!(codegen::check_supported(&program).is_ok(), "Ty::File should compile now");
+}

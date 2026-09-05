@@ -326,9 +326,10 @@ fn llvm_ty(ty: &Ty, registry: &TypeRegistry) -> Result<String, CodegenError> {
         Ty::Sandbox => unsupported(
             "codegen doesn't support `sandbox` yet — sandbox/stop are interpreter-only for now",
         ),
-        Ty::File => unsupported(
-            "codegen doesn't support `file` yet — open/send/recv/stop on file are interpreter-only for now",
-        ),
+        // A file descriptor/handle, exactly like `Ty::Tcp`/`Ty::TcpListener`
+        // above — `nir_file_*` (`runtime_kernels.rs`) is the linked-kernel
+        // backend `open`/`send`/`recv`/`stop` on a `file` compile to.
+        Ty::File => Ok("i64".to_string()),
         Ty::Dec128 => unsupported(
             "codegen doesn't support `dec128` yet — decimal arithmetic is interpreter-only for now (docs/LANGUAGE.md §6c/§6d)",
         ),
@@ -935,12 +936,12 @@ fn check_expr(e: &Expr, plugin_names: &std::collections::HashSet<String>, regist
             unsupported("codegen doesn't support `sandbox` yet — interpreter-only for now")
         }
         Expr::StopSandbox(inner, _) => check_expr(inner, plugin_names, registry),
-        // `open`/file I/O is interpreter-only for now, same treatment
-        // `Expr::Chan`/`Expr::SpawnSandbox` above get — no type info at
-        // this structural pre-pass, so straight rejection rather than
-        // recursing into a program that's unsupported regardless.
-        Expr::Open(_, _, _) => {
-            unsupported("codegen doesn't support `open`/file I/O yet — interpreter-only for now")
+        // `open(path, mode)` compiles now (`nir_file_open`,
+        // `runtime_kernels.rs`) — recurse into both operands the same as
+        // `Expr::Connect` below.
+        Expr::Open(path, mode, _) => {
+            check_expr(path, plugin_names, registry)?;
+            check_expr(mode, plugin_names, registry)
         }
         Expr::Connect(host, port, _) => {
             check_expr(host, plugin_names, registry)?;
@@ -1261,6 +1262,12 @@ fn emit_llvm_ir_impl<'a>(
     writeln!(cg.out, "declare i64 @nir_tcp_send(i64, ptr, i64)").unwrap();
     writeln!(cg.out, "declare i64 @nir_tcp_recv(i64, ptr, i64)").unwrap();
     writeln!(cg.out, "declare i32 @nir_tcp_stop(i64)").unwrap();
+    // `file`'s kernels — `open`/`send`/`recv`/`stop`, same shape as the
+    // `tcp` kernels just above (`runtime_kernels.rs`'s own "file" section).
+    writeln!(cg.out, "declare i64 @nir_file_open(ptr, i64, ptr, i64)").unwrap();
+    writeln!(cg.out, "declare i64 @nir_file_write(i64, ptr, i64)").unwrap();
+    writeln!(cg.out, "declare i64 @nir_file_read(i64, ptr, i64)").unwrap();
+    writeln!(cg.out, "declare i32 @nir_file_stop(i64)").unwrap();
     // `box`'s heap allocator — see `Expr::Box`'s doc comment for why
     // `nir_free` isn't called anywhere yet (this phase deliberately
     // leaks; a later phase wires the calls once ownership.rs's move data
@@ -2573,9 +2580,24 @@ impl Codegen<'_> {
             | Expr::Join(_, _)
             | Expr::Chan(_)
             | Expr::SpawnSandbox(_, _, _)
-            | Expr::Open(_, _, _)
             | Expr::Transact { .. } => {
                 unreachable!("check_supported already rejected this program")
+            }
+            // `open(path, mode)` — `path`/`mode` are both `str`, matching
+            // `nir_file_open`'s `{ptr, len}` x2 signature exactly
+            // (`runtime_kernels.rs`). `-1` (bad mode string, or a real
+            // I/O failure `interpreter.rs`'s own `Expr::Open` would
+            // return as `Err`) traps via `guard_io_ok`, the same
+            // "checker can't see this coming, so trap at runtime"
+            // treatment `nir_tcp_connect`'s own failure path already
+            // gets.
+            Expr::Open(path, mode, _span) => {
+                let (path_ptr, path_len) = self.str_parts(path, scopes)?;
+                let (mode_ptr, mode_len) = self.str_parts(mode, scopes)?;
+                let fd = self.fresh_reg("file_open_fd");
+                writeln!(self.out, "  {fd} = call i64 @nir_file_open(ptr {path_ptr}, i64 {path_len}, ptr {mode_ptr}, i64 {mode_len})").unwrap();
+                self.guard_io_ok(&fd);
+                Ok(fd)
             }
             // Row 11: `base.field` where the field is a plain scalar —
             // GEP to the field's index within `base`'s real named struct
@@ -2731,8 +2753,16 @@ impl Codegen<'_> {
                     self.guard_io_ok(&n);
                     Ok("0".to_string()) // send's own value is unit; never read
                 }
+                Ty::File => {
+                    let fd = self.expr(target, scopes)?;
+                    let (ptr, len) = self.str_parts(value, scopes)?;
+                    let n = self.fresh_reg("file_write_n");
+                    writeln!(self.out, "  {n} = call i64 @nir_file_write(i64 {fd}, ptr {ptr}, i64 {len})").unwrap();
+                    self.guard_io_ok(&n);
+                    Ok("0".to_string()) // send's own value is unit; never read
+                }
                 Ty::Channel(_) => unsupported("codegen doesn't support `chan` yet — interpreter-only for now"),
-                _ => unreachable!("typeck.rs already restricted send's first operand to tcp/chan"),
+                _ => unreachable!("typeck.rs already restricted send's first operand to tcp/chan/file"),
             },
             Expr::Recv(target, _span) => match self.local_ty_of(target, scopes) {
                 Ty::Tcp => {
@@ -2763,8 +2793,28 @@ impl Codegen<'_> {
                     writeln!(self.out, "  {full} = insertvalue {{ptr, i64}} {partial}, i64 {n}, 1").unwrap();
                     Ok(full)
                 }
+                Ty::File => {
+                    // One read syscall into a fixed 64KiB buffer, matching
+                    // `interpreter.rs::read_file` exactly. Unlike `Ty::Tcp`
+                    // above, `0` is valid EOF here, not an error --
+                    // `guard_io_ok` (traps only on negative), not
+                    // `guard_recv_ok` (traps on `<= 0` too), matches that.
+                    let fd = self.expr(target, scopes)?;
+                    let buf = self.fresh_reg("file_recv_buf");
+                    self.emit_alloca(&buf, "[65536 x i8]");
+                    let buf_ptr = self.fresh_reg("file_recv_ptr");
+                    writeln!(self.out, "  {buf_ptr} = getelementptr [65536 x i8], ptr {buf}, i64 0, i64 0").unwrap();
+                    let n = self.fresh_reg("file_recv_n");
+                    writeln!(self.out, "  {n} = call i64 @nir_file_read(i64 {fd}, ptr {buf_ptr}, i64 65536)").unwrap();
+                    self.guard_io_ok(&n);
+                    let partial = self.fresh_reg("file_recv_str");
+                    writeln!(self.out, "  {partial} = insertvalue {{ptr, i64}} undef, ptr {buf_ptr}, 0").unwrap();
+                    let full = self.fresh_reg("file_recv_str");
+                    writeln!(self.out, "  {full} = insertvalue {{ptr, i64}} {partial}, i64 {n}, 1").unwrap();
+                    Ok(full)
+                }
                 Ty::Channel(_) => unsupported("codegen doesn't support `chan` yet — interpreter-only for now"),
-                _ => unreachable!("typeck.rs already restricted recv's operand to tcp/chan"),
+                _ => unreachable!("typeck.rs already restricted recv's operand to tcp/chan/file"),
             },
             // `stop` shares one AST node across `sandbox`/`tcp`/
             // `tcp_listener` — `sandbox` is still unsupported (Phase E),
@@ -2777,7 +2827,12 @@ impl Codegen<'_> {
                     Ok("0".to_string()) // stop's own value is unit for tcp/tcp_listener; never read
                 }
                 Ty::Sandbox => unsupported("codegen doesn't support `sandbox` yet — interpreter-only for now"),
-                _ => unreachable!("typeck.rs already restricted stop's operand to sandbox/tcp/tcp_listener"),
+                Ty::File => {
+                    let fd = self.expr(inner, scopes)?;
+                    writeln!(self.out, "  call i32 @nir_file_stop(i64 {fd})").unwrap();
+                    Ok("0".to_string())
+                }
+                _ => unreachable!("typeck.rs already restricted stop's operand to sandbox/tcp/tcp_listener/file"),
             },
             // `v[i]` / `m[i, j]` — always yields a scalar element, so this
             // belongs in `expr()`, not `expr_ptr()`, even though the base
