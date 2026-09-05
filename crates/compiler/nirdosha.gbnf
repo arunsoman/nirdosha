@@ -19,6 +19,26 @@
 # `dashboard`/`module`/`workflow` UI/workflow DSLs, `audited`, and
 # `listen`/`accept` — every production docs/GRAMMAR.md documents.
 #
+# 2026-09-05: brought current again after `tests/fidelity.rs` was fixed to
+# actually recurse into `examples/`'s subdirectories (it previously swept
+# a flat directory and had silently stopped checking anything once real
+# examples moved into `examples/syntax/`/`examples/features/`) and caught
+# real drift a second time: `validate <fn> { pre:/post: }` (row F3) was
+# entirely unmodeled (`item` had no alternative for it at all); `module
+# Ident { pub ... }`'s real-namespace form and top-of-file `use "path"`
+# (row F2) existed only as the legacy string-named nav-grouping form;
+# `Mod::Name` qualified references (`qualified-ident`, row F2) were
+# unrepresented everywhere `ident` names something to look up rather
+# than declare (`type`, `primary`, `variant-arm`); a `workflow` `state`'s
+# `owner: role(...)` kv-entry had no room in `state-decl`'s old fixed
+# `on_entry?/on_exit?/transition*` order; and `layout { row/column/grid/
+# group/tabs/divider/... }` (row F4) didn't exist at all. Also fixed in
+# passing, found by the same real-parser check, not by inspection:
+# `dashboard-item`'s two-line body had no enclosing `(...)` around its
+# `|` — the exact "multi-line body not inside one already-open group"
+# trap this file's own note two paragraphs below already names, just not
+# yet applied there when `dashboard-item` was added.
+#
 # Found by that real check, not by re-reading this file more carefully:
 # llama.cpp's GBNF parser requires a rule's *entire* multi-line body to
 # sit inside one already-open, unclosed group — not just multi-line
@@ -54,9 +74,22 @@
 
 root        ::= ws program ws
 
-program     ::= (item ws)*
+program     ::= (use-decl ws)* (item ws)*
 
-item        ::= fn-decl | struct-decl | enum-decl | screen-decl | dashboard-decl | module-decl | workflow-decl | workspace-decl
+# `use "relative/path.nir"` -- only legal in this leading run, before
+# any other item; a `use` anywhere else falls through to `item`'s own
+# dispatch and is an ordinary "expected an item" rejection, not
+# special-cased here either.
+use-decl    ::= "use" ws str-lit
+
+item        ::= fn-decl | struct-decl | enum-decl | screen-decl | dashboard-decl | module-decl | workflow-decl | workspace-decl | validate-decl
+
+# `Mod::Name` / `Mod::Enum::Variant` -- a qualified reference, never a
+# declaration site (every `_-decl`'s own name stays a plain `ident`).
+# Reused wherever `ident` names something to look up rather than
+# declare: `type`'s struct/enum alternative, `primary`'s bare-name
+# alternative, and `variant-arm`'s pattern.
+qualified-ident ::= ident (ws "::" ws ident)*
 
 fn-decl     ::= "fn" ws ident ws "(" ws params? ws ")" ws ret-type? (ws effect-annotation)? (ws requires-annotation)? ws block
 
@@ -77,15 +110,38 @@ enum-decl   ::= "enum" ws ident (ws type-param-list)? ws "{" ws variant (ws "," 
 variant     ::= ident (ws "(" ws type (ws "," ws type)* ws ")")?
 
 screen-decl    ::= "screen" ws ident ws "{" ws (screen-item ws)* "}"
-screen-item    ::= paginate-block | field-override | action-decl | kv-entry
+screen-item    ::= paginate-block | field-override | action-decl | layout-decl | kv-entry
 paginate-block ::= "paginate" ws "{" ws (kv-entry ws)* "}"
 field-override ::= "field" ws ident ws "{" ws (kv-entry ws)* "}"
 action-decl    ::= "action" ws str-lit ws "->" ws ident (ws "{" ws (kv-entry ws)* "}")?
 kv-entry       ::= ident ws ":" ws expr
 
+# `layout { row { column { group "Title" { field x } } } }` -- an
+# optional arrangement tree over a screen's own field/action set.
+# `field`/`action` here *reference* an existing `screen-item`'s field/
+# action by name, never redeclare one -- typeck's job to check the name
+# resolves, not this grammar's.
+layout-decl ::= "layout" ws "{" ws (layout-node ws)* "}"
+layout-node ::= (
+                  (("row" | "column" | "grid" | ("group" (ws str-lit)?)) ws layout-body)
+                | ("tabs" ws "{" ws ("tab" ws str-lit ws "{" ws (layout-node ws)* "}" ws)* "}")
+                | ("field" ws ident)
+                | ("action" ws str-lit)
+                | (ident ws layout-body)
+                )
+layout-body ::= "{" ws (kv-entry ws)* (layout-node ws)* "}"
+
 dashboard-decl ::= "dashboard" ws "{" ws (dashboard-item ws)* "}"
-dashboard-item ::= ("tile" | "chart") ws str-lit ws "->" ws ident
-                  | "visual" ws str-lit ws "->" ws ident (ws "{" ws (kv-entry ws)* "}")?
+# Wrapped in one outer `(...)` even though it's already an alternation
+# -- llama.cpp's real GBNF parser requires a rule's entire multi-line
+# body to sit inside one already-open, unclosed group (this file's own
+# header comment), not just a bare `|` continuing onto the next line;
+# without the wrap it reports "expecting name" at the second line,
+# having already closed the rule at the first line's balanced parens.
+dashboard-item ::= (
+                     (("tile" | "chart") ws str-lit ws "->" ws ident)
+                   | ("visual" ws str-lit ws "->" ws ident (ws "{" ws (kv-entry ws)* "}")?)
+                   )
 
 # `workspace Name { subject: Struct panel "..." { ... } }` -- Track E1's
 # composite multi-panel screen. `action-decl` inside `panel-item` is
@@ -95,11 +151,31 @@ workspace-item ::= panel-decl | kv-entry
 panel-decl     ::= "panel" ws str-lit ws "{" ws (panel-item ws)* "}"
 panel-item     ::= action-decl | kv-entry
 
-module-decl ::= "module" ws str-lit ws "{" ws ((fn-decl | struct-decl | enum-decl) ws)* "}"
+# Two unrelated forms, told apart by the very next token after `module`
+# (a string literal -- legacy nav grouping, pure sugar, no scoping -- or
+# a bare `ident` -- a real namespace, `pub`-gated). Wrapped in one outer
+# `(...)` per this file's own multi-line-body-needs-wrapping discipline.
+module-decl ::= (
+                  ("module" ws str-lit ws "{" ws ((fn-decl | struct-decl | enum-decl) ws)* "}")
+                | ("module" ws ident ws "{" ws ("nav" ws ":" ws str-lit ws)? (pub-item ws)* "}")
+                )
+pub-item    ::= ("pub" ws)? (fn-decl | struct-decl | enum-decl)
+
+# `validate <fn_name> { pre: <expr>  post: <expr> ... }` -- a Hoare
+# contract on an existing `fn`, declared separately. `pre`/`post` are
+# ordinary `kv-entry`s (this file already has no separate predicate
+# grammar to add).
+validate-decl ::= "validate" ws ident ws "{" ws (kv-entry ws)* "}"
 
 workflow-decl  ::= "workflow" ws ident ws "{" ws (data-block ws)? (state-decl ws)+ "}"
 data-block     ::= "data" ws "{" ws field (ws "," ws field)* (ws ",")? ws "}"
-state-decl     ::= "state" ws ident (ws "terminal")? ws "{" ws (on-entry-block ws)? (on-exit-block ws)? (transition ws)* "}"
+# `state-item*` is unordered and repeatable (unlike an earlier, stricter
+# fixed-order draft of this rule) -- a real state can carry an `owner:
+# role(...)` kv-entry alongside any number of on_entry/on_exit/
+# transition items, in any order, the same "no arbitrary shape assumed"
+# posture kv-entry's own fallback already has elsewhere in this file.
+state-decl     ::= "state" ws ident (ws "terminal")? ws "{" ws (state-item ws)* "}"
+state-item     ::= on-entry-block | on-exit-block | transition | kv-entry
 on-entry-block ::= "on_entry" ws "{" ws (action-call ws)* "}"
 on-exit-block  ::= "on_exit" ws "{" ws (action-call ws)* "}"
 action-call    ::= ident ws "(" ws (expr (ws "," ws expr)*)? ws ")"
@@ -119,7 +195,7 @@ type        ::= (
                 | "Vector" ws "(" ws type ws "," ws int-lit ws ")"
                 | "Matrix" ws "(" ws type ws "," ws int-lit ws "," ws int-lit ws ")"
                 | scalar-type-name
-                | ident (ws "(" ws type (ws "," ws type)* ws ")")?
+                | qualified-ident (ws "(" ws type (ws "," ws type)* ws ")")?
                 | "fn" ws "(" ws (type (ws "," ws type)*)? ws ")" (ws "->" ws type)?
               )
 
@@ -145,7 +221,7 @@ if-expr     ::= "if" ws expr ws block (ws "else" ws (block | if-expr))?
 
 match-expr  ::= "match" ws expr ws "{" ws match-arm (ws "," ws match-arm)* (ws ",")? ws "}"
 match-arm   ::= variant-arm | literal-arm
-variant-arm ::= ident (ws "(" ws (ident (ws "," ws ident)*)? ws ")")? ws "=>" ws expr
+variant-arm ::= qualified-ident (ws "(" ws (ident (ws "," ws ident)*)? ws ")")? ws "=>" ws expr
 literal-arm ::= (str-lit | int-lit | "true" | "false" | "_") ws "=>" ws expr
 
 transact-expr ::= (
@@ -190,7 +266,7 @@ args        ::= expr (ws "," ws expr)*
 postfix     ::= primary (ws (("[" ws expr (ws "," ws expr)* ws "]") | ("." ws ident)))*
 
 primary     ::= (
-                  float-lit | int-lit | str-lit | "true" | "false" | ident
+                  float-lit | int-lit | str-lit | "true" | "false" | qualified-ident
                 | "(" ws expr ws ")"
                 | array-lit
               )
