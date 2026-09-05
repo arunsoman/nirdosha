@@ -1,6 +1,6 @@
 # Evidence for RFC 0005: the Nirdosha↔Rust plugin boundary
 
-Three standalone Cargo projects (not workspace members — see RFC 0005's
+Four standalone spikes (not workspace members — see RFC 0005's
 own Compatibility section for why), each reproducing one set of numbers
 cited in that RFC's Evidence section.
 
@@ -49,3 +49,12 @@ Runs in well under a minute for the 55-byte cases; the 61 KB repeat
 takes longer since it's doing real O(n) guest-side computation — this
 is the case RFC 0005 cites numbers from, so don't skip it if you're
 verifying that section specifically.
+
+## `native_plugin_spike/` — compiled native plugin call overhead (RFC 0005 §3)
+
+See its own `README.md`. The *automated, production* version of this
+mechanism is `codegen::build_with_native_plugins`, shipped to `main` —
+`crates/compiler/tests/native_plugin_codegen.rs` is the real,
+end-to-end test (compiles a genuine Rust function, links it, runs the
+resulting binary); this spike is only the hand-written numbers §3
+cites for the pure call-overhead comparison.

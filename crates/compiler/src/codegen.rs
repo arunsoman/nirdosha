@@ -1122,13 +1122,57 @@ struct Codegen<'a> {
 }
 
 pub fn emit_llvm_ir<'a>(program: &'a Program, smt_report: &'a SmtReport) -> Result<String, CodegenError> {
-    check_supported(program)?;
+    emit_llvm_ir_impl(program, smt_report, &[], &HashSet::new())
+}
+
+/// rfcs/0005-plugin-boundary-safety-and-performance.md §3: the compiled-
+/// path counterpart to `run_with_plugins` (`lib.rs`) — a project's own
+/// entrypoint, not the bare `nirdosha build`/`emit-llvm` CLI (which,
+/// like the interpreted path before Track G's own auto-discovery lands,
+/// has no way to *find* a plugin crate on its own), calls this instead
+/// of plain `emit_llvm_ir` once it has both a compiled-native-capable
+/// plugin roster (`native_plugins`) and, for honesty, the names of any
+/// *other* plugin the program's typecheck pass also saw but that has no
+/// native form (`reject_plugin_names` — still cleanly rejected by
+/// `check_supported_with_plugins`, exactly as before this existed,
+/// rather than silently accepted or hitting an untested "unknown
+/// function" path).
+pub fn emit_llvm_ir_with_native_plugins<'a>(
+    program: &'a Program,
+    smt_report: &'a SmtReport,
+    native_plugins: &[crate::plugin::NativePluginBuiltin],
+    reject_plugin_names: &HashSet<String>,
+) -> Result<String, CodegenError> {
+    for np in native_plugins {
+        if let Err(msg) = np.validate() {
+            return unsupported(msg);
+        }
+    }
+    emit_llvm_ir_impl(program, smt_report, native_plugins, reject_plugin_names)
+}
+
+fn emit_llvm_ir_impl<'a>(
+    program: &'a Program,
+    smt_report: &'a SmtReport,
+    native_plugins: &[crate::plugin::NativePluginBuiltin],
+    reject_plugin_names: &HashSet<String>,
+) -> Result<String, CodegenError> {
+    check_supported_with_plugins(program, reject_plugin_names)?;
     let registry = TypeRegistry::build(program);
-    let sigs = program
+    let mut sigs: HashMap<String, FnSig> = program
         .fns
         .iter()
         .map(|f| (f.name.clone(), FnSig { params: f.params.iter().map(|p| p.ty.clone()).collect(), ret: f.ret.clone() }))
         .collect();
+    // A native plugin's signature slots into the exact same table a
+    // user `fn`'s does — `Codegen::call`'s existing generic fallback
+    // (the `self.sigs.get(name)` path every ordinary function call
+    // already goes through) needs zero changes to reach it; only the
+    // `declare` line below (in place of a real `define`) and the linked
+    // staticlib (`build_with_native_plugins`) are new.
+    for np in native_plugins {
+        sigs.insert(np.name.clone(), FnSig { params: np.params.clone(), ret: np.ret.clone() });
+    }
     // Trusts the program already passed `ownership::check_ownership` (the
     // caller's job, same as `typecheck_and_own`'s existing precedent) —
     // this recomputes the same move-tracking traversal for its own
@@ -1246,6 +1290,19 @@ pub fn emit_llvm_ir<'a>(program: &'a Program, smt_report: &'a SmtReport) -> Resu
     // — matching `interpreter.rs`'s `render()`, which prints `"()"` for
     // `Value::Unit`, so interpreted/compiled output agree.
     writeln!(cg.out, "@.unit_fmt = private unnamed_addr constant [4 x i8] c\"()\\0A\\00\"").unwrap();
+    // Native plugin builtins (rfcs/0005 §3): one `declare` per symbol,
+    // the same "linked native call into a staticlib" shape as
+    // `nir_det`/`nir_rank`/etc. above, just for a third-party-supplied
+    // symbol/library instead of `runtime_kernels.rs`'s own. `validate()`
+    // (called by `emit_llvm_ir_with_native_plugins` before this ever
+    // runs) already proved every param/ret is a plain scalar `llvm_ty`
+    // knows how to render.
+    for np in native_plugins {
+        let param_lltys: Result<Vec<String>, CodegenError> = np.params.iter().map(|t| llvm_ty(t, &cg.registry)).collect();
+        let param_lltys = param_lltys?;
+        let ret_llty = llvm_ty(&np.ret, &cg.registry)?;
+        writeln!(cg.out, "declare {ret_llty} @{}({})", np.name, param_lltys.join(", ")).unwrap();
+    }
     writeln!(cg.out).unwrap();
 
     for f in &program.fns {
@@ -5433,7 +5490,34 @@ pub fn build(
     output_path: &std::path::Path,
     opt: OptLevel,
 ) -> Result<(), String> {
-    let ir = emit_llvm_ir(program, smt_report).map_err(|e| e.to_string())?;
+    build_impl(program, smt_report, output_path, opt, &[], &HashSet::new())
+}
+
+/// The compiled-path counterpart to `build()`, for a project entrypoint
+/// that has a native-callable plugin roster ready to link
+/// (rfcs/0005-plugin-boundary-safety-and-performance.md §3) — see
+/// `emit_llvm_ir_with_native_plugins`'s doc comment for the same
+/// "project's own entrypoint, not the bare CLI" scoping.
+pub fn build_with_native_plugins(
+    program: &Program,
+    smt_report: &SmtReport,
+    output_path: &std::path::Path,
+    opt: OptLevel,
+    native_plugins: &[crate::plugin::NativePluginBuiltin],
+    reject_plugin_names: &HashSet<String>,
+) -> Result<(), String> {
+    build_impl(program, smt_report, output_path, opt, native_plugins, reject_plugin_names)
+}
+
+fn build_impl(
+    program: &Program,
+    smt_report: &SmtReport,
+    output_path: &std::path::Path,
+    opt: OptLevel,
+    native_plugins: &[crate::plugin::NativePluginBuiltin],
+    reject_plugin_names: &HashSet<String>,
+) -> Result<(), String> {
+    let ir = emit_llvm_ir_with_native_plugins(program, smt_report, native_plugins, reject_plugin_names).map_err(|e| e.to_string())?;
 
     // `process::id()` alone is **not** unique enough: it's identical
     // across every thread inside one process, so two concurrent `build`
@@ -5456,8 +5540,24 @@ pub fn build(
     std::fs::write(&runtime_lib_path, RUNTIME_KERNELS_LIB)
         .map_err(|e| format!("writing {}: {e}", runtime_lib_path.display()))?;
 
+    // Each native plugin's own precompiled staticlib, written to a
+    // uniquely-named temp file (same collision-avoidance reasoning as
+    // `runtime_lib_path` above) and linked alongside `RUNTIME_KERNELS_LIB`
+    // — the exact same mechanism, generalized to a third-party-supplied
+    // library instead of only this compiler's own.
+    let mut native_plugin_lib_paths = Vec::with_capacity(native_plugins.len());
+    for (i, np) in native_plugins.iter().enumerate() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("nirdosha_plugin_{}_{n}_{i}.a", std::process::id()));
+        std::fs::write(&p, np.static_lib).map_err(|e| format!("writing {}: {e}", p.display()))?;
+        native_plugin_lib_paths.push(p);
+    }
+
     let mut clang_cmd = std::process::Command::new("clang");
     clang_cmd.arg(&ll_path).arg(&runtime_lib_path).arg(opt.clang_flag());
+    for p in &native_plugin_lib_paths {
+        clang_cmd.arg(p);
+    }
     // Phase 4's `declare double @atan2(double, double)` (geometry
     // builtins) has no LLVM intrinsic form, unlike `sqrt`/`sin`/`cos` —
     // it's the plain libm function, so it needs to actually be linked.
@@ -5505,6 +5605,9 @@ pub fn build(
     let result = clang_cmd.arg("-o").arg(output_path).output();
     let _ = std::fs::remove_file(&ll_path); // best-effort cleanup either way
     let _ = std::fs::remove_file(&runtime_lib_path);
+    for p in &native_plugin_lib_paths {
+        let _ = std::fs::remove_file(p);
+    }
 
     match result {
         Ok(output) if output.status.success() => Ok(()),
