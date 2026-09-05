@@ -25,28 +25,43 @@ or one at a time (`HTTPServer`, matching Nirdosha's own single-threaded
 import argparse
 import json
 import sqlite3
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 DB_PATH = "examples/killer_demo/ledger_naive.db"
 SLEEP_MS = 2  # matches ledger.nir's transfer_inner sleep_ms(2)
 _db_path = DB_PATH  # set from argv in main()
+_thread_local = threading.local()  # see _connect()'s doc comment
 
 
 def _connect():
-    # A fresh connection per request -- the idiomatic pattern real
-    # frameworks use (Flask's `g.db`, a SQLAlchemy scoped session), and
-    # deliberately *not* one global connection shared across threads:
-    # this demo's point is the missing transaction isolation around the
-    # SELECT-then-UPDATE sequence below, not "don't share a raw SQLite
-    # handle across threads" (a real but different bug -- see
-    # RESULTS.md's methodology note for why that one's fixed here
-    # instead of left in). `busy_timeout` makes a concurrent writer wait
-    # for SQLite's own file lock instead of raising "database is
-    # locked", so what this demo measures is the logical race, not
-    # filesystem lock contention.
-    conn = sqlite3.connect(_db_path, isolation_level=None, timeout=5.0)
-    conn.execute("PRAGMA busy_timeout = 5000")
+    # One connection per *thread*, reused for every request that thread
+    # handles, in WAL mode -- not a fresh connection per request. This
+    # matters for a fair comparison: `ledger.nir`'s `db_connect` draws
+    # from a real connection pool, every pooled connection opened in WAL
+    # mode plus a busy_timeout (`crates/compiler/src/dbconn.rs`'s
+    # `connect_sqlite_pooled`) -- amortized connection setup, and
+    # readers not blocked by the one active writer. A from-scratch
+    # connection per request, in SQLite's default rollback-journal mode,
+    # would make Python pay for that setup cost on every single request
+    # AND serialize readers behind writers -- a real, disclosed
+    # confound in a throughput comparison, not a property of "naive
+    # Python" worth measuring here. Thread-local reuse plus WAL is the
+    # closest honest match to what `db_connect` already gives Nirdosha,
+    # so the throughput numbers in RESULTS.md compare the two languages/
+    # runtimes, not "pooled vs. unpooled." None of this touches the
+    # actual bug this demo is about: WAL mode changes who blocks whom at
+    # the storage-engine level, not whether the SELECT-then-UPDATE
+    # sequence below is wrapped in a transaction -- it still isn't, on
+    # either side, which is why the race survives this fix (see
+    # RESULTS.md).
+    conn = getattr(_thread_local, "conn", None)
+    if conn is None:
+        conn = sqlite3.connect(_db_path, isolation_level=None, timeout=5.0)
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
+        _thread_local.conn = conn
     return conn
 
 
@@ -62,7 +77,6 @@ def reset_ledger():
     conn.execute("DELETE FROM account")
     conn.execute("INSERT INTO account (id, name, balance_cents) VALUES (1, 'alice', 1000000)")
     conn.execute("INSERT INTO account (id, name, balance_cents) VALUES (2, 'bob', 1000000)")
-    conn.close()
     return {"ok": {"value": "reset"}}
 
 
@@ -70,7 +84,6 @@ def balance(body):
     account_id = body["id"]
     conn = _connect()
     bal = _row_balance(conn, account_id)
-    conn.close()
     if bal is None:
         return {"err": {"variant": "NotFound", "payload": ["account"]}}
     return {"ok": bal}
@@ -79,9 +92,7 @@ def balance(body):
 def total():
     conn = _connect()
     cur = conn.execute("SELECT COALESCE(SUM(balance_cents), 0) FROM account")
-    result = cur.fetchone()[0]
-    conn.close()
-    return {"ok": result}
+    return {"ok": cur.fetchone()[0]}
 
 
 def transfer(body):
@@ -94,14 +105,11 @@ def transfer(body):
     conn = _connect()
     from_balance = _row_balance(conn, from_id)
     if from_balance is None:
-        conn.close()
         return {"err": {"variant": "NotFound", "payload": ["from account"]}}
     if from_balance < amount_cents:
-        conn.close()
         return {"err": {"variant": "InsufficientFunds", "payload": ["not enough funds"]}}
     to_balance = _row_balance(conn, to_id)
     if to_balance is None:
-        conn.close()
         return {"err": {"variant": "NotFound", "payload": ["to account"]}}
 
     # Models a real network round trip to the database between reading
@@ -112,7 +120,6 @@ def transfer(body):
     new_to = to_balance + amount_cents
     conn.execute("UPDATE account SET balance_cents = ? WHERE id = ?", (new_from, from_id))
     conn.execute("UPDATE account SET balance_cents = ? WHERE id = ?", (new_to, to_id))
-    conn.close()
     return {"ok": {"value": "transferred"}}
 
 

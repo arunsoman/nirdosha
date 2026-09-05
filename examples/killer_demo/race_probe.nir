@@ -1,0 +1,220 @@
+// Answers a fair objection to RESULTS.md head-on, with evidence instead
+// of prose: is the ledger really safe because of something Nirdosha's
+// *language* guarantees, or only because `nirdosha serve`'s request
+// loop happens to be single-threaded today? This file takes `serve.rs`
+// out of the picture entirely and drives the exact same naive
+// `transfer`/`total` logic from `ledger.nir` with Nirdosha's own
+// `spawn`/`thread`/`join` -- real OS threads (`docs/ROADMAP.md`'s
+// reused-worker thread pool), all hitting the same pooled, WAL-mode
+// SQLite connection (`crates/compiler/src/dbconn.rs`) `ledger.db` also
+// uses. If the language's ownership/concurrency guarantees were what
+// made the HTTP demo safe, this should still come out at 2,000,000. If
+// it's `serve.rs`'s sequential dispatch doing the work instead, this
+// should corrupt exactly like `ledger_naive.py` under
+// `ThreadingHTTPServer` did.
+//
+// Run it:
+//   nirdosha examples/killer_demo/race_probe.nir
+//
+// See RESULTS.md's "Does the language itself prevent this?" section
+// for the result and what it means.
+
+enum ErrorCode {
+    DbError(str),
+    NotFound(str),
+    InsufficientFunds(str),
+    InvalidAmount(str),
+}
+
+struct Text {
+    value: str,
+}
+
+fn reset_ledger_inner(conn: db) -> Result(Text, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, name TEXT, balance_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let cleared: Result(i64, ErrorCode) = match db_execute(conn, "DELETE FROM account") {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
+    let seeded_a: Result(i64, ErrorCode) = match cleared {
+        Ok(_) => match db_execute(conn, "INSERT INTO account (id, name, balance_cents) VALUES (1, ?, 1000000)", "alice") {
+            Ok(n) => Ok(n),
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(e),
+    }
+    let seeded_b: Result(Text, ErrorCode) = match seeded_a {
+        Ok(_) => match db_execute(conn, "INSERT INTO account (id, name, balance_cents) VALUES (2, ?, 1000000)", "bob") {
+            Ok(n) => Ok(Text("reset")),
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(e),
+    }
+    stop conn
+    return seeded_b
+}
+
+fn reset_ledger() -> Result(Text, ErrorCode) {
+    return match db_connect("examples/killer_demo/race_probe.db") {
+        Ok(conn) => reset_ledger_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn total_inner(conn: db) -> Result(i64, ErrorCode) {
+    let result: Result(i64, ErrorCode) = match db_query(conn, "SELECT COALESCE(SUM(balance_cents), 0) as s FROM account") {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "s") {
+                Ok(s) => Ok(s),
+                Err(e) => Err(DbError(e)),
+            },
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn total() -> Result(i64, ErrorCode) {
+    return match db_connect("examples/killer_demo/race_probe.db") {
+        Ok(conn) => total_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+// Identical shape to `ledger.nir`'s `transfer_inner`: read both
+// balances, `sleep_ms` to model a DB round trip, write both back.
+fn transfer_inner(conn: db, from_id: i64, to_id: i64, amount_cents: i64) -> Result(Text, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, name TEXT, balance_cents INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let from_balance: Result(i64, ErrorCode) = match db_query(conn, "SELECT balance_cents FROM account WHERE id = ?", from_id) {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "balance_cents") {
+                Ok(bal) => Ok(bal),
+                Err(e) => Err(DbError(e)),
+            },
+            Err(e) => Err(NotFound("from account")),
+        },
+        Err(e) => Err(DbError(e)),
+    }
+    let checked: Result(i64, ErrorCode) = match from_balance {
+        Ok(bal) => if bal >= amount_cents {
+            Ok(bal)
+        } else {
+            Err(InsufficientFunds("not enough funds"))
+        },
+        Err(e) => Err(e),
+    }
+    let to_balance: Result(i64, ErrorCode) = match checked {
+        Ok(_) => match db_query(conn, "SELECT balance_cents FROM account WHERE id = ?", to_id) {
+            Ok(rows) => match json_array_get(rows, 0) {
+                Ok(row) => match json_get_i64(row, "balance_cents") {
+                    Ok(bal) => Ok(bal),
+                    Err(e) => Err(DbError(e)),
+                },
+                Err(e) => Err(NotFound("to account")),
+            },
+            Err(e) => Err(DbError(e)),
+        },
+        Err(e) => Err(e),
+    }
+    let slept: unit = sleep_ms(2)
+    let debited: Result(i64, ErrorCode) = match checked {
+        Ok(bal) => match to_balance {
+            Ok(_) => match db_execute(conn, "UPDATE account SET balance_cents = ? WHERE id = ?", bal - amount_cents, from_id) {
+                Ok(n) => Ok(n),
+                Err(e) => Err(DbError(e)),
+            },
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    }
+    let credited: Result(Text, ErrorCode) = match debited {
+        Ok(_) => match to_balance {
+            Ok(tb) => match db_execute(conn, "UPDATE account SET balance_cents = ? WHERE id = ?", tb + amount_cents, to_id) {
+                Ok(n) => Ok(Text("transferred")),
+                Err(e) => Err(DbError(e)),
+            },
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    }
+    stop conn
+    return credited
+}
+
+fn transfer(from_id: i64, to_id: i64, amount_cents: i64) -> Result(Text, ErrorCode) {
+    return match db_connect("examples/killer_demo/race_probe.db") {
+        Ok(conn) => transfer_inner(conn, from_id, to_id, amount_cents),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+// Fires `iterations` transfers `from_id -> to_id`, back to back, on
+// whatever real OS thread this got `spawn`ed onto. Returns how many
+// actually succeeded (some legitimately fail on `InsufficientFunds` as
+// balances move around -- that's expected and fine; it's the *total*
+// this probe cares about, not the per-transfer outcome).
+fn worker(from_id: i64, to_id: i64, iterations: i64) -> i64 {
+    let i: i64 = 0
+    let successes: i64 = 0
+    while i < iterations {
+        let r: Result(Text, ErrorCode) = transfer(from_id, to_id, 1)
+        let ok: bool = match r {
+            Ok(_) => true,
+            Err(_) => false,
+        }
+        if ok {
+            successes = successes + 1
+        }
+        i = i + 1
+    }
+    return successes
+}
+
+fn main() {
+    let setup: Result(Text, ErrorCode) = reset_ledger()
+    match setup {
+        Ok(n) => print("ledger reset"),
+        Err(e) => print("setup error"),
+    }
+
+    // 8 real OS threads, 250 transfers each -- 2,000 concurrent
+    // transfers total, all against the same pooled SQLite connection
+    // `db_connect` already shares process-wide (`dbconn.rs`'s
+    // `SQLITE_POOLS`), same as `ledger.nir` would under a hypothetical
+    // multi-threaded `serve.rs`.
+    let t1: thread i64 = spawn worker(1, 2, 250)
+    let t2: thread i64 = spawn worker(2, 1, 250)
+    let t3: thread i64 = spawn worker(1, 2, 250)
+    let t4: thread i64 = spawn worker(2, 1, 250)
+    let t5: thread i64 = spawn worker(1, 2, 250)
+    let t6: thread i64 = spawn worker(2, 1, 250)
+    let t7: thread i64 = spawn worker(1, 2, 250)
+    let t8: thread i64 = spawn worker(2, 1, 250)
+
+    let s1: i64 = join t1
+    let s2: i64 = join t2
+    let s3: i64 = join t3
+    let s4: i64 = join t4
+    let s5: i64 = join t5
+    let s6: i64 = join t6
+    let s7: i64 = join t7
+    let s8: i64 = join t8
+
+    print("successful transfers:")
+    print(s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8)
+
+    let final_total: Result(i64, ErrorCode) = total()
+    print("final total (expected 2000000):")
+    match final_total {
+        Ok(n) => print(n),
+        Err(e) => print("error reading total"),
+    }
+}

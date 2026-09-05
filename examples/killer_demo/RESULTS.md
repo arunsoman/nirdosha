@@ -3,11 +3,16 @@
 **Claim under test**: a naive two-account transfer service, written the
 way an AI agent or a tired human actually writes it on a first pass (no
 lock, no explicit transaction, no optimistic version check), stays
-correct under real concurrent load on `nirdosha serve` and silently
-corrupts data under the same load on the equivalent naive Python
-service. This is a real, measured result from the two services in this
-directory, not a simulated one — see Methodology below for exactly how
-to reproduce every number here.
+correct under real concurrent HTTP load on `nirdosha serve` and silently
+corrupts data under the same load on an equally naive Python service.
+**A second, harder question this file also answers, because the first
+draft didn't and got called on it**: is that safety coming from the
+*language*, or just from `nirdosha serve`'s current server architecture?
+See "Does the language itself prevent this?" below — the honest answer
+is the second one, and it's demonstrated, not asserted.
+
+Every number in this file is from an actual run of the actual code in
+this directory (see Methodology) — none are estimated or simulated.
 
 ## The two services
 
@@ -16,13 +21,22 @@ to reproduce every number here.
   `sleep_ms(2)` to model a real database round trip, then writes both
   new balances back. Served with `nirdosha serve`.
 - [`ledger_naive.py`](./ledger_naive.py) — the same route, the same
-  schema, the same read-both/sleep/write-both shape, in ~140 lines of
-  Python standard library (`http.server` + `sqlite3`, no `pip install`).
-  A fresh SQLite connection per request (the idiomatic pattern real
-  frameworks use — Flask's `g.db`, a scoped SQLAlchemy session), not one
-  shared connection across threads — see the methodology note below on
-  why that specific, different bug was deliberately fixed rather than
-  left in.
+  schema, the same read-both/sleep/write-both shape, in Python standard
+  library (`http.server` + `sqlite3`, no `pip install`). One SQLite
+  connection per *thread* (reused across that thread's requests, WAL
+  mode, a `busy_timeout`) — matched deliberately to what
+  `ledger.nir`'s own `db_connect` already gets for free (a pooled, WAL
+  mode connection — `crates/compiler/src/dbconn.rs`), so the throughput
+  numbers below compare the two runtimes, not "pooled vs. unpooled" or
+  "WAL vs. rollback-journal." An earlier draft of this file used a
+  fresh, unpooled, default-journal-mode connection per request on the
+  Python side; that's a real, meaningful confound for a *speed*
+  comparison (SQLite's default journal mode also serializes readers
+  behind the one active writer) and has been fixed — see
+  `ledger_naive.py`'s `_connect()` doc comment. It does **not** touch
+  the race this demo is about: WAL mode changes who blocks whom at the
+  storage-engine level, not whether the SELECT-then-UPDATE sequence is
+  wrapped in a transaction — it still isn't, on either side.
 
 Both start from the same invariant: two accounts, 1,000,000 cents each,
 total 2,000,000. A transfer moves money between them; nothing should
@@ -31,167 +45,102 @@ read+write in a transaction, or does anything else to protect that
 invariant under concurrency — this is deliberately the naive shape both
 languages make easy to write by accident, not a hardened one.
 
-## The result
+## Result 1: `nirdosha serve` vs. Python, over real HTTP
 
-| | `nirdosha serve` | Python, single-threaded (`HTTPServer`) | Python, threaded (`ThreadingHTTPServer`) |
+500 `POST /api/transfer` calls, fired at 50-way client concurrency via
+`load_test.py`, checked against `POST /api/total` afterward.
+
+| | `nirdosha serve` | Python, `HTTPServer` (single-threaded control) | Python, `ThreadingHTTPServer` (the realistic default) |
 |---|---:|---:|---:|
-| Requests | 500 | 500 | 500 |
-| Concurrency (client-side) | 50 | 50 | 50 |
-| Runs | 2 | 2 | 3 |
-| Ledger drift, every run | **0** | **0** | **167 / 377 / -29** |
-| Verdict | PASS, every run | PASS, every run | **FAIL, every run** |
-| Throughput | 273–284 req/s | 17–25 req/s | 25–27 req/s |
+| Runs | 2 | 2 | 6 |
+| Runs with drift ≠ 0 | **0 / 2** | **0 / 2** | **5 / 6** |
+| Throughput | 274–283 req/s | 67 req/s | 111–118 req/s |
 
-**Every threaded-Python run corrupted the ledger. Every Nirdosha run and
-every single-threaded-Python run conserved it exactly.** Concurrency,
-not the language, is the variable that flips the result — see "What
-this does and doesn't prove" below.
+Drift on every threaded-Python run: `0, -261, +93, -33, -144, +1`. Money
+is created and destroyed in different runs — a lost-update race can go
+either direction depending on which of two racing writes lands last,
+and (like any real race) it doesn't fire on literally every run — run A
+came back clean. 5 of 6 is the honest number, not "always," and it's
+still a services-grade reliability disaster no one would accept.
 
-Raw output from the actual runs (2026-09-05, Ryzen/x86_64 Linux, `nirdosha`
-release build, Python 3.x stdlib):
+Nirdosha and single-threaded Python conserved the total on every run,
+with no exceptions. Nirdosha is also faster here — a Rust process
+making one SQLite call at a time comfortably outruns CPython doing the
+same, even with both sides now using a comparable pooled/WAL connection
+strategy — but that gap is secondary to the correctness result, and (see
+below) doesn't come from anything language-guaranteed either.
 
-```
-### Nirdosha, run A (seed 1) ###
-  requests:        500 in 1.831s  (273.0 req/s)
-  outcomes:        {'ok': 500, 'InsufficientFunds': 0, 'other_err': 0, 'exceptions': 0}
-  total before:    2000000
-  total after:     2000000
-  drift:           0  (conserved, exactly as expected)
-  verdict:         PASS
+## Does the language itself prevent this?
 
-### Nirdosha, run B (seed 2) ###
-  requests:        500 in 1.759s  (284.3 req/s)
-  total after:     2000000
-  drift:           0
-  verdict:         PASS
+**No — and this file said so only in prose the first time, which is a
+fair thing to be skeptical of.** Here's the direct test.
 
-### Python, single-threaded control, run A (seed 1) ###
-  requests:        500 in 19.742s  (25.3 req/s)
-  outcomes:        {'ok': 469, ..., 'exceptions': 31}
-  total after:     2000000
-  drift:           0
-  verdict:         PASS
+[`race_probe.nir`](./race_probe.nir) takes `nirdosha serve` out of the
+picture entirely. It's the exact same naive `transfer`/`total` logic as
+`ledger.nir`, run from `main()` with Nirdosha's own `spawn`/`thread`/
+`join` — 8 real OS threads, 250 transfers each, all hitting the same
+pooled SQLite connection `db_connect` already shares process-wide. No
+HTTP, no `serve.rs`, nothing to be single-threaded about.
 
-### Python, single-threaded control, run B (seed 2) ###
-  requests:        500 in 30.107s  (16.6 req/s)
-  total after:     2000000
-  drift:           0
-  verdict:         PASS
-
-### Python, THREADED (the realistic default), run A (seed 1) ###
-  requests:        500 in 19.953s  (25.1 req/s)
-  outcomes:        {'ok': 466, ..., 'exceptions': 34}
-  total before:    2000000
-  total after:     2000167
-  drift:           167  (CORRUPTED -- money was created or destroyed)
-  verdict:         FAIL
-
-### Python, THREADED, run B (seed 2) ###
-  total after:     2000377
-  drift:           377  (CORRUPTED)
-  verdict:         FAIL
-
-### Python, THREADED, run C (seed 3) ###
-  total after:     1999971
-  drift:           -29  (CORRUPTED)
-  verdict:         FAIL
+```sh
+nirdosha examples/killer_demo/race_probe.nir
 ```
 
-Money is both created (+167, +377) and destroyed (-29) across the three
-threaded runs — a lost-update race can go either direction, depending
-on which of two racing requests' write lands last.
+Three runs, expected total 2,000,000 every time:
 
-## Why this happens
+```
+Run 1:  successful transfers: 2000   final total: 2000004
+Run 2:  successful transfers: 2000   final total: 1999911
+Run 3:  successful transfers: 2000   final total: 1999892
+```
 
-Both services do the same three things per transfer:
-
-1. `SELECT` both balances into local variables.
-2. Wait ~2ms (standing in for a real network round trip to the
-   database).
-3. Compute each new balance from the value read in step 1, then `UPDATE`
-   both rows with the computed absolute value.
-
-Step 3 is the trap: it writes back a value computed from a balance that
-may be stale by the time the write happens. Two transfers racing on the
-same account can both read the same starting balance, both compute
-their own "correct" new balance from it, and the second write simply
-overwrites the first — one transfer's effect vanishes (or, if both
-credits land, gets double-counted). This is the textbook "lost update"
-/ TOCTOU bug, the same shape as `examples/online-trading.nir`'s
-`place_order_inner` and a large fraction of real-world double-spend and
-coupon-redemption bugs in production systems.
-
-**`nirdosha serve` never hits this window because its request loop is
-strictly sequential — one process, no `thread::spawn` anywhere in
-`serve.rs` (see that module's own doc comment). A whole request runs to
-completion before the next one is even looked at**, so the "stale read"
-step 1 describes is not reachable: there is no other request running
-between an `nirdosha serve` request's `SELECT`s and its `UPDATE`s.
-Python's `ThreadingHTTPServer`, and any production stack built the same
-way (a WSGI server with multiple worker threads, a Node.js app with
-async handlers touching shared state, a Flask dev server with
-`threaded=True`), makes exactly that window available to a second
-request — nothing in `ledger_naive.py` closes it, because nothing a
-typical naive implementation writes does either.
+**It corrupts, every time — the same lost-update race, in pure
+Nirdosha, with zero Python or HTTP involved.** This settles it: the
+safety in Result 1 above is not a language-level data-race proof the
+way `spawn`/`chan`'s *in-language* ownership guarantees already are
+(`docs/LANGUAGE.md`, `examples/comparison/01-concurrent-counter.md`,
+which is about a shared in-memory counter, a case the type system
+genuinely does close off). It's a real, verifiable, today's-code
+property of one specific thing: `nirdosha serve`'s request-handling loop
+processes one request at a time (`serve.rs`'s own doc comment — no
+`thread::spawn` anywhere in that file), so two `transfer` calls arriving
+over HTTP can never be mid-flight together. The instant a program
+introduces its own concurrency — `spawn`, exactly as intended — that
+protection is gone, because `db`/`transact`/`http` are interpreter-only
+today (Track B, `docs/PUBLIC_ROADMAP.md`) and carry no ownership
+discipline of their own the way `box`/`chan` do.
 
 ## What this does and doesn't prove
 
-**Honest framing, matching this repo's own standard (see the main
-[README](../../README.md) and the
-[wiki's Honest Scope page](https://github.com/arunsoman/nirdosha/wiki/Honest-Scope-and-Roadmap)):**
-
-- This is **not** a claim that Nirdosha's ownership/`spawn`/`chan` type
-  system (`docs/LANGUAGE.md`, proven for in-language concurrency, see
-  `examples/comparison/01-concurrent-counter.md`) is what prevents this
-  race. `db`/`http`/`transact` are interpreter-only today (Track B,
-  `docs/PUBLIC_ROADMAP.md`) and `transfer_inner` never touches `spawn`
-  or `chan` at all. What prevents it here is a real, verifiable,
-  today's-code property of `serve.rs`: its request-handling loop
-  processes one request at a time, so two `transfer` calls can never be
-  mid-flight together. That's a server-architecture fact, not a
-  language-level data-race proof — worth being exactly this precise
-  about, per this repo's own conventions.
-- That property is also a real, disclosed *cost*: `nirdosha serve`
-  cannot use more than one CPU core for request handling today. The
-  throughput numbers above show it anyway beating both Python
-  configurations at this concurrency level (a Rust process making one
-  SQLite call at a time comfortably outruns a CPython process doing the
-  same, even before Python's own threading/locking overhead is added
-  in) — but the honest limit is architectural, and a future
-  multi-threaded `serve.rs` would need a real concurrency story (a
-  per-connection lock, `transact`, or equivalent) to keep this
-  guarantee, not get to assume it forever.
-- The Python side's `sqlite3.connect(...)` calls are made honestly
-  naive on purpose — a fresh connection per request (the pattern real
-  frameworks actually use) with `PRAGMA busy_timeout` set, specifically
-  so the demonstrated bug is the missing transaction isolation around
-  the read-then-write sequence, not "don't share one raw SQLite handle
-  across threads without a lock" (a real, different, more famous SQLite
-  footgun — an earlier draft of this demo used one shared connection
-  and hit that bug instead, via a `sqlite3` `SQLITE_MISUSE` error and
-  `ConnectionResetError`s; fixed here so the result isolates the
-  intended failure mode). The residual `exceptions` count in every run
-  above (`27`–`34`, present even in the single-threaded, non-corrupting
-  control) is a real, disclosed side effect of that fix under this much
-  concurrency — occasional `database is locked` errors and
-  connection resets, a well-documented characteristic of SQLite's
-  single-writer model under load, not specific to the race this demo
-  targets, and not hidden from the numbers above.
-- The `-p 50` concurrency and 2ms simulated latency are the actual
-  parameters used for every number in this file — not tuned per-run to
-  produce a nicer result. See Methodology below to reproduce or vary
-  them.
+- **Does prove**: today, `nirdosha serve` is a safer place to run this
+  exact naive code than a threaded Python server is, because of a real,
+  disclosed architectural fact about `serve.rs`, and it's also faster at
+  this concurrency level.
+- **Does not prove**: that Nirdosha the *language* makes this class of
+  bug unrepresentable. It doesn't, yet — `race_probe.nir` is the
+  counter-proof, produced on purpose. A future multi-threaded
+  `serve.rs` would reintroduce exactly this race unless `db`/`transact`
+  (or a new construct) grows a real concurrency-safety story first, not
+  get to assume today's guarantee forever.
+- **Also disclosed**: `nirdosha serve`'s single-threaded loop is a real,
+  disclosed *cost* too — it cannot use more than one CPU core for
+  request handling. The throughput numbers above show it winning
+  anyway at this concurrency level, not that the ceiling doesn't exist.
+- The Python side's residual `exceptions` (2–26 per run, present even in
+  the non-corrupting single-threaded control) are `ConnectionResetError`s
+  and occasional `database is locked` errors under 50-way concurrency —
+  a disclosed, real characteristic of SQLite's single-writer model, not
+  hidden from the numbers and not the mechanism this demo targets.
+- The 50-way concurrency and 2ms simulated DB latency are the actual
+  parameters used for every number in this file, not tuned per run.
 
 ## Methodology
 
-Every number above came from an actual run of the actual code in this
-directory, verified by hand before being trusted here (same discipline
-`benchmarks/RESULTS.md` uses): each service was started fresh, its
-ledger reset to the known starting total via `POST /api/reset_ledger`,
-exactly 500 `POST /api/transfer` calls were fired at it through a
-`ThreadPoolExecutor(max_workers=50)`, and `POST /api/total` was read
-back afterward and diffed against the starting total. No number here
-was estimated, extrapolated, or hand-adjusted.
+Each service was started fresh, its ledger reset to the known starting
+total via `POST /api/reset_ledger`, exactly 500 `POST /api/transfer`
+calls were fired at it through a `ThreadPoolExecutor(max_workers=50)`,
+and `POST /api/total` was read back afterward and diffed against the
+starting total.
 
 ```sh
 # Terminal 1 -- Nirdosha
@@ -208,11 +157,12 @@ python3 examples/killer_demo/load_test.py --base-url http://127.0.0.1:8100 --n 5
 
 # Optional: the single-threaded Python control (omit --threaded above)
 # confirms the corruption is a concurrency property, not a Python- or
-# SQLite-specific one -- it passes every time, at roughly the same
-# (slow) per-request latency as the threaded run, just without the
-# race window.
+# SQLite-specific one.
+
+# The language-level question, independent of serve.rs entirely:
+nirdosha examples/killer_demo/race_probe.nir
 ```
 
 `load_test.py --seed N` reproduces one specific request ordering; the
-runs above used seeds 1/2 (Nirdosha, Python-sequential) and 1/2/3
+runs above used seeds 1/2 (Nirdosha, Python-sequential) and 1–6
 (Python-threaded).
