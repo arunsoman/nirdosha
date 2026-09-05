@@ -28,14 +28,16 @@ triage, or design feedback — helps.
 1. Check existing issues and the [Public Roadmap](./docs/PUBLIC_ROADMAP.md)
    so you're not duplicating work already scoped or underway.
 2. For anything non-trivial, open an issue first so we can agree on
-   direction before you sink time into an implementation.
+   direction before you sink time into an implementation. **Exception:**
+   an issue already labeled `good first issue` is pre-scoped — just send
+   the PR, no need to ask.
 3. Keep changes minimal and focused — a bug fix doesn't need drive-by
    refactoring bundled in.
 
 ## Development setup
 
 ```sh
-cd compiler
+cd crates/compiler
 cargo build          # fast dev build
 cargo test           # full suite (unit + crates/compiler/tests/*.rs)
 ```
@@ -67,7 +69,7 @@ the right design doc for whatever you're changing.
 ## Pull request process
 
 1. Fork and branch.
-2. Run the full test suite: `cargo test` in `compiler/`.
+2. Run the full test suite: `cargo test` in `crates/compiler/`.
 3. Update relevant docs (`docs/LANGUAGE.md`, `docs/GRAMMAR.md`, `docs/ROADMAP.md`,
    `docs/PUBLIC_ROADMAP.md`) in the *same* PR, not a follow-up — this
    project treats docs as load-bearing, not aspirational.
