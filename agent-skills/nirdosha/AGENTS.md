@@ -624,7 +624,7 @@ delete two lines." Save only what's between the fences as the `.nir`
 file's actual content.
 
 If you have shell access to a machine with `nirdosha` installed
-(`curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/arunsoman/nirdosha/main/scripts/install.sh | sh`),
+(`curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/kannamma-labs/nirdosha/main/scripts/install.sh | sh`),
 verify before presenting code as final:
 
 ```sh
@@ -652,7 +652,7 @@ run through the real compiler.
 Full type/builtin reference: `docs/LANGUAGE.md`. Full EBNF grammar:
 `docs/GRAMMAR.md`. `workflow`/state-ownership construct: `docs/WORKFLOW.md`.
 Worked examples: `examples/*.nir` in the main repo
-(https://github.com/arunsoman/nirdosha).
+(https://github.com/kannamma-labs/nirdosha).
 
 ## Verification is not optional
 

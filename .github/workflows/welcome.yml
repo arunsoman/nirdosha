@@ -39,7 +39,7 @@ jobs:
             Thanks for opening your first issue here — glad you tried Nirdosha.
 
             A couple of pointers while you wait:
-            - The ["Before you contribute"](https://github.com/arunsoman/nirdosha/blob/main/CONTRIBUTING.md#before-you-contribute) section of `CONTRIBUTING.md` covers checking the [Public Roadmap](https://github.com/arunsoman/nirdosha/blob/main/docs/PUBLIC_ROADMAP.md) for related work already scoped.
+            - The ["Before you contribute"](https://github.com/kannamma-labs/nirdosha/blob/main/CONTRIBUTING.md#before-you-contribute) section of `CONTRIBUTING.md` covers checking the [Public Roadmap](https://github.com/kannamma-labs/nirdosha/blob/main/docs/PUBLIC_ROADMAP.md) for related work already scoped.
             - This is a small team, but there's a **48-hour triage SLA** on every new issue (see `CONTRIBUTING.md`'s "Response time" section) — a real person will respond, even if it's just "seen, will look."
 
             You've been tagged `first-time contributor` so it's easy to spot. Thanks again.
@@ -47,8 +47,8 @@ jobs:
             Thanks for the PR — your first one here, welcome.
 
             A couple of pointers while it's in the queue:
-            - The ["Before you contribute"](https://github.com/arunsoman/nirdosha/blob/main/CONTRIBUTING.md#before-you-contribute) section of `CONTRIBUTING.md` covers what we look for before review (an issue discussed first for anything non-trivial, minimal/focused diffs, docs updated in the same PR).
-            - [`AREAS.md`](https://github.com/arunsoman/nirdosha/blob/main/AREAS.md) lists who owns the subsystem you touched, so you know who's likely to review.
+            - The ["Before you contribute"](https://github.com/kannamma-labs/nirdosha/blob/main/CONTRIBUTING.md#before-you-contribute) section of `CONTRIBUTING.md` covers what we look for before review (an issue discussed first for anything non-trivial, minimal/focused diffs, docs updated in the same PR).
+            - [`AREAS.md`](https://github.com/kannamma-labs/nirdosha/blob/main/AREAS.md) lists who owns the subsystem you touched, so you know who's likely to review.
             - **48-hour triage SLA** applies here too (`CONTRIBUTING.md`'s "Response time" section) — expect a first response, not necessarily a merge, within that window.
 
             You've been tagged `first-time contributor` so it's easy to spot. Thanks again.

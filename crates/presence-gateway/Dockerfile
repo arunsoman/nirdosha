@@ -32,7 +32,7 @@ RUN cargo build --release
 # ---- runtime stage -------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
-LABEL org.opencontainers.image.source="https://github.com/arunsoman/nirdosha" \
+LABEL org.opencontainers.image.source="https://github.com/kannamma-labs/nirdosha" \
       org.opencontainers.image.description="nirdosha-presence-gateway: terminates real browser WebSocket connections for workflow's notify() live-push path" \
       org.opencontainers.image.licenses="Apache-2.0"
 
