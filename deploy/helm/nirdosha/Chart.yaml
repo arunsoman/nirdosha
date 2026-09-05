@@ -10,9 +10,9 @@ description: |
 type: application
 version: 0.2.0
 appVersion: "0.1.0"
-home: https://github.com/arunsoman/nirdosha
+home: https://github.com/kannamma-labs/nirdosha
 sources:
-  - https://github.com/arunsoman/nirdosha
+  - https://github.com/kannamma-labs/nirdosha
 keywords:
   - nirdosha
   - low-code

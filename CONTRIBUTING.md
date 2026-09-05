@@ -7,7 +7,7 @@ triage, or design feedback — helps.
 ## Quick ways to help
 
 - **Try it and report what breaks.** Build from source (below) or grab
-  a [prebuilt binary](https://github.com/arunsoman/nirdosha/releases/latest),
+  a [prebuilt binary](https://github.com/kannamma-labs/nirdosha/releases/latest),
   run a few `examples/*.nir`
   files, open an issue for anything confusing or wrong.
 - **Improve docs.** Typos, unclear explanations, and missing examples

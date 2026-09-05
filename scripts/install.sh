@@ -1,7 +1,7 @@
 #!/bin/sh
 # One-line installer for the nirdosha CLI (macOS / Linux).
 #
-#   curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/arunsoman/nirdosha/main/scripts/install.sh | sh
+#   curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/kannamma-labs/nirdosha/main/scripts/install.sh | sh
 #
 # Downloads the right prebuilt binary from GitHub Releases, verifies its
 # sha256 checksum, and installs it to $NIRDOSHA_INSTALL_DIR (default
@@ -14,7 +14,7 @@
 # Windows: use scripts/install.ps1 instead.
 set -eu
 
-repo="arunsoman/nirdosha"
+repo="kannamma-labs/nirdosha"
 install_dir="${NIRDOSHA_INSTALL_DIR:-$HOME/.local/bin}"
 
 os="$(uname -s)"

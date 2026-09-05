@@ -18,6 +18,6 @@ int main(void) {
         ".nir file icon with macOS. Use the `nirdosha` CLI instead:\n"
         "  nirdosha serve <file.nir>\n"
         "  nirdosha emit-ui <file.nir>\n"
-        "See https://github.com/arunsoman/nirdosha\n");
+        "See https://github.com/kannamma-labs/nirdosha\n");
     return 0;
 }

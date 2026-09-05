@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please report security issues privately, not as a public GitHub issue —
-use [GitHub's private vulnerability reporting](https://github.com/arunsoman/nirdosha/security/advisories/new)
+use [GitHub's private vulnerability reporting](https://github.com/kannamma-labs/nirdosha/security/advisories/new)
 for this repository (the "Security" tab → "Report a vulnerability").
 This opens a private advisory only the maintainer can see until it's
 resolved.
@@ -26,7 +26,7 @@ response time is best-effort, not SLA-backed.
 Nirdosha is under active development. Some safety properties are proven
 today (ownership/affine types, SMT-discharged overflow bounds, the
 concurrency model); others are explicitly aspirational and documented
-as such — see [Honest Scope & Roadmap](https://github.com/arunsoman/nirdosha/wiki/Honest-Scope-and-Roadmap).
+as such — see [Honest Scope & Roadmap](https://github.com/kannamma-labs/nirdosha/wiki/Honest-Scope-and-Roadmap).
 A report that a *documented, disclosed* limitation is exploitable is
 still useful — please file it — but it's triaged differently from a
 violation of a claim the project actually makes.

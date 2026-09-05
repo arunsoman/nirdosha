@@ -21,15 +21,15 @@ for whichever tool you use.
 ```sh
 # from the root of a project that uses Nirdosha
 curl -o .claude/skills/nirdosha/SKILL.md --create-dirs \
-  https://raw.githubusercontent.com/arunsoman/nirdosha/main/agent-skills/nirdosha/claude-code/SKILL.md
+  https://raw.githubusercontent.com/kannamma-labs/nirdosha/main/agent-skills/nirdosha/claude-code/SKILL.md
 
 # or, for an AGENTS.md-reading tool:
 curl -o AGENTS.md \
-  https://raw.githubusercontent.com/arunsoman/nirdosha/main/agent-skills/nirdosha/AGENTS.md
+  https://raw.githubusercontent.com/kannamma-labs/nirdosha/main/agent-skills/nirdosha/AGENTS.md
 
 # or Cursor:
 curl -o .cursor/rules/nirdosha.mdc --create-dirs \
-  https://raw.githubusercontent.com/arunsoman/nirdosha/main/agent-skills/nirdosha/cursor/nirdosha.mdc
+  https://raw.githubusercontent.com/kannamma-labs/nirdosha/main/agent-skills/nirdosha/cursor/nirdosha.mdc
 ```
 
 Swap the URL/destination for the other tools using the table above.
