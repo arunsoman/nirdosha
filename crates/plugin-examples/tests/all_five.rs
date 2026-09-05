@@ -31,8 +31,10 @@ fn all_five_plugins_register_with_no_name_collisions() {
     names.sort_unstable();
     names.dedup();
     assert_eq!(names.len(), total, "two plugins in this gallery declared the same builtin name");
-    // 4 (mysql) + 4 (activemq) + 4 (cassandra) + 3 (neo4j) + 5 (hbase, incl. hbase_create_table)
-    assert_eq!(total, 20, "expected builtin count to match the gallery's five plugins' declared signatures");
+    // 8 (mysql: 4 bespoke mysql_* + 4 db_provider_mysql_*, docs/adr/0004)
+    // + 8 (activemq: 4 bespoke activemq_* + 4 mq_provider_stomp_*, docs/adr/0004)
+    // + 4 (cassandra) + 3 (neo4j) + 5 (hbase, incl. hbase_create_table)
+    assert_eq!(total, 28, "expected builtin count to match the gallery's five plugins' declared signatures");
 }
 
 /// A single `.nir` program referencing a builtin from every one of the

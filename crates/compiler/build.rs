@@ -77,7 +77,24 @@ fn main() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let built_lib = kernels_target_dir.join("release/libnirdosha_runtime_kernels.a");
+    // `cargo rustc` (unlike the old dependency-free bare `rustc` call this
+    // replaced) gives no way to name the output file explicitly -- it
+    // picks the artifact name from the platform's own staticlib
+    // convention: `lib<name>.a` everywhere `cargo` treats as
+    // GNU-flavored (Linux, macOS, windows-gnu), but `<name>.lib` (no
+    // `lib` prefix, MSVC's COFF archive format, not a `.a`) on
+    // windows-msvc -- the default host toolchain on GitHub's
+    // `windows-latest` runners. Reading `CARGO_CFG_TARGET_ENV` (cargo
+    // always sets this for a build script to the *target*'s env, `msvc`/
+    // `gnu`/empty) instead of `cfg!(windows)` keeps this correct under
+    // cross-compilation too, not just "happens to match on CI".
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let built_lib_name = if target_env == "msvc" {
+        "nirdosha_runtime_kernels.lib".to_string()
+    } else {
+        "libnirdosha_runtime_kernels.a".to_string()
+    };
+    let built_lib = kernels_target_dir.join("release").join(&built_lib_name);
     let out_lib = out_dir.join("libnirdosha_runtime.a");
     std::fs::copy(&built_lib, &out_lib).unwrap_or_else(|e| {
         panic!(
