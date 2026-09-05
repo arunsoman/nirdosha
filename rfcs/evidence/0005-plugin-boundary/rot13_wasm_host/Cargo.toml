@@ -1,0 +1,7 @@
+[package]
+name = "rot13_wasm_host"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wasmtime = "48.0.1"

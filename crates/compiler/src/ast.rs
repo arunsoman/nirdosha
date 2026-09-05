@@ -224,6 +224,40 @@ pub enum Ty {
     /// same "the Nirdosha-facing surface stays the same regardless of the
     /// driver underneath" stance `Ty::Db`'s doc comment already takes.
     Mq,
+    /// A compiler-enforced affine handle to a stateful resource a
+    /// **plugin** owns — a MySQL connection, a Cassandra session, a
+    /// Neo4j session — the fix for rfcs/0003-plugin-abi-v2.md's open
+    /// question and `nirdosha-plugin-support::HandleRegistry`'s own
+    /// doc comment ("the honest cost... a handle... is just a
+    /// `Value::Int`... `ownership.rs` gives it none of the affine
+    /// guarantees a real `Ty::Db`/`Ty::Mq`/`Ty::Sandbox` handle gets
+    /// today"). The `String` names the resource *kind* (a plugin's own
+    /// choice, e.g. `"MysqlConnection"`) so two different handle kinds
+    /// from the same or different plugins are distinct, incompatible
+    /// types — `Ty::Handle("MysqlConnection".into())` and
+    /// `Ty::Handle("Neo4jSession".into())` can never be typo'd into
+    /// each other by `typeck.rs`'s ordinary structural type equality,
+    /// same as any other `Ty::Named` mismatch already can't be.
+    ///
+    /// Deliberately **not** `Box<dyn Any>` or a new generic type
+    /// parameter anywhere in the compiler: at the type-checker/
+    /// ownership-checker level this is exactly as opaque as `Ty::Db`
+    /// already is (`ownership.rs::is_affine` doesn't know or care
+    /// what's *inside* a `Ty::Db` handle either) — `is_affine` is a
+    /// purely syntactic property of the type tag, never the runtime
+    /// value. At the *runtime* level a `Ty::Handle`-typed value is
+    /// still a plain `Value::Int` — the exact `i64` id
+    /// `HandleRegistry::insert` already mints — so a plugin's own
+    /// `call` closures need zero changes: `HandleRegistry<T>`'s
+    /// generic, monomorphized-per-`T` table is what actually recovers
+    /// a concrete Rust value from that `i64`, at runtime, inside the
+    /// plugin's own crate, exactly as it does today. This variant only
+    /// changes what the *compiler* proves about the id in between a
+    /// plugin's `connect`-shaped and `close`-shaped builtins — a real,
+    /// checked answer to "was this handle already closed" that today
+    /// only `HandleRegistry::remove`'s runtime `None` catches, one
+    /// call late.
+    Handle(String),
     /// A first-class function value — `fn(T1, T2) -> R`. Just a name
     /// under the hood (`Value::Fn` in `interpreter.rs`); this language has
     /// no closures, so there's no captured environment to carry, which is
@@ -320,6 +354,7 @@ impl Ty {
             Ty::File => "file".to_string(),
             Ty::Json => "json".to_string(),
             Ty::Db => "db".to_string(),
+            Ty::Handle(kind) => format!("handle<{kind}>"),
             Ty::Mq => "mq".to_string(),
             Ty::Fn(params, ret) => {
                 format!("fn({}) -> {}", params.iter().map(Ty::name).collect::<Vec<_>>().join(", "), ret.name())
@@ -473,7 +508,7 @@ impl Ty {
         // computation at once, so it has to be freely copyable — see its
         // own doc comment for where the actual ownership-transfer happens
         // instead (a channel's *payload*, at `send`, not the handle).
-        matches!(self, Ty::Box(_) | Ty::Thread(_) | Ty::Sandbox | Ty::Tcp | Ty::TcpListener | Ty::File | Ty::Db | Ty::Mq)
+        matches!(self, Ty::Box(_) | Ty::Thread(_) | Ty::Sandbox | Ty::Tcp | Ty::TcpListener | Ty::File | Ty::Db | Ty::Mq | Ty::Handle(_))
         // `Ty::Fn` deliberately excluded — see its own doc comment.
     }
 
@@ -533,6 +568,7 @@ impl Ty {
             | Ty::Json
             | Ty::Db
             | Ty::Mq
+            | Ty::Handle(_)
             | Ty::Fn(_, _)
             | Ty::Named(_, _)
             | Ty::F64

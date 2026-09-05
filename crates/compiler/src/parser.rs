@@ -223,6 +223,19 @@ impl Parser {
             self.expect(&Tok::RParen, "`)`")?;
             return Ok(Ty::Vector(Box::new(elem), n));
         }
+        // `handle(KindName)` — `Ty::Handle`'s syntax (a plugin-declared
+        // affine resource handle). `KindName` is a bare identifier, not
+        // looked up against the struct/enum registry the way a real
+        // `Ty::Named` argument would be -- it's just the nominal tag a
+        // plugin author chose (`"MysqlConnection"`, say), never a real
+        // declared type a `.nir` program could construct a value of.
+        if self.peek().tok == Tok::HandleKw {
+            self.bump();
+            self.expect(&Tok::LParen, "`(`")?;
+            let kind = self.expect_ident()?;
+            self.expect(&Tok::RParen, "`)`")?;
+            return Ok(Ty::Handle(kind));
+        }
         if self.peek().tok == Tok::MatrixKw {
             self.bump();
             self.expect(&Tok::LParen, "`(`")?;
