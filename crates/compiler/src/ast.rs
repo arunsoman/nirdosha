@@ -2457,6 +2457,24 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "__workflow_history",
 ];
 
+/// `BUILTIN_NAMES` as a `HashSet`, built once. `is_builtin` runs on the
+/// path to *every* call the interpreter/typechecker evaluate — a real
+/// builtin call, a plugin call, and a user-function call all check this
+/// first (`interpreter.rs`'s `Expr::Call` arm, `typeck.rs`'s
+/// `is_builtin_or_plugin`) — so a linear `<[&str]>::contains` scan over
+/// (today) 84 entries was a real, measured cost on every single one of
+/// those (rfcs/0005-plugin-boundary-safety-and-performance.md's own
+/// dispatch-mechanism micro-benchmark: ~30-90ns per call was traceable
+/// almost entirely to this scan, not to any of the actual dispatch
+/// mechanisms downstream of it). `HashSet::contains` turns every call
+/// site's worst case (a plugin or user-function name, which by
+/// definition can never match — `typecheck_with_plugins`'s own
+/// registration-time guard already proves that) from O(84) string
+/// comparisons into one hash + O(1) lookup, and only grows sub-linearly
+/// as more builtins are added.
+static BUILTIN_NAME_SET: std::sync::LazyLock<std::collections::HashSet<&'static str>> =
+    std::sync::LazyLock::new(|| BUILTIN_NAMES.iter().copied().collect());
+
 pub fn is_builtin(name: &str) -> bool {
-    BUILTIN_NAMES.contains(&name)
+    BUILTIN_NAME_SET.contains(name)
 }
