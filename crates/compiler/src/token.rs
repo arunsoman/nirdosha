@@ -166,6 +166,14 @@ pub enum Tok {
     /// bare keyword.
     VectorKw,
     MatrixKw,
+    /// `handle(KindName)` — `Ty::Handle`'s own syntax, the same
+    /// `Name(args)` shape `Vector`/`Matrix` already use (a bare
+    /// identifier argument, not a comma list, since a handle kind is
+    /// nominal, not parameterized). Lowercase, unlike `Vector`/`Matrix`,
+    /// since it names a *kind* of value (`box`/`thread`/`chan`/`sandbox`
+    /// are all lowercase type-formers too), not a capitalized
+    /// user-facing generic type.
+    HandleKw,
     TypeName(String), // i8/i16/.../usize/f64/bool/unit/str — validated by the parser
 
     // symbols
@@ -434,6 +442,7 @@ impl<'a> Lexer<'a> {
                     "use" => Tok::Use,
                     "Vector" => Tok::VectorKw,
                     "Matrix" => Tok::MatrixKw,
+                    "handle" => Tok::HandleKw,
                     "true" => Tok::True,
                     "false" => Tok::False,
                     t if TYPE_NAMES.contains(&t) => Tok::TypeName(t.to_string()),

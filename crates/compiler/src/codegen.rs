@@ -334,6 +334,9 @@ fn llvm_ty(ty: &Ty, registry: &TypeRegistry) -> Result<String, CodegenError> {
         ),
         Ty::Json => unsupported("codegen doesn't support `json` yet — JSON is interpreter-only for now"),
         Ty::Db => unsupported("codegen doesn't support `db` yet — DB connectivity is interpreter-only for now"),
+        Ty::Handle(kind) => unsupported(&format!(
+            "codegen doesn't support plugin handle types (`{kind}`) — plugins are interpreter-only for now"
+        )),
         Ty::Mq => unsupported("codegen doesn't support `mq` yet — message-queue connectivity is interpreter-only for now"),
         // A fixed-size, two-word value — pointer to the byte data plus an
         // explicit `i64` length, never NUL-terminated-only (a `str`'s
