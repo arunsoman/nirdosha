@@ -36,6 +36,10 @@ triage, or design feedback — helps.
 
 ## Development setup
 
+**No local toolchain?** [Open in GitHub Codespaces](https://codespaces.new/arunsoman/nirdosha?quickstart=1) —
+`.devcontainer/devcontainer.json` installs `clang`/`libz3-dev` and runs
+the first build for you, so you land in a ready-to-go shell.
+
 ```sh
 cd crates/compiler
 cargo build          # fast dev build
