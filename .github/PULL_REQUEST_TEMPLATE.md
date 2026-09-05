@@ -8,7 +8,7 @@ Closes #
 
 ## Checklist
 
-- [ ] `cargo test` passes locally (`cd compiler && cargo test`)
+- [ ] `cargo test` passes locally (`cd crates/compiler && cargo test`)
 - [ ] Docs updated in this same PR if behavior changed
       (`docs/LANGUAGE.md`/`docs/GRAMMAR.md`/`docs/ROADMAP.md`/`docs/PUBLIC_ROADMAP.md`, as
       applicable) — this project treats docs as load-bearing, not
