@@ -1,0 +1,152 @@
+// Level 5 -- platform services: file I/O, `db`, `json`, `http`, `mq`,
+// declared effects, and `validate` contracts.
+//
+// `db`/`mq`/`file`/`tcp`/`sandbox` handles are all affine (like `box`)
+// and have no borrowing story yet -- each is connected, used, and
+// `stop`ped inside one function.
+
+struct Text {
+    value: str,
+}
+
+// --- effect(...) -- fully inferred by default; a declared annotation is
+// checked against what the body actually does. ---
+fn add(a: i64, b: i64) -> i64 effect(pure) {
+    return a + b
+}
+
+fn log_result(n: i64) -> unit effect(io) {
+    print(n)
+}
+
+// --- validate -- a Hoare contract, orthogonal to `requires` (level 6):
+// `requires` gates *who* may call a function; `validate` states a fact
+// the function itself must honor, checked both statically (where
+// provable) and dynamically (always). ---
+fn max_of(a: i64, b: i64) -> i64 {
+    if a > b { return a }
+    return b
+}
+
+validate max_of {
+    post: result >= a
+    post: result >= b
+}
+
+// --- file / open -- `send`/`recv`/`stop` reused verbatim from `chan`. ---
+fn file_roundtrip() -> Text {
+    let out: file = open("/tmp/nirdosha_syntax_level5.txt", "w")
+    send(out, "hello from level 5")
+    stop out
+
+    let inp: file = open("/tmp/nirdosha_syntax_level5.txt", "r")
+    let content: str = recv(inp)
+    stop inp
+    return Text(content)
+}
+
+// --- db_connect/db_query/db_execute -- SQLite-backed; results always
+// read back as json, composing with json_get_*/json_array_*. A match
+// arm's body is a single `expr`, never a `{ ... }` block -- so, like
+// examples/db.nir, every statement lives at the function's own top
+// level and only the final value flows through `match`. ---
+fn run_all(conn: db) -> Text {
+    let created: i64 = match db_execute(conn, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let inserted: i64 = match db_execute(conn, "INSERT INTO users (name) VALUES (?)", "ada") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let name: Text = match db_query(conn, "SELECT name FROM users ORDER BY id") {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_str(row, "name") {
+                Ok(n) => Text(n),
+                Err(e) => Text(e),
+            },
+            Err(e) => Text(e),
+        },
+        Err(e) => Text(e),
+    }
+    stop conn
+    return name
+}
+
+fn db_roundtrip() -> Text {
+    return match db_connect(":memory:") {
+        Ok(conn) => run_all(conn),
+        Err(e) => Text(e),
+    }
+}
+
+// --- json_parse/json_get_* -- concrete, per-target-type accessors over
+// an already-parsed document. ---
+fn json_roundtrip() -> Text {
+    let text: str = "{\"name\": \"nirdosha\", \"version\": 1, \"stable\": false}"
+    return match json_parse(text) {
+        Ok(doc) => match json_get_str(doc, "name") {
+            Ok(name) => Text(name),
+            Err(msg) => Text(msg),
+        },
+        Err(msg) => Text(msg),
+    }
+}
+
+// --- http_get/http_post -- plain HTTP over a real TcpStream. No
+// listener is running for this file (unlike examples/http.rs's test
+// harness), so this always lands in `Err` here -- the point is the
+// syntax and the `Result` handling, not a successful round-trip. ---
+fn http_roundtrip() -> Text {
+    return match http_get("127.0.0.1", 8977, "/ping") {
+        Ok(resp) => match json_parse(resp.body) {
+            Ok(doc) => match json_get_str(doc, "message") {
+                Ok(msg) => Text(msg),
+                Err(e) => Text(e),
+            },
+            Err(e) => Text(e),
+        },
+        Err(e) => Text(e),
+    }
+}
+
+// --- mq_connect/mq_publish -- Redis-backed pub/sub, affine like `db`.
+// No Redis running for this file either -- same "demonstrate the Result
+// shape" point as http_roundtrip above. ---
+fn publish_demo(conn: mq) -> i64 {
+    let published: i64 = match mq_publish(conn, "level5.demo", "hello") {
+        Ok(u) => 0,
+        Err(e) => -1,
+    }
+    stop conn
+    return published
+}
+
+fn mq_roundtrip() -> i64 {
+    return match mq_connect("127.0.0.1", 6379) {
+        Ok(conn) => publish_demo(conn),
+        Err(e) => -1,
+    }
+}
+
+fn main() {
+    log_result(add(2, 3)) // effect(pure) feeding effect(io)
+    print(max_of(3, 9))   // 9 -- validate's `post` holds for every real call
+
+    // Postfix chaining stops at a call (`call ::= postfix ("(" args? ")")?`
+    // -- `f().field` doesn't parse), so a call's result is bound to a
+    // `let` first, then `.field`-accessed on the next line.
+    let file_result: Text = file_roundtrip()
+    print(file_result.value)
+
+    let db_result: Text = db_roundtrip()
+    print(db_result.value)
+
+    let json_result: Text = json_roundtrip()
+    print(json_result.value)
+
+    let http_result: Text = http_roundtrip()
+    print(http_result.value) // a real connection-refused message
+
+    print(mq_roundtrip()) // -1: no Redis running for this example
+}

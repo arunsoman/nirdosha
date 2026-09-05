@@ -1,0 +1,27 @@
+// Level 6, part A -- a tiny library file, imported by
+// `06_identity_and_declarative_ui.nir` via `use`. Exists only to give
+// that file something real to `use "06_shared_lib.nir"`.
+//
+// `module Ident { ... }` (a bare identifier, not a string) is a real
+// namespace: every declaration inside registers under its own qualified
+// key (`Shared::AuditEntry`, never bare `AuditEntry`), so it can share a
+// short name with the prelude or another module with zero collision.
+// `pub` marks a declaration visible from outside its own module --
+// omitted, it's private to this file.
+module Shared {
+    pub struct AuditEntry {
+        id: i64,
+        note: str,
+    }
+
+    struct InternalOnly {
+        secret: i64,
+    }
+
+    // Even inside its own module, a namespaced declaration is reachable
+    // only by its qualified form -- `make_entry` has to write
+    // `Shared::AuditEntry`, never bare `AuditEntry`.
+    pub fn make_entry(id: i64) -> Shared::AuditEntry {
+        return Shared::AuditEntry(id, "created")
+    }
+}

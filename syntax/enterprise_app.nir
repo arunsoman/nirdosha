@@ -1,0 +1,517 @@
+// enterprise_app.nir -- "Nirdosha Procurement & Payments" -- a single,
+// coherent program that pulls together every syntax layer from
+// hello_nir.nir through 06_identity_and_declarative_ui.nir into one
+// enterprise-shaped app: vendor management, a purchase-order approval
+// workflow, a durable payment disbursement, role-gated/privileged
+// actions, and the declarative screen/dashboard UI layer on top.
+//
+// Domain: a company (i) onboards vendors, (ii) raises purchase orders,
+// (iii) routes them through an owner-gated approval `workflow`, and
+// (iv) disburses payment through a durable `transact` once approved --
+// with a CFO-only spending-limit override (privileged fn + `acquire`),
+// async finance notification (`spawn`/`chan`), an audit trail (`box`,
+// `module` namespacing, `file`), and a real event bus (`mq`).
+
+// ---- namespacing: a real module, `pub`-exported audit log entry -------
+module Ledger {
+    pub struct AuditEntry {
+        id: i64,
+        action: str,
+    }
+
+    // Private to `Ledger` -- unreachable from outside, even qualified.
+    struct RetentionPolicy {
+        days: i64,
+    }
+
+    pub fn record_entry(id: i64, action: Text) -> Ledger::AuditEntry {
+        return Ledger::AuditEntry(id, action.value)
+    }
+}
+
+// ---- carrier struct for free text at a fn boundary ---------------------
+struct Text {
+    value: str,
+}
+
+// ---- domain errors: one closed enum, real dynamic messages preserved --
+enum ErrorCode {
+    DbError(str),
+    PaymentDeclined,
+    InvalidRequest,
+}
+
+// ---- domain data: struct/enum, plus the Money/Measure prelude types ---
+struct Vendor {
+    id: i64,
+    name: str,
+    rating: i64,
+}
+
+struct PurchaseOrder {
+    id: i64,
+    vendor_id: i64,
+    amount_cents: i64,
+}
+
+// A generic wrapper struct (Row 11 layer 6) -- one reusable shape for
+// "a value plus which vendor it came from," instantiated per call site
+// the same way `Vector(f64, 3)` is concrete-per-instantiation.
+struct Tagged(T) {
+    vendor_id: i64,
+    payload: T,
+}
+
+fn describe_tagged_amount(t: Tagged(i64)) -> i64 {
+    return t.payload
+}
+
+// A shipment's weight, using the built-in `Measure`/`UnitCode` prelude
+// types -- no declaration needed for either.
+struct Shipment {
+    po_id: i64,
+    weight: Measure,
+}
+
+enum ShipmentError {
+    UnitMismatch,
+}
+
+// Refuses (rather than converts) a mismatched-unit combination -- the
+// same discipline `add_money`/`add_measure` (LANGUAGE.md §6c/§6d) apply.
+fn combine_shipment_weight(a: Measure, b: Measure) -> Result(Measure, ShipmentError) {
+    if a.unit_code != b.unit_code {
+        return Err(UnitMismatch())
+    }
+    return Ok(Measure(a.value + b.value, a.unit_code))
+}
+
+// A price quote, priced in a real `Money` -- amount is a type-checked
+// `dec128`, currency is a closed, exhaustively-matchable enum.
+fn quote_in_usd(unscaled_cents: i64) -> Money {
+    return Money(dec_from_i64(unscaled_cents, 2), USD())
+}
+
+// ---- risk scoring: `effect(pure)`, `Vector`/`dot`, and a `validate`
+// Hoare contract, all on the same function ----
+fn risk_score(delivery: f64, quality: f64, price: f64) -> f64 effect(pure) {
+    let weights: Vector(f64, 3) = [0.5, 0.3, 0.2]
+    let factors: Vector(f64, 3) = [delivery, quality, price]
+    return dot(weights, factors)
+}
+
+validate risk_score {
+    post: result >= 0.0
+}
+
+// ---- ownership: `box`/`*`/move, and `&`/shared borrow -----------------
+struct AuditPayload {
+    po_id: i64,
+    note: str,
+}
+
+// Takes ownership -- the caller's `box AuditPayload` is moved here.
+fn archive_audit(p: box AuditPayload) -> i64 {
+    return (*p).po_id
+}
+
+// Reads through a shared reference without taking ownership, so the
+// caller can keep using the same value afterward.
+fn peek_rating(r: &i64) -> i64 {
+    return *r
+}
+
+// ---- concurrency: `spawn`/`join`/`thread`, `chan`/`send`/`recv` -------
+// A best-effort, fire-and-forget "notify finance" side channel, run
+// concurrently with the disbursement itself rather than blocking it.
+fn notify_finance_team(c: chan i64, po_id: i64) -> unit {
+    send(c, po_id)
+    return
+}
+
+fn notify_finance_async(po_id: i64) -> i64 {
+    let c: chan i64 = chan
+    let h: thread unit = spawn notify_finance_team(c, po_id)
+    let acked: i64 = recv(c)
+    join h
+    return acked
+}
+
+// ---- privileged first-class functions: `requires`/`acquire` -----------
+// Overriding a purchase order's normal approval-limit gate is a
+// CFO-only action -- the function's *value* is unobtainable without a
+// real proof, so it can't be called or even referenced without one.
+fn override_spending_limit(amount_cents: i64) -> i64 requires(role: "cfo") {
+    return amount_cents
+}
+
+// `requires(public)` -- a genuinely open, unauthenticated endpoint
+// (a Kubernetes liveness probe), marked so `serve`'s "did you mean to
+// leave this open?" warning stays quiet for this one, intentionally.
+fn health_check() -> bool requires(public) {
+    return true
+}
+
+// ---- vendor management: plain CRUD, SQLite-backed, admin-gated writes -
+// `db` is affine, like `box`/`file`/`tcp` -- no borrowing story yet, so
+// passing it to a shared "ensure the table exists" helper would move it
+// away from the caller. Every function below repeats its own
+// `CREATE TABLE IF NOT EXISTS`, the same discipline `examples/store.nir`
+// and `examples/db.nir` both document.
+fn list_vendor_inner(conn: db) -> Result(json, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS vendors (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, rating INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, name, rating FROM vendors ORDER BY id") {
+        Ok(r) => Ok(r),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return rows
+}
+
+fn list_vendor() -> Result(json, ErrorCode) {
+    return match db_connect("enterprise_app.db") {
+        Ok(conn) => list_vendor_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn create_vendor_inner(conn: db, v: Vendor) -> Result(i64, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS vendors (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, rating INTEGER)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let result: Result(i64, ErrorCode) = match db_execute(conn, "INSERT INTO vendors (name, rating) VALUES (?, ?)", v.name, v.rating) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return result
+}
+
+fn create_vendor(v: Vendor) -> Result(i64, ErrorCode) requires(role: "procurement_manager") {
+    return match db_connect("enterprise_app.db") {
+        Ok(conn) => create_vendor_inner(conn, v),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+screen Vendor {
+    title: "Vendors"
+    field name {
+        label: "Vendor Name"
+    }
+    field rating {
+        min: 0
+        max: 5
+    }
+}
+
+// ---- purchase orders: plain CRUD, plus the workflow below is what
+// actually moves one from draft to paid -----------------------------
+fn list_purchase_order_inner(conn: db) -> Result(json, ErrorCode) {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS purchase_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, vendor_id INTEGER, amount_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let rows: Result(json, ErrorCode) = match db_query(conn, "SELECT id, vendor_id, amount_cents, status FROM purchase_orders ORDER BY id DESC") {
+        Ok(r) => Ok(r),
+        Err(e) => Err(DbError(e)),
+    }
+    stop conn
+    return rows
+}
+
+fn list_purchase_order() -> Result(json, ErrorCode) {
+    return match db_connect("enterprise_app.db") {
+        Ok(conn) => list_purchase_order_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+fn insert_purchase_order_inner(conn: db, vendor_id: i64, amount_cents: i64) -> i64 {
+    let created: i64 = match db_execute(conn, "CREATE TABLE IF NOT EXISTS purchase_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, vendor_id INTEGER, amount_cents INTEGER, status TEXT)") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let inserted: i64 = match db_execute(conn, "INSERT INTO purchase_orders (vendor_id, amount_cents, status) VALUES (?, ?, ?)", vendor_id, amount_cents, "pending_approval") {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    let new_id: i64 = match db_query(conn, "SELECT last_insert_rowid() as oid") {
+        Ok(rows) => match json_array_get(rows, 0) {
+            Ok(row) => match json_get_i64(row, "oid") {
+                Ok(i) => i,
+                Err(e) => -1,
+            },
+            Err(e) => -1,
+        },
+        Err(e) => -1,
+    }
+    stop conn
+    return new_id
+}
+
+fn mark_purchase_order_paid_inner(conn: db, po_id: i64) -> i64 {
+    let updated: i64 = match db_execute(conn, "UPDATE purchase_orders SET status = ? WHERE id = ?", "paid", po_id) {
+        Ok(n) => n,
+        Err(e) => -1,
+    }
+    stop conn
+    return updated
+}
+
+fn mark_purchase_order_paid(po_id: i64) -> i64 {
+    return match db_connect("enterprise_app.db") {
+        Ok(conn) => mark_purchase_order_paid_inner(conn, po_id),
+        Err(e) => -1,
+    }
+}
+
+fn stat_purchase_order_count() -> i64 {
+    return 0
+}
+
+fn chart_purchase_orders_by_vendor() -> Result(json, ErrorCode) {
+    return match db_connect("enterprise_app.db") {
+        Ok(conn) => list_purchase_order_inner(conn),
+        Err(e) => Err(DbError(e)),
+    }
+}
+
+screen PurchaseOrder {
+    title: "Purchase Orders"
+    field amount_cents {
+        label: "Amount (cents)"
+        min: 0
+    }
+}
+
+dashboard {
+    tile "Open Purchase Orders" -> stat_purchase_order_count
+    chart "By Vendor" -> chart_purchase_orders_by_vendor
+}
+
+// ---- payment disbursement: `transact` -- precheck, network, verify,
+// commit, compensate, log, all in one durable block --------------------
+fn erp_reachable() -> bool {
+    return true
+}
+
+fn call_payment_gateway(txn_id: str, amount_cents: i64) -> i64 {
+    return match http_post("127.0.0.1", 9091, "/api/charge", "{}") {
+        Ok(resp) => resp.status,
+        Err(e) => -1,
+    }
+}
+
+fn payment_confirmed(status: i64) -> bool {
+    return status == 200
+}
+
+fn commit_disbursement(po_id: i64) -> i64 {
+    let updated: i64 = mark_purchase_order_paid(po_id)
+    return updated
+}
+
+fn compensate_disbursement(po_id: i64) -> i64 {
+    print("reversing disbursement for purchase order", po_id)
+    return po_id
+}
+
+fn write_disbursement_log(po_id: i64, ok: bool) -> unit {
+    let out: file = open("enterprise_app_audit.log", "a")
+    send(out, "disbursement attempted")
+    stop out
+    let entry: Ledger::AuditEntry = Ledger::record_entry(po_id, Text("disbursement"))
+    print(entry.action, entry.id, ok)
+}
+
+fn disburse(po_id: i64) -> bool {
+    return transact {
+        precheck:   erp_reachable()
+        network:    call_payment_gateway(txn_id, po_id)
+        verify:     payment_confirmed(network)
+        commit:     commit_disbursement(po_id)
+        compensate: compensate_disbursement(po_id)
+        log:        write_disbursement_log(po_id, verify)
+    }
+}
+
+// ---- event bus: `mq` -- best-effort, doesn't fail the disbursement ----
+fn publish_po_paid(mqconn: mq, po_id: i64) -> i64 {
+    let published: i64 = match mq_publish(mqconn, "po.paid", "po.paid") {
+        Ok(u) => 0,
+        Err(e) => -1,
+    }
+    stop mqconn
+    return published
+}
+
+fn announce_po_paid(po_id: i64) -> i64 {
+    return match mq_connect("127.0.0.1", 6379) {
+        Ok(mqconn) => publish_po_paid(mqconn, po_id),
+        Err(e) => -1,
+    }
+}
+
+// ---- approval workflow: `workflow` -- an owner-gated state machine ----
+fn finalize_purchase_order(instance_id: i64, po_id: i64) -> bool {
+    let paid: bool = disburse(po_id)
+    let announced: i64 = announce_po_paid(po_id)
+    let acked: i64 = notify_finance_async(po_id)
+    return paid
+}
+
+workflow PoApproval {
+    data {
+        po_id: i64,
+    }
+
+    state PendingApproval {
+        owner: role("finance_director")
+        on Approve -> Approved
+        on Reject -> Rejected
+    }
+
+    state Approved terminal {
+        on_entry {
+            finalize_purchase_order(instance_id, data.po_id)
+        }
+    }
+
+    state Rejected terminal {
+    }
+}
+
+fn submit_purchase_order(vendor_id: i64, amount_cents: i64) -> Result(i64, WorkflowActionError) {
+    let po_id: i64 = insert_purchase_order_inner_wrapper(vendor_id, amount_cents)
+    return start_po_approval(None(), PoApprovalData(po_id))
+}
+
+fn insert_purchase_order_inner_wrapper(vendor_id: i64, amount_cents: i64) -> i64 {
+    return match db_connect("enterprise_app.db") {
+        Ok(conn) => insert_purchase_order_inner(conn, vendor_id, amount_cents),
+        Err(e) => -1,
+    }
+}
+
+fn decide_purchase_order(identity: VerifiedIdentity, instance_id: i64, decision: PoApprovalEvent) -> Result(bool, WorkflowActionError) {
+    return match json_parse("{}") {
+        Ok(payload) => advance_po_approval(identity, instance_id, decision, payload),
+        Err(e) => Err(NoSuchTransition()),
+    }
+}
+
+fn main() {
+    // -- identity: `mock_issue_token` (the deliberate, explicitly-named
+    // inverse of `oidc_validate_token`) mints a real signed token
+    // against a fixed local JWKS, exactly `examples/identity_mock.nir`'s
+    // own pattern -- it then validates through the same, unmodified
+    // `oidc_validate_token` any real IdP's token would.
+    let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
+    let issuer: str = "https://mock-idp.local"
+    let audience: str = "enterprise-app"
+    // Deliberately missing "cfo" -- an ops user, not the CFO -- so
+    // `override_spending_limit`'s `acquire` below is denied for real.
+    let claims: str = "{\"roles\":[\"procurement_manager\",\"finance_director\"]}"
+    let ops_token: str = match mock_issue_token("ops-user", issuer, audience, 1700000000, 999999999, claims, jwks) {
+        Ok(t) => t,
+        Err(e) => "",
+    }
+
+    print(health_check()) // true -- requires(public), no token needed
+
+    // -- ownership: box a payload, move it into `archive_audit` ---------
+    let payload: box AuditPayload = box AuditPayload(1, "onboarded")
+    print(archive_audit(payload)) // 1 -- `payload` is moved away here
+
+    // -- borrow: `&`, re-usable afterward --------------------------------
+    let rating: i64 = 4
+    print(peek_rating(&rating))
+    print(peek_rating(&rating)) // `rating` was only borrowed -- fine
+
+    // -- generics: a `Tagged(i64)` value ---------------------------------
+    let tagged: Tagged(i64) = Tagged(7, 25000)
+    print(describe_tagged_amount(tagged)) // 25000
+
+    // -- Money / Measure prelude types ------------------------------------
+    let quote: Money = quote_in_usd(19999)
+    print(quote.amount)   // 199.99
+    print(quote.currency) // USD()
+
+    let w1: Measure = Measure(dec_from_i64(2, 0), Kilogram())
+    let w2: Measure = Measure(dec_from_i64(3, 0), Kilogram())
+    let total_weight: Measure = match combine_shipment_weight(w1, w2) {
+        Ok(m) => m,
+        Err(e) => Measure(dec_from_i64(0, 0), Kilogram()),
+    }
+    print(total_weight.value) // 5
+
+    // -- effect(pure) + validate ------------------------------------------
+    print(risk_score(0.9, 0.8, 0.5)) // a `dot` of two Vector(f64, 3)s
+
+    // -- privileged fn + acquire: only a real "cfo" proof can obtain a
+    // callable value for `override_spending_limit`. `ops_token` carries
+    // "procurement_manager"/"finance_director", not "cfo" -- so
+    // `check_role` itself fails here, the same failure path a real
+    // deployment's cfo-only gate relies on.
+    let overridden: i64 = match oidc_validate_token(ops_token, issuer, audience, jwks) {
+        Ok(identity) => match check_role(identity, "cfo") {
+            Ok(proof) => match acquire override_spending_limit(proof) {
+                Ok(f) => f(500000),
+                Err(e) => -1,
+            },
+            Err(e) => -2,
+        },
+        Err(e) => -3,
+    }
+    print(overridden) // -2: no "cfo" role on this token, check_role fails
+
+    // -- the actual procurement flow: vendor -> purchase order ->
+    // owner-gated workflow approval -> durable disbursement ---------------
+    // `create_vendor` is `requires(role: "procurement_manager")`-gated --
+    // its *value* is unobtainable without `acquire`ing it with a real
+    // `RoleView` proof first.
+    let vendor_id: i64 = match oidc_validate_token(ops_token, issuer, audience, jwks) {
+        Ok(identity) => match check_role(identity, "procurement_manager") {
+            Ok(proof) => match acquire create_vendor(proof) {
+                Ok(f) => match f(Vendor(0, "Acme Components", 4)) {
+                    Ok(id) => id,
+                    Err(e) => -1,
+                },
+                Err(e) => -1,
+            },
+            Err(e) => -1,
+        },
+        Err(e) => -1,
+    }
+
+    let instance_id: i64 = match submit_purchase_order(vendor_id, 250000) {
+        Ok(id) => id,
+        Err(e) => -1,
+    }
+
+    // `decide_purchase_order` is an ordinary (ungated) function that
+    // takes a real `identity`; the workflow's own `PendingApproval`
+    // state separately checks it against its `owner: role(...)` at
+    // runtime -- `ops_token`'s "finance_director" role satisfies it.
+    let approved: bool = match oidc_validate_token(ops_token, issuer, audience, jwks) {
+        Ok(identity) => match decide_purchase_order(identity, instance_id, Approve()) {
+            Ok(ok) => ok,
+            Err(e) => false,
+        },
+        Err(e) => false,
+    }
+    print(approved) // true -- the *transition* to `Approved` succeeded;
+                     // its `on_entry` ran `finalize_purchase_order`,
+                     // which ran `disburse`'s `transact` (no real payment
+                     // gateway is listening for this example, so its
+                     // `verify` slot fails and `compensate` runs instead
+                     // -- see the "reversing disbursement" line above),
+                     // published "po.paid" over `mq`, and notified
+                     // finance over a `chan` -- an `on_entry` action's
+                     // own outcome never blocks the transition itself
+}

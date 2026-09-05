@@ -1,0 +1,94 @@
+// Level 2 -- scalar types, operators, and control flow.
+//
+// Exercises: `i64`/`f64`/`bool`/`str` literals and locals, the
+// arithmetic/comparison/logical operator set, `if`/`else` used both as
+// a statement and as an expression, `while`, and recursion.
+
+fn is_even(n: i64) -> bool {
+    return n - (n / 2) * 2 == 0
+}
+
+// `str` can't cross a function boundary (LANGUAGE.md's "enum favoring"
+// rule -- see level 3 for the general escape hatch, `Text`). A closed
+// set of outcomes like this one belongs in a real `enum` instead.
+enum Classification {
+    Negative,
+    Even,
+    Odd,
+}
+
+// `if`/`else` as an *expression*: both branches return a value of the
+// same type, and the whole thing can be the function's `return`ed value.
+fn classify(n: i64) -> Classification {
+    return if n < 0 {
+        Negative()
+    } else {
+        if is_even(n) { Even() } else { Odd() }
+    }
+}
+
+fn factorial(n: i64) -> i64 {
+    if n <= 1 {
+        return 1
+    } else {
+        return n * factorial(n - 1)
+    }
+}
+
+fn average(a: f64, b: f64) -> f64 {
+    return (a + b) / 2.0
+}
+
+fn main() {
+    // i64: arithmetic + comparison
+    let x: i64 = 7
+    let y: i64 = 3
+    print(x + y)   // 10
+    print(x - y)   // 4
+    print(x * y)   // 21
+    print(x / y)   // 2 (integer division)
+    print(x > y && y > 0) // true
+
+    // f64: arithmetic, comparison, negation
+    let f: f64 = 3.5
+    let g: f64 = 1.5
+    print(f + g)  // 5
+    print(-f)     // -3.5
+    print(f == 3.5) // true
+    print(average(2.0, 4.0)) // 3
+
+    // bool + short-circuit logical operators
+    let a: bool = true
+    let b: bool = false
+    print(a && b) // false
+    print(a || b) // true
+    print(!a)     // false
+
+    // str: literal, escapes, equality (no concatenation/indexing -- see
+    // level 3 for why free text needs a carrier struct at fn boundaries)
+    let s: str = "line one\nline two\ttabbed"
+    print(s)
+    print("same" == "same") // true
+
+    // control flow: `if` as a statement (value discarded), `while`,
+    // mutation, recursion
+    if is_even(x) {
+        print("x is even")
+    } else {
+        print("x is odd")
+    }
+
+    let n: i64 = 5
+    let i: i64 = 0
+    let sum: i64 = 0
+    while i < n {
+        sum = sum + i
+        i = i + 1
+    }
+    print(sum) // 0+1+2+3+4 = 10
+
+    print(classify(-3)) // Negative()
+    print(classify(4))  // Even()
+    print(classify(7))  // Odd()
+    print(factorial(10)) // 3628800
+}

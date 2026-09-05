@@ -1,0 +1,16 @@
+// Level 0 -- hello, nirdosha.
+//
+// The absolute minimum: a `fn`, a call, and `print`. `main` is the
+// entry point every `.nir` program needs; `add` shows that an ordinary
+// function is just a name, a typed parameter list, a typed return, and
+// a body.
+fn add(a: i32, b: i32) -> i32 {
+    return a + b
+}
+
+fn main() {
+    let x: i32 = 5
+    let y: i32 = add(x, 3)
+    print(y) // 8
+    print("hello, nirdosha")
+}

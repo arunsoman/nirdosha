@@ -1,0 +1,203 @@
+// Level 6 -- identity/authorization, durable effects, state machines,
+// and the declarative UI layer: `requires`/`acquire`, `oidc_validate_token`
+// /`check_role`, `transact { ... }`, `workflow { ... }`, `screen`/
+// `dashboard`, and `module`/`use` namespacing.
+//
+// `use "path"` is only legal in the leading run at the very top of a
+// file, before any other item -- it imports another file's `pub`,
+// namespaced declarations (never a bare top-level one).
+use "06_shared_lib.nir"
+
+struct Text {
+    value: str,
+}
+
+// --- 6a. Privileged first-class functions -------------------------------
+// A `requires`-gated function's *value* is unobtainable without proof:
+// `transfer_funds(500)` or `let f = transfer_funds` are both *compile-time*
+// errors. `acquire` is the only way to obtain a callable value.
+fn transfer_funds(amount: i64) -> i64 requires(role: "physician") {
+    return amount
+}
+
+// An ordinary (ungated) function is already first-class, no proof needed.
+fn double(x: i64) -> i64 {
+    return x * 2
+}
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x)
+}
+
+// `requires(public)` -- doesn't gate the function at all; it's a marker
+// that silences `serve`'s "unintentionally open endpoint" warning for a
+// function that's genuinely meant to need no token.
+fn health_check() -> bool requires(public) {
+    return true
+}
+
+// --- transact { ... } -- durable-effect construct: precheck?, network,
+// verify, commit, compensate?, log? An expression producing `bool`. ---
+fn call_api(txn_id: str, amount: i64) -> i64 {
+    return amount
+}
+
+fn check_amount(resp: i64) -> bool {
+    return resp > 0
+}
+
+fn commit_amount(amount: i64) -> i64 {
+    print("committing", amount)
+    return amount
+}
+
+fn refund_amount(amount: i64) -> i64 {
+    print("compensating", amount)
+    return amount
+}
+
+fn charge(amount: i64) -> bool {
+    return transact {
+        network:    call_api(txn_id, amount)
+        verify:     check_amount(network)
+        commit:     commit_amount(amount)
+        compensate: refund_amount(amount)
+    }
+}
+
+// --- workflow { ... } -- a durable state machine. `data`/`data.<field>`
+// implicit bindings, `on_entry` actions, and `on <Event> -> <State>`
+// transitions. Desugars to `start_approval`/`advance_approval` plus a
+// synthesized `ApprovalData`/`ApprovalEvent`. ---
+fn log_decision(instance_id: i64, outcome: Text) -> unit {
+    print("approval", instance_id, outcome.value)
+}
+
+workflow Approval {
+    data {
+        amount: i64,
+    }
+
+    state Pending {
+        on Approve -> Approved
+        on Reject -> Rejected
+    }
+
+    state Approved terminal {
+        on_entry {
+            log_decision(instance_id, Text("approved"))
+        }
+    }
+
+    state Rejected terminal {
+        on_entry {
+            log_decision(instance_id, Text("rejected"))
+        }
+    }
+}
+
+// Thin wrapper over the desugared `start_approval`, same convention
+// `examples/kyc_onboarding.nir` and `examples/trade-finance/` both use.
+fn submit_approval(amount: i64) -> Result(i64, WorkflowActionError) {
+    return start_approval(None(), ApprovalData(amount))
+}
+
+fn decide_approval(identity: VerifiedIdentity, instance_id: i64, decision: ApprovalEvent) -> Result(bool, WorkflowActionError) {
+    return match json_parse("{}") {
+        Ok(payload) => advance_approval(identity, instance_id, decision, payload),
+        Err(e) => Err(NoSuchTransition()),
+    }
+}
+
+// --- screen/dashboard -- declarative, additive layer on top of the
+// list_/create_/update_/delete_<struct> and stat_/chart_<name> naming
+// conventions `emit-ui`/`serve` already infer from. Parsed/typechecked
+// here; only `emit-ui`/`serve` actually render them. ---
+struct Case {
+    id: i64,
+    title: str,
+    status: str,
+}
+
+enum ErrorCode {
+    MalformedListing(str),
+}
+
+fn list_case() -> Result(json, ErrorCode) {
+    return match json_parse("[]") {
+        Ok(doc) => Ok(doc),
+        Err(e) => Err(MalformedListing(e)),
+    }
+}
+
+fn stat_case_count() -> i64 {
+    return 0
+}
+
+fn chart_cases_by_status() -> Result(json, ErrorCode) {
+    return match json_parse("[]") {
+        Ok(doc) => Ok(doc),
+        Err(e) => Err(MalformedListing(e)),
+    }
+}
+
+screen Case {
+    title: "Cases"
+    field title {
+        label: "Case Title"
+    }
+}
+
+dashboard {
+    tile "Open Cases" -> stat_case_count
+    chart "By Status" -> chart_cases_by_status
+}
+
+fn main() {
+    // 6a: acquire a privileged fn's value via a real, externally-issued
+    // token -- same fixture `tests/privileged_fn.rs` uses: roles =
+    // ["physician"], department = "cardiology".
+    print(apply(double, 21)) // 42, no privilege needed
+
+    let token: str = "eyJhbGciOiAiSFMyNTYiLCAia2lkIjogImtleTEifQ.eyJzdWIiOiAiYWxpY2UiLCAiaXNzIjogImh0dHBzOi8vZXhhbXBsZS5jb20iLCAiYXVkIjogIm15LWFwcCIsICJleHAiOiAyMDAwMDAwMDAwLCAiaWF0IjogMTcwMDAwMDAwMCwgInJvbGVzIjogWyJwaHlzaWNpYW4iXSwgImRlcGFydG1lbnQiOiAiY2FyZGlvbG9neSJ9.nrFdeqNDwXWLeGzud6X9Q4ITzCXULzZBBK8y51LGYXs"
+    let jwks: str = "{\"keys\":[{\"kid\":\"key1\",\"kty\":\"oct\",\"k\":\"bXktc2VjcmV0LWtleQ\"}]}"
+
+    let acquired: i64 = match oidc_validate_token(token, "https://example.com", "my-app", jwks) {
+        Ok(identity) => match check_role(identity, "physician") {
+            Ok(proof) => match acquire transfer_funds(proof) {
+                Ok(f) => f(500),
+                Err(e) => -1,
+            },
+            Err(e) => -2,
+        },
+        Err(e) => -3,
+    }
+    print(acquired) // 500
+    print(health_check()) // true, no token needed
+
+    // transact
+    print(charge(10))  // true -- committing 10
+    print(charge(-5))  // false -- compensating -5
+
+    // workflow: submit (no identity yet -- a brand-new request has none
+    // to record), then decide (a real identity is required here).
+    let instance_id: i64 = match submit_approval(250) {
+        Ok(id) => id,
+        Err(e) => -1,
+    }
+
+    let decided: bool = match oidc_validate_token(token, "https://example.com", "my-app", jwks) {
+        Ok(identity) => match decide_approval(identity, instance_id, Approve()) {
+            Ok(ok) => ok,
+            Err(e) => false,
+        },
+        Err(e) => false,
+    }
+    print(decided) // true -- prints "approved <instance_id> approved" via on_entry
+
+    // module/use: `Shared::` is only reachable through its qualified
+    // name, never bare, even though it was `use`d from another file.
+    let entry: Shared::AuditEntry = Shared::make_entry(1)
+    print(entry.id)
+    print(entry.note)
+}

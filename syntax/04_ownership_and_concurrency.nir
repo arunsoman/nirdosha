@@ -1,0 +1,86 @@
+// Level 4 -- ownership and concurrency: `box`/`&`/move semantics,
+// `spawn`/`join`/`thread`, `chan`/`send`/`recv`, and `sandbox`.
+
+// `box`/`*` (deref)/move semantics. `consume` takes ownership -- calling
+// it moves the argument away from the caller; a second call with the
+// same value would be a compile-time "use after move" error.
+fn consume(b: box i64) -> i64 {
+    return *b
+}
+
+fn make_boxed(n: i64) -> box i64 {
+    return box n
+}
+
+// Shared borrows (`&`). `peek` reads through a reference without taking
+// ownership, so the caller can use the value again afterward -- unlike
+// `consume` above, where the same pattern would move it on the first call.
+fn peek(r: &i64) -> i64 {
+    return *r + 1
+}
+
+fn double(n: i64) -> i64 {
+    return n * 2
+}
+
+fn add(a: i64, b: i64) -> i64 {
+    return a + b
+}
+
+// `chan i64` is a handle to an unbounded MPMC queue. `send` never
+// blocks; `recv` blocks until a value is available. A channel handle is
+// freely copyable -- both the sender and receiver keep their own handle
+// to the same queue after `spawn`.
+fn producer(c: chan i64) -> unit {
+    send(c, 14)
+    send(c, 28)
+    return
+}
+
+// `sandbox worker(args)` runs `worker` as a real, separate OS process
+// (not a thread), returning an affine `sandbox` handle; `stop` kills it
+// if still running and yields its exit code. Layer 1 has no typed IPC --
+// a sandboxed fn's return value never reaches the caller, only its exit
+// status does, so it must return `unit` and take only plain scalars.
+fn background_work() -> unit {
+    while true {
+    }
+}
+
+fn main() {
+    // box / move
+    let a: box i64 = box 10
+    print(consume(a)) // moves `a`; using `a` again would not typecheck
+
+    let b: box i64 = make_boxed(32)
+    print(*b + 10) // 42
+
+    // & / shared borrow
+    let n: i64 = 41
+    print(peek(&n))
+    print(peek(&n)) // `n` was only borrowed, not moved -- fine
+
+    // spawn / join / thread -- `spawn f(args)` runs `f` on a real OS
+    // thread and returns a `thread T` handle; `join` blocks and consumes
+    // it, producing its `T`-typed result.
+    let h1: thread i64 = spawn double(21)
+    let h2: thread i64 = spawn add(10, 32)
+    print(join h1) // 42
+    print(join h2) // 42
+
+    // chan / send / recv
+    let c: chan i64 = chan
+    let h: thread unit = spawn producer(c)
+    let x: i64 = recv(c)
+    let y: i64 = recv(c)
+    join h
+    print(x + y) // 42
+
+    // sandbox / stop -- a real separate process; a handle that goes out
+    // of scope without `stop` still kills its process (no zombie left
+    // behind just because a program forgot to clean up).
+    let s: sandbox = sandbox background_work()
+    let code: i64 = stop s
+    print(code) // -1: background_work runs forever, so `stop` always
+                // catches it still running and kills it
+}
